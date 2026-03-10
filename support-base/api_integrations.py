@@ -729,26 +729,17 @@ def extract_area_from_text(text: str, language: str = 'ja') -> str:
 def extract_shops_from_response(text: str) -> list:
     """
     LLMの応答テキストからショップ情報を抽出
-    Geminiがプレーンテキストで返した場合のフォールバック
     """
     shops = []
-
-    # パターン1: "1. **店名** - 説明" or "1. **店名**（駅名）- 説明"
-    pattern1 = r'(\d+)\.\s*\*\*([^*]+)\*\*\s*(?:[\(（][^)）]+[\)）])?\s*[-–—:]\s*([^\n]+)'
-    # パターン2: "1.  **店名**\n    説明" (改行+インデントで説明が続くパターン)
-    pattern2 = r'(\d+)\.\s+\*\*([^*]+)\*\*\s*(?:[\(（][^)）]+[\)）])?\s*\n\s+([^\n]+)'
-
-    matches = re.findall(pattern1, text)
-    if not matches:
-        matches = re.findall(pattern2, text)
+    pattern = r'(\d+)\.\s*\*\*([^*]+)\*\*\s*(?:\([^)]+\))?\s*[-:]:]\s*([^\n]+)'
+    matches = re.findall(pattern, text)
 
     for match in matches:
         full_name = match[1].strip()
         description = match[2].strip()
 
         name = full_name
-        # 括弧内の読み仮名や英語名を除去
-        name_match = re.match(r'^([^(（]+)[(（]([^)）]+)[)）]', full_name)
+        name_match = re.match(r'^([^(]+)[(]([^)]+)[)]', full_name)
         if name_match:
             name = name_match.group(1).strip()
 

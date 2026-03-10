@@ -569,6 +569,7 @@ class SupportAssistant:
 
             logger.info(f"[Assistant] Gemini response received: {len(assistant_text)} chars")
 
+
             # 【デバッグ】エンコーディング確認用ログ
             logger.info(f"[DEBUG] Response encoding type: {type(assistant_text)}")
             logger.info(f"[DEBUG] Response first 200 chars: {repr(assistant_text[:200])}")
@@ -580,38 +581,6 @@ class SupportAssistant:
             except Exception as e:
                 logger.error(f"[DEBUG] UTF-8 encoding test: FAILED - {e}")
             parsed_message, parsed_shops, parsed_action = self._parse_json_response(assistant_text)
-
-            # Google検索グラウンディング使用時にJSONが返らなかった場合、
-            # テキストレスポンスをベースにJSON形式で再生成を試みる
-            if not parsed_shops and tools and '{' not in assistant_text:
-                logger.info("[Assistant] JSON未検出 - Google検索結果をベースにJSON再生成を試行")
-                try:
-                    json_retry_prompt = (
-                        f"以下のレストラン情報をJSON形式に変換してください。\n"
-                        f"フォーマット: {{\"message\": \"元のテキスト\", \"shops\": [{{\"name\": \"店名\", \"area\": \"エリア\", "
-                        f"\"category\": \"ジャンル\", \"description\": \"説明\", \"rating\": 4.0, \"reviewCount\": 100, "
-                        f"\"priceRange\": \"価格帯\", \"location\": \"所在地\", \"highlights\": [\"特徴1\", \"特徴2\"], "
-                        f"\"tips\": \"おすすめポイント\"}}]}}\n\n"
-                        f"元のテキスト:\n{assistant_text}"
-                    )
-                    retry_config = types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                    )
-                    retry_response = gemini_client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=json_retry_prompt,
-                        config=retry_config,
-                    )
-                    if retry_response.text:
-                        logger.info(f"[Assistant] JSON再生成成功: {len(retry_response.text)} chars")
-                        retry_message, retry_shops, retry_action = self._parse_json_response(retry_response.text)
-                        if retry_shops:
-                            parsed_message = retry_message
-                            parsed_shops = retry_shops
-                            parsed_action = retry_action
-                            logger.info(f"[Assistant] JSON再生成から{len(parsed_shops)}件のショップを取得")
-                except Exception as e:
-                    logger.warning(f"[Assistant] JSON再生成失敗: {e}")
 
             if parsed_shops:
                 self.session.save_current_shops(parsed_shops)
