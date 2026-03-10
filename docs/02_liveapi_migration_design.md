@@ -1,0 +1,924 @@
+# Gemini LiveAPI 移植設計書（gourmet-sp3）
+
+> **作成日**: 2026-03-10
+> **前提文書**: `docs/01_stt_stream_detailed_spec.md`（必ず先に読むこと）
+> **目的**: 現行REST APIベースのgourmet-sp3に、Gemini LiveAPIによるリアルタイム音声対話を追加する設計
+
+---
+
+## 0. Claudeへの厳守事項（最重要）
+
+### 過去3回の失敗パターン
+
+```
+1) 仕様書作成
+2) 仕様通りに実装（ここまではOK）
+3) 不備発見 → 修正開始
+4) 修正中に仕様書を読まずに推測で変更を入れる ← ★ここが問題
+5) 推測が間違っていて不具合増加
+6) 「仕様書を確認しろ」→「確認しました」と嘘をつく ← ★ここも問題
+7) 更に推測で修正 → ドツボ
+```
+
+### 防止ルール
+
+1. **修正する前に、必ず `01_stt_stream_detailed_spec.md` の該当セクションを `Read` ツールで読む**
+2. **「確認しました」と報告する場合、確認したファイルパスと行番号を明記する**
+3. **仕様書に記載がない機能を追加しない**
+4. **推測で API の引数やメソッド名を変えない**
+5. **困ったらユーザーに聞く。推測で進めない**
+
+---
+
+## 1. 移植のスコープ
+
+### 1.1 やること
+
+| # | 内容 | 優先度 |
+|---|---|---|
+| 1 | バックエンド: LiveAPI WebSocketプロキシの新設 | 必須 |
+| 2 | フロントエンド: AudioStreamManager の改修 | 必須 |
+| 3 | LiveAPI → REST API フォールバック機構 | 必須 |
+| 4 | セッション再接続メカニズム | 必須 |
+| 5 | トランスクリプション（文字起こし）表示 | 推奨 |
+| 6 | Function Calling（ショップ提案トリガー） | 将来 |
+
+### 1.2 やらないこと
+
+- 現行REST APIエンドポイント（`/api/chat`, `/api/tts/synthesize`, `/api/stt/transcribe`）の廃止
+  → LiveAPIが不安定な間は、REST APIをフォールバックとして維持
+- PyAudio関連の移植（ブラウザにはPyAudioがない）
+- 効果音生成（ブラウザ側で別途実装するなら可）
+
+---
+
+## 2. 全体アーキテクチャ
+
+### 2.1 現行アーキテクチャ（REST API方式）
+
+```
+ブラウザ
+├── マイク → AudioWorklet → PCM 16kHz → Socket.IO → サーバー
+│                                                      ├── Google STT（音声→テキスト）
+│                                                      ├── Gemini REST API（テキスト→テキスト）
+│                                                      └── Google TTS（テキスト→音声）
+│                                                             ↓
+└── スピーカー ← HTMLAudioElement ← MP3 base64 ← HTTP Response
+```
+
+**問題点**: 音声→テキスト→AI→テキスト→音声 の変換が多く、遅延が大きい
+
+### 2.2 新アーキテクチャ（LiveAPI方式）
+
+```
+ブラウザ
+├── マイク → AudioWorklet → PCM 16kHz → WebSocket → サーバー
+│                                                      ├── Gemini LiveAPI（音声→音声）
+│                                                      │   ├── 音声応答（PCM 24kHz）
+│                                                      │   ├── input_transcription（ユーザー文字起こし）
+│                                                      │   └── output_transcription（AI文字起こし）
+│                                                      │
+│                                                      └── [フォールバック] REST API + TTS
+│                                                             ↓
+└── スピーカー ← Web Audio API ← PCM 24kHz ← WebSocket
+    チャット欄 ← transcription テキスト ← WebSocket
+```
+
+**利点**: 音声→音声の直接変換で低遅延
+
+### 2.3 データフロー詳細
+
+```
+[ブラウザ → サーバー]
+1. WebSocket: {type: 'audio', data: base64_pcm_16khz}
+   → サーバーが base64デコード
+   → session.send_realtime_input(audio={"data": pcm_bytes, "mime_type": "audio/pcm"})
+
+[サーバー → ブラウザ]
+2. LiveAPIレスポンスを分類して転送:
+   a. 音声データ:
+      response.server_content.model_turn.parts[].inline_data.data
+      → WebSocket: {type: 'audio', data: base64_pcm_24khz}
+
+   b. ユーザー文字起こし:
+      response.server_content.input_transcription.text
+      → WebSocket: {type: 'user_transcript', text: '...'}
+
+   c. AI文字起こし:
+      response.server_content.output_transcription.text
+      → WebSocket: {type: 'ai_transcript', text: '...'}
+
+   d. ターン完了:
+      response.server_content.turn_complete == True
+      → WebSocket: {type: 'turn_complete'}
+
+   e. 割り込み:
+      response.server_content.interrupted == True
+      → WebSocket: {type: 'interrupted'}
+```
+
+---
+
+## 3. バックエンド設計
+
+### 3.1 新規ファイル: `live_api_handler.py`
+
+stt_stream.py の `GeminiLiveApp` をWeb向けに変換したクラス。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Gemini LiveAPI ハンドラ（WebSocket プロキシ）
+stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
+
+【重要】
+- 本ファイルの実装は 01_stt_stream_detailed_spec.md のセクション5-9に準拠する
+- LiveAPI の設定値・メソッド名は仕様書のコード引用を正解とする
+- 推測でメソッド名や引数を変えてはならない
+"""
+
+import asyncio
+import base64
+import logging
+from google import genai
+from google.genai import types
+
+logger = logging.getLogger(__name__)
+
+# stt_stream.py から転記（変更禁止）
+LIVE_API_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+MAX_AI_CHARS_BEFORE_RECONNECT = 800
+LONG_SPEECH_THRESHOLD = 500
+```
+
+### 3.2 LiveAPISession クラス設計
+
+```python
+class LiveAPISession:
+    """
+    1つのブラウザクライアントに対応するLiveAPIセッション
+
+    stt_stream.py の GeminiLiveApp を参考に、以下を移植:
+    - Live API接続設定 (仕様書 セクション5.2)
+    - 音声送受信 (仕様書 セクション7)
+    - 再接続メカニズム (仕様書 セクション8)
+    - エラーハンドリング (仕様書 セクション9)
+    """
+
+    def __init__(self, session_id: str, mode: str, language: str,
+                 system_prompt: str, socketio, client_sid: str):
+        self.session_id = session_id
+        self.mode = mode
+        self.language = language
+        self.system_prompt = system_prompt
+        self.socketio = socketio         # Socket.IOインスタンス
+        self.client_sid = client_sid     # ブラウザ側のSocket.IO ID
+
+        # Gemini APIクライアント
+        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+        # 状態管理（stt_stream.py:387-394 から転記）
+        self.user_transcript_buffer = ""
+        self.ai_transcript_buffer = ""
+        self.conversation_history = []
+        self.ai_char_count = 0
+        self.needs_reconnect = False
+        self.session_count = 0
+
+        # 非同期キュー
+        self.audio_queue_to_gemini = None   # ブラウザ→Gemini
+        self.is_running = False
+
+    def _build_config(self, with_context=None):
+        """
+        Live API接続設定を構築
+
+        【厳守】仕様書 セクション5.2 のconfig辞書をそのまま使う。
+        値を変えない。キーを追加・削除しない。
+        """
+        instruction = self.system_prompt
+
+        if with_context:
+            # 仕様書 セクション8.3 の再接続時コンテキスト注入
+            last_user_message = ""
+            for h in reversed(self.conversation_history):
+                if h['role'] == 'user':
+                    last_user_message = h['text'][:100]
+                    break
+
+            instruction += f"""
+
+【これまでの会話の要約】
+{with_context}
+
+【重要：必ず守ること】
+1. 直前のユーザーの発言「{last_user_message}」に対して短い相槌を入れる
+2. 既に話した内容は繰り返さない
+"""
+
+        config = {
+            "response_modalities": ["AUDIO"],
+            "system_instruction": instruction,
+            "input_audio_transcription": {},
+            "output_audio_transcription": {},
+            "speech_config": {
+                "language_code": self._get_speech_language_code(),
+            },
+            "realtime_input_config": {
+                "automatic_activity_detection": {
+                    "disabled": False,
+                    "start_of_speech_sensitivity": "START_SENSITIVITY_HIGH",
+                    "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+                    "prefix_padding_ms": 100,
+                    "silence_duration_ms": 500,
+                }
+            },
+            "context_window_compression": {
+                "sliding_window": {
+                    "target_tokens": 32000,
+                }
+            },
+        }
+        return config
+
+    def _get_speech_language_code(self):
+        """言語コードをLiveAPI形式に変換"""
+        lang_map = {
+            'ja': 'ja-JP',
+            'en': 'en-US',
+            'zh': 'zh-CN',
+            'ko': 'ko-KR',
+        }
+        return lang_map.get(self.language, 'ja-JP')
+```
+
+### 3.3 音声送受信の実装方針
+
+```python
+    async def run(self):
+        """
+        メインループ（再接続対応）
+        仕様書 セクション6.1 の run() を移植
+        """
+        self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
+        self.is_running = True
+
+        try:
+            while self.is_running:
+                self.session_count += 1
+                self.ai_char_count = 0
+                self.needs_reconnect = False
+
+                context = None
+                if self.session_count > 1:
+                    context = self._get_context_summary()
+
+                config = self._build_config(with_context=context)
+
+                try:
+                    # 仕様書 セクション6.2: 接続メソッド
+                    async with self.client.aio.live.connect(
+                        model=LIVE_API_MODEL,
+                        config=config
+                    ) as session:
+                        if self.session_count > 1:
+                            # 仕様書 セクション6.3: 再接続時のテキスト送信
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text="続きをお願いします")]
+                                ),
+                                turn_complete=True
+                            )
+
+                        await self._session_loop(session)
+
+                        if not self.needs_reconnect:
+                            break
+
+                except Exception as e:
+                    # 仕様書 セクション9.1: 接続エラー処理
+                    error_msg = str(e).lower()
+                    if any(kw in error_msg for kw in
+                        ["1011", "internal error", "disconnected",
+                         "closed", "websocket"]):
+                        await asyncio.sleep(3)
+                        self.needs_reconnect = True
+                        continue
+                    else:
+                        raise
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.is_running = False
+
+    async def _session_loop(self, session):
+        """
+        セッション内ループ
+        仕様書 セクション7.1: 2つのタスクを並行実行
+        （listen_audioとplay_audioはブラウザ側なので不要）
+        """
+        async def send_audio():
+            """ブラウザからの音声をLiveAPIに転送"""
+            while not self.needs_reconnect:
+                try:
+                    audio_data = await asyncio.wait_for(
+                        self.audio_queue_to_gemini.get(),
+                        timeout=0.1
+                    )
+                    # 仕様書 セクション7.2: send_realtime_input
+                    await session.send_realtime_input(
+                        audio={"data": audio_data, "mime_type": "audio/pcm"}
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    if self.needs_reconnect:
+                        return
+                    logger.error(f"[LiveAPI] 送信エラー: {e}")
+                    self.needs_reconnect = True
+                    return
+
+        async def receive():
+            """LiveAPIからの応答を受信してブラウザに転送"""
+            try:
+                await self._receive_and_forward(session)
+            except Exception as e:
+                if self.needs_reconnect:
+                    return
+                error_msg = str(e).lower()
+                # 仕様書 セクション9.2
+                if any(kw in error_msg for kw in
+                    ["1011", "1008", "internal error",
+                     "closed", "deadline", "policy"]):
+                    self.needs_reconnect = True
+                else:
+                    raise
+
+        # キューをクリア
+        while not self.audio_queue_to_gemini.empty():
+            try:
+                self.audio_queue_to_gemini.get_nowait()
+            except:
+                break
+
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(send_audio())
+                tg.create_task(receive())
+        except* Exception as eg:
+            if not self.needs_reconnect:
+                for e in eg.exceptions:
+                    error_msg = str(e).lower()
+                    if any(kw in error_msg for kw in
+                        ["1011", "internal error", "closed", "websocket"]):
+                        self.needs_reconnect = True
+                    else:
+                        logger.error(f"[LiveAPI] タスクエラー: {e}")
+```
+
+### 3.4 レスポンス受信・転送
+
+```python
+    async def _receive_and_forward(self, session):
+        """
+        LiveAPIレスポンスを受信してSocket.IOでブラウザに転送
+        仕様書 セクション7.3 の receive_audio() を移植
+        """
+        while not self.needs_reconnect:
+            turn = session.receive()
+            async for response in turn:
+                if self.needs_reconnect:
+                    return
+
+                # 1. tool_call（現在は無効化だが将来用）
+                if hasattr(response, 'tool_call') and response.tool_call:
+                    # 仕様書 セクション3: 現在は無効化
+                    continue
+
+                if response.server_content:
+                    sc = response.server_content
+
+                    # 2. ターン完了
+                    if hasattr(sc, 'turn_complete') and sc.turn_complete:
+                        self._process_turn_complete()
+                        self.socketio.emit('turn_complete', {},
+                                          room=self.client_sid)
+
+                    # 3. 割り込み検知
+                    if hasattr(sc, 'interrupted') and sc.interrupted:
+                        self.ai_transcript_buffer = ""
+                        self.socketio.emit('interrupted', {},
+                                          room=self.client_sid)
+                        continue
+
+                    # 4. 入力トランスクリプション
+                    if (hasattr(sc, 'input_transcription')
+                            and sc.input_transcription):
+                        text = sc.input_transcription.text
+                        if text:
+                            self.user_transcript_buffer += text
+                            self.socketio.emit('user_transcript',
+                                {'text': text}, room=self.client_sid)
+
+                    # 5. 出力トランスクリプション
+                    if (hasattr(sc, 'output_transcription')
+                            and sc.output_transcription):
+                        text = sc.output_transcription.text
+                        if text:
+                            self.ai_transcript_buffer += text
+                            self.socketio.emit('ai_transcript',
+                                {'text': text}, room=self.client_sid)
+
+                    # 6. 音声データ
+                    if sc.model_turn:
+                        for part in sc.model_turn.parts:
+                            if (hasattr(part, 'inline_data')
+                                    and part.inline_data):
+                                if isinstance(part.inline_data.data, bytes):
+                                    audio_b64 = base64.b64encode(
+                                        part.inline_data.data
+                                    ).decode('utf-8')
+                                    self.socketio.emit('live_audio',
+                                        {'data': audio_b64},
+                                        room=self.client_sid)
+```
+
+### 3.5 app_customer_support.py への統合
+
+既存の Socket.IO イベントハンドラに LiveAPI 用のイベントを追加:
+
+```python
+# 新規Socket.IOイベント
+@socketio.on('live_start')      # LiveAPIセッション開始
+@socketio.on('live_audio_in')   # ブラウザ→LiveAPI 音声データ
+@socketio.on('live_stop')       # LiveAPIセッション終了
+```
+
+**既存のイベントは変更しない**（`start_stream`, `audio_chunk`, `stop_stream` はSTT用として残す）
+
+---
+
+## 4. フロントエンド設計
+
+### 4.1 AudioStreamManager の改修方針
+
+Gemini_LiveAPI_ans.txt のベストプラクティスに従い:
+
+1. **AudioContext はシングルトン**（セッション全体で1つ）
+2. **MediaStream は再利用**（毎回 getUserMedia しない）
+3. **AudioWorkletNode は `addModule` 1回だけ**
+4. **半二重制御はフラグで**（`isAiSpeaking`）
+5. **VAD はGemini側に委譲**（クライアント側は帯域節約のみ）
+
+### 4.2 新規ファイル: `live-audio-manager.ts`
+
+```typescript
+/**
+ * Gemini LiveAPI 用 AudioStreamManager
+ *
+ * 【設計原則】(Gemini_LiveAPI_ans.txt より)
+ * - AudioContext/MediaStream/AudioWorkletNode はセッション中使い回し
+ * - 半二重制御はフラグ（isAiSpeaking）で行う
+ * - VADはGemini側に委譲
+ * - AI音声再生もWeb Audio APIで行う（iOS対策）
+ */
+
+class LiveAudioManager {
+    private audioContext: AudioContext | null = null;
+    private mediaStream: MediaStream | null = null;
+    private audioWorkletNode: AudioWorkletNode | null = null;
+    private socket: any; // Socket.IO
+
+    public isAiSpeaking: boolean = false;
+
+    // ========================================
+    // セッション開始時に1度だけ呼ぶ
+    // ========================================
+    async initialize(socket: any): Promise<void> {
+        if (this.audioContext) return; // 既に初期化済み
+
+        this.socket = socket;
+
+        // 1. AudioContext (1つだけ)
+        this.audioContext = new AudioContext({ sampleRate: 48000 });
+
+        // 2. getUserMedia (1回だけ)
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                channelCount: 1,
+            }
+        });
+
+        // 3. AudioWorklet登録 (1回だけ)
+        // 既存の audio-manager.ts のプロセッサを流用
+        // 48kHz → 16kHz ダウンサンプリング + Int16変換
+        await this.audioContext.audioWorklet.addModule(processorBlobUrl);
+
+        // 4. Node作成・接続
+        const source = this.audioContext.createMediaStreamSource(
+            this.mediaStream
+        );
+        this.audioWorkletNode = new AudioWorkletNode(
+            this.audioContext, 'audio-processor'
+        );
+        source.connect(this.audioWorkletNode);
+
+        // 5. フラグによる送信制御
+        this.audioWorkletNode.port.onmessage = (e) => {
+            if (this.isAiSpeaking) return; // 半二重: AI応答中は送信しない
+
+            const audioChunk = e.data.audioChunk; // Int16Array
+            const base64 = arrayBufferToBase64(audioChunk.buffer);
+            this.socket.emit('live_audio_in', { data: base64 });
+        };
+    }
+
+    // ========================================
+    // AI応答音声の再生（Web Audio API, iOS対策）
+    // ========================================
+    playPcmAudio(pcmBase64: string): void {
+        if (!this.audioContext) return;
+
+        const pcmBytes = base64ToArrayBuffer(pcmBase64);
+        // PCM 24kHz 16bit mono → Float32
+        const int16 = new Int16Array(pcmBytes);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) {
+            float32[i] = int16[i] / 32768.0;
+        }
+
+        const buffer = this.audioContext.createBuffer(1, float32.length, 24000);
+        buffer.copyToChannel(float32, 0);
+
+        const source = this.audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.audioContext.destination);
+        source.start();
+    }
+
+    // ========================================
+    // フラグ切り替え
+    // ========================================
+    onAiResponseStarted(): void { this.isAiSpeaking = true; }
+    onAiResponseEnded(): void   { this.isAiSpeaking = false; }
+
+    // ========================================
+    // 完全終了時のみ全破棄
+    // ========================================
+    terminate(): void {
+        if (this.mediaStream) {
+            this.mediaStream.getTracks().forEach(t => t.stop());
+        }
+        if (this.audioContext) {
+            this.audioContext.close();
+        }
+        this.audioContext = null;
+        this.mediaStream = null;
+        this.audioWorkletNode = null;
+    }
+}
+```
+
+### 4.3 Socket.IO イベントハンドリング
+
+```typescript
+// ブラウザ側の受信イベント
+socket.on('live_audio', (data) => {
+    // AI音声再生
+    liveAudioManager.onAiResponseStarted();
+    liveAudioManager.playPcmAudio(data.data);
+});
+
+socket.on('user_transcript', (data) => {
+    // ユーザー文字起こし → チャット欄に表示
+    updateUserTranscript(data.text);
+});
+
+socket.on('ai_transcript', (data) => {
+    // AI文字起こし → チャット欄に表示
+    updateAiTranscript(data.text);
+});
+
+socket.on('turn_complete', () => {
+    // ターン完了 → マイク送信再開
+    liveAudioManager.onAiResponseEnded();
+    finalizeTranscripts(); // バッファを確定してメッセージに変換
+});
+
+socket.on('interrupted', () => {
+    // 割り込み → 音声再生停止
+    stopAudioPlayback();
+    liveAudioManager.onAiResponseEnded();
+});
+```
+
+---
+
+## 5. ショップ提案の処理フロー
+
+### 5.1 課題
+
+LiveAPIは `response_modalities: ["AUDIO"]` で動作するため、**テキストJSONを直接返せない**。
+ショップ提案はJSON形式が必要（`shops` 配列、`action` フィールド等）。
+
+### 5.2 設計方針: ハイブリッドアプローチ
+
+stt_stream.py のハイブリッド方式（仕様書 セクション1.2）を踏襲:
+
+```
+[通常会話]
+ユーザー音声 → LiveAPI → AI音声応答（低遅延）
+                         ↓
+                   output_transcription → チャット欄表示
+
+[ショップ提案が必要な場合]
+ユーザー音声 → LiveAPI → 「お調べしますね」等の短い音声応答
+                         ↓
+                   output_transcriptionからショップ提案意図を検知
+                         ↓
+              サーバー側で REST API に切り替え
+                         ↓
+              Gemini REST API → JSON応答（shops配列）
+                         ↓
+              WebSocket → ブラウザ → ショップカード表示
+              Google TTS → WebSocket → ブラウザ → 音声再生
+```
+
+### 5.3 ショップ提案検知ロジック
+
+LiveAPIの `output_transcription` テキストを監視して、ショップ提案の意図を検知:
+
+```python
+# サーバー側
+SHOP_TRIGGER_KEYWORDS = [
+    'お探ししますね', 'お調べしますね', '探してみますね',
+    'ご紹介しますね', 'おすすめ', '提案',
+]
+
+def should_trigger_shop_search(ai_text: str) -> bool:
+    """AI発話からショップ検索トリガーを検知"""
+    return any(kw in ai_text for kw in SHOP_TRIGGER_KEYWORDS)
+```
+
+**注意**: この検知ロジックは暫定的。将来 Function Calling が有効になれば、明示的なトリガーに置き換え可能。
+
+### 5.4 ショップ提案時の処理フロー（詳細）
+
+```
+1. LiveAPI output_transcription でショップ提案意図を検知
+2. LiveAPI の音声応答は「お探ししますね」等の短い応答のみ
+3. ターン完了後、サーバー側で REST API を呼び出し:
+   - ユーザーの要望（user_transcript_buffer から取得）
+   - 現行の SupportAssistant.process_user_message() を流用
+4. REST API のJSON応答をブラウザに転送:
+   - WebSocket: {type: 'shop_result', shops: [...], message: '...'}
+5. ブラウザ側:
+   - shops → ShopCardList コンポーネントで表示
+   - message → TTS で読み上げ（既存の speakTextGCP() を流用）
+```
+
+---
+
+## 6. セッション管理
+
+### 6.1 LiveAPIセッションのライフサイクル
+
+```
+ブラウザ                    サーバー                      Gemini LiveAPI
+  │                          │                              │
+  ├─ emit('live_start') ──→ │                              │
+  │                          ├─ LiveAPISession 作成 ──────→│
+  │                          │  client.aio.live.connect()   │
+  │                          │←─ 接続完了 ─────────────────│
+  │ ←─ emit('live_ready')── │                              │
+  │                          │                              │
+  ├─ emit('live_audio_in')→ │                              │
+  │                          ├─ send_realtime_input() ────→│
+  │                          │                              │
+  │                          │←─ response ────────────────│
+  │ ←─ emit('live_audio') ─ │  (audio + transcription)     │
+  │ ←─ emit('*_transcript')─│                              │
+  │                          │                              │
+  ├─ emit('live_stop') ──→  │                              │
+  │                          ├─ セッション切断 ────────────→│
+  │                          │  is_running = False           │
+```
+
+### 6.2 既存セッションとの関係
+
+```python
+# 既存の SupportSession（RAM）に LiveAPI セッション情報を追加
+data = {
+    'session_id': ...,
+    'mode': ...,
+    'language': ...,
+    # 既存フィールド...
+
+    # LiveAPI用追加フィールド
+    'live_api_session': LiveAPISession,  # LiveAPIセッションオブジェクト
+    'live_api_active': True/False,       # LiveAPIが有効かどうか
+}
+```
+
+---
+
+## 7. 再接続メカニズム
+
+### 7.1 サーバー側の再接続（stt_stream.py準拠）
+
+仕様書 セクション8 をそのまま実装:
+
+1. **再接続トリガー**: 発言途切れ / 長い発話(500文字) / 累積上限(800文字)
+2. **会話履歴引き継ぎ**: 直近10ターン、各150文字まで
+3. **システムインストラクション再構築**: コンテキスト要約を注入
+4. **再接続通知**: `send_client_content(text="続きをお願いします")`
+
+### 7.2 ブラウザ側への通知
+
+```python
+# サーバーが再接続する際にブラウザに通知
+self.socketio.emit('live_reconnecting', {}, room=self.client_sid)
+# 再接続完了後
+self.socketio.emit('live_reconnected', {}, room=self.client_sid)
+```
+
+ブラウザ側は:
+- 再接続中: マイク送信を一時停止（音声が消失しないように）
+- 再接続完了: マイク送信を再開
+
+---
+
+## 8. フォールバック戦略
+
+### 8.1 LiveAPI → REST API フォールバック
+
+LiveAPIが利用不可能な場合（接続エラー、モデル非対応等）:
+
+```python
+try:
+    # LiveAPIで接続
+    async with self.client.aio.live.connect(...) as session:
+        ...
+except Exception as e:
+    logger.error(f"[LiveAPI] 接続失敗、REST APIにフォールバック: {e}")
+    # 既存のREST APIフローに切り替え
+    self.socketio.emit('live_fallback', {
+        'reason': str(e)
+    }, room=self.client_sid)
+```
+
+ブラウザ側:
+```typescript
+socket.on('live_fallback', (data) => {
+    // LiveAPIモードを無効化
+    // 既存のSTT→REST API→TTSフローに切り替え
+    switchToRestApiMode();
+});
+```
+
+### 8.2 モード切り替えUI
+
+ユーザーが手動でLiveAPIモードとREST APIモードを切り替えられるトグルを用意:
+
+```
+[LiveAPI モード（リアルタイム音声）] ←→ [テキストモード（従来方式）]
+```
+
+---
+
+## 9. 実装フェーズ計画
+
+### Phase 1: 基盤構築（最小動作確認）
+
+1. `live_api_handler.py` の作成（LiveAPISession クラス）
+2. Socket.IO イベントハンドラの追加（`live_start`, `live_audio_in`, `live_stop`）
+3. LiveAPI接続→音声送信→音声受信→ブラウザ再生の最小ループ確認
+4. **テスト**: ブラウザで話しかけて、AIの音声応答が聞こえることを確認
+
+### Phase 2: トランスクリプション
+
+1. `input_transcription` → チャット欄にユーザー発話表示
+2. `output_transcription` → チャット欄にAI発話表示
+3. ターン完了時のメッセージ確定処理
+
+### Phase 3: ショップ提案ハイブリッド
+
+1. AI発話からショップ提案意図の検知
+2. REST API へのフォールバック
+3. ショップカード表示 + TTS読み上げ
+
+### Phase 4: 安定化
+
+1. 再接続メカニズムの実装
+2. エラーハンドリングの強化
+3. iOS Safari 対応（Web Audio APIでの再生統一）
+4. フォールバック戦略の実装
+
+### Phase 5: 最適化
+
+1. 音声バッファリングの最適化
+2. 帯域節約（クライアント側無音カット）
+3. UIの改善（音声波形表示等）
+
+---
+
+## 10. 既知のリスク・未解決課題
+
+### 10.1 LiveAPIプレビュー版の制約
+
+- **Function Calling無効**: ポリシーエラーで使えない（stt_stream.py:57-58）
+- **音声出力の長さ制限**: 長文は途切れる（仕様書 セクション15.2）
+- **セッション品質劣化**: 累積発話量で品質が下がる（仕様書 セクション15.3）
+- **モデル名変更の可能性**: `gemini-2.5-flash-native-audio-preview-12-2025` は暫定名
+
+### 10.2 WebSocketの二重化
+
+現行: Socket.IO（STT用）
+新規: Socket.IO（LiveAPI用）
+
+同一のSocket.IO接続を共有するが、イベント名で分離する設計。
+
+### 10.3 async/syncの混在
+
+Flask + Socket.IO は同期ベース。LiveAPIは asyncio ベース。
+`asyncio.run()` または `threading` + `asyncio.new_event_loop()` での統合が必要。
+
+```python
+# 案: 別スレッドでasyncioイベントループを実行
+import threading
+
+def start_live_session_thread(session: LiveAPISession):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(session.run())
+    finally:
+        loop.close()
+
+thread = threading.Thread(target=start_live_session_thread,
+                          args=(live_session,), daemon=True)
+thread.start()
+```
+
+### 10.4 音声再生の連続性
+
+LiveAPIから断片的に送られてくるPCMチャンクを、途切れなく連続再生する必要がある。
+`AudioBufferSourceNode` を逐次作成する方式では、チャンク間にギャップが生じる可能性。
+
+**対策案**: ScriptProcessorNode または AudioWorklet で再生キューを実装
+
+```typescript
+// 再生キューの概念
+class AudioPlaybackQueue {
+    private queue: Float32Array[] = [];
+    private isPlaying = false;
+
+    enqueue(pcmData: Float32Array): void {
+        this.queue.push(pcmData);
+        if (!this.isPlaying) this.startPlayback();
+    }
+
+    // AudioWorklet内でキューから順次読み出して再生
+}
+```
+
+---
+
+## 11. テスト計画
+
+### 11.1 Phase 1 テスト項目
+
+| # | テスト内容 | 期待結果 |
+|---|---|---|
+| 1 | LiveAPI接続 | `live_ready` イベントがブラウザに届く |
+| 2 | 音声送信 | サーバーログに「音声受信」が表示される |
+| 3 | 音声受信 | ブラウザのスピーカーからAI音声が聞こえる |
+| 4 | ターン完了 | `turn_complete` イベントが届く |
+| 5 | 接続エラー | REST APIにフォールバックする |
+| 6 | セッション終了 | リソースが正しく解放される |
+
+### 11.2 Phase 2 テスト項目
+
+| # | テスト内容 | 期待結果 |
+|---|---|---|
+| 1 | ユーザー文字起こし | チャット欄にユーザー発話が表示される |
+| 2 | AI文字起こし | チャット欄にAI発話が表示される |
+| 3 | 割り込み | AI音声再生が停止し、新しい入力を受け付ける |
+
+### 11.3 Phase 3 テスト項目
+
+| # | テスト内容 | 期待結果 |
+|---|---|---|
+| 1 | ショップ提案トリガー | AI発話からショップ検索意図を検知する |
+| 2 | REST APIフォールバック | JSON形式のショップデータが返る |
+| 3 | ショップカード表示 | ブラウザにショップカードが表示される |
+| 4 | TTS読み上げ | ショップ紹介が音声で読み上げられる |
+
+---
+
+*以上が LiveAPI 移植設計書。実装時は本設計書と `01_stt_stream_detailed_spec.md` を常に参照すること。*
