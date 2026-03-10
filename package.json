@@ -1,0 +1,21 @@
+{
+  "name": "gourmet-support",
+  "type": "module",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@vite-pwa/astro": "^1.2.0",
+    "astro": "^4.0.0",
+    "workbox-window": "^7.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
+    "autoprefixer": "^10.4.22",
+    "tailwindcss": "^4.1.17"
+  }
+}
