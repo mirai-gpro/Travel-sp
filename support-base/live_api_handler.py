@@ -212,8 +212,7 @@ class LiveAPISession:
     }
 
     def __init__(self, session_id: str, mode: str, language: str,
-                 system_prompt: str, socketio, client_sid: str,
-                 shop_search_callback=None):
+                 system_prompt: str, socketio, client_sid: str):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -221,17 +220,9 @@ class LiveAPISession:
         self.socketio = socketio
         self.client_sid = client_sid
 
-        # ショップ検索コールバック（app_customer_support.py から注入）
-        # signature: (session_id, user_request, language, mode) -> dict | None
-        self._shop_search_callback = shop_search_callback
-
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
-
-        # ショップ検索ペンディング（仕様書02v2 セクション5.4）
-        self._shop_search_pending = None  # None or {'user_request': str}
-        self._resume_message = None  # 再接続時のトリガーメッセージ（ショップ説明後の復帰用）
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -368,30 +359,18 @@ class LiveAPISession:
                             self._is_initial_greeting_phase = False
                             self.socketio.emit('live_reconnecting', {},
                                                room=self.client_sid)
-                            # v2: ショップ説明後の復帰メッセージがあればそれを使う
-                            resume_text = getattr(self, '_resume_message', None) or "続きをお願いします"
-                            self._resume_message = None  # 使い終わったらクリア
                             await session.send_client_content(
                                 turns=types.Content(
                                     role="user",
-                                    parts=[types.Part(text=resume_text)]
+                                    parts=[types.Part(text="続きをお願いします")]
                                 ),
                                 turn_complete=True
                             )
-                            logger.info(f"[LiveAPI] 再接続通知送信: '{resume_text[:50]}'")
+                            logger.info("[LiveAPI] 再接続通知送信")
                             self.socketio.emit('live_reconnected', {},
                                                room=self.client_sid)
 
                         await self._session_loop(session)
-
-                        # v2: ショップ検索ペンディングチェック
-                        if self._shop_search_pending:
-                            pending = self._shop_search_pending
-                            self._shop_search_pending = None
-                            await self._handle_shop_search(pending['user_request'])
-                            # ショップ説明完了後、通常会話に復帰するため
-                            # is_running/needs_reconnect は _handle_shop_search 内で設定済み
-                            continue
 
                         if not self.needs_reconnect:
                             break
@@ -569,16 +548,17 @@ class LiveAPISession:
             logger.info(f"[LiveAPI] AI: {ai_text}")
             self._add_to_history("ai", ai_text)
 
-            # ショップ検索トリガー検知（仕様書02v2 セクション5.3-5.4）
+            # ショップ検索トリガー検知（仕様書02 セクション5.2-5.4）
             if should_trigger_shop_search(ai_text):
                 # ユーザーの要望を会話履歴全体から構築
                 user_request = self._build_search_request(user_text)
                 logger.info(f"[LiveAPI] ショップ検索トリガー検知: '{ai_text}' → ユーザー要望: '{user_request}'")
-                # v2: ブラウザにemitせず、サーバー側でショップ検索→LiveAPI説明を実行
-                self._shop_search_pending = {'user_request': user_request}
-                self.is_running = False  # session_loopを終了させる
-                self.ai_transcript_buffer = ""
-                return  # 再接続判定をスキップ
+                self.socketio.emit('shop_search_trigger', {
+                    'user_request': user_request,
+                    'session_id': self.session_id,
+                    'language': self.language,
+                    'mode': self.mode
+                }, room=self.client_sid)
             else:
                 logger.debug(f"[LiveAPI] トリガー未検知: '{ai_text[:50]}'")
 
@@ -688,243 +668,3 @@ class LiveAPISession:
             summary += f"\n\n【直前の質問（回答を待っています）】\n{last_ai[:200]}"
 
         return summary
-
-    # ============================================================
-    # ショップ検索 → LiveAPI説明フロー（仕様書02v2 セクション5.4）
-    # ============================================================
-
-    async def _handle_shop_search(self, user_request: str):
-        """
-        ショップ検索トリガー検知後の処理（仕様書02v2 セクション5.4.1）
-
-        1. REST APIでショップデータ(JSON)を取得
-        2. ブラウザにショップカードデータを送信
-        3. LiveAPI再接続で1軒ずつ音声説明
-        4. 通常会話に復帰
-        """
-        logger.info(f"[ShopSearch] 検索開始: '{user_request}'")
-
-        # ① REST APIでショップデータを取得（コールバック経由）
-        shop_data = await self._fetch_shop_data(user_request)
-
-        if not shop_data or not shop_data.get('shops'):
-            # ショップが見つからない → LiveAPIで伝えて通常会話に復帰
-            logger.info("[ShopSearch] ショップ見つからず、通常会話に復帰")
-            await self._restart_live_with_message(
-                "検索しましたが、条件に合うお店が見つかりませんでした。"
-                "条件を変えてもう一度お探ししましょうか？"
-            )
-            return
-
-        shops = shop_data['shops']
-        response_text = shop_data.get('response', '')
-
-        # ② ショップカードデータをブラウザに送信（表示用）
-        self.socketio.emit('shop_search_result', {
-            'shops': shops,
-            'response': response_text,
-        }, room=self.client_sid)
-        logger.info(f"[ShopSearch] {len(shops)}件をブラウザに送信")
-
-        # ③ ショップ説明をLiveAPIで1軒ずつ読み上げ
-        await self._describe_shops_via_live(shops)
-
-    async def _fetch_shop_data(self, user_request: str) -> dict:
-        """
-        ショップデータをREST API経由で取得（仕様書02v2 セクション5.4.1）
-
-        shop_search_callback を使って内部的にSupportAssistantを呼び出す。
-        音声生成はしない、JSONデータのみ取得。
-        """
-        if not self._shop_search_callback:
-            logger.error("[ShopSearch] shop_search_callback未設定")
-            return None
-
-        try:
-            # コールバックは同期関数なのでasyncio.to_threadで呼ぶ
-            result = await asyncio.to_thread(
-                self._shop_search_callback,
-                self.session_id,
-                user_request,
-                self.language,
-                self.mode
-            )
-            return result
-        except Exception as e:
-            logger.error(f"[ShopSearch] データ取得エラー: {e}")
-            return None
-
-    async def _describe_shops_via_live(self, shops: list):
-        """
-        ショップ説明をLiveAPIで読み上げ（1軒ごとに再接続）
-        仕様書02v2 セクション5.4.2
-        """
-        total = len(shops)
-
-        for i, shop in enumerate(shops):
-            shop_number = i + 1
-            is_last = (shop_number == total)
-
-            # ショップ情報をテキスト化
-            shop_context = self._format_shop_for_prompt(shop, shop_number, total)
-
-            # ショップ紹介専用のシステムプロンプトを構築
-            shop_instruction = self.system_prompt + f"""
-
-【現在のタスク：ショップ紹介】
-あなたは今、ユーザーに検索結果のお店を紹介しています。
-
-{shop_context}
-
-【読み上げルール】
-1. このお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
-2. 店名、ジャンル、エリア、特徴、価格帯を含める
-3. マークダウン記法は使わない（音声出力のため）
-4. 「{shop_number}軒目は」から始める
-5. 紹介が終わったら「以上です」で締める
-"""
-            if is_last:
-                shop_instruction += f"6. 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
-
-            # トリガーメッセージ
-            if shop_number == 1:
-                trigger_text = f"検索結果を紹介してください。まず{shop_number}軒目のお店からお願いします。"
-            else:
-                trigger_text = f"{shop_number}軒目のお店を紹介してください。"
-
-            try:
-                config = self._build_config()
-                config["system_instruction"] = shop_instruction
-
-                async with self.client.aio.live.connect(
-                    model=LIVE_API_MODEL,
-                    config=config
-                ) as session:
-                    await session.send_client_content(
-                        turns=types.Content(
-                            role="user",
-                            parts=[types.Part(text=trigger_text)]
-                        ),
-                        turn_complete=True
-                    )
-
-                    # 説明の音声応答を受信・転送
-                    await self._receive_shop_description(session, shop_number)
-
-                logger.info(f"[ShopDesc] ショップ{shop_number}/{total} 説明完了")
-
-            except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{shop_number}説明エラー: {e}")
-                continue
-
-        # 全ショップ説明完了 → 通常会話に復帰
-        summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
-        self._add_to_history("ai", summary)
-        await self._restart_live_with_message(
-            "ありがとうございます。気になるお店について教えてください。"
-        )
-
-    async def _receive_shop_description(self, session, shop_number: int):
-        """
-        ショップ説明のLiveAPI応答を受信してブラウザに転送
-        仕様書02v2 セクション5.4.3
-
-        通常の _receive_and_forward() とほぼ同じだが:
-        - input_transcription は転送しない（トリガーメッセージは表示不要）
-        - turn_complete で終了（1ターンで完結）
-        """
-        turn = session.receive()
-        async for response in turn:
-            if response.server_content:
-                sc = response.server_content
-
-                # ターン完了 → この軒の説明終了
-                if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                    if self.ai_transcript_buffer.strip():
-                        ai_text = self.ai_transcript_buffer.strip()
-                        logger.info(f"[ShopDesc] #{shop_number}: {ai_text[:80]}...")
-                        self._add_to_history("ai", ai_text)
-                        self.ai_transcript_buffer = ""
-
-                    self.socketio.emit('turn_complete', {
-                        'type': 'shop_description',
-                        'shop_number': shop_number,
-                    }, room=self.client_sid)
-                    return
-
-                # 割り込み
-                if hasattr(sc, 'interrupted') and sc.interrupted:
-                    self.ai_transcript_buffer = ""
-                    self.socketio.emit('interrupted', {}, room=self.client_sid)
-                    return
-
-                # output_transcription（AI文字起こし → チャット欄に表示）
-                if hasattr(sc, 'output_transcription') and sc.output_transcription:
-                    text = sc.output_transcription.text
-                    if text:
-                        self.ai_transcript_buffer += text
-                        self.socketio.emit('ai_transcript', {
-                            'text': text,
-                            'type': 'shop_description',
-                            'shop_number': shop_number,
-                        }, room=self.client_sid)
-
-                # 音声データ → ブラウザで再生
-                if sc.model_turn:
-                    for part in sc.model_turn.parts:
-                        if hasattr(part, 'inline_data') and part.inline_data:
-                            if isinstance(part.inline_data.data, bytes):
-                                audio_b64 = base64.b64encode(
-                                    part.inline_data.data
-                                ).decode('utf-8')
-                                self.socketio.emit('live_audio', {
-                                    'data': audio_b64,
-                                }, room=self.client_sid)
-
-                # input_transcription は転送しない（トリガーメッセージ非表示）
-
-    def _format_shop_for_prompt(self, shop: dict, number: int, total: int) -> str:
-        """
-        ショップデータをシステムプロンプト注入用テキストに変換
-        仕様書02v2 セクション5.4.4
-        """
-        name = shop.get('name', '不明')
-        genre = shop.get('genre', '')
-        area = shop.get('area', '')
-        budget = shop.get('budget', '')
-        rating = shop.get('rating', '')
-        description = shop.get('description', '')
-        features = shop.get('features', [])
-        access = shop.get('access', '')
-
-        text = f"【{number}軒目 / 全{total}軒】\n"
-        text += f"店名: {name}\n"
-        if genre: text += f"ジャンル: {genre}\n"
-        if area: text += f"エリア: {area}\n"
-        if budget: text += f"予算: {budget}\n"
-        if rating: text += f"評価: {rating}\n"
-        if access: text += f"アクセス: {access}\n"
-        if description: text += f"説明: {description}\n"
-        if features:
-            feat_str = ', '.join(features) if isinstance(features, list) else str(features)
-            text += f"特徴: {feat_str}\n"
-
-        return text
-
-    async def _restart_live_with_message(self, trigger_message: str):
-        """
-        メッセージ付きでLiveAPI通常会話に復帰
-        仕様書02v2 セクション5.4.5
-
-        run()のwhileループに戻すため、is_running/needs_reconnectを設定
-        """
-        self.is_running = True
-        self.needs_reconnect = True  # run()のwhileループで再接続させる
-        self.session_count += 1
-        self.ai_char_count = 0
-
-        # 会話履歴にショップ紹介の記録を追加（復帰時のコンテキスト用）
-        # _get_context_summary() が拾えるように
-
-        # 復帰メッセージを保持（次の再接続時のsend_client_contentで使用）
-        self._resume_message = trigger_message

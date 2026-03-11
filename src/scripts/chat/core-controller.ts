@@ -360,28 +360,10 @@ export class CoreController {
       this.isLiveMode = false;
     });
 
-    // ★ ショップ検索結果受信（v2: カード表示のみ、音声はLiveAPIから届く）
-    this.socket.on('shop_search_result', (data: any) => {
-      console.log('[LiveAPI] shop_search_result:', data.shops?.length, '件');
-      if (data.shops && data.shops.length > 0) {
-        this.currentShops = data.shops;
-        this.els.reservationBtn.classList.add('visible');
-        document.dispatchEvent(new CustomEvent('displayShops', {
-          detail: { shops: data.shops, language: this.currentLanguage }
-        }));
-        const section = document.getElementById('shopListSection');
-        if (section) section.classList.add('has-shops');
-
-        if (window.innerWidth < 1024) {
-          setTimeout(() => {
-            const shopSection = document.getElementById('shopListSection');
-            if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          }, 300);
-        }
-      }
-      if (data.response) {
-        this.addMessage('assistant', data.response);
-      }
+    // ★ ショップ検索トリガー（LiveAPIからのハイブリッド切替）
+    this.socket.on('shop_search_trigger', (data: any) => {
+      console.log('[LiveAPI] shop_search_trigger:', data);
+      this.handleShopSearchFromLiveAPI(data);
     });
   }
 
@@ -555,9 +537,77 @@ export class CoreController {
     this.terminateLiveSession();
   }
 
-  // handleShopSearchFromLiveAPI() は v2 で廃止
-  // ショップ検索→説明は全てサーバー側で処理（仕様書02v2 セクション5.5.3）
-  // ショップカード表示は shop_search_result イベントハンドラで処理
+  protected async handleShopSearchFromLiveAPI(data: any): Promise<void> {
+    const userRequest = data.user_request || '';
+    console.log('[LiveAPI→REST] ショップ検索開始:', userRequest);
+
+    // LiveAPIを停止してからREST検索（二重応答を防止）
+    this.terminateLiveSession();
+
+    const message = userRequest || 'おすすめのお店を探してください';
+
+    try {
+      this.isProcessing = true;
+
+      const response = await fetch(`${this.apiBase}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: this.sessionId,
+          message: message,
+          stage: this.currentStage,
+          language: this.currentLanguage,
+          mode: this.currentMode
+        })
+      });
+      const result = await response.json();
+
+      if (result.shops && result.shops.length > 0) {
+        this.currentShops = result.shops;
+        this.els.reservationBtn.classList.add('visible');
+        document.dispatchEvent(new CustomEvent('displayShops', {
+          detail: { shops: result.shops, language: this.currentLanguage }
+        }));
+        const section = document.getElementById('shopListSection');
+        if (section) section.classList.add('has-shops');
+
+        if (result.response) {
+          this.addMessage('assistant', result.response);
+        }
+
+        if (window.innerWidth < 1024) {
+          setTimeout(() => {
+            const shopSection = document.getElementById('shopListSection');
+            if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, 300);
+        }
+
+        // TTS で読み上げ（既存の speakTextGCP() を流用）— 仕様書02 セクション5.4
+        if (result.response && this.isTTSEnabled && this.isUserInteracted) {
+          (async () => {
+            try {
+              this.isAISpeaking = true;
+              await this.speakTextGCP(this.t('ttsIntro'), true, false, false);
+              await this.speakTextGCP(result.response, false, false, false);
+            } catch (_e) {}
+            this.isAISpeaking = false;
+          })();
+        }
+      } else if (result.response) {
+        this.addMessage('assistant', result.response);
+        if (this.isTTSEnabled && this.isUserInteracted) {
+          this.speakTextGCP(result.response, true, false, false);
+        }
+      }
+
+      console.log('[LiveAPI→REST] ショップ検索完了:', result.shops?.length || 0, '件');
+    } catch (error) {
+      console.error('[LiveAPI→REST] ショップ検索エラー:', error);
+    } finally {
+      this.isProcessing = false;
+      this.resetInputState();
+    }
+  }
 
   protected terminateLiveSession(): void {
     if (this.isLiveMode && this.socket && this.socket.connected) {
