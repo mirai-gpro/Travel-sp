@@ -202,9 +202,12 @@ class LiveAPISession:
         self.session_id = session_id
         self.mode = mode
         self.language = language
-        self.system_prompt = system_prompt
+        self.system_prompt = system_prompt  # 外部から受け取る（将来GCS移行対応）
         self.socketio = socketio         # Socket.IOインスタンス
         self.client_sid = client_sid     # ブラウザ側のSocket.IO ID
+
+        # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
+        self._is_initial_greeting_phase = True
 
         # Gemini APIクライアント
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -355,16 +358,23 @@ class LiveAPISession:
                     if any(kw in error_msg for kw in
                         ["1011", "internal error", "disconnected",
                          "closed", "websocket"]):
+                        logger.warning(f"[LiveAPI] 接続エラー、3秒後に再接続: {e}")
                         await asyncio.sleep(3)
                         self.needs_reconnect = True
                         continue
                     else:
-                        raise
+                        # 致命的エラー: ブラウザに通知してREST APIフォールバック
+                        logger.error(f"[LiveAPI] 致命的エラー: {e}")
+                        self.socketio.emit('live_fallback', {
+                            'reason': str(e)
+                        }, room=self.client_sid)
+                        break
 
         except asyncio.CancelledError:
             pass
         finally:
             self.is_running = False
+            logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
     async def _session_loop(self, session):
         """
@@ -503,13 +513,108 @@ class LiveAPISession:
 既存の Socket.IO イベントハンドラに LiveAPI 用のイベントを追加:
 
 ```python
-# 新規Socket.IOイベント
-@socketio.on('live_start')      # LiveAPIセッション開始
-@socketio.on('live_audio_in')   # ブラウザ→LiveAPI 音声データ
-@socketio.on('live_stop')       # LiveAPIセッション終了
+from live_api_handler import LiveAPISession
+
+# アクティブなLiveAPIセッションを管理
+active_live_sessions = {}  # {client_sid: LiveAPISession}
+
+@socketio.on('live_start')
+def handle_live_start(data):
+    """LiveAPIセッション開始"""
+    client_sid = request.sid
+    session_id = data.get('session_id')
+    mode = data.get('mode', 'chat')
+    language = data.get('language', 'ja')
+
+    # 既存のLiveAPIセッションがあれば停止
+    if client_sid in active_live_sessions:
+        old_session = active_live_sessions[client_sid]
+        old_session.stop()
+        del active_live_sessions[client_sid]
+
+    # プロンプト構築（03_prompt_modification_spec.md セクション7.1参照）
+    # テストフェーズ: build_system_instruction() でハードコードから構築
+    # 将来: GCSから取得する形に差し替え可能
+    system_prompt = build_system_instruction(mode)
+
+    # LiveAPIセッション作成
+    live_session = LiveAPISession(
+        session_id=session_id,
+        mode=mode,
+        language=language,
+        system_prompt=system_prompt,
+        socketio=socketio,
+        client_sid=client_sid
+    )
+    active_live_sessions[client_sid] = live_session
+
+    # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
+    def start_live_session_thread(session):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(session.run())
+        except Exception as e:
+            logger.error(f"[LiveAPI] スレッドエラー: {e}")
+        finally:
+            loop.close()
+
+    thread = threading.Thread(
+        target=start_live_session_thread,
+        args=(live_session,),
+        daemon=True
+    )
+    thread.start()
+
+    emit('live_ready', {'status': 'connected'})
+
+
+@socketio.on('live_audio_in')
+def handle_live_audio_in(data):
+    """ブラウザ → LiveAPI 音声データ"""
+    client_sid = request.sid
+    live_session = active_live_sessions.get(client_sid)
+
+    if not live_session or not live_session.is_running:
+        return
+
+    audio_b64 = data.get('data', '')
+    if not audio_b64:
+        return
+
+    try:
+        pcm_bytes = base64.b64decode(audio_b64)
+        live_session.enqueue_audio(pcm_bytes)
+    except Exception as e:
+        logger.error(f"[LiveAPI] 音声デコードエラー: {e}")
+
+
+@socketio.on('live_stop')
+def handle_live_stop():
+    """LiveAPIセッション終了"""
+    client_sid = request.sid
+    if client_sid in active_live_sessions:
+        live_session = active_live_sessions[client_sid]
+        live_session.stop()
+        del active_live_sessions[client_sid]
+    emit('live_stopped', {'status': 'disconnected'})
 ```
 
 **既存のイベントは変更しない**（`start_stream`, `audio_chunk`, `stop_stream` はSTT用として残す）
+
+### 3.6 Dockerfile への追記
+
+`live_api_handler.py` をコンテナに含める:
+
+```dockerfile
+COPY app_customer_support.py .
+COPY support_core.py .
+COPY api_integrations.py .
+COPY long_term_memory.py .
+COPY live_api_handler.py .    # ★ 追加必須
+```
+
+**注意**: このCOPYが漏れるとFlask起動時に `ImportError` → CORSヘッダーなしエラーになる。
 
 ---
 
@@ -670,6 +775,204 @@ socket.on('interrupted', () => {
 });
 ```
 
+### 4.4 フロントエンド起動フロー（コントローラー改修）
+
+**最重要**: アプリは起動時からLiveAPIありきで動作する。
+ユーザーがマイクボタンを押す前に、LiveAPI接続と初期挨拶が完了している。
+
+#### 4.4.1 起動シーケンス全体
+
+```
+ページロード
+  ↓
+CoreController.init()
+  ├── initSocket()          ← Socket.IO接続 + LiveAPIリスナー登録
+  └── initializeSession()   ← REST APIでsession_id取得 → startLiveMode()
+                                ↓
+                            LiveAudioManager.initialize(socket)
+                            socket.emit('live_start', {session_id, mode, language})
+                                ↓
+                            サーバー: LiveAPISession作成 → Gemini接続
+                            サーバー: ダミーメッセージ送信 → AI初期挨拶(音声)
+                                ↓
+                            ブラウザ: live_audio → 音声再生
+                            ブラウザ: ai_transcript → チャット欄表示
+                                ↓
+                            ★ ユーザーに「こんにちは！」が聞こえる
+                            ★ 以降、マイクから話しかけるだけで会話継続
+```
+
+#### 4.4.2 CoreController の改修
+
+**`initSocket()` — LiveAPIリスナーの登録**
+
+既存の `transcript`, `error` リスナーに加え、LiveAPI用のリスナーを登録:
+
+```typescript
+protected initSocket() {
+    this.socket = io(this.apiBase || window.location.origin, {
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionAttempts: 5,
+        timeout: 10000
+    });
+
+    // 既存リスナー（STTフォールバック用に残す）
+    this.socket.on('transcript', ...);
+    this.socket.on('error', ...);
+
+    // ★ LiveAPIリスナー（ここに全て登録する）
+    this.socket.on('live_ready', () => {
+        this.liveAudioManager.startStreaming();
+    });
+    this.socket.on('live_audio', (data) => {
+        if (!this.isLiveMode) return;
+        this.liveAudioManager.onAiResponseStarted();
+        this.liveAudioManager.playPcmAudio(data.data);
+    });
+    this.socket.on('user_transcript', (data) => { ... });
+    this.socket.on('ai_transcript', (data) => { ... });
+    this.socket.on('turn_complete', () => { ... });
+    this.socket.on('interrupted', () => { ... });
+    this.socket.on('live_reconnecting', () => { ... });
+    this.socket.on('live_reconnected', () => { ... });
+    this.socket.on('live_fallback', (data) => {
+        this.switchToRestApiMode();
+    });
+    this.socket.on('live_stopped', () => { ... });
+}
+```
+
+**`initializeSession()` — セッション開始とLiveAPI自動接続**
+
+REST APIでsession_idを取得した後、**自動的に** `startLiveMode()` を呼ぶ:
+
+```typescript
+protected async initializeSession() {
+    // 1. REST APIでsession_id取得（既存）
+    const res = await fetch(`${this.apiBase}/api/session/start`, ...);
+    const data = await res.json();
+    this.sessionId = data.session_id;
+
+    // 2. UIを有効化（既存）
+    this.els.userInput.disabled = false;
+    // ...
+
+    // 3. ★ LiveAPIで初期挨拶を開始（新規）
+    //    REST API挨拶 + GCP TTS の処理は全て削除
+    //    speakTextGCP(), preGeneratedAcks も不要
+    await this.startLiveMode();
+}
+```
+
+**削除するもの**:
+- `this.t('initialGreeting')` のテキスト表示
+- `speakTextGCP(this.t('initialGreeting'))` の呼び出し
+- `preGeneratedAcks` のTTS事前生成
+
+**`toggleRecording()` — マイクボタンの動作変更**
+
+LiveAPIモード中はマイクボタンは「LiveAPI停止」に変わる:
+
+```typescript
+protected async toggleRecording() {
+    this.enableAudioPlayback();
+    this.els.userInput.value = '';
+
+    // LiveAPIモード中 → 停止
+    if (this.isLiveMode) {
+        this.switchToRestApiMode();
+        this.isRecording = false;
+        this.els.micBtn.classList.remove('recording');
+        this.resetInputState();
+        return;
+    }
+
+    // 既存のSTT録音中 → 停止
+    if (this.isRecording) {
+        this.stopStreamingSTT();
+        return;
+    }
+
+    // ... 割り込み処理（既存） ...
+
+    // ★ LiveAPIモードで起動
+    if (this.socket && this.socket.connected) {
+        this.isRecording = true;
+        this.els.micBtn.classList.add('recording');
+        try {
+            await this.startLiveMode();
+        } catch (error) {
+            this.isRecording = false;
+            this.els.micBtn.classList.remove('recording');
+            this.showError(this.t('micAccessError'));
+        }
+    } else {
+        await this.startLegacyRecording();
+    }
+}
+```
+
+#### 4.4.3 ConciergeController の改修
+
+**`initSocket()` — 親クラスを呼んでからtranscriptだけ上書き**
+
+```typescript
+protected initSocket() {
+    // ★ 親クラスのinitSocket()を呼んでLiveAPIリスナーも登録
+    super.initSocket();
+
+    // コンシェルジュ版のtranscriptハンドラを上書き
+    this.socket.off('transcript');
+    this.socket.on('transcript', (data) => {
+        const { text, is_final } = data;
+        if (this.isAISpeaking) return;
+        if (is_final) {
+            this.handleStreamingSTTComplete(text);
+            this.currentAISpeech = "";
+        } else {
+            this.els.userInput.value = text;
+        }
+    });
+}
+```
+
+**重要**: 以前の実装では `super.initSocket()` を呼ばずに完全オーバーライドしていた。
+これだとLiveAPIリスナーが一切登録されない。必ず `super.initSocket()` を呼ぶこと。
+
+**`initializeSession()` — コンシェルジュ版もLiveAPI挨拶に統一**
+
+```typescript
+protected async initializeSession() {
+    // 1. REST APIでsession_id取得（既存、user_id付き）
+    const userId = this.getUserId();
+    const res = await fetch(`${this.apiBase}/api/session/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            user_info: { user_id: userId },
+            language: this.currentLanguage,
+            mode: 'concierge'
+        })
+    });
+    const data = await res.json();
+    this.sessionId = data.session_id;
+
+    // 2. UIを有効化
+    // ...
+
+    // 3. ★ LiveAPIで初期挨拶を開始
+    //    REST APIの greetingText + speakTextGCP() は全て削除
+    //    preGeneratedAcks のTTS事前生成も削除
+    await this.startLiveMode();
+}
+```
+
+**削除するもの**:
+- `data.initial_message || this.t('initialGreetingConcierge')` のテキスト表示
+- `speakTextGCP(greetingText)` の呼び出し
+- `preGeneratedAcks` のTTS事前生成（ackTextsのfetch群）
+
 ---
 
 ## 4.5 初期あいさつのLiveAPI統一
@@ -755,32 +1058,56 @@ INITIAL_GREETING_TRIGGERS = {
 **chatモード**: 用途を含めたメッセージ → AIがお店探しの文脈で応答
 **conciergeモード**: シンプルな挨拶 → AIがシステムプロンプトに従い名前を聞く等
 
-### 4.5.5 ブラウザ側の変更
+### 4.5.5 `_is_initial_greeting_phase` フラグの制御
 
-```typescript
-// 初期あいさつの制御
-socket.on('ai_transcript', (data) => {
-    // ★ ダミーメッセージのユーザー発話は表示しない
-    //   （サーバー側で user_transcript を送信しないことで対処）
-    // AI発話のみチャット欄に表示
-    updateAiTranscript(data.text);
-});
-```
+ダミーメッセージの `input_transcription`（「こんにちは。」等）がチャット欄に
+表示されないよう、サーバー側でフラグ制御する。
 
-サーバー側で、ダミーメッセージに対する `input_transcription` は
-ブラウザに転送しない（ユーザーが実際に話したわけではないため）:
+**フラグのライフサイクル**:
 
 ```python
-# _receive_and_forward() 内
+# __init__で True に設定
+self._is_initial_greeting_phase = True
+
+# run() 内:
+if self.session_count == 1:
+    # 初回接続: ダミーメッセージ送信前に True にする
+    self._is_initial_greeting_phase = True
+    # ... send_client_content() ...
+else:
+    # 再接続時: ダミーメッセージではないので False
+    self._is_initial_greeting_phase = False
+
+# _receive_and_forward() 内:
+# ターン完了時にフラグを解除
+if hasattr(sc, 'turn_complete') and sc.turn_complete:
+    if self._is_initial_greeting_phase:
+        self._is_initial_greeting_phase = False  # ★ 初期挨拶完了
+
+# input_transcription の転送判定
 if hasattr(sc, 'input_transcription') and sc.input_transcription:
     text = sc.input_transcription.text
     if text and not self._is_initial_greeting_phase:
         # ★ 初期あいさつフェーズのinput_transcriptionは転送しない
+        self.user_transcript_buffer += text
         self.socketio.emit('user_transcript',
             {'text': text}, room=self.client_sid)
 ```
 
-### 4.5.6 現行 get_initial_message() との関係
+### 4.5.6 ブラウザ側の変更
+
+ブラウザ側は特別な制御不要。サーバーが `user_transcript` を送信しないため、
+ダミーメッセージはチャット欄に表示されない。AI発話のみ通常通り表示される。
+
+```typescript
+// 通常のai_transcriptハンドラがそのまま使える
+socket.on('ai_transcript', (data) => {
+    // AI発話をチャット欄に表示
+    updateAiTranscript(data.text);
+});
+```
+
+### 4.5.7 現行 get_initial_message() との関係
 
 | | 現行 (REST API) | 新設計 (LiveAPI) |
 |---|---|---|
