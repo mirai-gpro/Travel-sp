@@ -557,6 +557,8 @@ export class CoreController {
       this.socket.emit('live_stop');
     }
     this.isLiveMode = false;
+    this.isRecording = false;
+    this.els.micBtn.classList.remove('recording');
     this.liveAudioManager.stopStreaming();
     this.liveAudioManager.clearPlaybackQueue();
     this.liveAudioManager.onAiResponseEnded();
@@ -771,6 +773,7 @@ export class CoreController {
         
         (async () => {
           try {
+            console.log('[TTS IIFE] 開始', { isTextInput, isTTSEnabled: this.isTTSEnabled, isUserInteracted: this.isUserInteracted, isRecording: this.isRecording });
             this.isAISpeaking = true;
             if (this.isRecording) { this.stopStreamingSTT(); }
 
@@ -886,7 +889,7 @@ export class CoreController {
               }
             }
             this.isAISpeaking = false;
-          } catch (_e) { this.isAISpeaking = false; }
+          } catch (_e) { console.error('[TTS IIFE] エラー:', _e); this.isAISpeaking = false; }
         })();
       } else {
         if (data.response) {
@@ -916,8 +919,8 @@ export class CoreController {
   }
 
   protected async speakTextGCP(text: string, stopPrevious: boolean = true, autoRestartMic: boolean = false, skipAudio: boolean = false) {
-    if (skipAudio) return Promise.resolve();
-    if (!this.isTTSEnabled || !text) return Promise.resolve();
+    if (skipAudio) { console.log('[TTS] skipAudio=true, スキップ'); return Promise.resolve(); }
+    if (!this.isTTSEnabled || !text) { console.log('[TTS] 無効またはテキスト空', { isTTSEnabled: this.isTTSEnabled, textEmpty: !text }); return Promise.resolve(); }
     
     if (stopPrevious && this.isTTSEnabled) {
       this.ttsPlayer.pause();
@@ -942,6 +945,7 @@ export class CoreController {
         })
       });
       const data = await response.json();
+      console.log('[TTS] API応答:', { success: data.success, hasAudio: !!data.audio, textPreview: cleanText.substring(0, 30) });
       if (data.success && data.audio) {
         this.ttsPlayer.src = `data:audio/mp3;base64,${data.audio}`;
         const playPromise = new Promise<void>((resolve) => {
@@ -963,9 +967,11 @@ export class CoreController {
         });
         
         if (this.isUserInteracted) {
+          console.log('[TTS] 再生開始:', cleanText.substring(0, 30));
           this.lastAISpeech = this.normalizeText(cleanText);
           await this.ttsPlayer.play();
           await playPromise;
+          console.log('[TTS] 再生完了');
         } else {
           this.showClickPrompt();
           this.els.voiceStatus.innerHTML = this.t('voiceStatusStopped');

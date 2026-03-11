@@ -540,6 +540,7 @@ export class ConciergeController extends CoreController {
         
         (async () => {
           try {
+            console.log('[TTS IIFE] 開始', { isTextInput, isTTSEnabled: this.isTTSEnabled, isUserInteracted: this.isUserInteracted, isRecording: this.isRecording });
             this.isAISpeaking = true;
             if (this.isRecording) { this.stopStreamingSTT(); }
 
@@ -655,7 +656,7 @@ export class ConciergeController extends CoreController {
               }
             }
             this.isAISpeaking = false;
-          } catch (_e) { this.isAISpeaking = false; }
+          } catch (_e) { console.error('[TTS IIFE] エラー:', _e); this.isAISpeaking = false; }
         })();
       } else {
         if (data.response) {
