@@ -41,9 +41,7 @@ from support_core import (
     SupportSession,
     SupportAssistant
 )
-from live_api_handler import LiveAPISession
-
-# ロギング設定
+# ロギング設定（他モジュールより先に初期化）
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
@@ -57,6 +55,16 @@ try:
 except Exception as e:
     logger.warning(f"[LTM] 長期記憶モジュールのインポート失敗: {e}")
     LONG_TERM_MEMORY_ENABLED = False
+
+# LiveAPIモジュールをインポート（失敗してもアプリは起動する）
+try:
+    from live_api_handler import LiveAPISession
+    LIVE_API_ENABLED = True
+    logger.info("[LiveAPI] モジュール読み込み成功")
+except Exception as e:
+    LIVE_API_ENABLED = False
+    LiveAPISession = None
+    logger.warning(f"[LiveAPI] モジュール読み込み失敗（フォールバックで動作）: {e}")
 
 # ========================================
 # Audio2Expression Service 設定
@@ -902,6 +910,12 @@ def handle_stop_stream():
 def handle_live_start(data):
     """LiveAPIセッション開始"""
     client_sid = request.sid
+
+    if not LIVE_API_ENABLED:
+        logger.warning("[LiveAPI] モジュール未読み込みのためフォールバック")
+        emit('live_fallback', {'reason': 'LiveAPI module not available'})
+        return
+
     session_id = data.get('session_id')
     mode = data.get('mode', 'chat')
     language = data.get('language', 'ja')
