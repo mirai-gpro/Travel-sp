@@ -584,6 +584,20 @@ export class CoreController {
           this.addMessage('assistant', result.response);
         }
 
+        // ★ TTS読み上げ（LiveAPI→REST切替後のショップ紹介）
+        if (result.response && this.isTTSEnabled && this.isUserInteracted) {
+          try {
+            this.isAISpeaking = true;
+            // まず短い導入を読む
+            await this.speakTextGCP(this.t('ttsIntro'), true, false, false);
+            // ショップ紹介テキストを読み上げ
+            await this.speakTextGCP(result.response, false, false, false);
+            this.isAISpeaking = false;
+          } catch (_e) {
+            this.isAISpeaking = false;
+          }
+        }
+
         // モバイルではショップセクションにスクロール
         if (window.innerWidth < 1024) {
           setTimeout(() => {
@@ -593,6 +607,10 @@ export class CoreController {
         }
       } else if (result.response) {
         this.addMessage('assistant', result.response);
+        // ★ ショップなし応答も読み上げ
+        if (this.isTTSEnabled && this.isUserInteracted) {
+          await this.speakTextGCP(result.response, true, false, false);
+        }
       } else {
         console.warn('[LiveAPI→REST] レスポンスにshopsもresponseもなし:', result);
       }
