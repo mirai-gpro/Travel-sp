@@ -286,8 +286,15 @@ def chat():
         # 検索指示を明示的に追加（LLMが追加質問せずshopsを返すようにする）
         if stage == 'shop_search':
             search_directive = (
-                "\n\n【指示】上記の条件でお店を検索し、JSON形式でshops配列を含めて返してください。"
-                "追加の質問はせず、今ある条件でお店を提案してください。"
+                "\n\n"
+                "【重要指示：ショップ検索モード】\n"
+                "これはショップ検索リクエストです。上記の条件でお店を検索して提案してください。\n"
+                "追加の質問は一切しないでください。今ある条件だけでお店を提案してください。\n"
+                "必ず以下のJSON形式のみで返答してください。マークダウンやプレーンテキストは禁止です。\n"
+                '{"message": "お客様への返答メッセージ", "shops": [{"name": "店名", "area": "エリア", '
+                '"genre": "ジャンル", "budget": "予算帯", "description": "お店の説明", '
+                '"specialty": "おすすめポイント", "atmosphere": "雰囲気", "features": "特徴"}]}\n'
+                "shopsは5件提案してください。"
             )
             user_message = user_message + search_directive
             logger.info(f"[Chat] ショップ検索モード: 検索指示を追加")
