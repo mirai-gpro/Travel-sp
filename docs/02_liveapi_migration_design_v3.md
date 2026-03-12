@@ -1,12 +1,46 @@
 # Gemini LiveAPI 移植設計書 v3（gourmet-sp3）
 
 > **作成日**: 2026-03-11
-> **改訂日**: 2026-03-12（v3.2: 重複セクション削除、ショップ検索フロー明記、フォールバック無効化）
+> **改訂日**: 2026-03-12（v3.3: ショップ検索トリガーをLLM判断方式に全面改訂。キーワードマッチング廃止）
 > **前版**: `docs/02_liveapi_migration_design_v2.md`（v2: 2026-03-11）
 > **前提文書**: `docs/01_stt_stream_detailed_spec.md`, `docs/03_prompt_modification_spec.md`
 > **成功事例**: `docs/stt_stream.py`（インタビューモードの再接続方式）
 > **移植元安定版**: `github.com/mirai-gpro/gourmet-support`（REST版）
 > **v3変更理由**: コンシェルジュモードの短期記憶がLiveAPI再接続時に失われる問題の対策
+
+---
+
+## v3.2 → v3.3 変更概要
+
+| 項目 | v3.2（旧） | v3.3（新） |
+|---|---|---|
+| ショップ検索トリガー | `should_trigger_shop_search()` キーワードマッチング | **廃止。LLMの判断に委ねる（REST版と同じ原理）** |
+| `_process_turn_complete()` | キーワードマッチングで `_shop_search_pending` をセット | **キーワードマッチング削除。会話履歴蓄積と再接続判定のみ** |
+| ショップ検索の発火 | コード側でAIの発話テキストからキーワード検知 | **LLMが会話の中で条件が揃ったと判断 → REST APIでショップ検索を実行（プロンプト指示に従う）** |
+| プロンプト | 短期記憶ルールのみ | **ショップ検索の判断基準を `03_prompt_modification_spec.md` に従いハードコード** |
+
+### v3.3変更の背景
+
+**v3.2の致命的欠陥:**
+```
+v3.2の§3.2.4は、AIの発話テキスト（ai_transcript_buffer）に対する
+キーワードマッチング（should_trigger_shop_search()）でショップ検索を発火させていた。
+
+これは根本的に間違ったアプローチ:
+- REST版ではキーワードマッチングは一切使っていない
+- REST版ではLLMが自然に判断し、shops配列をJSONで返すことで検索が発火する
+- キーワードマッチングはClaude（AI）が過去のセッションで妄想で作った誤ったロジック
+- テキスト入力では発火するのにSTT音声入力で発火しない原因がこの誤ったトリガー方式にあった
+```
+
+**v3.3の修正方針:**
+```
+REST版と同じ原理を適用する:
+- LLMが会話のキャッチボールの中で、ユーザーの要望が十分に揃ったかを判断する
+- 判断はプロンプト（03_prompt_modification_spec.md）の指示に従う
+- コード側でAIの発話を解析してトリガーを検知する処理は一切行わない
+- should_trigger_shop_search()、SHOP_TRIGGER_KEYWORDS は完全に削除する
+```
 
 ---
 
@@ -49,7 +83,7 @@ LiveAPI v3: REST版と同じ方式を再現
 
 ---
 
-## 0. Claudeへの厳守事項（v1から継続）
+## 0. Claudeへの厳守事項（v3.3改訂）
 
 ### 防止ルール
 
@@ -60,6 +94,20 @@ LiveAPI v3: REST版と同じ方式を再現
 5. **困ったらユーザーに聞く。推測で進めない**
 6. **間違えたら戻る。修正を重ねない。`git checkout`で最後の正常状態に戻してからやり直す** ← v3追加
 7. **診断ログを入れて→ログを見て→推測で修正、のサイクルは禁止** ← v3追加
+
+### v3.3追加：絶対禁止事項
+
+8. **`should_trigger_shop_search()` および `SHOP_TRIGGER_KEYWORDS` によるキーワードマッチングは絶対に使用禁止。**
+   - これはClaude（AI）が過去のセッションで妄想で作り出した誤ったロジックである
+   - AIの発話テキストをコード側で解析してショップ検索トリガーを検知するアプローチ自体が根本的に間違い
+   - REST版にはこのような仕組みは一切存在しない
+   - **ショップ検索の発火はLLM（Gemini）の判断に委ねる。コード側でトリガーを検知しない。**
+   - このルールに違反するコードを発見した場合は、即座に削除すること
+
+9. **Gemini LiveAPI（プレビュー版・2025年12月）の動作を推測しない。**
+   - このAPIはClaudeの知識ベースに存在しない
+   - LiveAPIのVAD、interrupted、turn_complete、output_transcriptionの動作タイミングについて推測で議論しない
+   - 不明な点はユーザーに確認する
 
 ---
 
@@ -77,6 +125,7 @@ LiveAPI v3: REST版と同じ方式を再現
 | 6 | ショップ説明のLiveAPI読み上げ（1軒ごとに再接続） | 必須 | 変更なし |
 | 7 | **プロンプトの短期記憶ルール強化（REST版準拠）** | **必須** | **v3改訂** |
 | 8 | **再接続時の会話履歴再送（send_client_content turns）** | **必須** | **v3新規** |
+| 9 | **ショップ検索トリガーをLLM判断方式に変更（`03_prompt_modification_spec.md`準拠）** | **必須** | **v3.3新規** |
 
 ### 1.2 やらないこと（v2から変更なし）
 
@@ -95,28 +144,33 @@ v2のセクション2をそのまま維持。
 
 ## 3. バックエンド設計（v3改訂：REST版準拠の履歴再注入方式）
 
-### 3.1 設計方針（v3改訂：キーワード抽出廃止）
+### 3.1 設計方針（v3.3改訂：キーワードマッチング完全廃止）
 
-**REST版で機能していた短期記憶の原理をそのまま踏襲する。**
+**REST版で機能していた原理をそのまま踏襲する。ショップ検索の判断もLLMに委ねる。**
 
 ```
 REST版の原理:
-1. プロンプト（concierge_ja.txt）に短期記憶ルールを詳細に記述
+1. プロンプト（concierge_ja.txt）に短期記憶ルール + ショップ検索の判断基準を記述
 2. 毎回の API 呼び出しで全会話履歴を送信
 → Geminiが会話履歴から「何が確定済みか」を自然に把握
-→ コード側のキーワード抽出・ステップ追跡は一切不要
+→ 条件が揃ったらGeminiが自ら「お探ししますね」と判断し、shops配列を返す
+→ コード側のキーワード抽出・ステップ追跡・トリガー検知は一切なし
 
-LiveAPI v3での再現:
-1. プロンプト（LIVEAPI_CONCIERGE_SYSTEM）にREST版の短期記憶ルールを強化ハードコード
+LiveAPI v3.3での再現:
+1. プロンプト（LIVEAPI_CONCIERGE_SYSTEM）にREST版の短期記憶ルール
+   + ショップ検索の判断基準（03_prompt_modification_spec.md準拠）を強化ハードコード
 2. 再接続時に send_client_content(turns) で会話履歴を再送
 → REST版と同じ情報量をGeminiに渡す
 → キーワード抽出（short_term_memory）、hearing_step は廃止
+→ should_trigger_shop_search()、SHOP_TRIGGER_KEYWORDS は完全削除
+→ ショップ検索の発火判断はLLM（Gemini）に委ねる
 ```
 
 **廃止した理由:**
-- キーワード抽出はリスト外のエリア名・曖昧な表現を拾えず網羅性が低い
-- REST版にはそもそも存在しない仕組みであり、REST版で問題なく機能していた
-- 会話履歴の再送 + プロンプトの短期記憶ルールで同等の精度が出る
+- キーワードマッチングはREST版に存在しない。Claude（AI）が妄想で作った誤ったロジック
+- キーワードリスト外の表現を拾えず網羅性が低い
+- STT音声入力でトリガーが発火しない根本原因がこの方式にあった
+- 会話履歴の再送 + プロンプトのルールで、LLMが自然に判断できる（REST版で実証済み）
 - コードの複雑性が大幅に低減される
 
 ### 3.2 再接続時のコンテキスト復元（v3改訂）
@@ -185,7 +239,7 @@ def _get_context_summary(self) -> str:
     return ""
 ```
 
-#### 3.2.3 run() メインループ（v3.2改訂：ショップ検索ペンディングチェック追加、フォールバック削除）
+#### 3.2.3 run() メインループ（v3.2改訂：フォールバック削除）
 
 ```python
 async def run(self):
@@ -247,15 +301,6 @@ async def run(self):
 
                     await self._session_loop(session)
 
-                    # ★ v3.2追加: ショップ検索ペンディングチェック
-                    # _process_turn_complete() で _shop_search_pending がセットされた場合、
-                    # _session_loop() 終了後にここで検知し、検索を実行する
-                    if self._shop_search_pending:
-                        pending = self._shop_search_pending
-                        self._shop_search_pending = None
-                        await self._handle_shop_search(pending['user_request'])
-                        continue  # ショップ検索後は再接続ループに戻る
-
                     if not self.needs_reconnect:
                         break
 
@@ -281,18 +326,23 @@ async def run(self):
         logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 ```
 
-**v3.2での重要な変更点:**
-1. `_session_loop()` 後に `_shop_search_pending` チェックを追加 — これがないと「お探ししますね」の後にショップ検索が実行されない
-2. エラー時の `live_fallback` イベント emit を削除 — テストフェーズではフォールバックしない（`switchToRestApiMode()` を発動させない）
+**v3.3での重要な変更点:**
+1. `_session_loop()` 後の `_shop_search_pending` チェックを**削除** — キーワードマッチングによるトリガー検知自体を廃止したため不要
+2. ショップ検索の発火はLLMの判断に委ねる（§5参照）
 
-#### 3.2.4 _process_turn_complete()（v3.2改訂：ショップ検索トリガー処理を明記）
+#### 3.2.4 _process_turn_complete()（v3.3改訂：キーワードマッチング完全削除）
 
 ```python
 def _process_turn_complete(self):
     """
     ターン完了時の処理
-    - キーワード抽出は行わない（REST版準拠、Geminiが履歴から判断）
-    - ショップ検索トリガーの検知 → _shop_search_pending にセット
+    - 会話履歴の蓄積
+    - 発言途切れ・累積文字数による再接続判定
+
+    【v3.3重要】
+    ショップ検索トリガーの検知は行わない。
+    should_trigger_shop_search() は廃止済み。
+    ショップ検索の発火はLLM（Gemini）の判断に委ねる（REST版と同じ原理）。
     """
     user_text = ""
     if self.user_transcript_buffer.strip():
@@ -306,18 +356,7 @@ def _process_turn_complete(self):
         logger.info(f"[LiveAPI] AI: {ai_text}")
         self._add_to_history("ai", ai_text)
 
-        # ★ ショップ検索トリガー検知
-        if should_trigger_shop_search(ai_text):
-            user_request = self._build_search_request(user_text)
-            logger.info(f"[LiveAPI] ショップ検索トリガー: '{user_request}'")
-            # ★ _shop_search_pending にセット（run()のループで検知される）
-            self._shop_search_pending = {
-                'user_request': user_request,
-            }
-        else:
-            logger.debug(f"[LiveAPI] トリガー未検知: '{ai_text[:50]}'")
-
-        # 発言途切れチェック・文字数カウント・再接続判定（v2と同じ）
+        # 発言途切れチェック・文字数カウント・再接続判定
         is_incomplete = self._is_speech_incomplete(ai_text)
         char_count = len(ai_text)
         self.ai_char_count += char_count
@@ -337,13 +376,17 @@ def _process_turn_complete(self):
             self.needs_reconnect = True
 ```
 
+**v3.3で削除したもの:**
+- `should_trigger_shop_search(ai_text)` の呼び出し — 完全削除
+- `_shop_search_pending` のセット — 完全削除
+- `_build_search_request()` の呼び出し — 完全削除
 
-### 3.3 プロンプトの短期記憶ルール（v3改訂：REST版準拠で強化ハードコード）
+### 3.3 プロンプト設計（v3.3改訂：ショップ検索判断基準を追加ハードコード）
 
-REST版 `concierge_ja.txt` の【短期記憶・セッション行動ルール（最重要）】を
-LiveAPI向けに凝縮して `LIVEAPI_CONCIERGE_SYSTEM` にハードコード。
+REST版 `concierge_ja.txt` の【短期記憶・セッション行動ルール（最重要）】に加え、
+`03_prompt_modification_spec.md` に従うショップ検索の判断基準をハードコードする。
 
-#### 3.3.1 ハードコードした短期記憶ルール
+#### 3.3.1 ハードコードする短期記憶ルール + ショップ検索判断基準
 
 `live_api_handler.py` の `LIVEAPI_CONCIERGE_SYSTEM` 内に以下を直接記述:
 
@@ -377,9 +420,39 @@ LiveAPI向けに凝縮して `LIVEAPI_CONCIERGE_SYSTEM` にハードコード。
 1位：本セクション > 2位：質問ルール > 3位：応答スタイル
 ```
 
-**設計根拠:** REST版では `concierge_ja.txt` 内の同等ルールにより、コード側のキーワード抽出なしで短期記憶が成立していた。LiveAPI版でも同じ原理を適用する。
+#### 3.3.2 ハードコードするショップ検索判断基準（v3.3新規）
 
-#### 3.3.2 含めないもの（意図的な除外）
+`03_prompt_modification_spec.md` §5（コンシェルジュモード）の会話フロー例に従い、
+LLMが自らショップ検索を行うタイミングを判断できるよう、以下をハードコード:
+
+```
+## 【ショップ検索の判断基準（REST版準拠・厳守）】
+
+### 判断の原則
+あなたは会話のキャッチボールを通じて、ユーザーの要望が十分に揃ったかを自ら判断する。
+条件が揃ったと判断したら、「お探ししますね」等と発言し、ショップ検索を実行する。
+コード側でトリガーを検知する仕組みは存在しない。あなたの判断が全てである。
+
+### 検索に必要な最低条件
+以下のうち、少なくとも2〜3項目が確定していれば検索可能と判断する:
+- エリア・地域
+- 料理ジャンルまたは利用シーン
+- 予算感（任意・なくても可）
+- 人数（任意・なくても可）
+
+### 検索を提案するタイミング
+- ユーザーが十分な条件を伝えた時点で、自然に「お探ししますね」と提案する
+- 全項目が揃うまで待つ必要はない。ユーザーが「もういいから探して」等と言った場合は即座に検索する
+- 簡易業態（ラーメン、カフェ等）はエリアだけでも検索可能
+
+### 検索提案の例
+「銀座の和食、個室があるお店をお探ししますね。」
+「渋谷で5000円のイタリアン、探しますね。」
+```
+
+**設計根拠:** REST版では `concierge_ja.txt` のプロンプト指示により、LLMが自然にショップ検索タイミングを判断していた。コード側のキーワード検知は不要だった。LiveAPI版でも同じ原理を適用する。
+
+#### 3.3.3 含めないもの（意図的な除外）
 
 `concierge_ja.txt` から以下は **LiveAPIプロンプトに含めない**:
 
@@ -391,6 +464,19 @@ LiveAPI向けに凝縮して `LIVEAPI_CONCIERGE_SYSTEM` にハードコード。
 | actionフィールド（名前変更等） | LiveAPIモードでの名前変更は音声で処理。JSON actionは不要 |
 | 予算表記ルール（漢数字等） | LiveAPIは音声出力なのでGeminiが自然に処理 |
 
+### 3.4 廃止するコード（v3.3：完全削除対象）
+
+以下は `live_api_handler.py` から**完全に削除**する:
+
+| 削除対象 | 理由 |
+|---|---|
+| `SHOP_TRIGGER_KEYWORDS` 定数 | キーワードマッチング廃止 |
+| `should_trigger_shop_search()` 関数 | キーワードマッチング廃止 |
+| `_shop_search_pending` 属性 | キーワードマッチング廃止に伴い不要 |
+| `_build_search_request()` メソッド | キーワードマッチング廃止に伴い不要 |
+| `run()` 内の `_shop_search_pending` チェック | 同上 |
+| `_process_turn_complete()` 内の `should_trigger_shop_search()` 呼び出し | 同上 |
+
 ---
 
 ## 4. フロントエンド設計（v2から変更なし）
@@ -400,15 +486,54 @@ v2のセクション4をそのまま維持。
 
 ---
 
-## 5. ショップ提案の処理フロー（v2から変更なし）
+## 5. ショップ提案の処理フロー（v3.3全面改訂：LLM判断方式）
 
-v2のセクション5をそのまま維持。
+### 5.1 設計方針（v3.3改訂）
+
+**REST版と同じ原理: ショップ検索の発火はLLMの判断に委ねる。**
+
+```
+REST版:
+LLM（Gemini）がプロンプトのルールに従い、条件が揃ったと判断
+→ LLMがshops配列をJSON応答に含めて返す
+→ コード側はJSON応答を受け取るだけ（トリガー検知ロジックなし）
+
+LiveAPI v3.3:
+LLM（Gemini）がプロンプトのルールに従い、条件が揃ったと判断
+→ LLMが「お探ししますね」と音声で発言する
+→ ★ この発言をサーバー側で検知し、REST APIでショップデータを取得する仕組みが必要
+→ ★ ただし、検知方式はキーワードマッチングではない（§5.2で定義）
+```
+
+### 5.2 ショップ検索の発火方式（v3.3新規：要設計）
+
+**v3.3時点の課題:**
+
+REST版ではLLMのJSON応答にshops配列が含まれることで自動的に検索が発火した。
+LiveAPIではLLMは音声で応答するため、JSON応答は返せない。
+
+LLMが「条件が揃った、検索する」と判断した後、実際にREST APIでショップデータを取得する
+ブリッジ機構が必要。この方式はテストフェーズで検証し、確定する。
+
+**候補（テストで検証）:**
+- LLMの会話履歴から、サーバー側が「検索提案に至った」ことを判断する
+- LiveAPIセッション内でのfunction calling（利用可否はテストで確認）
+- その他、テスト結果に基づく方式
+
+**禁止事項（再掲）:**
+- `should_trigger_shop_search()` によるキーワードマッチングは絶対に使用禁止
+- AIの発話テキストをコード側でパターンマッチする方式は全て禁止
+
+### 5.3 ショップ検索後のフロー（v2を維持）
+
+ショップ検索が発火した後のフロー（REST APIデータ取得 → カード送信 → LiveAPI説明読み上げ）は
+v2のセクション5.4以降をそのまま維持。
 
 ---
 
-## 6. セッション管理（v3改訂）
+## 6. セッション管理（v3.3改訂）
 
-### 6.1 LiveAPIセッションのライフサイクル（v3改訂）
+### 6.1 LiveAPIセッションのライフサイクル（v3.3改訂）
 
 ```
 [通常会話]
@@ -418,12 +543,11 @@ LiveAPIセッション#1 (初回接続・挨拶)
 LiveAPIセッション#2 (再接続・send_client_content(turns)で履歴再送)
   ↓ ...
   ↓ ★ conversation_history は累積蓄積される
-LiveAPIセッション#N (AIが「お探ししますね」と発言)
-  ↓ _process_turn_complete() で should_trigger_shop_search() が検知
-  ↓ _shop_search_pending にセット
-  ↓ _session_loop() 終了後、run() でペンディングチェック
+LiveAPIセッション#N (AIが条件を揃え、「お探ししますね」と判断・発言)
+  ↓ ★ LLMの判断により検索が発火（コード側キーワード検知ではない）
+  ↓ ★ 発火方式は §5.2 で定義（テストフェーズで確定）
   ↓
-[ショップ検索]  ★ v3.2: run()内で _handle_shop_search() を呼び出す
+[ショップ検索]
 REST API でショップデータ取得 (JSONのみ)
   ↓ shop_search_result イベントでブラウザにカード送信
   ↓
@@ -493,6 +617,8 @@ REST版と同じ方式で短期記憶を実現する:
                    │   → 聞き直し禁止                      │
                    │   → 会話履歴から条件を把握せよ          │
                    │   → 再接続時も同じ質問を繰り返すな      │
+                   │ + 【ショップ検索の判断基準】            │  ← v3.3追加
+                   │   → 条件が揃ったら自ら検索を提案        │  ← v3.3追加
                    │ + user_context（初期挨拶指示）          │
                    │ + LIVEAPI_COMMON_RULES                │
                    │                                        │
@@ -549,7 +675,7 @@ v2のセクション7.2をそのまま維持。
 
 ---
 
-## 9. 実装フェーズ計画（v3改訂）
+## 9. 実装フェーズ計画（v3.3改訂）
 
 ### Phase 1: 基盤構築（v1と同じ）
 - LiveAPI接続 → 音声送受信 → ブラウザ再生の最小ループ確認
@@ -562,30 +688,37 @@ v2のセクション7.2をそのまま維持。
 | # | 内容 | 詳細 |
 |---|---|---|
 | 1 | `LIVEAPI_CONCIERGE_SYSTEM` に短期記憶ルール強化ハードコード | REST版concierge_ja.txtの短期記憶ルールをLiveAPI向けに凝縮 |
-| 2 | `_send_history_on_reconnect()` 実装 | send_client_content()で会話履歴再送 |
-| 3 | `_get_context_summary()` 簡素化 | 直前の質問のみ補足。構造化条件注入は廃止 |
-| 4 | `run()` の再接続フロー修正 | 履歴再送 → トリガー の2段階送信 |
+| 2 | `LIVEAPI_CONCIERGE_SYSTEM` にショップ検索判断基準をハードコード | `03_prompt_modification_spec.md` 準拠。LLMが自ら検索タイミングを判断 |
+| 3 | `_send_history_on_reconnect()` 実装 | send_client_content()で会話履歴再送 |
+| 4 | `_get_context_summary()` 簡素化 | 直前の質問のみ補足。構造化条件注入は廃止 |
+| 5 | `run()` の再接続フロー修正 | 履歴再送 → トリガー の2段階送信 |
+| 6 | キーワードマッチング関連コードの完全削除 | §3.4の削除対象を全て除去 |
 
 **廃止した項目:**
 - ~~`short_term_memory` dict~~ → 不要（Geminiが会話履歴から判断）
 - ~~`_update_short_term_memory()`~~ → 不要（キーワード抽出廃止）
 - ~~`_update_hearing_step()`~~ → 不要（ステップ追跡廃止）
+- ~~`should_trigger_shop_search()`~~ → 不要（キーワードマッチング廃止）← v3.3追加
+- ~~`SHOP_TRIGGER_KEYWORDS`~~ → 不要（キーワードマッチング廃止）← v3.3追加
+- ~~`_shop_search_pending`~~ → 不要（キーワードマッチング廃止）← v3.3追加
+- ~~`_build_search_request()`~~ → 不要（キーワードマッチング廃止）← v3.3追加
 
 ### Phase 3: ショップ説明のLiveAPI統一（v2と同じ）
 
 v2のPhase 3をそのまま維持。
 
-### Phase 4: 安定化（v3改訂）
+### Phase 4: 安定化（v3.3改訂）
 - v2のPhase 4テスト項目に加え、以下を追加:
   - 短期記憶が再接続後も維持されるか
   - 同じ質問を繰り返さないか
-  - 検索トリガーに正しく到達するか
+  - LLMが自ら検索提案に到達するか（キーワードマッチングに依存しないこと）
+  - ショップ検索発火方式（§5.2）の検証
 
 ### Phase 5: 最適化（v1と同じ）
 
 ---
 
-## 10. 既知のリスク・未解決課題（v3改訂）
+## 10. 既知のリスク・未解決課題（v3.3改訂）
 
 ### 10.1 v1からの継続リスク（変更なし）
 - LiveAPIプレビュー版の制約
@@ -605,29 +738,39 @@ v2のセクション10.2をそのまま維持。
 | 再接続回数が多い場合の累積コスト | 同じ履歴を何度も再送 | 再接続のたびに最新10ターンのみ送信。古いターンは自然に落ちる |
 | プロンプトの短期記憶ルールの遵守率 | Geminiがルールを無視して聞き直す可能性 | ルールの優先順位を明記（本セクション > 他ルール）。テストで遵守率を検証 |
 
-### 10.4 REST版準拠の設計根拠
+### 10.4 v3.3追加リスク
+
+| リスク | 影響 | 対策 |
+|---|---|---|
+| LLMが検索提案タイミングを適切に判断できない | 条件不十分で検索 or いつまでも検索しない | プロンプトの判断基準を調整。REST版で実証済みの原理なので信頼性は高い |
+| ショップ検索の発火方式（§5.2）が未確定 | 実装着手できない | テストフェーズで検証し確定。候補は§5.2に記載 |
+
+### 10.5 REST版準拠の設計根拠
 
 ```
-REST版の短期記憶が機能していた原理:
-  1. プロンプト: 短期記憶ルール（聞き直し禁止、業態別制御等）
+REST版の短期記憶 + ショップ検索が機能していた原理:
+  1. プロンプト: 短期記憶ルール + ショップ検索判断基準
   2. 全会話履歴の送信: Geminiが文脈から条件を把握
-  → コード側のキーワード抽出・ステップ追跡は一切なし
+  3. Geminiが自ら検索タイミングを判断
+  → コード側のキーワード抽出・ステップ追跡・トリガー検知は一切なし
   → REST版で問題なく機能していた実績あり
 
-LiveAPI v3で同じ原理を再現:
-  1. プロンプト: REST版の短期記憶ルールを強化ハードコード
+LiveAPI v3.3で同じ原理を再現:
+  1. プロンプト: REST版の短期記憶ルール + ショップ検索判断基準を強化ハードコード
   2. send_client_content(turns): 会話履歴再送（REST版の全履歴送信に相当）
+  3. Geminiが自ら検索タイミングを判断（REST版と同じ）
   → キーワード抽出は廃止（網羅性の問題、コード複雑性の増大を回避）
+  → should_trigger_shop_search() は完全削除（Claude妄想ロジック）
   → REST版で実証済みの方式なので信頼性が高い
 ```
 
 ---
 
-## 11. テスト計画（v3改訂）
+## 11. テスト計画（v3.3改訂）
 
 ### 11.1〜11.2 v1と同じ
 
-### 11.3 Phase 2.5 テスト項目（v3改訂：REST版準拠）
+### 11.3 Phase 2.5 テスト項目（v3.3改訂）
 
 | # | テスト内容 | 期待結果 |
 |---|---|---|
@@ -635,13 +778,14 @@ LiveAPI v3で同じ原理を再現:
 | 2 | 再接続が発生した後 | AIが「エリアは？」「目的は？」と聞き直さない |
 | 3 | 再接続後にAIが次の質問をする | 既に回答済みの条件をスキップし、未確認の条件を質問する |
 | 4 | 条件を段階的に伝える（3〜4ターン） | conversation_history に全ターンが蓄積される |
-| 5 | 全条件確定後 | AIが「お探ししますね」と発言し、検索トリガーが発火する |
-| 6 | トリガー発火後 | _shop_search_pending がセットされ、run()でペンディングチェックにより_handle_shop_search()が呼ばれる |
-| 7 | ショップ検索実行後 | shop_search_result イベントがブラウザに送信され、カードが表示される |
+| 5 | 全条件確定後 | AIが自ら「お探ししますね」と発言する（LLM判断） |
+| 6 | AIの検索提案後 | ショップ検索が発火し、shop_search_result イベントがブラウザに送信される |
+| 7 | ショップ検索実行後 | カードが表示され、LiveAPIで説明読み上げが開始される |
 | 8 | 検索後に「別のエリアで」と言う | AIが他の条件を維持したまま新エリアで対応する |
 | 9 | 再接続時のsend_client_content再送 | 直近10ターンが正しく再送される（ログで確認） |
 | 10 | 任意のエリア名（リストにないもの含む） | Geminiが会話履歴から自然に理解する |
 | 11 | フォールバックが発動しないこと | `live_fallback` イベントが発火しない。マイクボタン以外で `terminateLiveSession()` が呼ばれない |
+| 12 | キーワードマッチング関連コードが存在しないこと | `should_trigger_shop_search`、`SHOP_TRIGGER_KEYWORDS` がコードに存在しない |
 
 ### 11.4 Phase 3 テスト項目（v2と同じ）
 
@@ -649,26 +793,26 @@ v2のセクション11.3をそのまま維持。
 
 ---
 
-## 12. REST版（gourmet-support）との対応表（v3新規・参考資料）
+## 12. REST版（gourmet-support）との対応表（v3.3改訂）
 
 LiveAPI移行で「何がどう変わったか」の対応表。
 実装時に迷った場合の参照用。
 
-| 機能 | REST版（gourmet-support） | LiveAPI版（gourmet-sp3 v3） |
+| 機能 | REST版（gourmet-support） | LiveAPI版（gourmet-sp3 v3.3） |
 |---|---|---|
-| システムプロンプト | concierge_ja.txt（537行） | LIVEAPI_CONCIERGE_SYSTEM（短期記憶ルール含む） |
+| システムプロンプト | concierge_ja.txt（537行） | LIVEAPI_CONCIERGE_SYSTEM（短期記憶ルール + ショップ検索判断基準含む） |
 | 会話履歴の送信 | 毎回全履歴をGemini REST APIに送信 | send_client_content(turns)で再接続時に再送 |
 | 短期記憶 | Geminiが全履歴から自然に把握 | 同じ方式: 会話履歴再送 + プロンプトルール（REST版準拠） |
 | ヒアリングステップ追跡 | Geminiが自然に追跡 | 同じ方式: Geminiが自然に追跡（コード側追跡は廃止） |
 | 条件の重複質問防止 | concierge_ja.txt内のルールで制御 | 同じ方式: プロンプト内の短期記憶ルールで制御 |
+| ショップ検索の発火 | LLMが自ら判断しshops配列を返す | **同じ原理: LLMが自ら判断（コード側キーワード検知は廃止）** |
 | セッション管理 | RAMベースのSupportSession | LiveAPISession + conversation_history |
 | 出力形式 | JSON（message + shops配列） | 音声（LiveAPI audio） |
 | ショップ検索 | /api/chat が全て処理 | REST API(データ取得のみ) + LiveAPI(音声説明) |
 
 ---
 
-*以上が LiveAPI 移植設計書 v3.2。*
-*v3.1→v3.2の変更: 重複セクション3.2削除、ショップ検索フロー（_shop_search_pending→run()ペンディングチェック）を明記、フォールバック（switchToRestApiMode）をテストフェーズで無効化。*
-*v3.2a修正: セクション8の削除対象を実コードと整合。存在しない「テキスト入力時」呼び出しを削除し、toggleRecording()（マイクボタン）のswitchToRestApiMode()→terminateLiveSession()直接呼び出しへの変更を明記。テスト項目11も更新。*
-*v3の主な方針: キーワード抽出（short_term_memory / hearing_step）を廃止し、REST版と同じ「プロンプト + 会話履歴送信」方式に統一。*
+*以上が LiveAPI 移植設計書 v3.3。*
+*v3.2→v3.3の変更: should_trigger_shop_search()キーワードマッチングを完全廃止。ショップ検索トリガーをLLM判断方式に全面改訂。§0にキーワードマッチング禁止の厳守事項追加。§3.3にショップ検索判断基準のハードコード指示追加。§5をLLM判断方式で再定義。§3.4に削除対象コード一覧を明記。*
+*v3の主な方針: キーワード抽出（short_term_memory / hearing_step）を廃止し、REST版と同じ「プロンプト + 会話履歴送信」方式に統一。ショップ検索トリガーもREST版と同じLLM判断方式に統一。*
 *実装時は本設計書、`01_stt_stream_detailed_spec.md`、`03_prompt_modification_spec.md` を常に参照すること。*
