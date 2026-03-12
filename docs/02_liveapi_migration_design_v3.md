@@ -1,6 +1,7 @@
 # Gemini LiveAPI 移植設計書 v3（gourmet-sp3）
 
 > **作成日**: 2026-03-11
+> **改訂日**: 2026-03-12（v3.2: 重複セクション削除、ショップ検索フロー明記、フォールバック無効化）
 > **前版**: `docs/02_liveapi_migration_design_v2.md`（v2: 2026-03-11）
 > **前提文書**: `docs/01_stt_stream_detailed_spec.md`, `docs/03_prompt_modification_spec.md`
 > **成功事例**: `docs/stt_stream.py`（インタビューモードの再接続方式）
@@ -70,7 +71,7 @@ LiveAPI v3: REST版と同じ方式を再現
 |---|---|---|---|
 | 1 | バックエンド: LiveAPI WebSocketプロキシの新設 | 必須 | 変更なし |
 | 2 | フロントエンド: LiveAudioManager の実装 | 必須 | 変更なし |
-| 3 | LiveAPI → REST API フォールバック機構 | 必須 | 変更なし |
+| 3 | ~~LiveAPI → REST API フォールバック機構~~ | ~~必須~~ | **v3.2: テストフェーズでは無効化。switchToRestApiMode()を削除** |
 | 4 | セッション再接続メカニズム | 必須 | 変更なし |
 | 5 | トランスクリプション（文字起こし）表示 | 必須 | 変更なし |
 | 6 | ショップ説明のLiveAPI読み上げ（1軒ごとに再接続） | 必須 | 変更なし |
@@ -184,40 +185,114 @@ def _get_context_summary(self) -> str:
     return ""
 ```
 
-#### 3.2.3 run() の再接続フロー（v3改訂）
+#### 3.2.3 run() メインループ（v3.2改訂：ショップ検索ペンディングチェック追加、フォールバック削除）
 
 ```python
-# 再接続時の処理（run()内）
-else:
-    self._is_initial_greeting_phase = False
-    self.socketio.emit('live_reconnecting', {}, room=self.client_sid)
+async def run(self):
+    """メインループ"""
+    self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
+    self.is_running = True
 
-    # 1. 会話履歴turnsを再送（turn_complete=False）
-    #    → REST版の「毎回全履歴送信」と同等
-    await self._send_history_on_reconnect(session)
+    try:
+        while self.is_running:
+            self.session_count += 1
+            self.ai_char_count = 0
+            self.needs_reconnect = False
 
-    # 2. トリガーメッセージ（turn_complete=True）
-    resume_text = self._resume_message or "続きをお願いします"
-    self._resume_message = None
-    await session.send_client_content(
-        turns=types.Content(
-            role="user",
-            parts=[types.Part(text=resume_text)]
-        ),
-        turn_complete=True
-    )
-    logger.info(f"[LiveAPI] 再接続: 履歴再送 + トリガー送信")
-    self.socketio.emit('live_reconnected', {}, room=self.client_sid)
+            context = None
+            if self.session_count > 1:
+                context = self._get_context_summary()
+
+            config = self._build_config(with_context=context)
+
+            try:
+                async with self.client.aio.live.connect(
+                    model=LIVE_API_MODEL,
+                    config=config
+                ) as session:
+
+                    if self.session_count == 1:
+                        # 初回接続: ダミーメッセージで初期あいさつを発火
+                        self._is_initial_greeting_phase = True
+                        trigger_msgs = self.INITIAL_GREETING_TRIGGERS
+                        mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
+                        dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
+
+                        await session.send_client_content(
+                            turns=types.Content(
+                                role="user",
+                                parts=[types.Part(text=dummy_text)]
+                            ),
+                            turn_complete=True
+                        )
+                    else:
+                        # ★ v3: 再接続時に会話履歴を再送
+                        self._is_initial_greeting_phase = False
+                        self.socketio.emit('live_reconnecting', {}, room=self.client_sid)
+
+                        # 1. 会話履歴turnsを再送（turn_complete=False）
+                        await self._send_history_on_reconnect(session)
+
+                        # 2. トリガーメッセージ（turn_complete=True）
+                        resume_text = self._resume_message or "続きをお願いします"
+                        self._resume_message = None
+                        await session.send_client_content(
+                            turns=types.Content(
+                                role="user",
+                                parts=[types.Part(text=resume_text)]
+                            ),
+                            turn_complete=True
+                        )
+                        self.socketio.emit('live_reconnected', {}, room=self.client_sid)
+
+                    await self._session_loop(session)
+
+                    # ★ v3.2追加: ショップ検索ペンディングチェック
+                    # _process_turn_complete() で _shop_search_pending がセットされた場合、
+                    # _session_loop() 終了後にここで検知し、検索を実行する
+                    if self._shop_search_pending:
+                        pending = self._shop_search_pending
+                        self._shop_search_pending = None
+                        await self._handle_shop_search(pending['user_request'])
+                        continue  # ショップ検索後は再接続ループに戻る
+
+                    if not self.needs_reconnect:
+                        break
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                if any(kw in error_msg for kw in
+                       ["1011", "internal error", "disconnected",
+                        "closed", "websocket"]):
+                    logger.warning(f"[LiveAPI] 接続エラー、3秒後に再接続: {e}")
+                    await asyncio.sleep(3)
+                    self.needs_reconnect = True
+                    continue
+                else:
+                    # ★ v3.2: フォールバック（switchToRestApiMode）は発動しない
+                    # テストフェーズではエラーをログに出すだけ
+                    logger.error(f"[LiveAPI] 致命的エラー: {e}")
+                    break
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        self.is_running = False
+        logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 ```
 
-#### 3.2.4 _process_turn_complete()（v3改訂：短期記憶更新を削除）
+**v3.2での重要な変更点:**
+1. `_session_loop()` 後に `_shop_search_pending` チェックを追加 — これがないと「お探ししますね」の後にショップ検索が実行されない
+2. エラー時の `live_fallback` イベント emit を削除 — テストフェーズではフォールバックしない（`switchToRestApiMode()` を発動させない）
+
+#### 3.2.4 _process_turn_complete()（v3.2改訂：ショップ検索トリガー処理を明記）
 
 ```python
 def _process_turn_complete(self):
     """
-    ターン完了時の処理（v3改訂: キーワード抽出を廃止）
-    短期記憶はプロンプト + 履歴再送で対応するため、
-    コード側の条件抽出は行わない。
+    ターン完了時の処理
+    - キーワード抽出は行わない（REST版準拠、Geminiが履歴から判断）
+    - ショップ検索トリガーの検知 → _shop_search_pending にセット
     """
     user_text = ""
     if self.user_transcript_buffer.strip():
@@ -231,232 +306,37 @@ def _process_turn_complete(self):
         logger.info(f"[LiveAPI] AI: {ai_text}")
         self._add_to_history("ai", ai_text)
 
-        # ショップ検索トリガー検知（v2と同じ）
+        # ★ ショップ検索トリガー検知
         if should_trigger_shop_search(ai_text):
-            # ... トリガー処理 ...
+            user_request = self._build_search_request(user_text)
+            logger.info(f"[LiveAPI] ショップ検索トリガー: '{user_request}'")
+            # ★ _shop_search_pending にセット（run()のループで検知される）
+            self._shop_search_pending = {
+                'user_request': user_request,
+            }
         else:
             logger.debug(f"[LiveAPI] トリガー未検知: '{ai_text[:50]}'")
 
         # 発言途切れチェック・文字数カウント・再接続判定（v2と同じ）
-        # ... 省略（変更なし）...
+        is_incomplete = self._is_speech_incomplete(ai_text)
+        char_count = len(ai_text)
+        self.ai_char_count += char_count
+        remaining = MAX_AI_CHARS_BEFORE_RECONNECT - self.ai_char_count
+        logger.info(f"[LiveAPI] 累積: {self.ai_char_count}文字 / 残り: {remaining}文字")
+
+        self.ai_transcript_buffer = ""
+
+        if is_incomplete:
+            logger.info("[LiveAPI] 発言途切れのため再接続")
+            self.needs_reconnect = True
+        elif char_count >= LONG_SPEECH_THRESHOLD:
+            logger.info(f"[LiveAPI] 長い発話({char_count}文字)のため再接続")
+            self.needs_reconnect = True
+        elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
+            logger.info("[LiveAPI] 累積制限到達のため再接続")
+            self.needs_reconnect = True
 ```
 
-### 3.2 再接続時のコンテキスト復元（v3全面改訂）
-
-REST版では毎回全会話履歴をGemini APIに送信していた。
-v3ではそれと同等の情報量を、以下の2つの手段で復元する:
-
-1. **`_get_context_summary()`** → システムプロンプトに構造化された条件状態を注入
-2. **`send_client_content()`** → 会話履歴turnsを再送
-
-#### 3.2.1 _get_context_summary()（v3全面改訂）
-
-```python
-def _get_context_summary(self) -> str:
-    """
-    再接続時のコンテキスト注入。
-
-    【v3変更点】
-    v2: チャットログの断片（"user: xxx\nai: xxx"）
-    v3: 構造化された条件状態 + ヒアリングステップ + 禁止事項
-
-    【設計根拠】
-    REST版では concierge_ja.txt の【短期記憶・セッション行動ルール】に
-    「一度確定した情報は有効」「聞き直し禁止」と明記されていた。
-    LiveAPIでは再接続でGeminiが全てを忘れるため、
-    この「何が確定済みか」を明示的に伝える必要がある。
-    """
-    parts = []
-
-    # ===== 1. 短期記憶（コンシェルジュモードのみ） =====
-    if self.mode == 'concierge' and any(self.short_term_memory.values()):
-        condition_labels = {
-            'area': 'エリア',
-            'purpose': '利用目的',
-            'cuisine': '料理ジャンル',
-            'atmosphere': '雰囲気',
-            'party_size': '人数',
-            'budget': '予算',
-            'date': '日時',
-        }
-
-        confirmed = []
-        unconfirmed = []
-
-        for key, label in condition_labels.items():
-            value = self.short_term_memory[key]
-            if value:
-                confirmed.append(f"  - {label}: {value}")
-            else:
-                unconfirmed.append(f"  - {label}: 未確認")
-
-        parts.append("【ユーザーの確定済み条件（短期記憶）】")
-        parts.append("以下は会話で既に確認済み。再度質問してはならない。")
-        parts.extend(confirmed)
-
-        if unconfirmed:
-            parts.append("")
-            parts.append("【未確認の条件】")
-            parts.extend(unconfirmed)
-
-        # ステップ指示
-        step_instructions = {
-            1: "まずエリアと利用目的を質問してください。",
-            2: "料理ジャンル・雰囲気・人数を質問してください。",
-            3: "予算を質問してください。",
-            4: "日時を質問してください。なお日時はユーザーが言わなければ省略可。",
-            5: "条件は十分です。「お探ししますね」と言って検索を開始してください。",
-        }
-        parts.append(f"\n【次のステップ】{step_instructions.get(self.hearing_step, '')}")
-
-    # ===== 2. 直前の会話（最小限の参考情報） =====
-    # send_client_content() で会話履歴turnsを別途再送するため、
-    # ここでは最後のAI発言が質問だった場合のみ強調する
-    if self.conversation_history:
-        last_ai = None
-        for h in reversed(self.conversation_history):
-            if h['role'] == 'ai':
-                last_ai = h['text']
-                break
-
-        if last_ai and ('?' in last_ai or '？' in last_ai
-                        or 'ですか' in last_ai or 'ますか' in last_ai):
-            parts.append(f"\n【直前のAIの質問（回答を待っています）】\n{last_ai[:200]}")
-
-    return "\n".join(parts)
-```
-
-#### 3.2.2 再接続時の会話履歴再送（v3新規）
-
-```python
-async def _send_history_on_reconnect(self, session):
-    """
-    再接続時に会話履歴をsend_client_content()で再送する。
-
-    【設計根拠】
-    REST版では毎回全会話履歴をAPI引数として送信していた。
-    LiveAPIのsend_client_content()のturnsパラメータで同等のことができる。
-    これにより、Geminiは再接続後も直前の会話文脈を把握できる。
-
-    【注意】
-    - turnsは types.Content のリストとして送信
-    - role は "user" または "model"（"ai"ではない）
-    - 直近10ターン、各150文字までに制限（トークン消費抑制）
-    """
-    if not self.conversation_history:
-        return
-
-    recent = self.conversation_history[-10:]
-    history_turns = []
-
-    for h in recent:
-        role = "user" if h['role'] == 'user' else "model"
-        text = h['text'][:150]
-        history_turns.append(
-            types.Content(
-                role=role,
-                parts=[types.Part(text=text)]
-            )
-        )
-
-    if history_turns:
-        await session.send_client_content(
-            turns=history_turns,
-            turn_complete=False  # ★ まだターンは終わっていない
-        )
-        logger.info(f"[LiveAPI] 会話履歴 {len(history_turns)} ターン再送")
-```
-
-#### 3.2.3 run() の再接続フロー修正（v3改訂）
-
-```python
-async def run(self):
-    """メインループ（v3改訂: 再接続時の履歴再送を追加）"""
-    self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
-    self.is_running = True
-
-    try:
-        while self.is_running:
-            self.session_count += 1
-            self.ai_char_count = 0
-            self.needs_reconnect = False
-
-            context = None
-            if self.session_count > 1:
-                context = self._get_context_summary()  # ★ v3: 構造化コンテキスト
-
-            config = self._build_config(with_context=context)
-
-            try:
-                async with self.client.aio.live.connect(
-                    model=LIVE_API_MODEL,
-                    config=config
-                ) as session:
-
-                    if self.session_count == 1:
-                        # 初回接続: ダミーメッセージで初期あいさつを発火（v2と同じ）
-                        self._is_initial_greeting_phase = True
-                        trigger_msgs = self.INITIAL_GREETING_TRIGGERS
-                        mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
-                        dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
-
-                        await session.send_client_content(
-                            turns=types.Content(
-                                role="user",
-                                parts=[types.Part(text=dummy_text)]
-                            ),
-                            turn_complete=True
-                        )
-                        logger.info(f"[LiveAPI] 初期あいさつトリガー送信: '{dummy_text}'")
-                    else:
-                        # ★ v3改訂: 再接続時に会話履歴を再送
-                        self._is_initial_greeting_phase = False
-                        self.socketio.emit('live_reconnecting', {},
-                                           room=self.client_sid)
-
-                        # 1. 会話履歴turnsを再送（turn_complete=False）
-                        await self._send_history_on_reconnect(session)
-
-                        # 2. トリガーメッセージ（turn_complete=True）
-                        await session.send_client_content(
-                            turns=types.Content(
-                                role="user",
-                                parts=[types.Part(text="続きをお願いします")]
-                            ),
-                            turn_complete=True
-                        )
-                        logger.info("[LiveAPI] 再接続: 履歴再送 + トリガー送信")
-                        self.socketio.emit('live_reconnected', {},
-                                           room=self.client_sid)
-
-                    await self._session_loop(session)
-
-                    if not self.needs_reconnect:
-                        break
-
-            except Exception as e:
-                # エラーハンドリング（v2と同じ）
-                error_msg = str(e).lower()
-                if any(kw in error_msg for kw in
-                       ["1011", "internal error", "disconnected",
-                        "closed", "websocket"]):
-                    logger.warning(f"[LiveAPI] 接続エラー、3秒後に再接続: {e}")
-                    await asyncio.sleep(3)
-                    self.needs_reconnect = True
-                    continue
-                else:
-                    logger.error(f"[LiveAPI] 致命的エラー: {e}")
-                    self.socketio.emit('live_fallback', {
-                        'reason': str(e)
-                    }, room=self.client_sid)
-                    break
-
-    except asyncio.CancelledError:
-        pass
-    finally:
-        self.is_running = False
-        logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
-```
 
 ### 3.3 プロンプトの短期記憶ルール（v3改訂：REST版準拠で強化ハードコード）
 
@@ -534,14 +414,18 @@ v2のセクション5をそのまま維持。
 [通常会話]
 LiveAPIセッション#1 (初回接続・挨拶)
   ↓ 累積制限 or 発話途切れ
-  ↓ ★ short_term_memory は保持される（サーバー側）
-LiveAPIセッション#2 (再接続・構造化コンテキスト注入 + 履歴再送)
+  ↓ ★ conversation_history はサーバー側で保持される
+LiveAPIセッション#2 (再接続・send_client_content(turns)で履歴再送)
   ↓ ...
-  ↓ ★ short_term_memory は累積更新される
-LiveAPIセッション#N (会話中にショップ検索トリガー)
+  ↓ ★ conversation_history は累積蓄積される
+LiveAPIセッション#N (AIが「お探ししますね」と発言)
+  ↓ _process_turn_complete() で should_trigger_shop_search() が検知
+  ↓ _shop_search_pending にセット
+  ↓ _session_loop() 終了後、run() でペンディングチェック
   ↓
-[ショップ検索]
+[ショップ検索]  ★ v3.2: run()内で _handle_shop_search() を呼び出す
 REST API でショップデータ取得 (JSONのみ)
+  ↓ shop_search_result イベントでブラウザにカード送信
   ↓
 [ショップ説明]
 LiveAPIセッション#N+1 (ショップ1説明)
@@ -552,7 +436,7 @@ LiveAPIセッション#N+3 (ショップ3説明)
   ↓ 再接続
 [通常会話復帰]
 LiveAPIセッション#N+4 (「気になるお店はありましたか？」)
-  ↓ ★ short_term_memory はショップ検索後もリセットしない（追加検索対応）
+  ↓ ★ conversation_history はショップ検索後もリセットしない（条件変更による再検索に対応）
 ```
 
 ### 6.2 セッション状態遷移（v2と同じ）
@@ -639,9 +523,25 @@ v2のセクション7.2をそのまま維持。
 
 ---
 
-## 8. フォールバック戦略（v2から変更なし）
+## 8. フォールバック戦略（v3.2改訂：テストフェーズでは無効化）
 
-v2のセクション8をそのまま維持。
+**テストフェーズでは `switchToRestApiMode()` によるフォールバックを完全に無効化する。**
+
+| 項目 | v2 | v3.2（テストフェーズ） |
+|---|---|---|
+| バックエンド: `live_fallback` イベント | 致命的エラー時に emit | **emit しない** |
+| フロントエンド: `switchToRestApiMode()` | `live_fallback` 受信で発動 | **削除（呼び出し箇所ごと削除）** |
+| フロントエンド: テキスト入力時の切替 | LiveAPI中にテキスト入力→REST切替 | **削除** |
+| エラー時の挙動 | REST APIモードに切り替え | **エラーログを出して終了（ユーザーが手動リロード）** |
+
+**削除対象（core-controller.ts）:**
+- `live_fallback` イベントハンドラ内の `switchToRestApiMode()` 呼び出し
+- テキスト入力時の `switchToRestApiMode()` 呼び出し
+- `switchToRestApiMode()` メソッド自体（テストフェーズでは不要）
+
+**理由:**
+テストフェーズではLiveAPIの挙動を正確に検証する必要がある。
+フォールバックが発動すると、LiveAPI側の問題が隠蔽され、デバッグが困難になる。
 
 ---
 
@@ -732,9 +632,12 @@ LiveAPI v3で同じ原理を再現:
 | 3 | 再接続後にAIが次の質問をする | 既に回答済みの条件をスキップし、未確認の条件を質問する |
 | 4 | 条件を段階的に伝える（3〜4ターン） | conversation_history に全ターンが蓄積される |
 | 5 | 全条件確定後 | AIが「お探ししますね」と発言し、検索トリガーが発火する |
-| 6 | 検索後に「別のエリアで」と言う | AIが他の条件を維持したまま新エリアで対応する |
-| 7 | 再接続時のsend_client_content再送 | 直近10ターンが正しく再送される（ログで確認） |
-| 8 | 任意のエリア名（リストにないもの含む） | Geminiが会話履歴から自然に理解する |
+| 6 | トリガー発火後 | _shop_search_pending がセットされ、run()でペンディングチェックにより_handle_shop_search()が呼ばれる |
+| 7 | ショップ検索実行後 | shop_search_result イベントがブラウザに送信され、カードが表示される |
+| 8 | 検索後に「別のエリアで」と言う | AIが他の条件を維持したまま新エリアで対応する |
+| 9 | 再接続時のsend_client_content再送 | 直近10ターンが正しく再送される（ログで確認） |
+| 10 | 任意のエリア名（リストにないもの含む） | Geminiが会話履歴から自然に理解する |
+| 11 | フォールバックが発動しないこと | switchToRestApiModeが呼ばれない。コンソールに「REST APIモードに切り替え」が出ない |
 
 ### 11.4 Phase 3 テスト項目（v2と同じ）
 
@@ -760,7 +663,7 @@ LiveAPI移行で「何がどう変わったか」の対応表。
 
 ---
 
-*以上が LiveAPI 移植設計書 v3（改訂版）。*
-*v3改訂の主な変更: キーワード抽出（short_term_memory / hearing_step）を廃止し、REST版と同じ「プロンプト + 会話履歴送信」方式に統一。*
-*v2との差分はセクション3（履歴再注入方式）、セクション7（再接続メカニズム）が中心。*
+*以上が LiveAPI 移植設計書 v3.2。*
+*v3.1→v3.2の変更: 重複セクション3.2削除、ショップ検索フロー（_shop_search_pending→run()ペンディングチェック）を明記、フォールバック（switchToRestApiMode）をテストフェーズで無効化。*
+*v3の主な方針: キーワード抽出（short_term_memory / hearing_step）を廃止し、REST版と同じ「プロンプト + 会話履歴送信」方式に統一。*
 *実装時は本設計書、`01_stt_stream_detailed_spec.md`、`03_prompt_modification_spec.md` を常に参照すること。*
