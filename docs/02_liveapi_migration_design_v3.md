@@ -13,11 +13,12 @@
 
 | 項目 | v2（旧） | v3（新） |
 |---|---|---|
-| 再接続時のコンテキスト | チャットログの断片を要約テキストとして注入 | **会話履歴の`send_client_content()`再送（REST版準拠）** |
-| 短期記憶の管理 | なし（Geminiのセッション内記憶に依存） | **キーワード抽出は廃止。プロンプト強化 + 履歴再送で対応** |
-| `_get_context_summary()` | `"user: xxx\nai: xxx"` 形式のテキスト断片 | **最小限（直前の質問のみ補足）。主力は履歴再送** |
+| 再接続時のコンテキスト | チャットログの断片を要約テキストとして注入 | **構造化された条件状態 + 会話履歴の`send_client_content()`再送** |
+| 短期記憶の管理 | なし（Geminiのセッション内記憶に依存） | **サーバー側で`short_term_memory`として構造化管理** |
+| ヒアリング進捗の追跡 | なし | **`hearing_step`（1〜4）で現在のステップを追跡** |
+| `_get_context_summary()` | `"user: xxx\nai: xxx"` 形式のテキスト断片 | **確定済み/未確認条件の構造化テキスト + 禁止事項** |
 | 再接続時の`send_client_content()` | `"続きをお願いします"` のみ | **会話履歴turnsの再送 + トリガーメッセージ** |
-| `LIVEAPI_CONCIERGE_SYSTEM` | 短期記憶ルールなし | **REST版concierge_ja.txtの短期記憶ルールを凝縮してハードコード** |
+| `LIVEAPI_CONCIERGE_SYSTEM` | 短期記憶ルールなし | **短期記憶の注入指示を追加**（03_prompt_modification_spec.md準拠で最小限） |
 
 ### v3変更の背景
 
@@ -26,24 +27,22 @@
 REST: 毎回 system_prompt（concierge_ja.txt全文）+ 全会話履歴 → Gemini REST API
 → Geminiは全ターンを見て「何が確定済みか」を自然に把握できた
 → 短期記憶は会話履歴の全量送信により「無料で」成立していた
-→ コード側のキーワード抽出・ステップ追跡は一切なし
 ```
 
 **LiveAPI版で壊れた理由:**
 ```
 LiveAPI: セッション内はGeminiが記憶保持 → だが再接続で全消失
 → 再接続時に「user: 接待で... ai: 承知しました...」の断片しか渡していない
-→ Geminiは「何が確定済みで何が未確認か」を把握できない
+→ Geminiは「何が確定済みで何が未確認か」を構造的に把握できない
 → ステップ1に戻って同じ質問を繰り返す → 検索に辿りつけない
 ```
 
-**v3の解決方針（REST版準拠）:**
+**v3の解決方針:**
 ```
-LiveAPI v3: REST版と同じ方式を再現
-→ 再接続時に send_client_content(turns) で会話履歴を再送（REST版の全履歴送信に相当）
-→ プロンプトにREST版の短期記憶ルールを強化ハードコード（聞き直し禁止を明示）
-→ キーワード抽出・hearing_step等のコード側追跡は不要（Geminiが自然に判断）
-→ REST版と同等の精度を、同じ原理で実現する
+LiveAPI v3: サーバー側で条件を構造化管理（short_term_memory）
+→ 再接続時に「確定済み条件」「未確認条件」「次のステップ」を明示的に注入
+→ さらにsend_client_content()で会話履歴turnsも再送
+→ REST版と同等の情報量をGeminiに渡す
 ```
 
 ---
@@ -74,8 +73,8 @@ LiveAPI v3: REST版と同じ方式を再現
 | 4 | セッション再接続メカニズム | 必須 | 変更なし |
 | 5 | トランスクリプション（文字起こし）表示 | 必須 | 変更なし |
 | 6 | ショップ説明のLiveAPI読み上げ（1軒ごとに再接続） | 必須 | 変更なし |
-| 7 | **プロンプトの短期記憶ルール強化（REST版準拠）** | **必須** | **v3改訂** |
-| 8 | **再接続時の会話履歴再送（send_client_content turns）** | **必須** | **v3新規** |
+| 7 | **短期記憶の構造化管理（コンシェルジュモード）** | **必須** | **v3新規** |
+| 8 | **再接続時の会話履歴再送** | **必須** | **v3新規** |
 
 ### 1.2 やらないこと（v2から変更なし）
 
@@ -92,132 +91,215 @@ v2のセクション2をそのまま維持。
 
 ---
 
-## 3. バックエンド設計（v3改訂：REST版準拠の履歴再注入方式）
+## 3. バックエンド設計（v3改訂：短期記憶追加）
 
-### 3.1 設計方針（v3改訂：キーワード抽出廃止）
+### 3.1 LiveAPISession クラスの拡張（v3新規）
 
-**REST版で機能していた短期記憶の原理をそのまま踏襲する。**
-
-```
-REST版の原理:
-1. プロンプト（concierge_ja.txt）に短期記憶ルールを詳細に記述
-2. 毎回の API 呼び出しで全会話履歴を送信
-→ Geminiが会話履歴から「何が確定済みか」を自然に把握
-→ コード側のキーワード抽出・ステップ追跡は一切不要
-
-LiveAPI v3での再現:
-1. プロンプト（LIVEAPI_CONCIERGE_SYSTEM）にREST版の短期記憶ルールを強化ハードコード
-2. 再接続時に send_client_content(turns) で会話履歴を再送
-→ REST版と同じ情報量をGeminiに渡す
-→ キーワード抽出（short_term_memory）、hearing_step は廃止
-```
-
-**廃止した理由:**
-- キーワード抽出はリスト外のエリア名・曖昧な表現を拾えず網羅性が低い
-- REST版にはそもそも存在しない仕組みであり、REST版で問題なく機能していた
-- 会話履歴の再送 + プロンプトの短期記憶ルールで同等の精度が出る
-- コードの複雑性が大幅に低減される
-
-### 3.2 再接続時のコンテキスト復元（v3改訂）
-
-#### 3.2.1 _send_history_on_reconnect()（v3新規）
+#### 3.1.1 短期記憶データ構造
 
 ```python
-async def _send_history_on_reconnect(self, session):
-    """
-    再接続時に会話履歴をsend_client_content()で再送する。
+class LiveAPISession:
+    def __init__(self, session_id, mode, language,
+                 system_prompt, socketio, client_sid):
+        # ... 既存の初期化（v2と同じ）...
 
-    【設計根拠（REST版準拠）】
-    REST版では毎回全会話履歴をGemini APIに送信していた。
-    LiveAPIのsend_client_content()のturnsパラメータで同等のことを実現。
+        # ===== v3新規: 短期記憶（コンシェルジュモード用） =====
+        self.short_term_memory = {
+            'area': None,         # エリア（例: "六本木"）
+            'purpose': None,      # 利用目的（例: "接待"）
+            'cuisine': None,      # 料理ジャンル（例: "和食"）
+            'atmosphere': None,   # 雰囲気（例: "落ち着いた"）
+            'party_size': None,   # 人数（例: "4名"）
+            'budget': None,       # 予算（例: "1万円程度"）
+            'date': None,         # 日時（例: "来週金曜"）
+        }
+        self.hearing_step = 1     # ヒアリングステップ（1〜4、5=全条件確定）
+        # concierge_ja.txt のステップ定義:
+        #   1: 場所・目的
+        #   2: ジャンル・雰囲気・人数
+        #   3: 予算
+        #   4: 日程
+        #   5: 全条件確定 → 検索可能
+```
 
-    - turnsは types.Content のリストとして送信
-    - role は "user" または "model"（"ai"ではない）
-    - 直近10ターン、各150文字までに制限（トークン消費抑制）
+**設計根拠:**
+- REST版（gourmet-support）では `concierge_ja.txt` の【初回ヒアリングの必須フロー】で定義されたステップ1〜4を、Geminiが会話履歴全量から自然に追跡していた
+- LiveAPIでは再接続で会話履歴が消えるため、サーバー側で明示的に追跡する必要がある
+- `short_term_memory` の各フィールドは `concierge_ja.txt` の【短期記憶・セッション行動ルール】セクションの「記憶対象となる情報」に対応
+
+#### 3.1.2 短期記憶の更新（ターン完了時）
+
+```python
+def _update_short_term_memory(self, user_text: str, ai_text: str):
     """
-    if not self.conversation_history:
+    ターン完了時に呼ばれる。ユーザー発言から条件をキーワードベースで抽出。
+
+    【設計方針】
+    - LLM呼び出しは行わない（レイテンシ回避）
+    - キーワードマッチによる簡易抽出
+    - 拾えない条件は会話履歴の再送で補完される（3.2.2参照）
+    - ユーザーが明示的に言った条件のみ記録。推測しない。
+    """
+    if not user_text:
         return
 
-    recent = self.conversation_history[-10:]
-    history_turns = []
+    import re
 
-    for h in recent:
-        role = "user" if h['role'] == 'user' else "model"
-        text = h['text'][:150]
-        history_turns.append(
-            types.Content(
-                role=role,
-                parts=[types.Part(text=text)]
-            )
-        )
-
-    if history_turns:
-        await session.send_client_content(
-            turns=history_turns,
-            turn_complete=False  # まだターンは終わっていない
-        )
-        logger.info(f"[LiveAPI] 会話履歴 {len(history_turns)} ターン再送")
-```
-
-#### 3.2.2 _get_context_summary()（v3改訂：最小限に簡素化）
-
-```python
-def _get_context_summary(self) -> str:
-    """
-    再接続時のコンテキスト要約。
-    主力は send_client_content(turns) による履歴再送。
-    ここでは最後のAIの質問のみ補足情報として返す。
-    """
-    if not self.conversation_history:
-        return ""
-
-    last_ai = None
-    for h in reversed(self.conversation_history):
-        if h['role'] == 'ai':
-            last_ai = h['text']
+    # ---- エリア検出 ----
+    area_keywords = [
+        '六本木', '渋谷', '新宿', '銀座', '恵比寿', '池袋',
+        '表参道', '赤坂', '麻布', '品川', '東京駅', '丸の内',
+        '目黒', '中目黒', '代官山', '自由が丘', '吉祥寺',
+        '横浜', '新橋', '浜松町', '五反田', '大崎', '田町',
+        '上野', '秋葉原', '神田', '日本橋', '八重洲',
+        '大阪', '梅田', '難波', '心斎橋', '京都', '神戸',
+        '名古屋', '栄', '福岡', '天神', '博多', '札幌',
+    ]
+    for area in area_keywords:
+        if area in user_text:
+            self.short_term_memory['area'] = area
             break
 
-    if last_ai and ('?' in last_ai or '？' in last_ai
-                    or 'ですか' in last_ai or 'ますか' in last_ai):
-        return f"【直前のAIの質問（回答を待っています）】\n{last_ai[:200]}"
+    # ---- 利用目的検出 ----
+    purpose_map = {
+        '接待': '接待', 'デート': 'デート', '女子会': '女子会',
+        '忘年会': '忘年会', '新年会': '新年会', '歓迎会': '歓迎会',
+        '送別会': '送別会', '家族': '家族利用', '記念日': '記念日',
+        '誕生日': '誕生日', '会食': '会食', '飲み会': '飲み会',
+        '合コン': '合コン', '同窓会': '同窓会', 'ランチ': 'ランチ',
+        '食事会': '食事会', '打ち上げ': '打ち上げ',
+    }
+    for kw, purpose in purpose_map.items():
+        if kw in user_text:
+            self.short_term_memory['purpose'] = purpose
+            break
 
-    return ""
+    # ---- 料理ジャンル検出 ----
+    cuisine_map = {
+        '和食': '和食', '洋食': '洋食', 'イタリアン': 'イタリアン',
+        'フレンチ': 'フレンチ', '中華': '中華', '焼肉': '焼肉',
+        '寿司': '寿司', '鮨': '寿司', '焼き鳥': '焼き鳥',
+        'ラーメン': 'ラーメン', 'カフェ': 'カフェ',
+        '居酒屋': '居酒屋', '韓国料理': '韓国料理',
+        'タイ料理': 'タイ料理', 'インド料理': 'インド料理',
+        'スペイン料理': 'スペイン料理', '鉄板焼': '鉄板焼',
+        'しゃぶしゃぶ': 'しゃぶしゃぶ', 'すき焼き': 'すき焼き',
+        '天ぷら': '天ぷら', 'うなぎ': 'うなぎ', 'そば': 'そば',
+    }
+    for kw, cuisine in cuisine_map.items():
+        if kw in user_text:
+            self.short_term_memory['cuisine'] = cuisine
+            break
+
+    # ---- 人数検出 ----
+    party_match = re.search(r'(\d+)\s*[人名]', user_text)
+    if party_match:
+        self.short_term_memory['party_size'] = f"{party_match.group(1)}名"
+    else:
+        num_words = {
+            '二人': '2名', 'ふたり': '2名', '2人': '2名',
+            '三人': '3名', '四人': '4名', '五人': '5名',
+        }
+        for kw, size in num_words.items():
+            if kw in user_text:
+                self.short_term_memory['party_size'] = size
+                break
+
+    # ---- 雰囲気検出 ----
+    atmo_map = {
+        '落ち着い': '落ち着いた雰囲気', '静か': '静かな雰囲気',
+        'カジュアル': 'カジュアル', '高級': '高級感',
+        '個室': '個室希望', 'おしゃれ': 'おしゃれ',
+        '賑やか': '賑やかな雰囲気', 'アットホーム': 'アットホーム',
+        '隠れ家': '隠れ家的', 'モダン': 'モダン',
+    }
+    for kw, atmo in atmo_map.items():
+        if kw in user_text:
+            self.short_term_memory['atmosphere'] = atmo
+            break
+
+    # ---- 予算検出 ----
+    # 「5000円」「五千円」「1万円」等
+    budget_match = re.search(r'(\d[\d,]*)\s*円', user_text)
+    if budget_match:
+        self.short_term_memory['budget'] = budget_match.group(0)
+    else:
+        man_match = re.search(r'(\d+)\s*万', user_text)
+        if man_match:
+            self.short_term_memory['budget'] = f"{man_match.group(1)}万円程度"
+
+    # ---- 日時検出 ----
+    date_patterns = [
+        '今日', '明日', '明後日', '今週', '来週', '再来週',
+        '今月', '来月', '月曜', '火曜', '水曜', '木曜',
+        '金曜', '土曜', '日曜', '週末', '祝日',
+    ]
+    for pattern in date_patterns:
+        if pattern in user_text:
+            self.short_term_memory['date'] = user_text  # 日時は文脈が重要なので発言全体を保持
+            break
+    # 「○月○日」「○/○」パターン
+    if not self.short_term_memory['date']:
+        date_match = re.search(r'\d+[月/]\d+', user_text)
+        if date_match:
+            self.short_term_memory['date'] = date_match.group(0)
+
+    # ---- ヒアリングステップの自動更新 ----
+    self._update_hearing_step()
+
+    logger.info(f"[ShortTermMemory] step={self.hearing_step}, "
+                f"conditions={self._get_confirmed_conditions()}")
 ```
 
-#### 3.2.3 run() の再接続フロー（v3改訂）
+#### 3.1.3 ヒアリングステップの自動更新
 
 ```python
-# 再接続時の処理（run()内）
-else:
-    self._is_initial_greeting_phase = False
-    self.socketio.emit('live_reconnecting', {}, room=self.client_sid)
+def _update_hearing_step(self):
+    """
+    確定条件に基づいてヒアリングステップを更新。
 
-    # 1. 会話履歴turnsを再送（turn_complete=False）
-    #    → REST版の「毎回全履歴送信」と同等
-    await self._send_history_on_reconnect(session)
+    concierge_ja.txt のヒアリングフローに対応:
+      ステップ1: 場所・目的
+      ステップ2: ジャンル・雰囲気・人数
+      ステップ3: 予算
+      ステップ4: 日程
+      ステップ5: 全条件確定
+    """
+    m = self.short_term_memory
 
-    # 2. トリガーメッセージ（turn_complete=True）
-    resume_text = self._resume_message or "続きをお願いします"
-    self._resume_message = None
-    await session.send_client_content(
-        turns=types.Content(
-            role="user",
-            parts=[types.Part(text=resume_text)]
-        ),
-        turn_complete=True
-    )
-    logger.info(f"[LiveAPI] 再接続: 履歴再送 + トリガー送信")
-    self.socketio.emit('live_reconnected', {}, room=self.client_sid)
+    # ステップ1: 場所 or 目的が1つでもあれば次へ
+    if not m['area'] and not m['purpose']:
+        self.hearing_step = 1
+        return
+
+    # ステップ2: ジャンル or 人数があれば次へ
+    if not m['cuisine'] and not m['party_size']:
+        self.hearing_step = 2
+        return
+
+    # ステップ3: 予算
+    if not m['budget']:
+        self.hearing_step = 3
+        return
+
+    # ステップ4: 日時（省略可能 — ユーザーが言わなくてもAIが検索を促してよい）
+    if not m['date']:
+        self.hearing_step = 4
+        return
+
+    self.hearing_step = 5
+
+def _get_confirmed_conditions(self) -> dict:
+    """確定済み条件のみを返す（ログ・デバッグ用）"""
+    return {k: v for k, v in self.short_term_memory.items() if v}
 ```
 
-#### 3.2.4 _process_turn_complete()（v3改訂：短期記憶更新を削除）
+#### 3.1.4 _process_turn_complete() の修正
 
 ```python
 def _process_turn_complete(self):
     """
-    ターン完了時の処理（v3改訂: キーワード抽出を廃止）
-    短期記憶はプロンプト + 履歴再送で対応するため、
-    コード側の条件抽出は行わない。
+    ターン完了時の処理（v3改訂: 短期記憶更新を追加）
     """
     user_text = ""
     if self.user_transcript_buffer.strip():
@@ -231,14 +313,41 @@ def _process_turn_complete(self):
         logger.info(f"[LiveAPI] AI: {ai_text}")
         self._add_to_history("ai", ai_text)
 
+        # ★ v3新規: 短期記憶を更新（コンシェルジュモードのみ）
+        if self.mode == 'concierge':
+            self._update_short_term_memory(user_text, ai_text)
+
         # ショップ検索トリガー検知（v2と同じ）
         if should_trigger_shop_search(ai_text):
-            # ... トリガー処理 ...
+            user_request = self._build_search_request(user_text)
+            logger.info(f"[LiveAPI] ショップ検索トリガー: '{user_request}'")
+            self.socketio.emit('shop_search_trigger', {
+                'user_request': user_request,
+                'session_id': self.session_id,
+                'language': self.language,
+                'mode': self.mode
+            }, room=self.client_sid)
         else:
             logger.debug(f"[LiveAPI] トリガー未検知: '{ai_text[:50]}'")
 
         # 発言途切れチェック・文字数カウント・再接続判定（v2と同じ）
-        # ... 省略（変更なし）...
+        is_incomplete = self._is_speech_incomplete(ai_text)
+        char_count = len(ai_text)
+        self.ai_char_count += char_count
+        remaining = MAX_AI_CHARS_BEFORE_RECONNECT - self.ai_char_count
+        logger.info(f"[LiveAPI] 累積: {self.ai_char_count}文字 / 残り: {remaining}文字")
+
+        self.ai_transcript_buffer = ""
+
+        if is_incomplete:
+            logger.info("[LiveAPI] 発言途切れのため再接続")
+            self.needs_reconnect = True
+        elif char_count >= LONG_SPEECH_THRESHOLD:
+            logger.info(f"[LiveAPI] 長い発話({char_count}文字)のため再接続")
+            self.needs_reconnect = True
+        elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
+            logger.info("[LiveAPI] 累積制限到達のため再接続")
+            self.needs_reconnect = True
 ```
 
 ### 3.2 再接続時のコンテキスト復元（v3全面改訂）
@@ -458,48 +567,56 @@ async def run(self):
         logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 ```
 
-### 3.3 プロンプトの短期記憶ルール（v3改訂：REST版準拠で強化ハードコード）
+### 3.3 プロンプトへの短期記憶指示追加（v3新規）
 
-REST版 `concierge_ja.txt` の【短期記憶・セッション行動ルール（最重要）】を
-LiveAPI向けに凝縮して `LIVEAPI_CONCIERGE_SYSTEM` にハードコード。
+`03_prompt_modification_spec.md` に準拠し、`LIVEAPI_CONCIERGE_SYSTEM` への追加は最小限とする。
 
-#### 3.3.1 ハードコードした短期記憶ルール
+#### 3.3.1 追加する内容
 
-`live_api_handler.py` の `LIVEAPI_CONCIERGE_SYSTEM` 内に以下を直接記述:
+```python
+# live_api_handler.py の LIVEAPI_CONCIERGE_SYSTEM に以下を追加:
 
+LIVEAPI_CONCIERGE_SYSTEM = """あなたはグルメコンシェルジュです。
+高級レストランのコンシェルジュのように、丁寧にユーザーの好みを引き出してください。
+
+## 役割
+- 会話のキャッチボールを通じて、ユーザーの本当の希望を引き出す。
+- 一方的に質問を並べるのではなく、ユーザーの回答に寄り添い、深掘りする。
+- 条件が十分に揃ったら、「お探ししますね」と言って店舗検索を促す。
+
+{user_context}
+
+## 質問ルール（厳守）
+- 1ターンの質問は最大3つまで。それ以上は絶対に聞かない。
+- 理想は1ターン1質問。必要な場合のみ2-3に増やす。
+- ユーザーが答えやすい順番で聞く（まず大枠、次に詳細）。
+
+## 禁止事項
+以下のように一度に大量の質問を並べることは禁止：
+「料理のジャンルは？エリアは？人数は？目的は？予算は？雰囲気は？」
+→ ユーザーは一度にこれだけの質問には答えられない。
+
+## 正しい会話の進め方
+2ターン目以降: ユーザーの回答に応じて自然に深掘りする。
+例: 「接待ですね。和食と洋食、どちらがお好みですか？」
+例: 「お二人でしたら、カウンターのお店も素敵ですよ。いかがですか？」
+
+## 応答スタイル
+- 丁寧語（です・ます調）を基本とする。
+- 押しつけず、提案する姿勢。「いかがですか？」「よろしければ」を活用。
+- ユーザーの発言を受け止めてから次に進む。「素敵ですね」「なるほど」等。
+
+## 短期記憶ルール（v3追加・厳守）
+- 再接続時、システムインストラクションに【ユーザーの確定済み条件】が注入される。
+- 確定済み条件は既にユーザーが回答済み。再度質問してはならない。
+- 確定済み条件を踏まえて、未確認の条件のみを質問する。
+- 条件が十分に揃ったら「お探ししますね」と言って検索を促す。
+
+{common_rules}
+"""
 ```
-## 【短期記憶・セッション行動ルール（最重要・厳守）】
 
-### 1. 短期記憶の前提
-あなたは会話履歴の内容を記憶している前提で行動すること。
-会話中に一度確定・明示された情報は、ユーザーが条件を変えない限り有効。
-「覚えていない前提」での聞き直しは絶対に禁止。
-
-### 2. 記憶対象（会話履歴から把握すべき情報）
-- 利用目的・シーン（接待、デート、忘年会、女子会、家族利用 等）
-- エリア・地域
-- 予算感
-- 参加人数
-- 料理ジャンル
-- 店の雰囲気・優先条件（個室、静か、カジュアル、高級 等）
-
-### 3. 重複質問の禁止ルール（絶対厳守）
-✅ 再質問してよいケース：ユーザーが明示的に条件変更を指示した場合のみ
-❌ 再質問してはいけないケース：すでに取得済みの条件を理由なく聞き直す行為
-
-### 4. 業態別ヒアリング制御
-簡易飲食業態（ラーメン、カフェ、ファーストフード等）は即提案優先
-
-### 5. 再接続時の行動ルール（LiveAPI固有・最重要）
-再接続後も会話履歴が再送されるので確認し、同じ質問を繰り返さない
-
-### 6. このルールの優先順位
-1位：本セクション > 2位：質問ルール > 3位：応答スタイル
-```
-
-**設計根拠:** REST版では `concierge_ja.txt` 内の同等ルールにより、コード側のキーワード抽出なしで短期記憶が成立していた。LiveAPI版でも同じ原理を適用する。
-
-#### 3.3.2 含めないもの（意図的な除外）
+#### 3.3.2 追加しないもの（意図的な除外）
 
 `concierge_ja.txt` から以下は **LiveAPIプロンプトに含めない**:
 
@@ -565,57 +682,60 @@ class SessionState(Enum):
     RETURNING_TO_CHAT = "returning_to_chat"
 ```
 
-### 6.3 短期記憶の実現方式（v3改訂：REST版準拠）
+### 6.3 短期記憶のライフサイクル（v3新規）
 
 ```
-短期記憶の実現:
+short_term_memory の状態遷移:
 
-コード側の構造化管理（short_term_memory / hearing_step）は廃止。
-REST版と同じ方式で短期記憶を実現する:
-
-1. プロンプト: 短期記憶ルールを強くハードコード
-   → Geminiに「会話履歴から条件を把握し、聞き直しを禁止」と指示
-2. 会話履歴: conversation_history にサーバー側で蓄積
-   → 再接続時に send_client_content(turns) で再送
-3. Geminiが自然に判断
-   → 会話履歴 + プロンプトルールにより、REST版と同等の精度
-
-ライフサイクル:
-- conversation_history はセッション終了まで蓄積（最大20ターン保持）
-- 再接続時に直近10ターンを再送
-- ショップ検索後もリセットしない（条件変更による再検索に対応）
+1. 初期化（全てNone） → LiveAPISession.__init__()
+2. ターンごとに更新    → _update_short_term_memory() ※コンシェルジュモードのみ
+3. 再接続時に注入      → _get_context_summary() → system_instruction に含める
+4. ショップ検索後      → リセットしない（追加条件の変更検索に対応）
+5. セッション終了      → LiveAPISession と共に破棄
 ```
+
+**リセットしない理由:**
+ユーザーが「別のエリアでも探して」と言った場合、既存条件を土台に
+area だけ上書きして再検索できる。REST版（gourmet-support）でも
+セッション内で条件は蓄積されていた。
 
 ---
 
 ## 7. 再接続メカニズム（v3改訂）
 
-### 7.1 通常会話の再接続（v3改訂：REST版準拠）
+### 7.1 通常会話の再接続（v3改訂）
 
 | # | 項目 | v2 | v3 |
 |---|---|---|---|
 | 1 | 再接続トリガー | 発言途切れ / 長い発話 / 累積上限 | **変更なし** |
-| 2 | システムプロンプト注入 | チャットログ断片 | **短期記憶ルール強化プロンプト + 直前質問の補足のみ** |
-| 3 | 会話履歴の再送 | なし | **send_client_content()でturns再送（REST版の全履歴送信に相当）** |
+| 2 | システムプロンプト注入 | チャットログ断片 | **構造化された条件状態**（3.2.1） |
+| 3 | 会話履歴の再送 | なし | **send_client_content()でturns再送**（3.2.2） |
 | 4 | トリガーメッセージ | `"続きをお願いします"` | **変更なし**（履歴再送の後に送信） |
 
-**再接続時のデータフロー（v3・REST版準拠）:**
+**再接続時のデータフロー（v3）:**
 
 ```
-                   system_instruction（毎回同じ）
+                   system_instruction
                    ┌──────────────────────────────────────┐
                    │ LIVEAPI_CONCIERGE_SYSTEM              │
-                   │ + 【短期記憶・セッション行動ルール】    │
-                   │   → 聞き直し禁止                      │
-                   │   → 会話履歴から条件を把握せよ          │
-                   │   → 再接続時も同じ質問を繰り返すな      │
+                   │ + 短期記憶ルール（v3追加）              │
                    │ + user_context（初期挨拶指示）          │
                    │ + LIVEAPI_COMMON_RULES                │
                    │                                        │
-                   │ （補足：直前AIの質問があれば追記）      │
+                   │ 【ユーザーの確定済み条件（短期記憶）】    │
+                   │   - エリア: 六本木                      │
+                   │   - 利用目的: 接待                      │
+                   │ 以上は再度質問してはならない。            │
+                   │                                        │
+                   │ 【未確認の条件】                        │
+                   │   - 料理ジャンル: 未確認                │
+                   │   - 予算: 未確認                        │
+                   │                                        │
+                   │ 【次のステップ】                        │
+                   │ 料理ジャンル・雰囲気・人数を質問。      │
                    └──────────────────────────────────────┘
 
-                   send_client_content (turns) ← REST版の全履歴送信に相当
+                   send_client_content (turns)
                    ┌──────────────────────────────────────┐
                    │ user: "接待で使いたい"                  │
                    │ model: "どのエリアをお考えですか？"      │
@@ -628,9 +748,8 @@ REST版と同じ方式で短期記憶を実現する:
                    │ user: "続きをお願いします"              │ turn_complete=True
                    └──────────────────────────────────────┘
 
-→ Geminiは会話履歴から「六本木で接待、ジャンルを聞いている途中」と把握
-→ プロンプトの短期記憶ルールにより「聞き直し禁止」が強く効く
-→ REST版と同じ原理でコンテキストが復元される
+→ Geminiは「六本木で接待、ジャンルを聞いている途中」と正確に把握できる
+→ REST版と同等のコンテキストが復元される
 ```
 
 ### 7.2 ショップ説明の再接続（v2と同じ）
@@ -653,19 +772,17 @@ v2のセクション8をそのまま維持。
 ### Phase 2: トランスクリプション（v1と同じ）
 - input/output_transcription → チャット欄表示
 
-### Phase 2.5: 短期記憶（v3改訂：REST版準拠）
+### Phase 2.5: 短期記憶（v3新規）
 
 | # | 内容 | 詳細 |
 |---|---|---|
-| 1 | `LIVEAPI_CONCIERGE_SYSTEM` に短期記憶ルール強化ハードコード | REST版concierge_ja.txtの短期記憶ルールをLiveAPI向けに凝縮 |
-| 2 | `_send_history_on_reconnect()` 実装 | send_client_content()で会話履歴再送 |
-| 3 | `_get_context_summary()` 簡素化 | 直前の質問のみ補足。構造化条件注入は廃止 |
-| 4 | `run()` の再接続フロー修正 | 履歴再送 → トリガー の2段階送信 |
-
-**廃止した項目:**
-- ~~`short_term_memory` dict~~ → 不要（Geminiが会話履歴から判断）
-- ~~`_update_short_term_memory()`~~ → 不要（キーワード抽出廃止）
-- ~~`_update_hearing_step()`~~ → 不要（ステップ追跡廃止）
+| 1 | `short_term_memory` dict追加 | LiveAPISession.__init__() に追加 |
+| 2 | `_update_short_term_memory()` 実装 | キーワードベースの条件抽出 |
+| 3 | `_update_hearing_step()` 実装 | ステップ自動更新 |
+| 4 | `_get_context_summary()` 全面改訂 | 構造化された条件状態の注入 |
+| 5 | `_send_history_on_reconnect()` 実装 | send_client_content()で履歴再送 |
+| 6 | `run()` の再接続フロー修正 | 履歴再送 → トリガー の2段階送信 |
+| 7 | `LIVEAPI_CONCIERGE_SYSTEM` に短期記憶ルール追加 | 最小限の追加（03仕様書準拠） |
 
 ### Phase 3: ショップ説明のLiveAPI統一（v2と同じ）
 
@@ -697,24 +814,25 @@ v2のセクション10.2をそのまま維持。
 
 | リスク | 影響 | 対策 |
 |---|---|---|
+| キーワード抽出の網羅性不足 | 「表参道ヒルズ付近で」等、リストにないエリアを拾えない | 会話履歴のsend_client_content()再送で補完。Geminiが文脈から判断 |
 | send_client_content()のturns再送がトークンを消費 | コンテキストウィンドウの圧迫 | 直近10ターン・各150文字に制限。context_window_compression(32000)も有効 |
-| 再接続回数が多い場合の累積コスト | 同じ履歴を何度も再送 | 再接続のたびに最新10ターンのみ送信。古いターンは自然に落ちる |
-| プロンプトの短期記憶ルールの遵守率 | Geminiがルールを無視して聞き直す可能性 | ルールの優先順位を明記（本セクション > 他ルール）。テストで遵守率を検証 |
+| ユーザーが条件を暗示的に変更した場合 | 「やっぱり...」のニュアンスを拾えない | キーワードマッチは最後にマッチしたもので上書き。大きな変更はユーザーが明示する前提 |
+| ステップの厳密な追跡が困難 | カジュアルな業態（ラーメン等）ではステップ2-4が不要 | concierge_ja.txtの業態別制御ルールに従い、cuisineが簡易業態ならstep=5に飛ばす（将来拡張） |
 
-### 10.4 REST版準拠の設計根拠
+### 10.4 キーワード抽出 vs 会話履歴再送 の役割分担
 
 ```
-REST版の短期記憶が機能していた原理:
-  1. プロンプト: 短期記憶ルール（聞き直し禁止、業態別制御等）
-  2. 全会話履歴の送信: Geminiが文脈から条件を把握
-  → コード側のキーワード抽出・ステップ追跡は一切なし
-  → REST版で問題なく機能していた実績あり
+キーワード抽出（short_term_memory）:
+  ✅ 「何が確定済みか」を構造化して明示 → Geminiに「聞き直すな」と指示
+  ✅ ヒアリングステップの自動追跡
+  ❌ 網羅性は完璧ではない
 
-LiveAPI v3で同じ原理を再現:
-  1. プロンプト: REST版の短期記憶ルールを強化ハードコード
-  2. send_client_content(turns): 会話履歴再送（REST版の全履歴送信に相当）
-  → キーワード抽出は廃止（網羅性の問題、コード複雑性の増大を回避）
-  → REST版で実証済みの方式なので信頼性が高い
+会話履歴再送（send_client_content turns）:
+  ✅ 会話の文脈を正確に復元 → Geminiが自分で判断できる
+  ✅ キーワード抽出が拾えない情報も含まれる
+  ❌ 「何が確定済みか」の構造的な指示にはならない
+
+→ 両方を併用することで、REST版と同等の精度を実現する
 ```
 
 ---
@@ -723,18 +841,18 @@ LiveAPI v3で同じ原理を再現:
 
 ### 11.1〜11.2 v1と同じ
 
-### 11.3 Phase 2.5 テスト項目（v3改訂：REST版準拠）
+### 11.3 Phase 2.5 テスト項目（v3新規）
 
 | # | テスト内容 | 期待結果 |
 |---|---|---|
-| 1 | コンシェルジュモードで「接待で六本木」と発言 | conversation_history に記録される |
+| 1 | コンシェルジュモードで「接待で六本木」と発言 | short_term_memory に purpose="接待", area="六本木" が記録される |
 | 2 | 再接続が発生した後 | AIが「エリアは？」「目的は？」と聞き直さない |
-| 3 | 再接続後にAIが次の質問をする | 既に回答済みの条件をスキップし、未確認の条件を質問する |
-| 4 | 条件を段階的に伝える（3〜4ターン） | conversation_history に全ターンが蓄積される |
+| 3 | 再接続後にAIが次のステップの質問をする | ステップ2（ジャンル・雰囲気・人数）の質問が出る |
+| 4 | 条件を段階的に伝える（3〜4ターン） | 各ターンでshort_term_memoryが累積更新される |
 | 5 | 全条件確定後 | AIが「お探ししますね」と発言し、検索トリガーが発火する |
-| 6 | 検索後に「別のエリアで」と言う | AIが他の条件を維持したまま新エリアで対応する |
-| 7 | 再接続時のsend_client_content再送 | 直近10ターンが正しく再送される（ログで確認） |
-| 8 | 任意のエリア名（リストにないもの含む） | Geminiが会話履歴から自然に理解する |
+| 6 | 検索後に「別のエリアで」と言う | short_term_memory.area のみ上書きされ、他条件は維持 |
+| 7 | chatモードでは短期記憶が動作しない | _update_short_term_memory()が呼ばれない |
+| 8 | キーワードリストにないエリア名 | 会話履歴再送でGeminiが文脈から理解する（短期記憶にはNone） |
 
 ### 11.4 Phase 3 テスト項目（v2と同じ）
 
@@ -751,16 +869,14 @@ LiveAPI移行で「何がどう変わったか」の対応表。
 |---|---|---|
 | システムプロンプト | concierge_ja.txt（537行） | LIVEAPI_CONCIERGE_SYSTEM（短期記憶ルール含む） |
 | 会話履歴の送信 | 毎回全履歴をGemini REST APIに送信 | send_client_content(turns)で再接続時に再送 |
-| 短期記憶 | Geminiが全履歴から自然に把握 | 同じ方式: 会話履歴再送 + プロンプトルール（REST版準拠） |
-| ヒアリングステップ追跡 | Geminiが自然に追跡 | 同じ方式: Geminiが自然に追跡（コード側追跡は廃止） |
-| 条件の重複質問防止 | concierge_ja.txt内のルールで制御 | 同じ方式: プロンプト内の短期記憶ルールで制御 |
-| セッション管理 | RAMベースのSupportSession | LiveAPISession + conversation_history |
+| 短期記憶 | Geminiが全履歴から自然に把握 | サーバー側のshort_term_memoryで構造化管理 |
+| ヒアリングステップ追跡 | Geminiが自然に追跡 | サーバー側のhearing_stepで明示的追跡 |
+| 条件の重複質問防止 | concierge_ja.txt内のルールで制御 | 構造化コンテキスト注入 + プロンプトルール |
+| セッション管理 | RAMベースのSupportSession | LiveAPISession + short_term_memory |
 | 出力形式 | JSON（message + shops配列） | 音声（LiveAPI audio） |
 | ショップ検索 | /api/chat が全て処理 | REST API(データ取得のみ) + LiveAPI(音声説明) |
 
 ---
 
-*以上が LiveAPI 移植設計書 v3（改訂版）。*
-*v3改訂の主な変更: キーワード抽出（short_term_memory / hearing_step）を廃止し、REST版と同じ「プロンプト + 会話履歴送信」方式に統一。*
-*v2との差分はセクション3（履歴再注入方式）、セクション7（再接続メカニズム）が中心。*
-*実装時は本設計書、`01_stt_stream_detailed_spec.md`、`03_prompt_modification_spec.md` を常に参照すること。*
+*以上が LiveAPI 移植設計書 v3。v2との差分はセクション3（短期記憶）、セクション7（再接続メカニズム）が中心。
+実装時は本設計書、`01_stt_stream_detailed_spec.md`、`03_prompt_modification_spec.md` を常に参照すること。*
