@@ -350,20 +350,35 @@ export class CoreController {
       console.log('[LiveAPI] 再接続完了');
     });
 
-    this.socket.on('live_fallback', (data: any) => {
-      console.log('[LiveAPI] フォールバック:', data?.reason);
-      this.switchToRestApiMode();
-    });
-
     this.socket.on('live_stopped', () => {
       console.log('[LiveAPI] live_stopped');
       this.isLiveMode = false;
     });
 
-    // ★ ショップ検索トリガー（LiveAPIからのハイブリッド切替）
-    this.socket.on('shop_search_trigger', (data: any) => {
-      console.log('[LiveAPI] shop_search_trigger:', data);
-      this.handleShopSearchFromLiveAPI(data);
+    // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
+    this.socket.on('shop_search_result', (data: any) => {
+      console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
+      const shops = data?.shops || [];
+      if (shops.length > 0) {
+        this.currentShops = shops;
+        this.els.reservationBtn.classList.add('visible');
+        document.dispatchEvent(new CustomEvent('displayShops', {
+          detail: { shops: shops, language: this.currentLanguage }
+        }));
+        const section = document.getElementById('shopListSection');
+        if (section) section.classList.add('has-shops');
+
+        if (data.response) {
+          this.addMessage('assistant', data.response);
+        }
+
+        if (window.innerWidth < 1024) {
+          setTimeout(() => {
+            const shopSection = document.getElementById('shopListSection');
+            if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, 300);
+        }
+      }
     });
   }
 
@@ -409,9 +424,9 @@ export class CoreController {
     this.enableAudioPlayback();
     this.els.userInput.value = '';
 
-    // ★ LiveAPIモード中 → 停止（仕様書02 セクション4.4.2）
+    // ★ LiveAPIモード中 → 停止（v5仕様書: RESTフォールバックなし）
     if (this.isLiveMode) {
-      this.switchToRestApiMode();
+      this.terminateLiveSession();
       this.isRecording = false;
       this.els.micBtn.classList.remove('recording');
       this.resetInputState();
@@ -529,83 +544,6 @@ export class CoreController {
     } catch (error) {
       console.error('[LiveAPI] startLiveModeエラー:', error);
       throw error;
-    }
-  }
-
-  protected switchToRestApiMode(): void {
-    console.log('[LiveAPI] REST APIモードに切り替え');
-    this.terminateLiveSession();
-  }
-
-  protected async handleShopSearchFromLiveAPI(data: any): Promise<void> {
-    const userRequest = data.user_request || '';
-    console.log('[LiveAPI→REST] ショップ検索開始:', userRequest);
-
-    // LiveAPIを停止してからREST検索（二重応答を防止）
-    this.terminateLiveSession();
-
-    const message = userRequest || 'おすすめのお店を探してください';
-
-    try {
-      this.isProcessing = true;
-
-      const response = await fetch(`${this.apiBase}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: this.sessionId,
-          message: message,
-          stage: this.currentStage,
-          language: this.currentLanguage,
-          mode: this.currentMode
-        })
-      });
-      const result = await response.json();
-
-      if (result.shops && result.shops.length > 0) {
-        this.currentShops = result.shops;
-        this.els.reservationBtn.classList.add('visible');
-        document.dispatchEvent(new CustomEvent('displayShops', {
-          detail: { shops: result.shops, language: this.currentLanguage }
-        }));
-        const section = document.getElementById('shopListSection');
-        if (section) section.classList.add('has-shops');
-
-        if (result.response) {
-          this.addMessage('assistant', result.response);
-        }
-
-        if (window.innerWidth < 1024) {
-          setTimeout(() => {
-            const shopSection = document.getElementById('shopListSection');
-            if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          }, 300);
-        }
-
-        // TTS で読み上げ（既存の speakTextGCP() を流用）— 仕様書02 セクション5.4
-        if (result.response && this.isTTSEnabled && this.isUserInteracted) {
-          (async () => {
-            try {
-              this.isAISpeaking = true;
-              await this.speakTextGCP(this.t('ttsIntro'), true, false, false);
-              await this.speakTextGCP(result.response, false, false, false);
-            } catch (_e) {}
-            this.isAISpeaking = false;
-          })();
-        }
-      } else if (result.response) {
-        this.addMessage('assistant', result.response);
-        if (this.isTTSEnabled && this.isUserInteracted) {
-          this.speakTextGCP(result.response, true, false, false);
-        }
-      }
-
-      console.log('[LiveAPI→REST] ショップ検索完了:', result.shops?.length || 0, '件');
-    } catch (error) {
-      console.error('[LiveAPI→REST] ショップ検索エラー:', error);
-    } finally {
-      this.isProcessing = false;
-      this.resetInputState();
     }
   }
 

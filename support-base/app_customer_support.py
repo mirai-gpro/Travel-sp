@@ -778,6 +778,27 @@ def handle_live_start(data):
 
     system_prompt = build_system_instruction(mode, user_profile=user_profile)
 
+    # ショップ検索コールバック（v5 §5.5: SupportAssistant経由でデータ取得）
+    def shop_search_callback(user_request, lang, search_mode):
+        """LiveAPIからのfunction calling時にショップデータを取得する"""
+        try:
+            session = SupportSession(session_id)
+            session_data = session.get_data()
+            if not session_data:
+                logger.error(f"[ShopSearch] セッション {session_id} が見つかりません")
+                return None
+            session.update_language(lang)
+            session.update_mode(search_mode)
+            session.add_message('user', user_request, 'chat')
+            assistant = SupportAssistant(session, SYSTEM_PROMPTS)
+            result = assistant.process_user_message(user_request, 'conversation')
+            if result.get('shops'):
+                session.add_message('model', result['response'], 'chat')
+            return result
+        except Exception as e:
+            logger.error(f"[ShopSearch] コールバックエラー: {e}", exc_info=True)
+            return None
+
     # LiveAPIセッション作成
     live_session = LiveAPISession(
         session_id=session_id,
@@ -785,7 +806,8 @@ def handle_live_start(data):
         language=language,
         system_prompt=system_prompt,
         socketio=socketio,
-        client_sid=client_sid
+        client_sid=client_sid,
+        shop_search_callback=shop_search_callback
     )
     active_live_sessions[client_sid] = live_session
 
