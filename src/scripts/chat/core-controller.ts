@@ -352,6 +352,7 @@ export class CoreController {
 
     this.socket.on('live_fallback', (data: any) => {
       console.log('[LiveAPI] フォールバック:', data?.reason);
+      this.switchToRestApiMode();
     });
 
     this.socket.on('live_stopped', () => {
@@ -428,7 +429,7 @@ export class CoreController {
 
     // ★ LiveAPIモード中 → 停止（仕様書02 セクション4.4.2）
     if (this.isLiveMode) {
-      this.terminateLiveSession();
+      this.switchToRestApiMode();
       this.isRecording = false;
       this.els.micBtn.classList.remove('recording');
       this.resetInputState();
@@ -547,6 +548,11 @@ export class CoreController {
       console.error('[LiveAPI] startLiveModeエラー:', error);
       throw error;
     }
+  }
+
+  protected switchToRestApiMode(): void {
+    console.log('[LiveAPI] REST APIモードに切り替え');
+    this.terminateLiveSession();
   }
 
   // handleShopSearchFromLiveAPI() は v2 で廃止
