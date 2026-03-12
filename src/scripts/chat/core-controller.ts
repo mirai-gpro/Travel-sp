@@ -350,9 +350,9 @@ export class CoreController {
       console.log('[LiveAPI] 再接続完了');
     });
 
-    // v3.2: テストフェーズではフォールバック無効化（switchToRestApiMode削除）
     this.socket.on('live_fallback', (data: any) => {
-      console.log('[LiveAPI] エラー通知（フォールバック無効）:', data?.reason);
+      console.log('[LiveAPI] フォールバック:', data?.reason);
+      this.switchToRestApiMode();
     });
 
     this.socket.on('live_stopped', () => {
@@ -427,10 +427,9 @@ export class CoreController {
     this.enableAudioPlayback();
     this.els.userInput.value = '';
 
-    // ★ LiveAPIモード中 → v3.2: フォールバックせず、LiveAPIを停止するのみ
+    // ★ LiveAPIモード中 → 停止（仕様書02 セクション4.4.2）
     if (this.isLiveMode) {
-      console.log('[LiveAPI] LiveAPIモード中にマイクボタン押下、セッション停止');
-      this.terminateLiveSession();
+      this.switchToRestApiMode();
       this.isRecording = false;
       this.els.micBtn.classList.remove('recording');
       this.resetInputState();
@@ -551,8 +550,10 @@ export class CoreController {
     }
   }
 
-  // v3.2: switchToRestApiMode() はテストフェーズでは削除
-  // フォールバックが発動するとLiveAPI側の問題が隠蔽されデバッグ困難になるため
+  protected switchToRestApiMode(): void {
+    console.log('[LiveAPI] REST APIモードに切り替え');
+    this.terminateLiveSession();
+  }
 
   // handleShopSearchFromLiveAPI() は v2 で廃止
   // ショップ検索→説明は全てサーバー側で処理（仕様書02v2 セクション5.5.3）
