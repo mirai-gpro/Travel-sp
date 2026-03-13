@@ -1,12 +1,7 @@
 name: Deploy audio2exp-service to Cloud Run
 
 on:
-  push:
-    branches: [main, 'claude/**']
-    paths:
-      - 'audio2exp-service/**'
-      - '.github/workflows/deploy-audio2exp.yml'
-  workflow_dispatch:
+  workflow_dispatch:  # 手動実行のみ（モデル398MBのため自動デプロイ無効化）
 
 env:
   PROJECT_ID: ai-meet-486502
