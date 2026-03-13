@@ -14,7 +14,6 @@ from google import genai
 from google.genai import types
 from google.cloud import storage
 import google.generativeai as genai_legacy
-import anthropic
 
 # api_integrations から必要な関数をインポート
 from api_integrations import extract_shops_from_response
@@ -29,13 +28,10 @@ except Exception as e:
     logger.warning(f"[LTM] 長期記憶モジュールのインポート失敗: {e}")
     LONG_TERM_MEMORY_ENABLED = False
 
-# Gemini クライアント初期化（サマリー生成等で引き続き使用）
+# Gemini クライアント初期化
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 genai_legacy.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai_legacy.GenerativeModel('gemini-2.5-flash')
-
-# Claude クライアント初期化（ショップ検索・会話メイン処理用）
-claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # ========================================
 # RAMベースのセッション管理 (Firestore完全廃止)
@@ -535,30 +531,14 @@ class SupportAssistant:
         message_lower = user_message.lower()
         return any(pattern in message_lower for pattern in followup_patterns)
 
-    def _convert_history_for_claude(self, gemini_history):
-        """types.Content リストを Claude messages 形式に変換"""
-        claude_messages = []
-        for content in gemini_history:
-            role = "user" if content.role == "user" else "assistant"
-            text = content.parts[0].text
-            # Claude APIでは連続する同一roleは許可されないため、マージする
-            if claude_messages and claude_messages[-1]["role"] == role:
-                claude_messages[-1]["content"] += "\n" + text
-            else:
-                claude_messages.append({"role": role, "content": text})
-        # Claude APIでは最初のメッセージがuserである必要がある
-        if claude_messages and claude_messages[0]["role"] != "user":
-            claude_messages = claude_messages[1:]
-        return claude_messages
-
     def process_user_message(self, user_message, conversation_stage='conversation'):
         """
-        ユーザーメッセージを処理（Claude REST API版）
-
+        ユーザーメッセージを処理
+        
         【重要】改善されたフロー:
         1. 履歴を構造化リストで取得
-        2. Claude messages形式に変換
-        3. Claude REST APIで推論
+        2. 履歴には既に最新のユーザーメッセージが含まれている(add_message$00E3$0081§$00E8$00BF$00BD$00E5$0160 $00E6$00B8$02C6$00E3$0081$00BF$00EF$00BC‰
+        3. そのため、履歴をそのままGeminiに渡す
         """
         # 履歴を構造化リストで取得(既に最新のユーザーメッセージを含む)
         history = self.session.get_history_for_api()
@@ -579,43 +559,68 @@ class SupportAssistant:
                     'footer': 'The user is asking about the restaurants listed above. Please refer to the restaurant information when answering.'
                 },
                 'zh': {
-                    'header': '【当前推荐的餐厅信息】',
-                    'footer': '用户正在询问上述餐厅的信息。请参考餐厅信息进行回答。'
+                    'header': '【当前推荐的餐$5385信息】',
+                    'footer': '用$6237正在$8BE2$95EE上述餐$5385的信息。$8BF7参考餐$5385信息$8FDB行回答。'
                 },
                 'ko': {
-                    'header': '【현재 제안 중인 레스토랑 정보】',
-                    'footer': '사용자는 위 레스토랑에 대해 질문하고 있습니다. 레스토랑 정보를 참조하여 답변하세요.'
+                    'header': '【$D604$C7AC $C81C$C548 $C911$C778 $B808$C2A4$D1A0$B791 $C815$BCF4】',
+                    'footer': '$C0AC$C6A9$C790$B294 $C704 $B808$C2A4$D1A0$B791$C5D0 $B300$D574 $C9C8$BB38$D558$ACE0 $C788$C2B5$B2C8$B2E4. $B808$C2A4$D1A0$B791 $C815$BCF4$B97C $CC38$C870$D558$C5EC $B2F5$BCC0$D558$C138$C694.'
                 }
             }
-            current_followup_msg = followup_messages.get(self.language, followup_messages['ja'])
             shop_context = f"\n\n{current_followup_msg['header']}\n{self._format_current_shops(current_shops)}\n\n{current_followup_msg['footer']}"
             system_prompt = self.system_prompt + shop_context
             logger.info("[Assistant] フォローアップ質問モード: 店舗情報をシステムプロンプトに追加")
 
-        try:
-            # 会話履歴をClaude形式に変換
-            claude_messages = self._convert_history_for_claude(history)
-            logger.info(f"[Assistant] Claude API呼び出し開始: 履歴={len(claude_messages)}件")
+        # ツール設定
+        tools = None
+        if not is_followup:
+            tools = [types.Tool(google_search=types.GoogleSearch())]
+            logger.info("[Assistant] Google検索グラウンディングを有効化")
 
-            response = claude_client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=system_prompt if system_prompt else "",
-                messages=claude_messages,
+        try:
+            logger.info(f"[Assistant] Gemini API呼び出し開始: 履歴={len(history)}件")
+
+            # ---------------------------------------------------------
+            # 【修正箇所】ここを書き換えてください
+            # ---------------------------------------------------------
+            # 【重要】configパラメータの設定
+            # Google検索(tools)を使う場合は、response_mime_type="application/json" を
+            # 指定してはいけません（400エラーの原因になります）。
+            config = types.GenerateContentConfig(
+                system_instruction=system_prompt if system_prompt else None,
+                tools=tools if tools else None,
+                # response_mime_type="application/json"  # ← ★必ずコメントアウト（先頭に # をつける）
             )
 
-            logger.info("[Assistant] Claude API呼び出し完了")
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=history,
+                config=config
+            )
+            # ---------------------------------------------------------
+
+            logger.info("[Assistant] Gemini API呼び出し完了")
 
             # レスポンスからテキストを取得
-            assistant_text = response.content[0].text
+            assistant_text = response.text
 
             if not assistant_text:
-                logger.error("[Assistant] Empty response from Claude")
-                raise RuntimeError("Claude returned empty response")
+                logger.error("[Assistant] Empty response from Gemini")
+                raise RuntimeError("Gemini returned empty response")
 
-            logger.info(f"[Assistant] Claude response received: {len(assistant_text)} chars")
+            logger.info(f"[Assistant] Gemini response received: {len(assistant_text)} chars")
+
+
+            # 【デバッグ】エンコーディング確認用ログ
+            logger.info(f"[DEBUG] Response encoding type: {type(assistant_text)}")
             logger.info(f"[DEBUG] Response first 200 chars: {repr(assistant_text[:200])}")
 
+            # UTF-8として正しくエンコードされているか確認
+            try:
+                test_encode = assistant_text.encode('utf-8')
+                logger.info(f"[DEBUG] UTF-8 encoding test: OK ({len(test_encode)} bytes)")
+            except Exception as e:
+                logger.error(f"[DEBUG] UTF-8 encoding test: FAILED - {e}")
             parsed_message, parsed_shops, parsed_action = self._parse_json_response(assistant_text)
 
             if parsed_shops:
@@ -627,8 +632,8 @@ class SupportAssistant:
                     summary_messages = {
                         'ja': lambda count: f"{count}軒のお店を提案しました。",
                         'en': lambda count: f"Suggested {count} restaurants.",
-                        'zh': lambda count: f"推荐了{count}家餐厅。",
-                        'ko': lambda count: f"{count}개의 레스토랑을 제안했습니다."
+                        'zh': lambda count: f"推荐了{count}家餐$5385。",
+                        'ko': lambda count: f"{count}$AC1C$C758 $B808$C2A4$D1A0$B791$C744 $C81C$C548$D588$C2B5$B2C8$B2E4."
                     }
                     summary_func = summary_messages.get(self.language, summary_messages['ja'])
                     summary = summary_func(len(parsed_shops))
@@ -645,12 +650,12 @@ class SupportAssistant:
             }
 
         except Exception as e:
-            logger.error(f"[Assistant] Claude API error: {e}", exc_info=True)
+            logger.error(f"[Assistant] Gemini API error: {e}", exc_info=True)
             error_messages = {
                 'ja': 'エラーが発生しました。もう一度お試しください。',
                 'en': 'An error occurred. Please try again.',
-                'zh': '发生错误。请重试。',
-                'ko': '오류가 발생했습니다. 다시 시도해주세요.'
+                'zh': '発生錯誤。請重試。',
+                'ko': '$C624$B958$AC00 $BC1C$C0DD$D588$C2B5$B2C8$B2E4. $B2E4$C2DC $C2DC$B3C4$D574$C8FC$C138$C694.'
             }
             return {
                 'response': error_messages.get(self.language, error_messages['ja']),

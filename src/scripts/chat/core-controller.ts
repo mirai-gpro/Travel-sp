@@ -361,22 +361,9 @@ export class CoreController {
       this.isLiveMode = false;
     });
 
-    // ★ ショップ検索開始 → ウェイティングアニメーション表示
-    this.socket.on('shop_search_started', () => {
-      console.log('[LiveAPI] shop_search_started: ウェイティング表示');
-      this.showWaitOverlay();
-    });
-
-    // ★ ショップ検索失敗 → ウェイティングアニメーション非表示
-    this.socket.on('shop_search_failed', () => {
-      console.log('[LiveAPI] shop_search_failed: ウェイティング非表示');
-      this.hideWaitOverlay();
-    });
-
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
-      this.hideWaitOverlay();
       const shops = data?.shops || [];
       if (shops.length > 0) {
         this.currentShops = shops;
