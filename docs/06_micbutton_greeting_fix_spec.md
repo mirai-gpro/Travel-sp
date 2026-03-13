@@ -182,17 +182,18 @@ this.socket.on('live_ready', () => {
 **追加コード**:
 ```typescript
 this.socket.on('greeting_done', () => {
-  console.log('[LiveAPI] greeting_done受信 → ストリーミング開始');
-  this.liveAudioManager.startStreaming();
-  this.isRecording = true;
-  this.els.micBtn.classList.add('recording');
+  console.log('[LiveAPI] greeting_done受信 → マイクOFF状態で待機（ユーザータップ待ち）');
+  // ★ startStreaming()は呼ばない。ユーザーがマイクボタンを押すまでOFF状態。
+  //   理由: iOSではユーザージェスチャーなしのマイク有効化がセキュリティ制約に抵触する。
+  //   マイクON/OFFはtoggleRecording()で制御する。
 });
 ```
 
 **変更理由**:
-- 挨拶ターン完了後にストリーミングを開始する
-- `isRecording = true` + UI更新により、ユーザーにマイクが有効であることを示す
-- `initializeSession()` 経由で `startLiveMode()` が呼ばれた場合、`isRecording` は `false` のままだったが、この変更で挨拶完了後に自動的に `true` になる
+- 挨拶ターン完了を受信し、LiveAPIセッションが挨拶フェーズを完了したことをフロント側で認知する
+- **ストリーミングは開始しない**: iOSではユーザージェスチャーなしのマイク有効化がセキュリティ制約に抵触するため
+- ユーザーがマイクボタンをタップして初めて `toggleRecording()` → `startStreaming()` が実行される
+- `isRecording = false` のまま待機し、マイクボタンは非録音状態で表示される
 
 ### 4.4 変更4: 挨拶ターン完了時に `greeting_done` emit `[仕様]`
 
@@ -334,9 +335,9 @@ Browser                          Server                         Gemini LiveAPI
   |                                |<--- turn_complete -------------|
   |<-- turn_complete --------------|                                |
   |<-- greeting_done --------------|  ★新規                         |
-  |   startStreaming()             |                                |
-  |   isRecording = true           |                                |
-  |   マイクボタン: 録音表示         |                                |
+  |   (何もしない = マイクOFF待機)   |                                |
+  |   isRecording = false          |                                |
+  |   マイクボタン: 通常表示（ユーザータップ待ち）                       |
 ```
 
 ### 5.2 マイクボタン操作
@@ -392,7 +393,7 @@ Browser                          Server                         Gemini LiveAPI
   |                                |     → 挨拶スキップ             |
   |<-- live_ready ------------------|                                |
   |<-- greeting_done --------------|  (即座にemitされる※)           |
-  |   startStreaming()             |                                |
+  |   (何もしない = マイクOFF待機)   |                                |
 ```
 
 ※ ソフトリロード時の `greeting_done` の扱いについて:

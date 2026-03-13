@@ -274,10 +274,10 @@ export class CoreController {
     });
 
     this.socket.on('greeting_done', () => {
-      console.log('[LiveAPI] greeting_done受信 → ストリーミング開始');
-      this.liveAudioManager.startStreaming();
-      this.isRecording = true;
-      this.els.micBtn.classList.add('recording');
+      console.log('[LiveAPI] greeting_done受信 → マイクOFF状態で待機（ユーザータップ待ち）');
+      // ★ startStreaming()は呼ばない。ユーザーがマイクボタンを押すまでOFF状態。
+      //   理由: iOSではユーザージェスチャーなしのマイク有効化がセキュリティ制約に抵触する。
+      //   マイクON/OFFはtoggleRecording()で制御する。
     });
 
     this.socket.on('live_audio', (data: any) => {
