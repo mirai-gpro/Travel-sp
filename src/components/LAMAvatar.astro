@@ -86,7 +86,9 @@
     try {
       // Gaussian Splat Renderer の動的インポート
       // パッケージがインストールされていない場合はフォールバック
-      const GaussianSplatModule = await import('gaussian-splat-renderer-for-lam').catch(() => null);
+      // ★ Viteの静的解析を回避するために変数経由でimport
+      const moduleName = 'gaussian-splat-renderer-for-lam';
+      const GaussianSplatModule = await import(/* @vite-ignore */ moduleName).catch(() => null);
 
       if (!GaussianSplatModule) {
         console.warn('[LAMAvatar] gaussian-splat-renderer-for-lam が未インストール → フォールバック');
