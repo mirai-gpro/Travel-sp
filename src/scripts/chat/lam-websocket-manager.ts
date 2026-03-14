@@ -73,12 +73,12 @@ export class LAMWebSocketManager {
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
                 camera.position.z = 0.4;    // 近づけて顔を大きく
-                camera.position.y = 1.78;   // カメラの高さ
+                camera.position.y = 1.68;   // カメラの高さ
 
-                // 注視点（controls.target）を顔の高さに合わせる
+                // 注視点（controls.target）を顔〜首の高さに合わせる
                 const controls = this.renderer.viewer.controls;
                 if (controls) {
-                    controls.target.set(0, 1.75, 0);  // 顔の中心を注視
+                    controls.target.set(0, 1.62, 0);  // 顔+首が見える高さを注視
                     controls.update();
                 }
 
