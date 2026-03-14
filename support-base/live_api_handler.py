@@ -11,6 +11,8 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import io
+import struct
 import os
 import logging
 import aiohttp
@@ -1056,10 +1058,33 @@ class LiveAPISession:
         # 非同期でA2Eに送信（音声再生をブロックしない）
         asyncio.create_task(self._send_to_a2e(buffer_copy, chunk_index))
 
+    @staticmethod
+    def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
+        """PCM バイト列を WAV フォーマットに変換"""
+        buf = io.BytesIO()
+        data_size = len(pcm_bytes)
+        # WAV ヘッダ書き込み
+        buf.write(b'RIFF')
+        buf.write(struct.pack('<I', 36 + data_size))
+        buf.write(b'WAVE')
+        buf.write(b'fmt ')
+        buf.write(struct.pack('<I', 16))  # chunk size
+        buf.write(struct.pack('<H', 1))   # PCM format
+        buf.write(struct.pack('<H', channels))
+        buf.write(struct.pack('<I', sample_rate))
+        buf.write(struct.pack('<I', sample_rate * channels * sample_width))  # byte rate
+        buf.write(struct.pack('<H', channels * sample_width))  # block align
+        buf.write(struct.pack('<H', sample_width * 8))  # bits per sample
+        buf.write(b'data')
+        buf.write(struct.pack('<I', data_size))
+        buf.write(pcm_bytes)
+        return buf.getvalue()
+
     async def _send_to_a2e(self, pcm_bytes: bytes, chunk_index: int):
-        """A2EサービスにPCMを送信し、expressionフレームをブラウザに転送"""
+        """A2EサービスにPCMをWAV変換して送信し、expressionフレームをブラウザに転送"""
         try:
-            audio_b64 = base64.b64encode(pcm_bytes).decode('utf-8')
+            wav_bytes = self._pcm_to_wav(pcm_bytes)
+            audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
 
             if not self._a2e_http_session:
                 self._a2e_http_session = aiohttp.ClientSession()
@@ -1069,7 +1094,7 @@ class LiveAPISession:
                 json={
                     "audio_base64": audio_b64,
                     "session_id": self.session_id,
-                    "audio_format": "pcm_24000_16bit_mono",
+                    "audio_format": "wav",
                     "is_start": chunk_index == 0,
                     "is_final": False,
                 },
