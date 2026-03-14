@@ -68,6 +68,15 @@ export class LAMWebSocketManager {
                 }
             );
 
+            // カメラZ位置を調整してアバターの顔サイズを制御
+            // デフォルト z=1 → z=0.55 でカメラを近づけ顔を大きく表示
+            if (this.renderer.viewer && this.renderer.viewer.camera) {
+                const camera = this.renderer.viewer.camera;
+                camera.position.z = 0.55;
+                camera.updateProjectionMatrix();
+                console.log('[LAMWebSocketManager] カメラZ位置調整:', camera.position.z);
+            }
+
             this.isModelLoaded = true;
             console.log('[LAMWebSocketManager] モデルロード完了');
         } catch (error) {
