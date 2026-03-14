@@ -73,7 +73,7 @@ export class LAMWebSocketManager {
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
                 camera.position.z = 0.4;    // 近づけて顔を大きく
-                camera.position.y = 1.65;   // 顔の中心に合わせる
+                camera.position.y = 1.78;   // 顔の下半分が見えるよう上げる
                 camera.updateProjectionMatrix();
                 console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z);
             }
