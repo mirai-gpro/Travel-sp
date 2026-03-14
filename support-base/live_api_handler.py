@@ -1083,7 +1083,7 @@ class LiveAPISession:
                 json={
                     "audio_base64": audio_b64,
                     "session_id": self.session_id,
-                    "audio_format": "pcm_16000_16bit_mono",
+                    "audio_format": "pcm",
                     "is_start": chunk_index == 0,
                     "is_final": False,
                 },
