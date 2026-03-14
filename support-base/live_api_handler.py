@@ -11,7 +11,6 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
-import io
 import os
 import logging
 import aiohttp
@@ -1058,24 +1057,23 @@ class LiveAPISession:
         asyncio.create_task(self._send_to_a2e(buffer_copy, chunk_index))
 
     @staticmethod
-    def _pcm_to_mp3(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
-        """PCM 24kHz 16bit mono → MP3 変換（A2Eサービスが受け付けるフォーマット）"""
-        from pydub import AudioSegment
-        audio = AudioSegment(
-            data=pcm_bytes,
-            sample_width=sample_width,
-            frame_rate=sample_rate,
-            channels=channels
-        )
-        buf = io.BytesIO()
-        audio.export(buf, format='mp3')
-        return buf.getvalue()
+    def _resample_24k_to_16k(pcm_24k_bytes: bytes) -> bytes:
+        """24kHz 16bit mono PCM → 16kHz 16bit mono PCM にリサンプリング（A2Eモデル入力仕様）"""
+        import numpy as np
+        from scipy.signal import resample_poly
+        # int16 → float32
+        audio_fp32 = np.frombuffer(pcm_24k_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # 24kHz → 16kHz (比率 2:3)
+        audio_16k = resample_poly(audio_fp32, 2, 3)
+        # float32 → int16 バイト列
+        audio_int16 = (audio_16k * 32768.0).clip(-32768, 32767).astype(np.int16)
+        return audio_int16.tobytes()
 
     async def _send_to_a2e(self, pcm_bytes: bytes, chunk_index: int):
-        """A2EサービスにPCMをMP3変換して送信（app_customer_support.pyと同じMP3フォーマット）"""
+        """A2Eサービスに16kHz PCMを送信（圧縮なし・低遅延）"""
         try:
-            mp3_bytes = self._pcm_to_mp3(pcm_bytes)
-            audio_b64 = base64.b64encode(mp3_bytes).decode('utf-8')
+            pcm_16k = self._resample_24k_to_16k(pcm_bytes)
+            audio_b64 = base64.b64encode(pcm_16k).decode('utf-8')
 
             if not self._a2e_http_session:
                 self._a2e_http_session = aiohttp.ClientSession()
@@ -1085,7 +1083,7 @@ class LiveAPISession:
                 json={
                     "audio_base64": audio_b64,
                     "session_id": self.session_id,
-                    "audio_format": "mp3",
+                    "audio_format": "pcm_16000_16bit_mono",
                     "is_start": chunk_index == 0,
                     "is_final": False,
                 },
