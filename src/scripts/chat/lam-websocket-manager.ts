@@ -74,7 +74,7 @@ export class LAMWebSocketManager {
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
                 camera.position.z = 0.4;    // 近づけて顔を大きく
-                camera.position.y = 1.68;   // カメラの高さ
+                camera.position.y = 1.73;   // カメラの高さ（上から見下ろして鼻の穴を目立たなく）
 
                 // 注視点（controls.target）を顔〜首の高さに合わせる
                 const controls = this.renderer.viewer.controls;
@@ -84,7 +84,7 @@ export class LAMWebSocketManager {
                 }
 
                 camera.updateProjectionMatrix();
-                console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z, 'target.y=', controls?.target?.y);
+                console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z, 'target.y=', controls?.target?.y, '(見下ろし角度差:', (camera.position.y - (controls?.target?.y ?? 0)).toFixed(2), ')');
             }
 
             this.isModelLoaded = true;

@@ -89,19 +89,20 @@ const { apiBaseUrl = '' } = Astro.props;
 
 <style>
 /* 全体レイアウト */
-.gourmet-chat-container { 
+.gourmet-chat-container {
   background: white;
-  border-radius: 16px; 
-  box-shadow: 0 20px 60px rgba(0,0,0,0.15); 
-  width: 100%; 
-  max-width: 800px; 
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+  width: 100%;
+  max-width: 800px;
   max-height: 650px;
-  display: flex;        
-  flex-direction: column; 
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
-  margin: 0 auto; 
-  position: relative; 
+  margin: 0 auto;
+  position: relative;
   transition: all 0.5s ease;
+  box-sizing: border-box;
 }
 
 .gourmet-chat-container.mode-concierge {
@@ -263,6 +264,7 @@ input:checked + .slider:before { transform: translateX(20px); }
 
 /* モバイル対応 */
 @media (max-width: 768px) {
+  .gourmet-chat-container { max-width: 100vw; }
   .avatar-stage { height: 150px; }
   .avatar-container { width: 100%; height: 100%; }
   .floating-buttons { bottom: 80px; right: 16px; gap: 8px; } 
