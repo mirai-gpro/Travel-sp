@@ -27,8 +27,9 @@ A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-417509
 # プロトコルが省略された場合に自動補完
 if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
-A2E_MIN_BUFFER_BYTES = 4800   # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
-A2E_AUTO_FLUSH_BYTES = 24000  # 自動フラッシュ閾値（0.5秒分 = 24000bytes）
+A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
+A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
+A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）品質優先
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
@@ -936,8 +937,9 @@ class LiveAPISession:
     def _buffer_for_a2e(self, pcm_data: bytes):
         """PCMをバッファに追加。閾値超過で自動フラッシュ（句読点待ち不要）"""
         self._a2e_audio_buffer.extend(pcm_data)
-        # ★ サイズベース自動フラッシュ: 句読点がなくてもバッファが溜まったら送信
-        if len(self._a2e_audio_buffer) >= A2E_AUTO_FLUSH_BYTES:
+        # ★ 初回は即フラッシュ（遅延最小化）、2回目以降は品質優先で大きく溜める
+        threshold = A2E_FIRST_FLUSH_BYTES if self._a2e_chunk_index == 0 else A2E_AUTO_FLUSH_BYTES
+        if len(self._a2e_audio_buffer) >= threshold:
             asyncio.ensure_future(self._flush_a2e_buffer(force=True))
 
     def _on_output_transcription(self, text: str):
