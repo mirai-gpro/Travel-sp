@@ -289,16 +289,49 @@ export class LiveAudioManager {
             this.expressionFrameBuffer.push({ values });
         }
 
-        // デバッグ: バッファ状態とjawOpen値を出力
+        // デバッグ: 全52パラメータの詳細ログ
         if (data.expressions.length > 0) {
-            const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
             const firstFrame = data.expressions[0];
             const lastFrame = data.expressions[data.expressions.length - 1];
+
+            // 非ゼロのパラメータを名前付きで表示
+            const nonZeroParams = firstFrame
+                .map((v: number, i: number) => ({ name: this.expressionNames[i] || `[${i}]`, value: v }))
+                .filter((p: { name: string; value: number }) => Math.abs(p.value) > 0.001)
+                .map((p: { name: string; value: number }) => `${p.name}=${p.value.toFixed(4)}`)
+                .join(', ');
+
+            // 全52パラメータのサマリー統計
+            const values = firstFrame as number[];
+            const min = Math.min(...values);
+            const max = Math.max(...values);
+            const avg = values.reduce((a: number, b: number) => a + b, 0) / values.length;
+            const nonZeroCount = values.filter((v: number) => Math.abs(v) > 0.001).length;
+
             console.log(
                 `[A2E Buffer] chunk=${data.chunk_index}, +${data.expressions.length}frames, total=${this.expressionFrameBuffer.length}, ` +
-                `jawOpenIdx=${jawOpenIdx}, jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}], ` +
-                `firstChunkStartTime=${this.firstChunkStartTime.toFixed(3)}`
+                `dims=${firstFrame.length}, nonZero=${nonZeroCount}/52, ` +
+                `range=[${min.toFixed(4)}..${max.toFixed(4)}], avg=${avg.toFixed(4)}`
             );
+            console.log(`[A2E Params] firstFrame nonZero: {${nonZeroParams || 'ALL ZERO'}}`);
+
+            // 最終フレームも比較表示
+            if (data.expressions.length > 1) {
+                const lastNonZero = lastFrame
+                    .map((v: number, i: number) => ({ name: this.expressionNames[i] || `[${i}]`, value: v }))
+                    .filter((p: { name: string; value: number }) => Math.abs(p.value) > 0.001)
+                    .map((p: { name: string; value: number }) => `${p.name}=${p.value.toFixed(4)}`)
+                    .join(', ');
+                console.log(`[A2E Params] lastFrame nonZero: {${lastNonZero || 'ALL ZERO'}}`);
+            }
+
+            // チャンク0のみ: 全52パラメータを名前付きで完全出力
+            if (data.chunk_index === 0) {
+                const fullDump = firstFrame
+                    .map((v: number, i: number) => `${this.expressionNames[i] || `[${i}]`}: ${v.toFixed(6)}`)
+                    .join('\n  ');
+                console.log(`[A2E Full Dump] chunk0 firstFrame (all 52):\n  ${fullDump}`);
+            }
         }
     }
 
