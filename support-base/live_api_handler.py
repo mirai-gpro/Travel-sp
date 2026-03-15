@@ -516,7 +516,7 @@ class LiveAPISession:
                             await self._send_history_on_reconnect(session)
 
                             # 2. トリガーメッセージ（turn_complete=True）
-                            resume_text = self._resume_message or "続きをお願いします"
+                            resume_text = self._resume_message or self._build_resume_context()
                             self._resume_message = None
                             await session.send_client_content(
                                 turns=types.Content(
@@ -766,13 +766,14 @@ class LiveAPISession:
             shops = shop_data['shops']
             response_text = shop_data.get('response', '')
 
-            # ★ 1軒目のセッション接続を先行開始（カード表示と並行）
-            first_session_task = asyncio.ensure_future(
-                self._create_shop_session(shops, len(shops))
-            )
-            logger.info(f"[ShopSearch] 1軒目セッション先行接続開始")
+            if self.mode != 'concierge':
+                # chatモード: 先行接続 + 1セッション方式
+                first_session_task = asyncio.ensure_future(
+                    self._create_shop_session(shops, len(shops))
+                )
+                logger.info(f"[ShopSearch] 1軒目セッション先行接続開始")
 
-            # ショップカードデータをブラウザに送信（接続と並行）
+            # ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
@@ -780,8 +781,12 @@ class LiveAPISession:
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
-            # ショップ説明をLiveAPIで読み上げ（先行接続セッションを渡す）
-            await self._describe_shops_via_live(shops, first_session_task=first_session_task)
+            if self.mode == 'concierge':
+                # コンシェルジュモード: 従来方式（1軒ごと再接続で安定動作）
+                await self._describe_shops_via_live_legacy(shops)
+            else:
+                # chatモード: 先行接続セッションを渡す
+                await self._describe_shops_via_live(shops, first_session_task=first_session_task)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -935,6 +940,72 @@ class LiveAPISession:
         self._add_to_history("ai", summary)
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
         self.needs_reconnect = True  # 通常会話に復帰するために再接続
+
+    async def _describe_shops_via_live_legacy(self, shops: list):
+        """
+        ショップ説明をLiveAPIで読み上げ（1軒ごとに再接続・従来方式）
+        コンシェルジュモード用。安定性を優先し、1軒ずつセッションを作り直す。
+        """
+        total = len(shops)
+
+        for i, shop in enumerate(shops):
+            if not self.is_running:
+                break
+
+            shop_number = i + 1
+            is_last = (shop_number == total)
+
+            shop_context = self._format_shop_for_prompt(shop, shop_number, total)
+
+            shop_instruction = self.system_prompt + f"""
+
+【現在のタスク：ショップ紹介】
+あなたは今、ユーザーに検索結果のお店を紹介しています。
+
+{shop_context}
+
+【読み上げルール】
+1. このお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
+2. 店名、ジャンル、エリア、特徴、価格帯を含める
+3. マークダウン記法は使わない（音声出力のため）
+4. 「{shop_number}軒目は」から始める
+5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
+"""
+            if is_last:
+                shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
+
+            try:
+                config = self._build_config()
+                config["system_instruction"] = shop_instruction
+                config.pop("tools", None)
+
+                async with self.client.aio.live.connect(
+                    model=LIVE_API_MODEL,
+                    config=config
+                ) as session:
+                    trigger_text = f"{shop_number}軒目のお店を紹介してください。"
+                    if shop_number == 1:
+                        trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
+
+                    await session.send_client_content(
+                        turns=types.Content(
+                            role="user",
+                            parts=[types.Part(text=trigger_text)]
+                        ),
+                        turn_complete=True
+                    )
+
+                    await self._receive_shop_description(session, shop_number)
+
+            except Exception as e:
+                logger.error(f"[ShopDesc] ショップ{shop_number}説明エラー: {e}")
+                continue
+
+        # 全ショップ説明完了 → 通常会話に復帰
+        summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
+        self._add_to_history("ai", summary)
+        self._resume_message = "ありがとうございます。気になるお店について教えてください。"
+        self.needs_reconnect = True
 
     async def _create_shop_session(self, shops: list, total: int):
         """ショップ説明用セッションを作成（コンテキストマネージャを手動管理）"""
@@ -1194,6 +1265,33 @@ class LiveAPISession:
 
         return ""
 
+    def _build_resume_context(self) -> str:
+        """
+        再接続時のトリガーメッセージを会話履歴から構築する。
+        コンシェルジュモードでは確定済み条件のサマリーを含める。
+        """
+        if self.mode != 'concierge' or not self.conversation_history:
+            return "続きをお願いします"
+
+        # 会話履歴からユーザーの発言を集約し、確定条件を抽出
+        user_texts = [
+            h['text'] for h in self.conversation_history if h['role'] == 'user'
+        ]
+        if not user_texts:
+            return "続きをお願いします"
+
+        # ユーザー発言を要約として結合（最大500文字）
+        combined = " / ".join(user_texts)
+        if len(combined) > 500:
+            combined = combined[-500:]
+
+        return (
+            f"【再接続】これまでのユーザーの要望: {combined}\n"
+            f"上記の情報は既に取得済みです。同じ質問を繰り返さず、"
+            f"まだ不足している情報があれば聞いてください。"
+            f"十分であればsearch_shopsを呼び出してください。"
+        )
+
     async def _send_history_on_reconnect(self, session):
         """
         再接続時に会話履歴をsend_client_content()で再送する（v5 §3.2.1）
@@ -1204,7 +1302,7 @@ class LiveAPISession:
 
         - turnsは types.Content のリストとして送信
         - role は "user" または "model"（"ai"ではない）
-        - 直近10ターン、各150文字までに制限（トークン消費抑制）
+        - 直近10ターン、各300文字までに制限（コンシェルジュのコンテキスト保持強化）
         """
         if not self.conversation_history:
             return
@@ -1214,7 +1312,7 @@ class LiveAPISession:
 
         for h in recent:
             role = "user" if h['role'] == 'user' else "model"
-            text = h['text'][:150]
+            text = h['text'][:300]
             history_turns.append(
                 types.Content(
                     role=role,
