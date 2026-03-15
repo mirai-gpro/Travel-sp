@@ -56,10 +56,11 @@ export class LiveAudioManager {
     public isAiSpeaking: boolean = false;
     private isStreaming: boolean = false;
 
-    // PCM再生（24kHz）
+    // PCM再生キュー（24kHz）
     private playbackQueue: AudioBuffer[] = [];
+    private isPlaying: boolean = false;
     private nextPlayTime: number = 0;
-    private activeSources: AudioBufferSourceNode[] = [];  // interrupt時にstop()用
+    private currentSource: AudioBufferSourceNode | null = null;  // interrupt時にstop()用
 
     // ★ Expression同期機能（仕様書08 セクション4.1）
     private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
@@ -202,12 +203,16 @@ export class LiveAudioManager {
         const buffer = this.audioContext.createBuffer(1, float32.length, 24000);
         buffer.copyToChannel(float32, 0);
 
-        // ★ ギャップレス再生: 即座にスケジューリング（onended待ち不要）
-        this._scheduleBuffer(buffer);
+        // キューに追加してシーケンシャルに再生
+        this.playbackQueue.push(buffer);
+        this._processPlaybackQueue();
     }
 
-    private _scheduleBuffer(buffer: AudioBuffer): void {
-        if (!this.audioContext) return;
+    private _processPlaybackQueue(): void {
+        if (this.isPlaying || this.playbackQueue.length === 0 || !this.audioContext) return;
+
+        this.isPlaying = true;
+        const buffer = this.playbackQueue.shift()!;
 
         const source = this.audioContext.createBufferSource();
         source.buffer = buffer;
@@ -218,11 +223,11 @@ export class LiveAudioManager {
         source.start(startTime);
         this.nextPlayTime = startTime + buffer.duration;
 
-        // interrupt時にstop()できるようリストに追加
-        this.activeSources.push(source);
+        this.currentSource = source;
         source.onended = () => {
-            const idx = this.activeSources.indexOf(source);
-            if (idx >= 0) this.activeSources.splice(idx, 1);
+            this.isPlaying = false;
+            this.currentSource = null;
+            this._processPlaybackQueue();
         };
     }
 
@@ -307,11 +312,12 @@ export class LiveAudioManager {
     clearPlaybackQueue(): void {
         this.playbackQueue = [];
         this.nextPlayTime = 0;
-        // ★ スケジュール済みの音声ソースを全停止
-        for (const source of this.activeSources) {
-            try { source.stop(); } catch (_) { /* already stopped */ }
+        // 再生中の音声ソースを停止
+        if (this.currentSource) {
+            try { this.currentSource.stop(); } catch (_) { /* already stopped */ }
+            this.currentSource = null;
         }
-        this.activeSources = [];
+        this.isPlaying = false;
         // ★ expressionバッファもクリア
         this.expressionFrameBuffer = [];
         this.firstChunkStartTime = 0;
@@ -324,9 +330,8 @@ export class LiveAudioManager {
         // ★ 新しいAI応答ターンの最初のチャンクのみリセット（仕様書08 セクション4.4）
         if (!this.isAiSpeaking) {
             this.firstChunkStartTime = 0;
-                this.expressionFrameBuffer = [];
+            this.expressionFrameBuffer = [];
             this._a2eDebugCounter = 0;
-            this.nextPlayTime = 0;
         }
         this.isAiSpeaking = true;
     }
