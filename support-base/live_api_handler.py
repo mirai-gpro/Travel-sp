@@ -503,6 +503,14 @@ class LiveAPISession:
                             self.socketio.emit('greeting_done', {},
                                                room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
+                        else:
+                            # ★ native-audioモデル用フォールバック:
+                            # function callingが発火しないモデルのため、
+                            # AIの出力トランスクリプトから検索意図を検出して
+                            # プログラム側でショップ検索を発動する。
+                            # gemini-3.0-flash-native-audio-preview移行後に
+                            # function callingが動作すれば削除可能。
+                            await self._detect_search_intent_fallback()
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
@@ -552,6 +560,39 @@ class LiveAPISession:
                                                        room=self.client_sid)
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
                                     self._buffer_for_a2e(part.inline_data.data)
+
+    # ★ native-audioモデル用: 検索意図を検出するキーワード
+    _SEARCH_INTENT_KEYWORDS = ["お調べ", "お探し", "検索", "探して"]
+
+    async def _detect_search_intent_fallback(self):
+        """
+        native-audioモデル用フォールバック。
+        function callingが発火しないモデルのため、AIの出力トランスクリプトと
+        ユーザーの入力トランスクリプトから検索意図を検出し、
+        プログラム側でショップ検索を発動する。
+
+        gemini-3.0-flash-native-audio-preview移行後、
+        function callingが正常動作すれば削除可能。
+        """
+        ai_text = self.ai_transcript_buffer
+        user_text = self.user_transcript_buffer
+
+        # AIが検索意図のキーワードを発話したかチェック
+        has_search_intent = any(kw in ai_text for kw in self._SEARCH_INTENT_KEYWORDS)
+        if not has_search_intent:
+            return
+
+        # ユーザーの発話をsearch_shopsのuser_requestとして使用
+        if not user_text.strip():
+            return
+
+        logger.info(f"[LiveAPI] 検索意図フォールバック検出: AI='{ai_text}', User='{user_text}'")
+
+        # 検索開始をブラウザに通知
+        self.socketio.emit('shop_search_start', {}, room=self.client_sid)
+
+        # ショップ検索を実行
+        await self._handle_shop_search(user_text.strip())
 
     async def _handle_tool_call(self, tool_call, session):
         """
