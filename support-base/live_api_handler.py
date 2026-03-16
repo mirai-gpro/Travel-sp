@@ -81,6 +81,9 @@ def build_system_instruction(mode: str, user_profile: dict = None) -> str:
     else:
         base_prompt = _load_prompt_file("support_system_ja.txt")
 
+    # LiveAPI専用: 「喋る前にまずfunction call」を強制
+    # 音声生成とfunction call準備が同時に走ると1008で切断されるため
+    base_prompt += SEARCH_SHOPS_INSTRUCTION
     return base_prompt
 
 
@@ -582,15 +585,14 @@ class LiveAPISession:
                 # ショップ検索を実行
                 await self._handle_shop_search(user_request)
 
-                # function responseを返す（LiveAPI confirmed syntax）
-                tool_response = types.LiveClientToolResponse(
+                # function responseを返す
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
