@@ -99,15 +99,23 @@ SEARCH_SHOPS_INSTRUCTION = """
 
 お店を検索する際は、必ず search_shops ツールをfunction callingで呼び出すこと。
 
+### 行動の優先順位（厳守）
+1. search_shops の実行が最優先。返事は二の次。
+2. 店探しを依頼されたら、挨拶は最小限（「わかりました」程度）にし、直ちに search_shops を実行すること。
+3. 検索結果が出る前に「今調べています」などと長々と喋ってターンを終了してはいけない。
+4. 何も喋らずに search_shops を呼び出しても良い（無言実行OK）。
+5. 音声で返答を生成しきる前に、必ず search_shops を呼び出すこと。
+
 ### 絶対に守るルール
-- 検索が必要な場合は、ユーザーへの返答よりも先に search_shops を実行すること
-- 「お調べしますね」等と喋るだけでターンを終了してはいけない。喋ると同時にsearch_shopsを呼び出すこと
-- テキストや音声だけで応答して検索を省略することは絶対に禁止
+- 「お調べしますね」等と喋るだけでターンを終了することは禁止
 - search_shops を呼ばずにターンを終了することは禁止
+- テキストや音声だけで応答して検索を省略することは絶対に禁止
 
 ### 呼び出し方法
 - search_shops(user_request="恵比寿 イタリアン") のように、要望をキーワードで要約して渡す
+- ユーザーの音声が曖昧な場合は正しく補完する（例: 「エピス」→「恵比寿」）
 - ユーザーが条件を1つでも言ったら、即座に search_shops を呼び出す
+- 情報が不足していても呼び出してよい。エリアだけ、ジャンルだけでもOK。
 """
 
 
@@ -159,7 +167,8 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
                 description="検索用のキーワード群。ユーザーの要望からエリア・ジャンル・予算・人数等を抽出してスペース区切りで渡す。例: '恵比寿 イタリアン' '六本木 接待 和食 1万円 4名'"
             )
         },
-        required=["user_request"]
+        # required を外す: AIが「情報不足」と判断してサイレントに
+        # function callを拒否するのを防ぐ
     )
 )
 
@@ -211,6 +220,9 @@ class LiveAPISession:
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
+
+        # ターン内でtool_callを受信したかの追跡フラグ
+        self._tool_call_received_in_turn = False
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -481,7 +493,11 @@ class LiveAPISession:
                     return
 
                 # 1. tool_call: search_shops（v5 §5.4）
-                if hasattr(response, 'tool_call') and response.tool_call:
+                # Native Audioモデルでは音声データの間にtool_callが
+                # 遅延して届くことがある。確実にキャッチする。
+                if response.tool_call:
+                    logger.info("[LiveAPI] !!! Function Call 発火 !!!")
+                    self._tool_call_received_in_turn = True
                     await self._handle_tool_call(response.tool_call, session)
                     continue
 
@@ -504,13 +520,10 @@ class LiveAPISession:
                                                room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
                         else:
-                            # ★ native-audioモデル用フォールバック:
-                            # function callingが発火しないモデルのため、
-                            # AIの出力トランスクリプトから検索意図を検出して
-                            # プログラム側でショップ検索を発動する。
-                            # gemini-3.0-flash-native-audio-preview移行後に
-                            # function callingが動作すれば削除可能。
-                            await self._detect_search_intent_fallback()
+                            # ターン完了したがtool_callが来なかった場合をログ記録
+                            # （Native Audioモデルではtool_callが遅延する場合がある）
+                            logger.info(f"[LiveAPI] ターン完了（tool_call無し）: AI='{self.ai_transcript_buffer[:50]}'")
+                            self._tool_call_received_in_turn = False
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
@@ -561,39 +574,6 @@ class LiveAPISession:
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
                                     self._buffer_for_a2e(part.inline_data.data)
 
-    # ★ native-audioモデル用: 検索意図を検出するキーワード
-    _SEARCH_INTENT_KEYWORDS = ["お調べ", "お探し", "検索", "探して"]
-
-    async def _detect_search_intent_fallback(self):
-        """
-        native-audioモデル用フォールバック。
-        function callingが発火しないモデルのため、AIの出力トランスクリプトと
-        ユーザーの入力トランスクリプトから検索意図を検出し、
-        プログラム側でショップ検索を発動する。
-
-        gemini-3.0-flash-native-audio-preview移行後、
-        function callingが正常動作すれば削除可能。
-        """
-        ai_text = self.ai_transcript_buffer
-        user_text = self.user_transcript_buffer
-
-        # AIが検索意図のキーワードを発話したかチェック
-        has_search_intent = any(kw in ai_text for kw in self._SEARCH_INTENT_KEYWORDS)
-        if not has_search_intent:
-            return
-
-        # ユーザーの発話をsearch_shopsのuser_requestとして使用
-        if not user_text.strip():
-            return
-
-        logger.info(f"[LiveAPI] 検索意図フォールバック検出: AI='{ai_text}', User='{user_text}'")
-
-        # 検索開始をブラウザに通知
-        self.socketio.emit('shop_search_start', {}, room=self.client_sid)
-
-        # ショップ検索を実行
-        await self._handle_shop_search(user_text.strip())
-
     async def _handle_tool_call(self, tool_call, session):
         """
         LLMからのfunction calling応答を処理する（v5 §5.4）
@@ -602,6 +582,9 @@ class LiveAPISession:
         for fc in tool_call.function_calls:
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
+                # user_requestが空の場合、ユーザーのトランスクリプトを使う
+                if not user_request.strip():
+                    user_request = self.user_transcript_buffer.strip()
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
