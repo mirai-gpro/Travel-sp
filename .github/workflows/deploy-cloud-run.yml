@@ -46,6 +46,17 @@ jobs:
             --location=${{ env.REGION }} \
             --project=${{ env.PROJECT_ID }}
 
+      - name: Sync prompts to GCS
+        run: |
+          if [ -n "${{ secrets.PROMPTS_BUCKET_NAME }}" ]; then
+            gcloud storage cp ./support-base/prompts/*.txt \
+              "gs://${{ secrets.PROMPTS_BUCKET_NAME }}/prompts/" \
+              --project=${{ env.PROJECT_ID }}
+            echo "::notice::Prompts synced to GCS"
+          else
+            echo "::warning::PROMPTS_BUCKET_NAME not set, skipping GCS sync"
+          fi
+
       - name: Build and push Docker image
         run: |
           IMAGE="${{ env.GAR_LOCATION }}/${{ env.PROJECT_ID }}/${{ env.SERVICE_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
