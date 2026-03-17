@@ -11,8 +11,10 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import glob
 import os
 import logging
+import random
 import struct
 import httpx
 from scipy.signal import resample_poly
@@ -391,6 +393,10 @@ class LiveAPISession:
         self.audio_queue_to_gemini = None
         self.is_running = False
 
+        # ★ 定型アナウンス音声ロード（PCM 24kHz 16bit mono）
+        self._search_wait_audio = self._load_audio_files("search_wait_*.pcm")
+        self._shop_intro_audio = self._load_audio_files("shop_intro_*.pcm")
+
     def _build_config(self, with_context=None):
         """
         Live API接続設定を構築
@@ -739,6 +745,8 @@ class LiveAPISession:
         - コールバックは SupportAssistant.process_user_message() を内部的に呼び出す
         - 取得したデータはshop_search_resultイベントでブラウザに送信
         - エラー時・空結果時もshop_search_resultを送信してフロントの待機を解除
+        - ★ 5秒経過で検索中フォローアナウンスを再生（定型PCM）
+        - ★ 検索完了後、つなぎ音声 + 1軒目preconnect を並行実行
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
@@ -750,11 +758,21 @@ class LiveAPISession:
         try:
             # ★ 同期ブロッキング呼び出しをイベントループ外で実行
             loop = asyncio.get_event_loop()
-            shop_data = await loop.run_in_executor(
-                None,
-                self._shop_search_callback,
-                user_request, self.language, self.mode
+            search_task = asyncio.create_task(
+                loop.run_in_executor(
+                    None,
+                    self._shop_search_callback,
+                    user_request, self.language, self.mode
+                )
             )
+
+            # ★ 5秒フォローアナウンスを並行で走らせる
+            announce_task = asyncio.create_task(
+                self._search_wait_announce(search_task)
+            )
+
+            shop_data = await search_task
+            announce_task.cancel()  # 検索完了後はキャンセル
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
@@ -774,7 +792,7 @@ class LiveAPISession:
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
-            # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
+            # ★ つなぎ音声再生 → ショップ説明をLiveAPIで読み上げ
             await self._describe_shops_via_live(shops)
 
         except Exception as e:
@@ -782,6 +800,17 @@ class LiveAPISession:
             self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
             }, room=self.client_sid)
+
+    async def _search_wait_announce(self, search_task: asyncio.Task):
+        """検索開始から5秒経過で定型フォロー音声を再生"""
+        try:
+            await asyncio.sleep(5)
+            if not search_task.done() and self._search_wait_audio:
+                pcm = random.choice(self._search_wait_audio)
+                logger.info("[Announce] 検索中フォローアナウンス再生")
+                await self._play_prerecorded_audio(pcm)
+        except asyncio.CancelledError:
+            pass
 
     def _process_turn_complete(self):
         """
@@ -824,10 +853,11 @@ class LiveAPISession:
 
     async def _describe_shops_via_live(self, shops: list):
         """
-        ショップ説明をLiveAPIで読み上げ（v6 並行化）
+        ショップ説明をLiveAPIで読み上げ（v6 並行化 + つなぎ音声 + preconnect）
 
         【改善】
-        - 1軒目: 即座にストリーミング再生（ユーザー待ち時間ゼロ）
+        - ★ つなぎ音声再生中に1軒目のLiveAPI接続をpreconnect（B-1）
+        - 1軒目: preconnect済みセッションで即ストリーミング再生
         - 2軒目以降: 1軒目再生中にバックグラウンドで並行生成
         - 1軒目完了後、生成済み音声を順次再生（接続待ちなし）
         """
@@ -843,8 +873,45 @@ class LiveAPISession:
             )
             remaining_tasks.append(task)
 
-        # ── 1軒目: 即座にストリーミング再生 ──
-        await self._stream_single_shop(shops[0], 1, total)
+        # ── ★ つなぎ音声 + 1軒目preconnect を並行実行 ──
+        intro_task = None
+        if self._shop_intro_audio:
+            pcm = random.choice(self._shop_intro_audio)
+            intro_task = asyncio.create_task(self._play_prerecorded_audio(pcm))
+            logger.info("[Announce] つなぎ音声再生開始 + 1軒目preconnect並行")
+
+        # 1軒目用の config 構築
+        shop_instruction = self._build_shop_instruction(shops[0], 1, total)
+        config = self._build_config()
+        config["system_instruction"] = shop_instruction
+        config.pop("tools", None)
+
+        # ★ B-1: つなぎ音声再生中にLiveAPI接続を確立
+        connector = self.client.aio.live.connect(
+            model=LIVE_API_MODEL,
+            config=config
+        )
+        session = await connector.__aenter__()
+
+        try:
+            # つなぎ音声の完了を待つ
+            if intro_task:
+                await intro_task
+
+            # ── 1軒目: preconnect済みセッションでストリーミング再生 ──
+            trigger_text = "検索結果を紹介してください。まず1軒目のお店からお願いします。"
+            await session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text=trigger_text)]
+                ),
+                turn_complete=True
+            )
+            await self._receive_shop_description(session, 1)
+        except Exception as e:
+            logger.error(f"[ShopDesc] ショップ1ストリーミングエラー: {e}")
+        finally:
+            await connector.__aexit__(None, None, None)
 
         # ── 2軒目以降: 生成済み音声を順次再生 ──
         for i, task in enumerate(remaining_tasks):
@@ -863,12 +930,12 @@ class LiveAPISession:
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
         self.needs_reconnect = True  # 通常会話に復帰するために再接続
 
-    async def _stream_single_shop(self, shop, shop_number: int, total: int):
-        """1軒目用: 音声を直接ブラウザにストリーミング"""
+    def _build_shop_instruction(self, shop, shop_number: int, total: int) -> str:
+        """ショップ紹介用のシステムプロンプトを構築"""
         is_last = (shop_number == total)
         shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
-        shop_instruction = self.system_prompt + f"""
+        instruction = self.system_prompt + f"""
 
 【現在のタスク：ショップ紹介】
 あなたは今、ユーザーに検索結果のお店を紹介しています。
@@ -883,55 +950,15 @@ class LiveAPISession:
 5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
 """
         if is_last:
-            shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
-
-        try:
-            config = self._build_config()
-            config["system_instruction"] = shop_instruction
-            config.pop("tools", None)
-
-            async with self.client.aio.live.connect(
-                model=LIVE_API_MODEL,
-                config=config
-            ) as session:
-                trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
-                await session.send_client_content(
-                    turns=types.Content(
-                        role="user",
-                        parts=[types.Part(text=trigger_text)]
-                    ),
-                    turn_complete=True
-                )
-                await self._receive_shop_description(session, shop_number)
-
-        except Exception as e:
-            logger.error(f"[ShopDesc] ショップ{shop_number}ストリーミングエラー: {e}")
+            instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
+        return instruction
 
     async def _collect_shop_audio(self, shop, shop_number: int, total: int):
         """2軒目以降用: LiveAPI接続して音声をバッファに収集（ブラウザには送信しない）"""
-        is_last = (shop_number == total)
-        shop_context = self._format_shop_for_prompt(shop, shop_number, total)
-
-        shop_instruction = self.system_prompt + f"""
-
-【現在のタスク：ショップ紹介】
-あなたは今、ユーザーに検索結果のお店を紹介しています。
-
-{shop_context}
-
-【読み上げルール】
-1. このお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
-2. 店名、ジャンル、エリア、特徴、価格帯を含める
-3. マークダウン記法は使わない（音声出力のため）
-4. 「{shop_number}軒目は」から始める
-5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
-"""
-        if is_last:
-            shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
-
         audio_chunks = []
         transcript = ""
 
+        shop_instruction = self._build_shop_instruction(shop, shop_number, total)
         config = self._build_config()
         config["system_instruction"] = shop_instruction
         config.pop("tools", None)
@@ -1048,6 +1075,41 @@ class LiveAPISession:
                                                    room=self.client_sid)
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
+
+    # ============================================================
+    # 定型アナウンス音声（PCM再生 + A2E）
+    # ============================================================
+
+    @staticmethod
+    def _load_audio_files(pattern: str) -> list[bytes]:
+        """audio/ ディレクトリから glob パターンに一致する PCM ファイルをロード"""
+        audio_dir = os.path.join(os.path.dirname(__file__), "audio")
+        files = sorted(glob.glob(os.path.join(audio_dir, pattern)))
+        result = []
+        for f in files:
+            with open(f, "rb") as fp:
+                result.append(fp.read())
+        if result:
+            logger.info(f"[Announce] {pattern}: {len(result)}ファイルロード済み")
+        else:
+            logger.warning(f"[Announce] {pattern}: ファイルが見つかりません ({audio_dir})")
+        return result
+
+    async def _play_prerecorded_audio(self, pcm_data: bytes):
+        """定型音声PCMをブラウザ再生 + A2Eパイプラインに流す"""
+        CHUNK_SIZE = 4800  # 0.1秒分 (24kHz * 2bytes * 0.1s)
+        for offset in range(0, len(pcm_data), CHUNK_SIZE):
+            chunk = pcm_data[offset:offset + CHUNK_SIZE]
+            audio_b64 = base64.b64encode(chunk).decode('utf-8')
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
+            self._buffer_for_a2e(chunk)
+            # 実時間に近いペースで送信（ブラウザ側バッファ溢れ防止）
+            await asyncio.sleep(0.05)
+
+        # A2E: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
 
     # ============================================================
     # A2E バッファリングメソッド（仕様書08 セクション3.3）
