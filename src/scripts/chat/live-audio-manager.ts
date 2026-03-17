@@ -318,6 +318,15 @@ export class LiveAudioManager {
     }
 
     // ========================================
+    // A2E expression状態リセット（音声セグメント切り替わり時）
+    // ========================================
+    resetExpressionState(): void {
+        this.expressionFrameBuffer = [];
+        this.firstChunkStartTime = 0;
+        this._a2eDebugCounter = 0;
+    }
+
+    // ========================================
     // フラグ切り替え
     // ========================================
     onAiResponseStarted(): void {

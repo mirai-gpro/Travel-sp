@@ -286,6 +286,13 @@ export class CoreController {
       this.liveAudioManager.playPcmAudio(data.data);
     });
 
+    // ★ A2E expression状態リセット（音声セグメント切り替わり時）
+    this.socket.on('live_expression_reset', () => {
+      if (!this.isLiveMode) return;
+      console.log('[A2E] live_expression_reset受信: バッファ・タイミングリセット');
+      this.liveAudioManager.resetExpressionState();
+    });
+
     // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
     this.socket.on('live_expression', (data: any) => {
       if (!this.isLiveMode) return;

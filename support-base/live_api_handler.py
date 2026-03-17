@@ -861,6 +861,8 @@ class LiveAPISession:
             remaining_tasks.append(task)
 
         # ── 1軒目: 即座にストリーミング再生 ──
+        # expression状態リセット（1軒目は_buffer_for_a2eストリーミングパス使用）
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
         await self._stream_single_shop(shops[0], 1, total)
 
         # ── 2軒目以降: 生成済み音声を順次再生 ──
@@ -1109,6 +1111,9 @@ class LiveAPISession:
         """
         if not pcm_data:
             return
+
+        # ── Step 0: フロントエンドのexpression状態をリセット ──
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
 
         # ── Step 1: A2Eに一括送信してexpressionを取得 ──
         try:
