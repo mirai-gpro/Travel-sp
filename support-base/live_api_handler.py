@@ -641,9 +641,6 @@ class LiveAPISession:
                         # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
-                        # ★ A2E: ターン完了時にexpressionリセット通知
-                        self.socketio.emit('live_expression_reset',
-                                           room=self.client_sid)
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
@@ -660,9 +657,6 @@ class LiveAPISession:
                         # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
-                        # ★ A2E: 割り込み時にexpressionリセット通知
-                        self.socketio.emit('live_expression_reset',
-                                           room=self.client_sid)
                         self.ai_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
                                            room=self.client_sid)
@@ -794,8 +788,8 @@ class LiveAPISession:
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
-            # 「お待たせしました」音声をA2E同期モードで再生（リップシンク必要）
-            await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM, with_a2e=True)
+            # 「お待たせしました」音声をA2Eパイプライン経由で再生
+            await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
 
             # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
             await self._describe_shops_via_live(shops)
@@ -867,16 +861,12 @@ class LiveAPISession:
             remaining_tasks.append(task)
 
         # ── 1軒目: 即座にストリーミング再生 ──
-        # expression状態リセット（1軒目は_buffer_for_a2eストリーミングパス使用）
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
         await self._stream_single_shop(shops[0], 1, total)
 
         # ── 2軒目以降: 生成済み音声を順次再生 ──
         for i, task in enumerate(remaining_tasks):
             if not self.is_running:
                 break
-            # ★ イベントループ解放: ショップ間でSocket.IOのping/pongを処理
-            await asyncio.sleep(0)
             try:
                 audio_chunks, transcript = await task
                 if audio_chunks:
@@ -885,8 +875,6 @@ class LiveAPISession:
                 logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
         # 全ショップ説明完了 → 通常会話に復帰
-        # ★ イベントループ解放: 再接続前にSocket.IOのping/pongを確実に処理
-        await asyncio.sleep(0.1)
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
         self._add_to_history("ai", summary)
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
@@ -1005,14 +993,21 @@ class LiveAPISession:
         return audio_chunks, transcript
 
     async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int):
-        """収集済み音声をブラウザに送信（A2E同期モード）"""
+        """収集済み音声をブラウザに順次送信（A2E付き）"""
         if transcript:
             logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
             self._add_to_history("ai", transcript)
 
-        # 全チャンクを結合して一括A2E処理→同期送信
-        combined_pcm = b''.join(audio_chunks)
-        await self._emit_audio_with_a2e_sync(combined_pcm, f"[ShopDesc] ショップ{shop_number}")
+        for chunk in audio_chunks:
+            audio_b64 = base64.b64encode(chunk).decode('utf-8')
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
+            # ★ A2E: リップシンク用バッファ蓄積
+            self._buffer_for_a2e(chunk)
+
+        # A2E: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
 
     async def _receive_shop_description(self, session, shop_number: int):
         """
@@ -1032,9 +1027,6 @@ class LiveAPISession:
                     # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                     await self._flush_a2e_buffer(force=True, is_final=True)
                     self._a2e_chunk_index = 0  # 次ターン用にリセット
-                    # ★ A2E: ショップ説明ターン完了時もexpressionリセット通知
-                    self.socketio.emit('live_expression_reset',
-                                       room=self.client_sid)
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
                         logger.info(f"[ShopDesc] ショップ{shop_number}: {ai_text}")
@@ -1075,120 +1067,37 @@ class LiveAPISession:
                                 self._buffer_for_a2e(part.inline_data.data)
 
     # ============================================================
-    # キャッシュ済み音声再生
+    # キャッシュ済み音声再生（A2Eパイプライン経由）
     # ============================================================
 
-    async def _emit_cached_audio(self, pcm_data: bytes | None, with_a2e: bool = False):
-        """キャッシュ済みPCM音声を送信
-
-        with_a2e=True: 先にA2Eで全量処理→expression取得後にaudio+expressionを同期送信
-        with_a2e=False: live_audioのみ送信（ウェイティングアニメ中など）
-        """
+    async def _emit_cached_audio(self, pcm_data: bytes | None):
+        """キャッシュ済みPCM音声をlive_audio + A2Eパイプラインで送信
+        _emit_collected_shop() と同じパターン"""
         if not pcm_data:
             logger.warning("[CachedAudio] PCMデータなし、スキップ")
             return
 
-        if with_a2e:
-            # A2E同期モード: 先にexpression取得、その後audio+expressionを同期送信
-            await self._emit_audio_with_a2e_sync(pcm_data, "[CachedAudio]")
-        else:
-            # 音声のみモード: live_audioだけ送信（A2Eなし）
-            CHUNK_SIZE = 4800  # 0.1秒分 (24kHz 16bit mono)
-            for i in range(0, len(pcm_data), CHUNK_SIZE):
-                chunk = pcm_data[i:i + CHUNK_SIZE]
-                audio_b64 = base64.b64encode(chunk).decode('utf-8')
-                self.socketio.emit('live_audio', {'data': audio_b64},
-                                   room=self.client_sid)
-            logger.info(f"[CachedAudio] 音声のみ再生完了: {len(pcm_data)} bytes")
-
-    async def _delayed_cached_audio(self, pcm_data: bytes | None, delay: float):
-        """指定秒数待機後にキャッシュ済み音声を再生（ウェイティング用・A2Eなし）"""
-        try:
-            await asyncio.sleep(delay)
-            await self._emit_cached_audio(pcm_data, with_a2e=False)
-        except asyncio.CancelledError:
-            pass  # 検索が先に完了した場合はキャンセルされる
-
-    # ============================================================
-    # A2E同期送信（収集済み音声・キャッシュ音声共通）
-    # ============================================================
-
-    async def _emit_audio_with_a2e_sync(self, pcm_data: bytes, label: str = ""):
-        """音声全量を先にA2Eに送信→expression取得後にaudio+expressionを同期送信
-
-        手順:
-        1. PCM全量をA2Eに一括送信 → expressionフレーム取得
-        2. expressionフレームをブラウザに送信（先にバッファに入れる）
-        3. 音声チャンクをブラウザに送信
-        → フロントエンドではexpressionが先にバッファに溜まり、音声再生に同期して消費される
-        """
-        if not pcm_data:
-            return
-
-        # ── Step 0: フロントエンドのexpression状態をリセット ──
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
-
-        # ── Step 1: A2Eに一括送信してexpressionを取得 ──
-        try:
-            # PCM 24kHz 16bit mono → 16kHz リサンプリング
-            int16_array = np.frombuffer(pcm_data, dtype=np.int16)
-            resampled = resample_poly(int16_array.astype(np.float32), up=2, down=3)
-            int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
-            audio_b64_a2e = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
-
-            response = await self._a2e_http_client.post(
-                f"{A2E_SERVICE_URL}/api/audio2expression",
-                json={
-                    "audio_base64": audio_b64_a2e,
-                    "session_id": self.session_id,
-                    "audio_format": "pcm",
-                    "is_start": True,
-                    "is_final": True,
-                },
-                timeout=10.0
-            )
-
-            expressions = []
-            expression_names = []
-            frame_rate = A2E_EXPRESSION_FPS
-
-            if response.status_code == 200:
-                result = response.json()
-                frames = result.get('frames', [])
-                expression_names = result.get('names', [])
-                frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
-                expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
-                logger.info(f"{label} A2E一括処理完了: {len(expressions)} frames")
-            else:
-                logger.warning(f"{label} A2Eサービスエラー: {response.status_code}")
-
-        except Exception as e:
-            logger.error(f"{label} A2E一括送信エラー: {e}")
-            expressions = []
-            expression_names = []
-            frame_rate = A2E_EXPRESSION_FPS
-
-        # ── Step 2: expressionを先にブラウザに送信 ──
-        if expressions:
-            self.socketio.emit('live_expression', {
-                'expressions': expressions,
-                'expression_names': expression_names,
-                'frame_rate': frame_rate,
-                'chunk_index': 0,
-            }, room=self.client_sid)
-
-        # ── Step 3: 音声をチャンク分割してブラウザに送信 ──
+        # PCMをチャンク分割してlive_audioで送信（LiveAPIと同じ形式）
         CHUNK_SIZE = 4800  # 0.1秒分 (24kHz 16bit mono)
         for i in range(0, len(pcm_data), CHUNK_SIZE):
             chunk = pcm_data[i:i + CHUNK_SIZE]
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
             self.socketio.emit('live_audio', {'data': audio_b64},
                                room=self.client_sid)
-            # ★ イベントループ解放: Socket.IOのping/pongが処理される時間を確保
-            if i % (CHUNK_SIZE * 10) == 0:
-                await asyncio.sleep(0)
+            self._buffer_for_a2e(chunk)
 
-        logger.info(f"{label} A2E同期送信完了: {len(pcm_data)} bytes")
+        # A2E: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
+        logger.info(f"[CachedAudio] 再生完了: {len(pcm_data)} bytes")
+
+    async def _delayed_cached_audio(self, pcm_data: bytes | None, delay: float):
+        """指定秒数待機後にキャッシュ済み音声を再生"""
+        try:
+            await asyncio.sleep(delay)
+            await self._emit_cached_audio(pcm_data)
+        except asyncio.CancelledError:
+            pass  # 検索が先に完了した場合はキャンセルされる
 
     # ============================================================
     # A2E バッファリングメソッド（仕様書08 セクション3.3）

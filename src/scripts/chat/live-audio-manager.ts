@@ -186,11 +186,8 @@ export class LiveAudioManager {
         if (!this.audioContext) return;
 
         // ★ 最初のチャンク時にfirstChunkStartTimeを記録（仕様書08 セクション4.2）
-        // 実際の再生スケジュール時刻に合わせる（到着時刻ではなく）
-        // → expressionフレームのインデックスが音声再生と正確に同期する
         if (this.firstChunkStartTime === 0) {
-            const now = this.audioContext.currentTime;
-            this.firstChunkStartTime = Math.max(now + 0.005, this.nextPlayTime);
+            this.firstChunkStartTime = this.audioContext.currentTime;
         }
 
         const pcmBytes = base64ToArrayBuffer(pcmBase64);
@@ -251,10 +248,6 @@ export class LiveAudioManager {
         // ★ 音声と同じ時間ベース（firstChunkStartTime）を使用
         // expressionフレームは音声の特定時点に対応するため、音声基準で正確に同期
         const offsetMs = this.getCurrentPlaybackOffset();
-
-        // 再生開始前（offsetMs < 0）はフレームを返さない → 口閉じ状態を維持
-        if (offsetMs < 0) return null;
-
         const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
         const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
 
@@ -285,17 +278,6 @@ export class LiveAudioManager {
         frame_rate: number;
         chunk_index: number;
     }): void {
-        // ★ chunk_index=0 → 新しい音声セグメントの開始。バッファとタイミングをリセット
-        // 通常会話パス: _send_to_a2eがchunk_index=0で送信
-        // バッチパス: _emit_audio_with_a2e_syncはlive_expression_resetを送信するが、
-        //            到着しない場合のセーフティとしても機能
-        if (data.chunk_index === 0) {
-            this.expressionFrameBuffer = [];
-            this.firstChunkStartTime = 0;
-            this._a2eDebugCounter = 0;
-            console.log('[A2E] chunk_index=0: バッファ・タイミングリセット');
-        }
-
         // フレームレートとブレンドシェイプ名を更新
         if (data.frame_rate) this.expressionFrameRate = data.frame_rate;
         if (data.expression_names && data.expression_names.length > 0) {
@@ -336,21 +318,15 @@ export class LiveAudioManager {
     }
 
     // ========================================
-    // A2E expression状態リセット（音声セグメント切り替わり時）
-    // ========================================
-    resetExpressionState(): void {
-        this.expressionFrameBuffer = [];
-        this.firstChunkStartTime = 0;
-        this._a2eDebugCounter = 0;
-    }
-
-    // ========================================
     // フラグ切り替え
     // ========================================
     onAiResponseStarted(): void {
-        // ★ isAiSpeakingフラグのみセット（expressionバッファのリセットはlive_expression_resetに一任）
-        // 理由: _emit_audio_with_a2e_sync()ではexpression→audioの順で送信されるため、
-        //       ここでexpressionをクリアすると、先に届いたexpressionデータが消えてしまう
+        // ★ 新しいAI応答ターンの最初のチャンクのみリセット（仕様書08 セクション4.4）
+        if (!this.isAiSpeaking) {
+            this.firstChunkStartTime = 0;
+            this.expressionFrameBuffer = [];
+            this._a2eDebugCounter = 0;
+        }
         this.isAiSpeaking = true;
     }
 
