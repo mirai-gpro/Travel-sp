@@ -258,6 +258,10 @@ export class CoreController {
       }
     });
 
+    this.socket.on('disconnect', (reason: string) => {
+      console.warn(`[Socket.IO] 切断: reason=${reason}, isLiveMode=${this.isLiveMode}`);
+    });
+
     // ★案A: live_resume成功
     this.socket.on('live_resumed', (data: any) => {
       console.log('[LiveAPI] セッション再開成功:', data?.session_id);
@@ -366,7 +370,7 @@ export class CoreController {
 
     this.socket.on('turn_complete', () => {
       if (!this.isLiveMode) return;
-      console.log('[LiveAPI] turn_complete');
+      console.log(`[LiveAPI] turn_complete (isAiSpeaking=${this.liveAudioManager.isAiSpeaking})`);
       this.liveAudioManager.onAiResponseEnded();
 
       // ユーザー発話をチャット欄に確定表示
