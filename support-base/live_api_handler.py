@@ -899,9 +899,6 @@ class LiveAPISession:
             except Exception as e:
                 logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
-        # A2E: 全ショップ完了後にexpressionリセット
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
-
         # 全ショップ説明完了 → 通常会話に復帰
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
         self._add_to_history("ai", summary)
@@ -939,10 +936,6 @@ class LiveAPISession:
                 model=LIVE_API_MODEL,
                 config=config
             ) as session:
-                # A2E: 新音声セグメント開始前にexpressionリセット（仕様書12 §3.1.4）
-                self.socketio.emit('live_expression_reset', room=self.client_sid)
-                await asyncio.sleep(0.03)  # リセットがフロントで処理される時間マージン
-
                 trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
                 await session.send_client_content(
                     turns=types.Content(
@@ -1025,26 +1018,20 @@ class LiveAPISession:
         return audio_chunks, transcript
 
     async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int):
-        """収集済み音声をA2E先行+sleep方式で送信（仕様書12 §3.1.2）"""
+        """収集済み音声を前半と同じストリーミング方式で送信（テスト: A2E先行方式廃止）"""
         if transcript:
             logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
             self._add_to_history("ai", transcript)
 
-        # 1. expressionリセット → フロントのバッファクリア
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
-
-        # 2. A2E先行: 全音声チャンクを結合してA2Eに一括送信
-        all_pcm = b''.join(audio_chunks)
-        await self._send_a2e_ahead(all_pcm)
-
-        # 3. sleep: Expressionがフロントのバッファに格納される時間マージン
-        await asyncio.sleep(0.05)
-
-        # 4. 音声送信: Expressionが既にバッファにある状態で再生開始
+        # 前半と同じプロトコル: live_audio送信 + _buffer_for_a2eストリーミング
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
             self.socketio.emit('live_audio', {'data': audio_b64},
                                room=self.client_sid)
+            self._buffer_for_a2e(chunk)
+        # 最終チャンク: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
 
     async def _receive_shop_description(self, session, shop_number: int):
         """
