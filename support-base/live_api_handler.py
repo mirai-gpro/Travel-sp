@@ -802,11 +802,12 @@ class LiveAPISession:
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
             # 「お待たせしました」音声をA2Eパイプライン経由で再生
-            await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
-
-            # ★ 音声再生完了を待ってから次のセグメントへ（A2E同期崩壊防止）
-            if _CACHED_ANNOUNCE_PCM:
-                await asyncio.sleep(len(_CACHED_ANNOUNCE_PCM) / 48000)
+            # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
+            # await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
+            #
+            # # ★ 音声再生完了を待ってから次のセグメントへ（A2E同期崩壊防止）
+            # if _CACHED_ANNOUNCE_PCM:
+            #     await asyncio.sleep(len(_CACHED_ANNOUNCE_PCM) / 48000)
 
             # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
             await self._describe_shops_via_live(shops)
