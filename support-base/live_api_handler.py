@@ -810,32 +810,17 @@ class LiveAPISession:
             response_text = shop_data.get('response', '')
             area = shop_data.get('area', '')
 
-            # 2. ★ ショップ1のTTS生成を先行開始（競合なしで最速セッション確立）
+            # 2. ★ TTS並行生成を即開始（enrich前のraw_shopsで）
             import copy
             tts_shops = copy.deepcopy(raw_shops)
             total = len(tts_shops)
             all_tts_tasks = []
-
-            # ショップ1: 即座に開始
-            task1 = asyncio.create_task(
-                self._collect_shop_audio(tts_shops[0], 1, total)
-            )
-            all_tts_tasks.append(task1)
-            logger.info(f"[ShopSearch] ★ ショップ1 TTS先行開始（enrich前）")
-
-            # ショップ2-5: 2秒後に開始（ショップ1のセッション確立と競合させない）
-            async def _start_remaining_tts():
-                await asyncio.sleep(2.0)
-                tasks = []
-                for i in range(1, total):
-                    t = asyncio.create_task(
-                        self._collect_shop_audio(tts_shops[i], i + 1, total)
-                    )
-                    tasks.append(t)
-                logger.info(f"[ShopSearch] ★ ショップ2-{total} TTS開始（2秒遅延）")
-                return tasks
-
-            remaining_tts_future = asyncio.create_task(_start_remaining_tts())
+            for i in range(total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(tts_shops[i], i + 1, total)
+                )
+                all_tts_tasks.append(task)
+            logger.info(f"[ShopSearch] ★ TTS {total}軒の並行生成を開始（enrich前）")
 
             # 3. ★ enrichをTTS生成と並行実行
             from api_integrations import enrich_shops_with_photos
@@ -844,10 +829,6 @@ class LiveAPISession:
             )
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
-
-            # 残りのTTSタスクを回収
-            remaining_tasks = await remaining_tts_future
-            all_tts_tasks.extend(remaining_tasks)
 
             # 4. ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
