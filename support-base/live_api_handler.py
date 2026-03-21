@@ -921,24 +921,24 @@ class LiveAPISession:
         bridge_start = time.time()
         total_bridge_duration = 0.0
 
-        # 1) bridge: 「お待たせしました。それではお薦めのお店をご紹介します。」
-        if _CACHED_BRIDGE_PCM:
-            await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
-            dur = len(_CACHED_BRIDGE_PCM) / 48000
-            total_bridge_duration += dur
-            logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
+        # 1) bridge: コメントアウト（A2Eバッファ衝突切り分け）
+        # if _CACHED_BRIDGE_PCM:
+        #     await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
+        #     dur = len(_CACHED_BRIDGE_PCM) / 48000
+        #     total_bridge_duration += dur
+        #     logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
 
         # bridge再生完了を待ってからplease_waitへ
         elapsed = time.time() - bridge_start
         wait1 = max(total_bridge_duration - elapsed + 0.3, 0.3)
         await asyncio.sleep(wait1)
 
-        # 2) please_wait: 「只今、お店の情報を確認中です。もう少々お待ち下さい」
-        if _CACHED_PLEASE_WAIT_PCM:
-            await self._emit_cached_audio(_CACHED_PLEASE_WAIT_PCM)
-            dur = len(_CACHED_PLEASE_WAIT_PCM) / 48000
-            total_bridge_duration += dur
-            logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
+        # 2) please_wait: コメントアウト（A2Eバッファ衝突切り分け）
+        # if _CACHED_PLEASE_WAIT_PCM:
+        #     await self._emit_cached_audio(_CACHED_PLEASE_WAIT_PCM)
+        #     dur = len(_CACHED_PLEASE_WAIT_PCM) / 48000
+        #     total_bridge_duration += dur
+        #     logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
 
         # ── 場繋ぎ再生中に1軒目のcollect完了を待つ + A2E事前計算 ──
         next_a2e_task = None
