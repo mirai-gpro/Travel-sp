@@ -140,10 +140,10 @@ export class LAMWebSocketManager {
         }
 
         // === STEP2: 小さすぎる口の動き対策 ===
-        // バイアス: jawOpenが0.001〜0.03の区間を0.03に底上げ（0は静止なのでそのまま）
+        // バイアス: jawOpenが0.001〜0.05の区間を0.05に底上げ（0は静止なのでそのまま）
         const jawOpen = result['jawOpen'] ?? 0;
-        if (jawOpen >= 0.001 && jawOpen < 0.03) {
-            result['jawOpen'] = 0.03;
+        if (jawOpen >= 0.001 && jawOpen < 0.05) {
+            result['jawOpen'] = 0.05;
         }
 
         // スムージング: 口周り全体にフレーム間補間（α=0.3）
@@ -156,7 +156,7 @@ export class LAMWebSocketManager {
             'mouthPressLeft', 'mouthPressRight', 'mouthLowerDownLeft', 'mouthLowerDownRight',
             'mouthUpperUpLeft', 'mouthUpperUpRight',
         ];
-        const SMOOTH_ALPHA = 0.3;
+        const SMOOTH_ALPHA = 0.45;
         for (const name of MOUTH_SHAPES) {
             if (result[name] !== undefined) {
                 const prev = this._prevMouthValues[name] ?? 0;
