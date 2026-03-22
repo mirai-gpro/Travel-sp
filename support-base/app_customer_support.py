@@ -39,7 +39,8 @@ from support_core import (
     INITIAL_GREETINGS,
     SYSTEM_PROMPTS,
     SupportSession,
-    SupportAssistant
+    SupportAssistant,
+    gemini_client
 )
 from live_api_handler import LiveAPISession, build_system_instruction
 
@@ -802,7 +803,7 @@ def handle_live_start(data):
                 system_instruction=SEARCH_ONLY_PROMPT,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             )
-            response = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).models.generate_content(
+            response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
                 config=config
