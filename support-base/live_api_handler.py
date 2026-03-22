@@ -608,15 +608,7 @@ class LiveAPISession:
                         task.cancel()
                         logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
 
-                # function responseを返す（LiveAPI confirmed syntax）
-                tool_response = types.LiveClientToolResponse(
-                    function_responses=[types.FunctionResponse(
-                        name=fc.name,
-                        id=fc.id,
-                        response={"result": "検索結果をユーザーに表示しました"}
-                    )]
-                )
-                await session.send_tool_response(tool_response)
+                # tool_response送信は省略（エラー回避のため即終了）
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
