@@ -177,13 +177,28 @@ def _get_returning_user_context(preferred_name: str, name_honorific: str) -> str
 
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
-    description="ユーザーの条件に基づいてレストランを検索する。条件が十分に揃ったと判断した時に呼び出す。user_requestには会話で確認した全条件を必ず含めること。",
+    description=(
+        "Search restaurants based on user's confirmed conditions. "
+        "Call this when enough conditions are gathered from the conversation. "
+        "IMPORTANT: user_request must contain ALL conditions confirmed with the user during the conversation. "
+        "Incomplete conditions cause search failure and waste the user's time. "
+        "The search engine needs the full context — area, genre, budget, party size, and any special requests — to find the best match for the user."
+    ),
     parameters=types.Schema(
         type="OBJECT",
         properties={
             "user_request": types.Schema(
                 type="STRING",
-                description="検索条件の要約。会話で確定した全条件（エリア・ジャンル/シーン・予算・人数・その他希望）を漏れなく含めること。例: '六本木 接待向けイタリアン 予算1万円 4名 個室希望'"
+                description=(
+                    "A complete summary of ALL search conditions confirmed with the user. "
+                    "This text is passed directly to the search engine. "
+                    "Always include: area/location, cuisine type or scene, budget, party size, and any special requests the user mentioned. "
+                    "To help the user find the perfect restaurant, combine every confirmed detail into one string. "
+                    "Examples: "
+                    "'六本木 接待向けイタリアン 予算1万円 4名 個室希望', "
+                    "'渋谷駅周辺 カジュアルな焼肉 予算5000円 2名 禁煙席', "
+                    "'新宿 誕生日ディナー フレンチ 予算15000円 6名 サプライズ演出あり'"
+                )
             )
         },
         required=["user_request"]
