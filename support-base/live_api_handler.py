@@ -663,12 +663,21 @@ class LiveAPISession:
             tts_shops = copy.deepcopy(raw_shops)
             total = len(tts_shops)
             all_tts_tasks = []
-            for i in range(total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(tts_shops[i], i + 1, total)
-                )
-                all_tts_tasks.append(task)
-            logger.info(f"[ShopSearch] ★ TTS {total}軒の並行生成を開始（enrich前）")
+            # ショップ1を先行開始（LiveAPI同時接続の競合回避）
+            task1 = asyncio.create_task(
+                self._collect_shop_audio(tts_shops[0], 1, total)
+            )
+            all_tts_tasks.append(task1)
+            logger.info(f"[ShopSearch] ★ ショップ1のTTS生成を先行開始")
+            # 2秒後にショップ2-5を開始
+            if total > 1:
+                await asyncio.sleep(2)
+                for i in range(1, total):
+                    task = asyncio.create_task(
+                        self._collect_shop_audio(tts_shops[i], i + 1, total)
+                    )
+                    all_tts_tasks.append(task)
+                logger.info(f"[ShopSearch] ★ ショップ2-{total}のTTS生成を開始（2秒遅延）")
 
             # 3. ★ enrichをTTS生成と並行実行
             from api_integrations import enrich_shops_with_photos
@@ -754,11 +763,18 @@ class LiveAPISession:
             logger.info(f"[ShopDesc] 事前生成済みTTSタスク {len(all_tasks)}件を使用")
         else:
             all_tasks = []
-            for i in range(total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(shops[i], i + 1, total)
-                )
-                all_tasks.append(task)
+            # ショップ1を先行開始（LiveAPI同時接続の競合回避）
+            task1 = asyncio.create_task(
+                self._collect_shop_audio(shops[0], 1, total)
+            )
+            all_tasks.append(task1)
+            if total > 1:
+                await asyncio.sleep(2)
+                for i in range(1, total):
+                    task = asyncio.create_task(
+                        self._collect_shop_audio(shops[i], i + 1, total)
+                    )
+                    all_tasks.append(task)
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
