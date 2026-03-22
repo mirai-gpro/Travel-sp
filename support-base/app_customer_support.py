@@ -790,7 +790,7 @@ def handle_live_start(data):
                 logger.error(f"[ShopSearch] セッション {session_id} が見つかりません")
                 return None
             session.update_language(lang)
-            session.update_mode(search_mode)
+            session.update_mode('chat')  # 検索発火以降はグルメモードと完全に同じプロンプト・ロジックを使う
 
             # グルメモードと完全に同じロジック
             session.add_message('user', user_request, 'chat')
