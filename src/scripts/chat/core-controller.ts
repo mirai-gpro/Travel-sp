@@ -26,7 +26,7 @@ export class CoreController {
   protected preGeneratedAcks: Map<string, string> = new Map();
   protected isAISpeaking = false;
   protected currentAISpeech = "";
-  protected currentMode: 'chat' | 'concierge' = 'chat';
+  protected currentMode: 'chat' | 'concierge' | 'lesson' = 'chat';
 
   // ★ LiveAPI状態変数（仕様書02 セクション4.4.2）
   protected isLiveMode = false;

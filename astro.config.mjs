@@ -26,9 +26,9 @@ export default defineConfig({
 
       includeAssets: ['favicon.svg', 'apple-touch-icon.png'],
       manifest: {
-        name: 'Gourmet SP',
-        short_name: 'Gourmet',
-        description: '美味しいグルメを探すためのアプリ',
+        name: 'Travel AI',
+        short_name: 'Travel AI',
+        description: '旅行をサポートするAIアプリ',
         theme_color: '#ffffff',
         background_color: '#ffffff',
         display: 'standalone',
