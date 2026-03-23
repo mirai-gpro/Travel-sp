@@ -138,7 +138,7 @@ def build_system_instruction(mode: str, user_profile: dict = None,
         return base_prompt.replace('{user_context}', user_context)
     elif mode == 'lesson':
         # レッスンモード: 講師名・ユーザー名・user_contextを埋め込む
-        teacher_name = (user_profile or {}).get('lesson_teacher_name', 'Emma')
+        teacher_name = (user_profile or {}).get('lesson_teacher_name', 'Lisa')
         user_context = _build_lesson_user_context(user_profile)
         prompt = base_prompt.replace('{teacher_name}', teacher_name)
         prompt = prompt.replace('{user_context}', user_context)
@@ -194,7 +194,7 @@ def _build_lesson_user_context(user_profile: dict = None) -> str:
     is_first_visit = user_profile.get('is_first_visit', True)
     preferred_name = user_profile.get('preferred_name', '')
     name_honorific = user_profile.get('name_honorific', 'さん')
-    teacher_name = user_profile.get('lesson_teacher_name', 'Emma')
+    teacher_name = user_profile.get('lesson_teacher_name', 'Lisa')
 
     if is_first_visit or not preferred_name:
         return _get_lesson_first_visit_context(teacher_name)
@@ -202,7 +202,7 @@ def _build_lesson_user_context(user_profile: dict = None) -> str:
         return _get_lesson_returning_context(preferred_name, name_honorific, teacher_name)
 
 
-def _get_lesson_first_visit_context(teacher_name: str = 'Emma') -> str:
+def _get_lesson_first_visit_context(teacher_name: str = 'Lisa') -> str:
     """レッスンモード: 新規ユーザー用コンテキスト"""
     return f"""## 初期あいさつ（新規ユーザー）
 このユーザーは初めてのレッスンです。
@@ -211,7 +211,7 @@ def _get_lesson_first_visit_context(teacher_name: str = 'Emma') -> str:
 
 
 def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
-                                   teacher_name: str = 'Emma') -> str:
+                                   teacher_name: str = 'Lisa') -> str:
     """レッスンモード: リピーター用コンテキスト"""
     full_name = f"{preferred_name}{name_honorific}"
     return f"""## 初期あいさつ（リピーター）

@@ -453,7 +453,7 @@ class SupportAssistant:
             elif profile:
                 preferred_name = profile.get('preferred_name', '')
                 name_honorific = profile.get('name_honorific', 'さん')
-                teacher_name = profile.get('lesson_teacher_name', 'Emma')
+                teacher_name = profile.get('lesson_teacher_name', 'Lisa')
 
                 if preferred_name:
                     lesson_context = f"""
@@ -534,7 +534,7 @@ class SupportAssistant:
         if self.mode == 'lesson':
             is_first_visit = session_data.get('is_first_visit', True) if session_data else True
             profile = session_data.get('long_term_profile', {}) if session_data else {}
-            teacher_name = profile.get('lesson_teacher_name', 'Emma') if profile else 'Emma'
+            teacher_name = profile.get('lesson_teacher_name', 'Lisa') if profile else 'Lisa'
 
             if is_first_visit:
                 first_lesson_greetings = {
