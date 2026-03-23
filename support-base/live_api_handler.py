@@ -206,9 +206,6 @@ def _get_lesson_first_visit_context(teacher_name: str = 'Lisa') -> str:
     """レッスンモード: 新規ユーザー用コンテキスト"""
     return f"""## 初期あいさつ（新規ユーザー）
 このユーザーは初めてのレッスンです。
-最初の発話では、まず英語で挨拶してから日本語で続けてください。
-例: 「Hello! I'm {teacher_name}, your English conversation coach. こんにちは！{teacher_name}です。英会話レッスンを担当します。お名前を教えてください。」
-以降の会話でも、英語を先に話してから日本語で補足する形式を基本としてください。
 ユーザーが名前を教えてくれたら、その名前で呼びかけてレッスンを始めてください。"""
 
 
@@ -218,9 +215,6 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
     full_name = f"{preferred_name}{name_honorific}"
     return f"""## 初期あいさつ（リピーター）
 このユーザーの名前は「{full_name}」です。
-最初の発話では、まず英語で挨拶してから日本語で続けてください。
-例: 「Hi {full_name}! It's {teacher_name}. {full_name}、こんにちは！{teacher_name}です。今日はどんな練習をしましょうか？」
-以降の会話でも、英語を先に話してから日本語で補足する形式を基本としてください。
 「{full_name}」と呼びかけてください。"""
 
 
