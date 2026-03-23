@@ -72,15 +72,21 @@ export class LAMWebSocketManager {
 
             // カメラ位置を調整してアバターの顔サイズ・位置を制御
             // デフォルト: x=0, y=1.8, z=1
+            // モデルごとにカメラパラメータを切り替え
+            const isElf = config.modelUrl.includes('elf.zip');
+            const camParams = isElf
+                ? { posY: 1.63, posZ: 0.4, targetY: 1.52 }  // elf: 10cm下げ
+                : { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // meruru: 従来値
+
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
-                camera.position.z = 0.4;    // 近づけて顔を大きく
-                camera.position.y = 1.73;   // カメラの高さ（やや上から見下ろして鼻の穴を目立たなく）
+                camera.position.z = camParams.posZ;
+                camera.position.y = camParams.posY;
 
                 // 注視点（controls.target）を顔〜首の高さに合わせる
                 const controls = this.renderer.viewer.controls;
                 if (controls) {
-                    controls.target.set(0, 1.62, 0);  // 顔+首が見える高さを注視
+                    controls.target.set(0, camParams.targetY, 0);
                     controls.update();
                 }
 
