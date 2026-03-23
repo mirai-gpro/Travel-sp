@@ -447,6 +447,11 @@ class SupportAssistant:
 - まず自己紹介をして、名前を聞いてください
 - ユーザーが名前を教えてくれたら、必ず action フィールドで保存してください
 - action形式: {"type": "update_user_profile", "updates": {"preferred_name": "名前", "name_honorific": "さん"}}
+
+【会話形式ルール: 英語先行】
+すべての発話で、まず英語で話してから、続けて日本語で同じ内容を伝えてください。
+例: "Let's practice ordering at a restaurant today! 今日はレストランでの注文を練習しましょう！"
+この形式を会話全体を通して一貫して守ってください。
 """
                 self.system_prompt = f"{self.system_prompt}\n\n{lesson_context}"
                 logger.info(f"[Assistant] レッスンモード: 初回ユーザーコンテキスト注入")
@@ -460,12 +465,22 @@ class SupportAssistant:
 【ユーザー情報】
 - 呼び方: {preferred_name}{name_honorific}
 - AI講師名: {teacher_name}
+
+【会話形式ルール: 英語先行】
+すべての発話で、まず英語で話してから、続けて日本語で同じ内容を伝えてください。
+例: "Let's practice ordering at a restaurant today! 今日はレストランでの注文を練習しましょう！"
+この形式を会話全体を通して一貫して守ってください。
 """
                 else:
                     lesson_context = f"""
 【ユーザー情報】
 - 名前: 未登録（まず名前を聞いてください）
 - AI講師名: {teacher_name}
+
+【会話形式ルール: 英語先行】
+すべての発話で、まず英語で話してから、続けて日本語で同じ内容を伝えてください。
+例: "Let's practice ordering at a restaurant today! 今日はレストランでの注文を練習しましょう！"
+この形式を会話全体を通して一貫して守ってください。
 """
                 self.system_prompt = f"{self.system_prompt}\n\n{lesson_context}"
                 logger.info(f"[Assistant] レッスンモード: ユーザーコンテキスト注入（リピーター）")
