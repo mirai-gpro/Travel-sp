@@ -75,7 +75,7 @@ export class LAMWebSocketManager {
             // モデルごとにカメラパラメータを切り替え
             const isElf = config.modelUrl.includes('elf.zip');
             const camParams = isElf
-                ? { posY: 1.63, posZ: 0.4, targetY: 1.52 }  // elf: 10cm下げ
+                ? { posY: 1.83, posZ: 0.4, targetY: 1.73 }  // elf: 10cm上げ
                 : { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // meruru: 従来値
 
             if (this.renderer.viewer && this.renderer.viewer.camera) {
