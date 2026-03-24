@@ -427,6 +427,144 @@ A2Eサービスへ送信
 
 ---
 
+## 11. A2Eサービス側 context 持ち回し改修（案A: セッション辞書方式）
+
+**作成日**: 2026-03-24
+**根拠**: Gemini / ChatGPT 両LLMの分析 + 実コード確認に基づく。Claude独自の推論は含まない。
+
+### 11.1 問題の事実
+
+`a2e_engine.py` の `_process_with_infer()` は、毎回の HTTP POST で `context = None` から推論を開始している。
+
+```python
+# 現行コード（a2e_engine.py L403-428）
+def _process_with_infer(self, audio_pcm, duration):
+    context = None  # ← 毎回リセット。前チャンクのcontextは破棄される
+
+    for start in range(0, len(audio_pcm), chunk_samples):
+        result, context = self._infer.infer_streaming_audio(
+            audio=chunk, ssr=INFER_INPUT_SAMPLE_RATE, context=context
+        )
+```
+
+また `app.py` は `session_id` / `is_start` / `is_final` をリクエストから読み取ってはいるが、`engine.process()` に渡していない。
+
+```python
+# 現行コード（app.py L96-108）
+session_id = data.get('session_id', 'unknown')   # ← ログ用のみ
+result = engine.process(audio_base64, audio_format=audio_format)  # ← session_id未使用
+```
+
+### 11.2 影響範囲
+
+| モード | POST回数 | context | 症状 |
+|--------|----------|---------|------|
+| A2E Ahead（お店説明2軒目以降） | 1回（全PCM一括） | POST内で1秒チャンク間を引き継ぎ → **正常** | なし |
+| ストリーミング（通常会話） | 複数回（0.1秒→5秒→句読点flush→残り） | **各POSTが `context=None` から開始** | 語尾もごもご・境界不安定 |
+
+### 11.3 修正方針: セッション辞書方式
+
+`session_id` をキーにcontextを辞書で管理し、POST間でcontextを持ち回す。
+
+- `is_start=True` → contextリセット（新ターン開始）
+- `is_start=False` → 前回contextを引き継ぎ
+- `is_final=True` → 推論後にcontextを破棄
+
+### 11.4 修正対象ファイルと変更内容
+
+#### (1) `a2e_engine.py` — エンジン側
+
+**`process()` メソッドのシグネチャ変更**:
+```python
+def process(self, audio_base64, audio_format="mp3",
+            session_id="unknown", is_start=False, is_final=False):
+    audio_pcm = self._decode_audio(audio_base64, audio_format)
+    duration = len(audio_pcm) / INFER_INPUT_SAMPLE_RATE
+
+    if self._use_infer:
+        return self._process_with_infer(
+            audio_pcm, duration, session_id, is_start, is_final)
+    else:
+        return self._process_with_fallback(audio_pcm, duration)
+```
+
+**`__init__` に辞書追加**:
+```python
+self._session_contexts = {}  # {session_id: context}
+```
+
+**`_process_with_infer()` のcontext管理**:
+```python
+def _process_with_infer(self, audio_pcm, duration,
+                        session_id, is_start, is_final):
+    chunk_samples = INFER_INPUT_SAMPLE_RATE
+    all_expressions = []
+
+    # context取得: is_start=True or 未知セッション → None
+    if is_start or session_id not in self._session_contexts:
+        context = None
+    else:
+        context = self._session_contexts[session_id]
+
+    for start in range(0, len(audio_pcm), chunk_samples):
+        end = min(start + chunk_samples, len(audio_pcm))
+        chunk = audio_pcm[start:end]
+        if len(chunk) < INFER_INPUT_SAMPLE_RATE // 10:
+            continue
+        result, context = self._infer.infer_streaming_audio(
+            audio=chunk, ssr=INFER_INPUT_SAMPLE_RATE, context=context)
+        expr = result.get("expression")
+        if expr is not None:
+            all_expressions.append(expr.astype(np.float32))
+
+    # context保存 or 破棄
+    if is_final:
+        self._session_contexts.pop(session_id, None)
+    else:
+        self._session_contexts[session_id] = context
+
+    # ... 以降は既存と同じ（expression結合・フレーム変換）
+```
+
+#### (2) `app.py` — APIエンドポイント側
+
+**`session_id` / `is_start` / `is_final` を `engine.process()` に渡す**:
+```python
+result = engine.process(
+    audio_base64,
+    audio_format=audio_format,
+    session_id=session_id,
+    is_start=data.get('is_start', False),
+    is_final=data.get('is_final', False),
+)
+```
+
+### 11.5 `live_api_handler.py` 側の変更: なし
+
+バックエンド（`live_api_handler.py`）は既に `session_id`, `is_start`, `is_final` をHTTP POSTのJSONに含めて送信している（L1364-1374）。A2Eサービス側がこれらを受け取って使うようになれば、バックエンド側の変更は不要。
+
+### 11.6 期待される効果
+
+```
+修正前:
+  POST#0 (0.1秒, is_start=True)  → context=None → 推論 → context破棄
+  POST#1 (5秒, is_start=False)   → context=None → 推論 → context破棄  ← 境界不連続
+  POST#2 (残り, is_final=True)   → context=None → 推論 → context破棄  ← 境界不連続
+
+修正後:
+  POST#0 (0.1秒, is_start=True)  → context=None → 推論 → context保存
+  POST#1 (5秒, is_start=False)   → context復元  → 推論 → context保存  ← 連続
+  POST#2 (残り, is_final=True)   → context復元  → 推論 → context破棄  ← 連続
+```
+
+### 11.7 セクション10（A-1 + A-2）との関係
+
+- セクション10の A-1（最終チャンク最小長制限）と A-2（無音パディング）は**本改修と独立**
+- A-1 + A-2 は最終チャンク単体の品質改善、本改修はチャンク間の連続性確保
+- **両方を併用**することで、ストリーミング全体の品質が向上する
+
+---
+
 ## 12. 実装の必須ルール（チェックリスト）
 
 新たに `live_audio` を送信するコードパスを作る場合:
