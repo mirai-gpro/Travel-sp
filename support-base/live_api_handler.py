@@ -576,8 +576,6 @@ class LiveAPISession:
         LiveAPIレスポンスを受信してSocket.IOでブラウザに転送
         仕様書 セクション7.3 の receive_audio() を移植
         """
-        turn_pcm_chunks = []  # ★ A2E collect方式: turn単位でPCM蓄積
-
         while not self.needs_reconnect and self.is_running:
             turn = session.receive()
             async for response in turn:
@@ -594,19 +592,9 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # ★ A2E collect方式: 蓄積した全PCMを一括A2E処理
-                        if turn_pcm_chunks:
-                            all_pcm = b''.join(turn_pcm_chunks)
-                            a2e_result = await self._precompute_a2e_expressions(all_pcm)
-                            if a2e_result:
-                                self.socketio.emit('live_expression', {
-                                    'expressions': a2e_result['expressions'],
-                                    'expression_names': a2e_result['expression_names'],
-                                    'frame_rate': a2e_result['frame_rate'],
-                                    'chunk_index': 0,
-                                }, room=self.client_sid)
-                                logger.info(f"[A2E] collect方式: {len(a2e_result['expressions'])} frames一括送信")
-                            turn_pcm_chunks = []
+                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
+                        await self._flush_a2e_buffer(force=True, is_final=True)
+                        self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
@@ -620,8 +608,9 @@ class LiveAPISession:
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
-                        # ★ A2E collect方式: バッファクリアのみ（フラッシュ不要）
-                        turn_pcm_chunks = []
+                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
+                        await self._flush_a2e_buffer(force=True, is_final=True)
+                        self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self.ai_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
                                            room=self.client_sid)
@@ -648,6 +637,8 @@ class LiveAPISession:
                             self.socketio.emit('ai_transcript',
                                                {'text': text},
                                                room=self.client_sid)
+                            # ★ A2E: 句読点検出でバッファフラッシュ（仕様書08 セクション3.2）
+                            self._on_output_transcription(text)
 
                     # 6. 音声データ
                     if sc.model_turn:
@@ -661,8 +652,8 @@ class LiveAPISession:
                                     self.socketio.emit('live_audio',
                                                        {'data': audio_b64},
                                                        room=self.client_sid)
-                                    # ★ A2E collect方式: PCMを蓄積のみ（A2Eには送信しない）
-                                    turn_pcm_chunks.append(part.inline_data.data)
+                                    # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
+                                    self._buffer_for_a2e(part.inline_data.data)
 
     async def _handle_tool_call(self, tool_call, session):
         """
