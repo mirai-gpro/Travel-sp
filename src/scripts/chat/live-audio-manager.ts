@@ -60,9 +60,11 @@ export class LiveAudioManager {
     private nextPlayTime: number = 0;
     private scheduledSources: AudioBufferSourceNode[] = [];  // interrupt時にstop()用
 
-    // ★ Expression同期機能（仕様書08 セクション4.1）
+    // ★ Expression同期機能（仕様書08 セクション4.1, 仕様書13 §14.7）
     private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
-    private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームデータ
+    private expressionFrameMap: Map<number, ExpressionFrame> = new Map();  // ★ 絶対フレーム位置で格納
+    private expressionFrameMaxIndex: number = -1;     // Map内の最大フレームインデックス
+    private lastValidFrame: ExpressionFrame | null = null;  // 未到着フレーム用の前フレーム保持
     public expressionFrameRate: number = 30;           // fps（デフォルト30）
     public expressionNames: string[] = [];             // ARKit ブレンドシェイプ名
     private _a2eDebugCounter: number = 0;              // デバッグログ間引き用
@@ -240,43 +242,49 @@ export class LiveAudioManager {
     }
 
     /**
-     * 現在のフレームインデックスからexpressionフレームを取得
+     * 現在のフレームインデックスからexpressionフレームを取得（仕様書13 §14.7）
+     * ★ Map（絶対フレーム位置）から取得。未到着フレームは前フレームを保持。
      */
     getCurrentExpressionFrame(): ExpressionFrame | null {
-        if (this.expressionFrameBuffer.length === 0) return null;
+        if (this.expressionFrameMap.size === 0) return null;
 
         // ★ 音声と同じ時間ベース（firstChunkStartTime）を使用
-        // expressionフレームは音声の特定時点に対応するため、音声基準で正確に同期
         const offsetMs = this.getCurrentPlaybackOffset();
         const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
-        const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
 
-        if (clampedIndex < 0) return null;
-
-        const frame = this.expressionFrameBuffer[clampedIndex];
+        // ★ Mapから絶対フレーム位置で取得
+        const frame = this.expressionFrameMap.get(frameIndex);
+        if (frame) {
+            this.lastValidFrame = frame;
+        }
 
         // デバッグ: 60フレームごと（約1秒）にログ出力
         this._a2eDebugCounter++;
         if (this._a2eDebugCounter % 60 === 0) {
+            const currentFrame = frame ?? this.lastValidFrame;
             const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
-            const jawVal = jawOpenIdx >= 0 && frame.values[jawOpenIdx] !== undefined
-                ? frame.values[jawOpenIdx].toFixed(3) : 'N/A';
+            const jawVal = currentFrame && jawOpenIdx >= 0 && currentFrame.values[jawOpenIdx] !== undefined
+                ? currentFrame.values[jawOpenIdx].toFixed(3) : 'N/A';
             console.log(
-                `[A2E Sync] offsetMs=${offsetMs.toFixed(0)}, frameIdx=${clampedIndex}/${this.expressionFrameBuffer.length}, jawOpen=${jawVal}`
+                `[A2E Sync] offsetMs=${offsetMs.toFixed(0)}, frameIdx=${frameIndex}/${this.expressionFrameMaxIndex}, ` +
+                `hit=${!!frame}, jawOpen=${jawVal}`
             );
         }
 
-        return frame;
+        // フレームが存在すればそれを返す。未到着なら前フレームを保持
+        return frame ?? this.lastValidFrame ?? null;
     }
 
     /**
-     * Socket.IO live_expression イベントデータをフレームバッファに追加
+     * Socket.IO live_expression イベントデータをフレームバッファに追加（仕様書13 §14.7）
+     * ★ start_frame ベースの絶対位置でMapに格納。到着順序に依存しない。
      */
     onExpressionReceived(data: {
         expressions: number[][];
         expression_names: string[];
         frame_rate: number;
         chunk_index: number;
+        start_frame?: number;
     }): void {
         // フレームレートとブレンドシェイプ名を更新
         if (data.frame_rate) this.expressionFrameRate = data.frame_rate;
@@ -284,9 +292,14 @@ export class LiveAudioManager {
             this.expressionNames = data.expression_names;
         }
 
-        // フレームデータをバッファに追加
-        for (const values of data.expressions) {
-            this.expressionFrameBuffer.push({ values });
+        // ★ start_frame ベースの絶対位置格納（仕様書13 §14.7）
+        const startFrame = data.start_frame ?? this.expressionFrameMaxIndex + 1;
+        for (let i = 0; i < data.expressions.length; i++) {
+            const frameIndex = startFrame + i;
+            this.expressionFrameMap.set(frameIndex, { values: data.expressions[i] });
+            if (frameIndex > this.expressionFrameMaxIndex) {
+                this.expressionFrameMaxIndex = frameIndex;
+            }
         }
 
         // デバッグ: バッファ状態とjawOpen値を出力
@@ -295,7 +308,8 @@ export class LiveAudioManager {
             const firstFrame = data.expressions[0];
             const lastFrame = data.expressions[data.expressions.length - 1];
             console.log(
-                `[A2E Buffer] chunk=${data.chunk_index}, +${data.expressions.length}frames, total=${this.expressionFrameBuffer.length}, ` +
+                `[A2E Buffer] chunk=${data.chunk_index}, start_frame=${startFrame}, ` +
+                `+${data.expressions.length}frames, total=${this.expressionFrameMap.size}, ` +
                 `jawOpenIdx=${jawOpenIdx}, jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}], ` +
                 `firstChunkStartTime=${this.firstChunkStartTime.toFixed(3)}`
             );
@@ -312,8 +326,10 @@ export class LiveAudioManager {
             try { source.stop(); } catch (_) { /* already stopped */ }
         }
         this.scheduledSources = [];
-        // ★ expressionバッファもクリア
-        this.expressionFrameBuffer = [];
+        // ★ expressionバッファもクリア（仕様書13 §14.7）
+        this.expressionFrameMap = new Map();
+        this.expressionFrameMaxIndex = -1;
+        this.lastValidFrame = null;
         this.firstChunkStartTime = 0;
     }
 
@@ -324,7 +340,9 @@ export class LiveAudioManager {
         // ★ 新しいAI応答ターンの最初のチャンクのみリセット（仕様書08 セクション4.4）
         if (!this.isAiSpeaking) {
             this.firstChunkStartTime = 0;
-            this.expressionFrameBuffer = [];
+            this.expressionFrameMap = new Map();  // ★ 仕様書13 §14.7
+            this.expressionFrameMaxIndex = -1;
+            this.lastValidFrame = null;
             this._a2eDebugCounter = 0;
         }
         this.isAiSpeaking = true;
@@ -345,8 +363,10 @@ export class LiveAudioManager {
         }
         this.scheduledSources = [];
 
-        // Expressionバッファクリア + タイムスタンプリセット
-        this.expressionFrameBuffer = [];
+        // Expressionバッファクリア + タイムスタンプリセット（仕様書13 §14.7）
+        this.expressionFrameMap = new Map();
+        this.expressionFrameMaxIndex = -1;
+        this.lastValidFrame = null;
         this.firstChunkStartTime = 0;
 
         // ★ isAiSpeaking = true を維持
