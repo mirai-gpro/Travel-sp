@@ -60,12 +60,9 @@ export class LiveAudioManager {
     private nextPlayTime: number = 0;
     private scheduledSources: AudioBufferSourceNode[] = [];  // interrupt時にstop()用
 
-    // ★ Expression同期機能（仕様書08 セクション4.1, 仕様書13 §14.7）
+    // ★ Expression同期機能（仕様書08 セクション4.1）
     private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
-    private expressionFrameMap: Map<number, ExpressionFrame> = new Map();  // ★ 絶対フレーム位置で格納
-    private expressionFrameMaxIndex: number = -1;     // Map内の最大フレームインデックス
-    private lastValidFrame: ExpressionFrame | null = null;  // 未到着・範囲外フレーム用
-    private expressionDelayMs: number = 300;           // ★ §14.7 v2: expression参照遅延（ms）
+    private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームバッファ（到着順＝時間軸順）
     public expressionFrameRate: number = 30;           // fps（デフォルト30）
     public expressionNames: string[] = [];             // ARKit ブレンドシェイプ名
     private _a2eDebugCounter: number = 0;              // デバッグログ間引き用
@@ -243,65 +240,43 @@ export class LiveAudioManager {
     }
 
     /**
-     * 現在のフレームインデックスからexpressionフレームを取得（仕様書13 §14.7 v2）
-     * ★ 三段構え: (1) Map直接hit → (2) maxIndexへのclamping → (3) lastValidFrame
-     * ★ expressionDelayMs で再生ヘッドの先走りを抑制
+     * 現在のフレームインデックスからexpressionフレームを取得（仕様書08 セクション4.1）
+     * A2E Ahead方式: Expressionは音声より先にバッファに到着済み。
+     * 時間軸ベースでframeIndexを算出し、Arrayから直接取得。
      */
     getCurrentExpressionFrame(): ExpressionFrame | null {
-        if (this.expressionFrameMap.size === 0) return null;
+        if (this.expressionFrameBuffer.length === 0) return null;
 
-        // ★ v2: expression参照を音声再生より expressionDelayMs 遅らせる
-        const audioOffsetMs = this.getCurrentPlaybackOffset();
-        const offsetMs = audioOffsetMs - this.expressionDelayMs;
-        if (offsetMs < 0) return this.lastValidFrame;
-
+        const offsetMs = this.getCurrentPlaybackOffset();
         const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
-
-        // ★ 三段構えのフレーム取得（§14.7 v2: Gemini・ChatGPT共通提案）
-        let frame: ExpressionFrame | undefined;
-
-        // 1. Mapに直接存在する場合（理想的なケース）
-        frame = this.expressionFrameMap.get(frameIndex);
-        if (frame) {
-            this.lastValidFrame = frame;
-        }
-        // 2. 再生位置がMap最大インデックスを超えている場合（clamping）
-        else if (frameIndex > this.expressionFrameMaxIndex && this.expressionFrameMaxIndex >= 0) {
-            frame = this.expressionFrameMap.get(this.expressionFrameMaxIndex);
-            if (frame) {
-                this.lastValidFrame = frame;
-            }
-        }
-        // 3. Map範囲内だが穴がある場合 → lastValidFrame を返す（下のreturnで処理）
+        const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
 
         // デバッグ: 60フレームごと（約1秒）にログ出力
         this._a2eDebugCounter++;
         if (this._a2eDebugCounter % 60 === 0) {
-            const currentFrame = frame ?? this.lastValidFrame;
+            const frame = this.expressionFrameBuffer[clampedIndex];
             const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
-            const jawVal = currentFrame && jawOpenIdx >= 0 && currentFrame.values[jawOpenIdx] !== undefined
-                ? currentFrame.values[jawOpenIdx].toFixed(3) : 'N/A';
+            const jawVal = frame && jawOpenIdx >= 0 && frame.values[jawOpenIdx] !== undefined
+                ? frame.values[jawOpenIdx].toFixed(3) : 'N/A';
             console.log(
-                `[A2E Sync] audioOffsetMs=${audioOffsetMs.toFixed(0)}, exprOffsetMs=${offsetMs.toFixed(0)}, ` +
-                `frameIdx=${frameIndex}/${this.expressionFrameMaxIndex}, ` +
-                `hit=${!!this.expressionFrameMap.get(frameIndex)}, clamped=${frameIndex > this.expressionFrameMaxIndex}, ` +
+                `[A2E Sync] offsetMs=${offsetMs.toFixed(0)}, ` +
+                `frameIdx=${frameIndex}/${this.expressionFrameBuffer.length - 1}, ` +
                 `jawOpen=${jawVal}`
             );
         }
 
-        return frame ?? this.lastValidFrame ?? null;
+        return this.expressionFrameBuffer[clampedIndex] ?? null;
     }
 
     /**
-     * Socket.IO live_expression イベントデータをフレームバッファに追加（仕様書13 §14.7）
-     * ★ start_frame ベースの絶対位置でMapに格納。到着順序に依存しない。
+     * Socket.IO live_expression イベントデータをフレームバッファに追加（仕様書08 セクション4.1）
+     * A2E Ahead方式: Expressionは音声より先に到着するため、到着順にpushするだけで時間軸順になる。
      */
     onExpressionReceived(data: {
         expressions: number[][];
         expression_names: string[];
         frame_rate: number;
         chunk_index: number;
-        start_frame?: number;
     }): void {
         // フレームレートとブレンドシェイプ名を更新
         if (data.frame_rate) this.expressionFrameRate = data.frame_rate;
@@ -309,14 +284,9 @@ export class LiveAudioManager {
             this.expressionNames = data.expression_names;
         }
 
-        // ★ start_frame ベースの絶対位置格納（仕様書13 §14.7）
-        const startFrame = data.start_frame ?? this.expressionFrameMaxIndex + 1;
+        // 到着順にpush（A2E Ahead方式では到着順＝時間軸順が保証される）
         for (let i = 0; i < data.expressions.length; i++) {
-            const frameIndex = startFrame + i;
-            this.expressionFrameMap.set(frameIndex, { values: data.expressions[i] });
-            if (frameIndex > this.expressionFrameMaxIndex) {
-                this.expressionFrameMaxIndex = frameIndex;
-            }
+            this.expressionFrameBuffer.push({ values: data.expressions[i] });
         }
 
         // デバッグ: バッファ状態とjawOpen値を出力
@@ -325,9 +295,9 @@ export class LiveAudioManager {
             const firstFrame = data.expressions[0];
             const lastFrame = data.expressions[data.expressions.length - 1];
             console.log(
-                `[A2E Buffer] chunk=${data.chunk_index}, start_frame=${startFrame}, ` +
-                `+${data.expressions.length}frames, total=${this.expressionFrameMap.size}, ` +
-                `jawOpenIdx=${jawOpenIdx}, jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}], ` +
+                `[A2E Buffer] chunk=${data.chunk_index}, ` +
+                `+${data.expressions.length}frames, total=${this.expressionFrameBuffer.length}, ` +
+                `jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}], ` +
                 `firstChunkStartTime=${this.firstChunkStartTime.toFixed(3)}`
             );
         }
@@ -343,10 +313,8 @@ export class LiveAudioManager {
             try { source.stop(); } catch (_) { /* already stopped */ }
         }
         this.scheduledSources = [];
-        // ★ expressionバッファもクリア（仕様書13 §14.7）
-        this.expressionFrameMap = new Map();
-        this.expressionFrameMaxIndex = -1;
-        this.lastValidFrame = null;
+        // ★ expressionバッファもクリア
+        this.expressionFrameBuffer = [];
         this.firstChunkStartTime = 0;
     }
 
@@ -357,9 +325,7 @@ export class LiveAudioManager {
         // ★ 新しいAI応答ターンの最初のチャンクのみリセット（仕様書08 セクション4.4）
         if (!this.isAiSpeaking) {
             this.firstChunkStartTime = 0;
-            this.expressionFrameMap = new Map();  // ★ 仕様書13 §14.7
-            this.expressionFrameMaxIndex = -1;
-            this.lastValidFrame = null;
+            this.expressionFrameBuffer = [];
             this._a2eDebugCounter = 0;
         }
         this.isAiSpeaking = true;
@@ -380,10 +346,8 @@ export class LiveAudioManager {
         }
         this.scheduledSources = [];
 
-        // Expressionバッファクリア + タイムスタンプリセット（仕様書13 §14.7）
-        this.expressionFrameMap = new Map();
-        this.expressionFrameMaxIndex = -1;
-        this.lastValidFrame = null;
+        // Expressionバッファクリア + タイムスタンプリセット
+        this.expressionFrameBuffer = [];
         this.firstChunkStartTime = 0;
 
         // ★ isAiSpeaking = true を維持
