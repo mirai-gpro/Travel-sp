@@ -237,6 +237,25 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     )
 )
 
+UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
+    name="update_user_profile",
+    description="ユーザーが名前を教えてくれた時、または名前の変更を依頼された時に呼び出す。初回の名前登録にも、名前変更にも使用する。",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "preferred_name": types.Schema(
+                type="STRING",
+                description="ユーザーの名前（例: 太郎、花子）"
+            ),
+            "name_honorific": types.Schema(
+                type="STRING",
+                description="敬称（例: 様、さん、くん）。デフォルトは「様」"
+            )
+        },
+        required=["preferred_name"]
+    )
+)
+
 
 # ============================================================
 # LiveAPISession クラス
@@ -279,7 +298,7 @@ class LiveAPISession:
 
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
-                 shop_search_callback=None):
+                 shop_search_callback=None, user_id: str = None):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -287,6 +306,7 @@ class LiveAPISession:
         self.socketio = socketio
         self.client_sid = client_sid
         self._shop_search_callback = shop_search_callback  # v5 §5.5: ショップ検索用コールバック
+        self.user_id = user_id  # 長期記憶のプロファイル更新に使用
 
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
@@ -366,9 +386,13 @@ class LiveAPISession:
             },
         }
 
-        # lesson モードではショップ検索ツールを除外
-        if self.mode != 'lesson':
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION])]
+        # モードに応じたfunction calling定義
+        if self.mode == 'lesson':
+            # lessonモードはショップ検索不要、プロファイル更新のみ
+            config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
+        else:
+            # conciergeモード等はショップ検索 + プロファイル更新
+            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -671,6 +695,30 @@ class LiveAPISession:
                         name=fc.name,
                         id=fc.id,
                         response={"result": "検索結果をユーザーに表示しました"}
+                    )]
+                )
+                await session.send_tool_response(tool_response)
+            elif fc.name == "update_user_profile":
+                # ユーザー名登録・変更をDBに永続化
+                updates = fc.args or {}
+                if updates and self.user_id:
+                    try:
+                        from long_term_memory import LongTermMemory
+                        ltm = LongTermMemory()
+                        success = ltm.update_profile(self.user_id, updates)
+                        if success:
+                            logger.info(f"[LiveAPI] プロファイル更新成功: updates={updates}, user_id={self.user_id}")
+                        else:
+                            logger.error(f"[LiveAPI] プロファイル更新失敗: updates={updates}, user_id={self.user_id}")
+                    except Exception as e:
+                        logger.error(f"[LiveAPI] プロファイル更新エラー: {e}")
+
+                # function responseを返す
+                tool_response = types.LiveClientToolResponse(
+                    function_responses=[types.FunctionResponse(
+                        name=fc.name,
+                        id=fc.id,
+                        response={"result": "プロファイルを更新しました"}
                     )]
                 )
                 await session.send_tool_response(tool_response)

@@ -761,13 +761,15 @@ def handle_live_start(data):
         del active_live_sessions[client_sid]
 
     # プロンプト構築（03_prompt_modification_spec.md セクション7.1参照）
-    # コンシェルジュモードの場合、セッションからユーザープロファイルを取得
+    # セッションからユーザープロファイル・user_idを取得
     user_profile = None
-    if mode == 'concierge' and session_id:
+    user_id = None
+    if session_id:
         try:
             session = SupportSession(session_id)
             session_data = session.get_data()
             if session_data:
+                user_id = session_data.get('user_id')
                 is_first_visit = session_data.get('is_first_visit', True)
                 profile = session_data.get('long_term_profile') or {}
                 user_profile = {
@@ -864,7 +866,8 @@ def handle_live_start(data):
         system_prompt=system_prompt,
         socketio=socketio,
         client_sid=client_sid,
-        shop_search_callback=shop_search_callback
+        shop_search_callback=shop_search_callback,
+        user_id=user_id
     )
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ

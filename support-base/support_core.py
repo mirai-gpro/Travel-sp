@@ -233,11 +233,8 @@ class SupportSession:
         is_first_visit = True
         user_context = ""
 
-        # チャットモードはDB読み込みをスキップ（高速化）
-        # concierge/lesson モードは長期記憶を使用（名前の呼びかけ等）
-        if mode == 'chat':
-            logger.info(f"[Session] チャットモード: DB読み込みスキップ")
-        elif LONG_TERM_MEMORY_ENABLED and user_id and mode in ('concierge', 'lesson'):
+        # 全モードで長期記憶を使用（ユーザー名の共有）
+        if LONG_TERM_MEMORY_ENABLED and user_id:
             try:
                 ltm = LongTermMemory()
 
