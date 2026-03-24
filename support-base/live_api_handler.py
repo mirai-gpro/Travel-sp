@@ -31,7 +31,7 @@ if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
 A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
 A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
-A2E_AUTO_FLUSH_BYTES = 48000     # 2回目以降フラッシュ閾値（1秒分 = 48000bytes）
+A2E_AUTO_FLUSH_BYTES = 96000     # 2回目以降フラッシュ閾値（2秒分 = 96000bytes）
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
