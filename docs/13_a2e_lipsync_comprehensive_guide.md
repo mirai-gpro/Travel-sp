@@ -131,50 +131,40 @@ turn_complete → リセット
 
 **コード位置**: `live_api_handler.py` L630-713 `_receive_and_forward()`
 
-### 3.2 全ショップ共通: collect + A2E事前計算 + emit（統一collect方式）
+### 3.2 ショップ1軒目: ストリーミング（`_stream_single_shop` + `_receive_shop_description`）
 
-**方式**: A2E先行（全ショップ統一。1軒目も2軒目以降も同じパス）
+**方式**: インターリーブ（正常パスと同等）
 
-**設計思想**: 1軒目をストリーミング方式（小分けチャンク逐次A2E）で処理すると、A2Eがコンテキスト不足で品質低下し、チャンク到着順序の乱れも発生する。2軒目以降のcollect+一括A2E方式は高品質であることが実証済みのため、1軒目も含め全ショップをこの方式に統一した。
-
-**各ショップの再生フロー**（`_emit_collected_shop`）:
 ```
 live_expression_reset → resetForNewSegment()
   ↓
-_precompute_a2e_expressions(全PCM結合)
-  → is_start=True, is_final=True の1回呼び出し（一括）
-  → expression結果をdict保持（emitしない）
+新LiveAPIセッション → ストリーミング受信
+  live_audio + _buffer_for_a2e（正常パスと同じインターリーブ）
   ↓
-live_expression emit（事前計算済み全フレーム先着）
+turn_complete → フラッシュ
+```
+
+**コード位置**: `live_api_handler.py` L917-960 `_stream_single_shop()`、L1052-1110 `_receive_shop_description()`
+
+### 3.3 ショップ2軒目以降: A2E先行方式（`_emit_collected_shop`）
+
+**方式**: A2E先行（Expression全フレームが先着 → 音声再生開始）
+
+```
+live_expression_reset → resetForNewSegment()
+  ↓
+_send_a2e_ahead(全PCM結合) → live_expression（全フレーム先着）
   ↓
 sleep(50ms) → 到着マージン
   ↓
 live_audio × N chunks → 再生開始
 ```
 
-**A2E事前計算のパイプライン**: 再生待ち中に次のショップのA2E事前計算を`asyncio.create_task`で先行実行。これにより各ショップ間のA2E HTTP待ち時間を隠蔽する。
-
-```
-ショップN再生中:
-  ├── await asyncio.sleep(audio_duration)  ← 音声再生完了待ち
-  └── 並行: next_a2e_task = asyncio.create_task(
-              _precompute_a2e_expressions(次ショップの全PCM))
-  ↓
-ショップN+1:
-  a2e_result = await next_a2e_task  ← 事前計算済み、待ち時間なし
-  → _emit_collected_shop(audio_chunks, transcript, shop_number, a2e_result)
-```
-
-**`_precompute_a2e_expressions`の特徴**:
-- インスタンス変数（`_a2e_chunk_index`等）に触れない（並行安全）
-- フロントへのemitも行わない（純粋な計算+API呼び出し）
-- 戻り値: `{'expressions': [...], 'expression_names': [...], 'frame_rate': 30}`
-
-**コード位置**: `live_api_handler.py` `_collect_shop_audio()`、`_emit_collected_shop()`、`_precompute_a2e_expressions()`
+**コード位置**: `live_api_handler.py` L1029-1051 `_emit_collected_shop()`
 
 ### 3.4 キャッシュ音声: A2E先行方式（`_emit_cached_audio`）
 
-**方式**: A2E先行（3.2と同じ）
+**方式**: A2E先行（3.3と同じ）
 
 ```
 live_expression_reset → resetForNewSegment()
@@ -188,7 +178,7 @@ live_audio × N chunks → 再生開始
 
 **コード位置**: `live_api_handler.py` L1116-1146 `_emit_cached_audio()`
 
-**現在の用途**: 場繋ぎ音声（bridge「お待たせしました…」等）の再生に使用。`_describe_shops_via_live()`内で場繋ぎとして呼ばれる。please_waitはコメントアウト中（A2Eバッファ衝突切り分け）。
+**現在の状態**: L729-737でコメントアウト（切り分けテスト用に無効化中）
 
 ---
 
@@ -237,63 +227,39 @@ socketio.emit                      core-controller.ts L305:
 
 | タイミング | 信号 | コード位置 |
 |-----------|------|-----------|
-| 通常会話のターン完了 | `turn_complete` | `_receive_and_forward()` |
-| ユーザー割り込み | `interrupted` | `_receive_and_forward()` |
-| キャッシュ音声（場繋ぎ等）の前 | `live_expression_reset` | `_emit_cached_audio()` |
-| 各ショップ再生の前 | `live_expression_reset` | `_emit_collected_shop()` |
-| ショップ検索開始時の初期リセット | `live_expression_reset` | `_describe_shops_via_live()` |
+| 通常会話のターン完了 | `turn_complete` | L650-663 |
+| ユーザー割り込み | `interrupted` | L666-673 |
+| キャッシュ音声の前 | `live_expression_reset` | `_emit_cached_audio()` L1130 |
+| 1軒目ストリーミングの前 | `live_expression_reset` | `_describe_shops_via_live()` L882 |
+| 2軒目以降 collected の前 | `live_expression_reset` | `_emit_collected_shop()` L1038 |
 
 ---
 
 ## 5. ショップ検索フロー全体のタイムライン
 
-### 5.1 案A: enrich並行方式（`_handle_shop_search`）
-
 ```
 LLM発話 → tool_call: search_shops
   ↓
-_handle_shop_search():
-  ├── 1. callbackでLLM JSON生成（enrichなし）→ raw_shops取得
-  ├── 2. ★ raw_shopsで即座にTTS並行生成を開始（enrich前）
-  │     ├── ショップ1を先行開始（LiveAPI同時接続の競合回避）
-  │     └── 2秒後にショップ2-5を開始（スタガー）
-  ├── 3. ★ enrichをTTS生成と並行でrun_in_executor実行
-  │     └── enrichで除外された店のTTSタスクをフィルタリング
-  ├── 4. enrich完了 → shop_search_result送信（ショップカード表示）
-  └── 5. _describe_shops_via_live(shops, pre_generated_tasks=all_tts_tasks)
-```
-
-**ポイント**: enrichに5-15秒かかる間にTTS生成（3-5秒）が完了する。ショップカード表示時点でTTS生成済みのため、即座に読み上げ開始可能。
-
-### 5.2 全ショップ統一再生（`_describe_shops_via_live`）
-
-```
-_describe_shops_via_live(shops, pre_generated_tasks):
-  ├── TTSタスク取得（事前生成済み or ここで並行生成開始）
-  ├── A2Eリセット（_a2e_chunk_index = 0, _a2e_audio_buffer クリア）
-  │
-  ├── 場繋ぎ: bridge再生（A2E先行方式）
-  │     └── 「お待たせしました。それではお薦めのお店をご紹介します。」
-  │
-  ├── 場繋ぎ再生中に1軒目のcollect完了を待ち + A2E事前計算
-  │     └── next_a2e_task = asyncio.create_task(_precompute_a2e_expressions(...))
-  │
-  ├── 場繋ぎ再生完了待ち
-  │
-  └── 全ショップ(1-N)を順次再生:
-        ├── a2e_result = await next_a2e_task  ← 事前計算済み
-        ├── _emit_collected_shop(audio_chunks, transcript, shop_number, a2e_result)
-        ├── sleep(audio_duration)  ← 音声再生完了待ち
-        └── 再生待ち中に次ショップのA2E事前計算を先行開始
+shop_search_start送信 (L725)
   ↓
-会話履歴に追加
-needs_reconnect = True → 通常会話に復帰
+[キャッシュ音声は現在無効化 L729-737]
+  ↓
+REST API検索 → shop_search_result送信 (L797)
+  ↓
+_describe_shops_via_live() (L860):
+  ├── 2軒目以降の並行生成をasyncio.create_task (L876-879)
+  ├── live_expression_reset (L882) ← 1軒目前のリセット
+  ├── _a2e_chunk_index = 0, _a2e_audio_buffer クリア (L883-884)
+  ├── _stream_single_shop() (L887) ← 1軒目ストリーミング
+  │     └── _receive_shop_description() ← インターリーブ方式
+  ├── sleep(1軒目の音声再生時間) (L890-893)
+  └── 2軒目以降を順次再生 (L896-909):
+        ├── _emit_collected_shop() ← A2E先行方式
+        └── sleep(音声再生時間) ← 各ショップ間
+  ↓
+会話履歴に追加 (L912-913)
+needs_reconnect = True → 通常会話に復帰 (L915)
 ```
-
-**全ショップ統一の利点**:
-- 全ショップで同品質のA2Eリップシンク（一括A2E処理）
-- A2E事前計算のパイプライン化でHTTP待ち時間を隠蔽
-- `_precompute_a2e_expressions`はインスタンス変数に触れないため並行安全
 
 ---
 
@@ -364,68 +330,16 @@ GaussianSplatRenderer コールバック:
 
 ## 9. 現在の残課題
 
-### 9.1 please_waitキャッシュ音声の再有効化
+### 9.1 キャッシュ音声の再有効化
 
-`_describe_shops_via_live()`内でplease_wait（「只今、お店の情報を確認中です。もう少々お待ち下さい」）がコメントアウト中。A2Eバッファ衝突の切り分けテスト用に無効化されている。bridge + please_waitの2段連続再生で場繋ぎ時間を約8-9秒に延長可能。
+L729-737でコメントアウト中。A2Eバッファ汚染の切り分けテスト用に無効化されている。
+A2E先行方式（`_emit_cached_audio`）が正常動作すれば、コメントアウトを解除して再有効化できる。
 
-### 9.2 通常会話（`_receive_and_forward`）のA2E方式をcollect方式に変更
+### 9.2 ショップ間のsleep値の最適化
 
-現在の通常会話パス（Section 3.1）はインターリーブ方式（LiveAPIから届く0.1秒チャンクを即座にA2Eへ逐次送信）で動作しているが、ショップ説明で実証済みのcollect方式（音声を塊で蓄積してからA2Eに一括送信）に変更する。
-
-#### 9.2.1 変更の背景: インターリーブ方式の3つの構造的弱点
-
-**（1）モデルの前後参照（コンテキスト）の欠如**
-
-A2E（Wav2Vec）は、ある瞬間の音だけでなく**前後の音の流れ（文脈）**を見て口の形を決定する。
-
-| パス | 挙動 |
-|------|------|
-| ショップ説明collect方式（成功） | 文章全体を渡すため、モデルは「言葉の始まりから終わりまで」を把握し、滑らかな表情を生成 |
-| 通常会話0.1秒チャンク | 「おはよ…」の「お」だけでは「おはよう」か「おやすみ」か判断不能。自信がないため「口をあまり動かさない（もごもご）」を返す |
-
-**（2）時計のズレ（ドリフト）の蓄積**
-
-| パス | 挙動 |
-|------|------|
-| ショップ説明collect方式（成功） | 1ショップの再生ごとに時計をリセット。多少ズレても数秒で再生完了するため問題にならない |
-| 通常会話インターリーブ | 最初の発話から最後まで同じ時計（`performance.now`）を使い続ける。1チャンクごとに数ミリ秒ずつ発生する推論待ち時間やネットワーク揺らぎが雪だるま式に蓄積し、**「音はもう終わったのに、計算上の時計だけが未来を走っている」**状態になりうる |
-
-**（3）チャンク繋ぎ目の不連続性**
-
-| パス | 挙動 |
-|------|------|
-| ショップ説明collect方式（成功） | 繋ぎ目がない。1つの連続した音声として処理 |
-| 通常会話0.1秒チャンク | 0.1秒ごとに推論結果を繋げている。カクツキや口閉じ固定の原因になりうる |
-
-#### 9.2.2 変更方針: 「ショップ説明の成功ロジック」を通常会話に逆輸入する
-
-**核心**: Gemini LiveAPIから流れてくる細かな音声は**そのまま再生**しつつ、A2E（表情）の処理だけを、ショップ説明と同じ**意味のある塊（セグメント）**単位にまとめる。
-
-```
-変更前（インターリーブ）:
-  LiveAPI → 0.1秒チャンク到着
-    ├── live_audio emit → フロント再生（即座）
-    └── _buffer_for_a2e → 閾値到達 → A2E送信 → live_expression emit
-    ↕ 繰り返し（turn_completeまで）
-
-変更後（collect方式）:
-  LiveAPI → 0.1秒チャンク到着
-    ├── live_audio emit → フロント再生（即座。ここは変更なし）
-    └── PCMバッファに蓄積（A2Eには送信しない）
-  ↓ turn_complete到着
-  全PCM結合 → _precompute_a2e_expressions（一括A2E処理）
-  → live_expression emit（全フレーム一括）
-```
-
-**重要な設計原則**:
-1. **音声再生は変更しない** — `live_audio`はLiveAPIからの到着順にそのまま即座に再生し続ける
-2. **A2Eへの投入単位だけを変更** — 0.1秒逐次送信から、turn単位の一括送信に変更
-3. **同期基準の変更** — ターン単位でリセットされるため、ドリフト蓄積が発生しない
-
-### 9.3 ショップ間のsleep値の最適化
-
-`_describe_shops_via_live()`内:
-- 各ショップ再生待ち: `len(all_pcm) / 48000 + 0.3` 秒
+`_describe_shops_via_live()` L890-907:
+- 1軒目再生待ち: `_last_stream_pcm_bytes / 48000` 秒
+- 2軒目以降再生待ち: `len(all_pcm) / 48000` 秒
 
 これらのsleep値は「前セグメントの音声が再生し終わるまで待つ」ための概算値。
 音声再生とA2Eフレーム消費が完全に同期していれば、次セグメントの `live_expression_reset` で安全にリセットできるため、厳密なsleep値は不要。
