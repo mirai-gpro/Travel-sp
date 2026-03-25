@@ -781,15 +781,14 @@ class LiveAPISession:
             )
             all_tts_tasks.append(task1)
             logger.info(f"[ShopSearch] ★ ショップ1のTTS生成を先行開始")
-            # 2秒後にショップ2-5を開始
+            # ショップ2-5はタスク内部で6秒遅延後にLiveAPI接続（メインフローはブロックしない）
+            for i in range(1, total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(tts_shops[i], i + 1, total, delay=6)
+                )
+                all_tts_tasks.append(task)
             if total > 1:
-                await asyncio.sleep(2)
-                for i in range(1, total):
-                    task = asyncio.create_task(
-                        self._collect_shop_audio(tts_shops[i], i + 1, total)
-                    )
-                    all_tts_tasks.append(task)
-                logger.info(f"[ShopSearch] ★ ショップ2-{total}のTTS生成を開始（2秒遅延）")
+                logger.info(f"[ShopSearch] ★ ショップ2-{total}のTTSタスク作成（各タスク内で6秒遅延）")
 
             # 3. ★ enrichをTTS生成と並行実行
             from api_integrations import enrich_shops_with_photos
