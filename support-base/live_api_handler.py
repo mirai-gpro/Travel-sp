@@ -770,7 +770,24 @@ class LiveAPISession:
             response_text = shop_data.get('response', '')
             area = shop_data.get('area', '')
 
-            # 2. enrich実行
+            # 2. ★ TTS並行生成を即開始（enrich前のraw_shopsで）
+            import copy
+            tts_shops = copy.deepcopy(raw_shops)
+            total = len(tts_shops)
+            all_tts_tasks = []
+            task1 = asyncio.create_task(
+                self._collect_shop_audio(tts_shops[0], 1, total)
+            )
+            all_tts_tasks.append(task1)
+            if total > 1:
+                await asyncio.sleep(2)
+                for i in range(1, total):
+                    task = asyncio.create_task(
+                        self._collect_shop_audio(tts_shops[i], i + 1, total)
+                    )
+                    all_tts_tasks.append(task)
+
+            # 3. enrich実行（TTS生成と並行）
             from api_integrations import enrich_shops_with_photos
             enriched = await loop.run_in_executor(
                 None, enrich_shops_with_photos, raw_shops, area, self.language
@@ -778,7 +795,7 @@ class LiveAPISession:
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
 
-            # 3. ショップカードデータをブラウザに送信
+            # 4. ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
@@ -786,8 +803,8 @@ class LiveAPISession:
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
             await asyncio.sleep(0.3)
 
-            # 4. TTS再生（ショップカード提示後にTTS生成開始）
-            await self._describe_shops_via_live(shops)
+            # 5. TTS再生（生成済みタスクを渡す）
+            await self._describe_shops_via_live(shops, pre_generated_tasks=all_tts_tasks)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -834,7 +851,7 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    async def _describe_shops_via_live(self, shops: list):
+    async def _describe_shops_via_live(self, shops: list, pre_generated_tasks: list = None):
         """
         ショップ説明をLiveAPIで読み上げ（案A: enrich並行方式対応）
 
