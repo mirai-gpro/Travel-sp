@@ -849,12 +849,18 @@ class LiveAPISession:
         if total == 0:
             return
 
-        # ── TTS生成: ショップ1のみ先行開始 ──
-        task1 = asyncio.create_task(
-            self._collect_shop_audio(shops[0], 1, total)
-        )
-        all_tasks = [task1]
-        logger.info(f"[ShopDesc] ショップ1のTTS生成開始")
+        # ── TTS生成: 全ショップ一括開始（事前生成済みならそれを使う）──
+        if pre_generated_tasks:
+            all_tasks = pre_generated_tasks
+            logger.info(f"[ShopDesc] 事前生成済みTTSタスク {len(all_tasks)}件を使用")
+        else:
+            all_tasks = []
+            for i in range(total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(shops[i], i + 1, total)
+                )
+                all_tasks.append(task)
+            logger.info(f"[ShopDesc] 全{total}件のTTS生成を一括開始")
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
@@ -885,21 +891,13 @@ class LiveAPISession:
         #     total_bridge_duration += dur
         #     logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
 
-        # ── ショップ1のcollect完了を待つ + A2E事前計算 ──
+        # ── 場繋ぎ再生中に1軒目のcollect完了を待つ + A2E事前計算 ──
         next_a2e_task = None
         audio_chunks_1, transcript_1 = await all_tasks[0]
-        logger.info(f"[ShopDesc] ショップ1生成完了 → 2軒目以降のTTS生成開始")
         if audio_chunks_1:
             next_a2e_task = asyncio.create_task(
                 self._precompute_a2e_expressions(b''.join(audio_chunks_1))
             )
-
-        # ── ショップ1完了後に2軒目以降のTTS生成を開始 ──
-        for i in range(1, total):
-            task = asyncio.create_task(
-                self._collect_shop_audio(shops[i], i + 1, total)
-            )
-            all_tasks.append(task)
 
         # please_wait再生完了を待つ
         elapsed = time.time() - bridge_start
@@ -1026,7 +1024,7 @@ class LiveAPISession:
             model=LIVE_API_MODEL,
             config=config
         ) as session:
-            trigger_text = f"{shop_number}軒目のお店の説明を読み上げてください。"
+            trigger_text = f"ショップカードとしてチャット画面に表示済みの{shop_number}軒目のお店の説明を、そのまま読み上げてください。"
             await session.send_client_content(
                 turns=types.Content(
                     role="user",
