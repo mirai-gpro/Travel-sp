@@ -770,27 +770,7 @@ class LiveAPISession:
             response_text = shop_data.get('response', '')
             area = shop_data.get('area', '')
 
-            # 2. ★ TTS並行生成を即開始（enrich前のraw_shopsで）
-            import copy
-            tts_shops = copy.deepcopy(raw_shops)
-            total = len(tts_shops)
-            all_tts_tasks = []
-            # ショップ1を先行開始（LiveAPI同時接続の競合回避）
-            task1 = asyncio.create_task(
-                self._collect_shop_audio(tts_shops[0], 1, total)
-            )
-            all_tts_tasks.append(task1)
-            logger.info(f"[ShopSearch] ★ ショップ1のTTS生成を先行開始")
-            # ショップ2-5はタスク内部で6秒遅延後にLiveAPI接続（メインフローはブロックしない）
-            for i in range(1, total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(tts_shops[i], i + 1, total, delay=6)
-                )
-                all_tts_tasks.append(task)
-            if total > 1:
-                logger.info(f"[ShopSearch] ★ ショップ2-{total}のTTSタスク作成（各タスク内で6秒遅延）")
-
-            # 3. ★ enrichをTTS生成と並行実行
+            # 2. enrich実行
             from api_integrations import enrich_shops_with_photos
             enriched = await loop.run_in_executor(
                 None, enrich_shops_with_photos, raw_shops, area, self.language
@@ -798,17 +778,7 @@ class LiveAPISession:
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
 
-            # 3.5. enrichで除外された店のTTSタスクをフィルタリング
-            # ※ raw_shopsはenrichに参照渡しされるため、生存した店にはplace_idが付与される
-            if len(all_tts_tasks) != len(shops):
-                filtered_tasks = []
-                for i, rs in enumerate(raw_shops):
-                    if rs.get('place_id'):
-                        filtered_tasks.append(all_tts_tasks[i])
-                all_tts_tasks = filtered_tasks
-                logger.info(f"[ShopSearch] TTSタスクをフィルタリング: {len(all_tts_tasks)}件に絞り込み")
-
-            # 4. ショップカードデータをブラウザに送信
+            # 3. ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
@@ -816,8 +786,8 @@ class LiveAPISession:
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
             await asyncio.sleep(0.3)
 
-            # 5. TTS再生（生成済みタスクを渡す）
-            await self._describe_shops_via_live(shops, pre_generated_tasks=all_tts_tasks)
+            # 4. TTS再生（ショップカード提示後にTTS生成開始）
+            await self._describe_shops_via_live(shops)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -864,7 +834,7 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    async def _describe_shops_via_live(self, shops: list, pre_generated_tasks: list = None):
+    async def _describe_shops_via_live(self, shops: list):
         """
         ショップ説明をLiveAPIで読み上げ（案A: enrich並行方式対応）
 
@@ -879,17 +849,12 @@ class LiveAPISession:
         if total == 0:
             return
 
-        # ── TTS生成タスク: 事前生成済みならそれを使う、なければここで開始 ──
-        if pre_generated_tasks:
-            all_tasks = pre_generated_tasks
-            logger.info(f"[ShopDesc] 事前生成済みTTSタスク {len(all_tasks)}件を使用")
-        else:
-            all_tasks = []
-            for i in range(total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(shops[i], i + 1, total, delay=0 if i == 0 else 3)
-                )
-                all_tasks.append(task)
+        # ── TTS生成: ショップ1のみ先行開始 ──
+        task1 = asyncio.create_task(
+            self._collect_shop_audio(shops[0], 1, total)
+        )
+        all_tasks = [task1]
+        logger.info(f"[ShopDesc] ショップ1のTTS生成開始")
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
@@ -920,13 +885,21 @@ class LiveAPISession:
         #     total_bridge_duration += dur
         #     logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
 
-        # ── 場繋ぎ再生中に1軒目のcollect完了を待つ + A2E事前計算 ──
+        # ── ショップ1のcollect完了を待つ + A2E事前計算 ──
         next_a2e_task = None
         audio_chunks_1, transcript_1 = await all_tasks[0]
+        logger.info(f"[ShopDesc] ショップ1生成完了 → 2軒目以降のTTS生成開始")
         if audio_chunks_1:
             next_a2e_task = asyncio.create_task(
                 self._precompute_a2e_expressions(b''.join(audio_chunks_1))
             )
+
+        # ── ショップ1完了後に2軒目以降のTTS生成を開始 ──
+        for i in range(1, total):
+            task = asyncio.create_task(
+                self._collect_shop_audio(shops[i], i + 1, total)
+            )
+            all_tasks.append(task)
 
         # please_wait再生完了を待つ
         elapsed = time.time() - bridge_start
