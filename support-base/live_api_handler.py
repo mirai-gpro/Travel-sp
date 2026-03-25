@@ -687,8 +687,8 @@ class LiveAPISession:
                 searching_task = asyncio.ensure_future(asyncio.sleep(0))
                 please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
 
-                # ショップ検索を実行
-                await self._handle_shop_search(user_request)
+                # ショップ検索を実行（既存セッションを渡して1軒目の読み上げに使用）
+                await self._handle_shop_search(user_request, session)
 
                 # 検索完了 → 未再生のタスクをキャンセル
                 for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
@@ -732,16 +732,15 @@ class LiveAPISession:
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
-    async def _handle_shop_search(self, user_request: str):
+    async def _handle_shop_search(self, user_request: str, session=None):
         """
-        ショップ検索を実行し、結果をブラウザに送信する（案A: enrich並行方式）
+        ショップ検索を実行し、結果をブラウザに送信する
 
         【設計】
         - callbackでLLM JSON生成のみ（enrichなし）→ raw_shopsを取得
-        - raw_shopsで即座にTTS並行生成を開始
-        - enrichをTTS生成と並行でrun_in_executor実行
+        - enrichをrun_in_executor実行
         - enrich完了後にショップカードをブラウザに送信
-        - TTS再生（生成済みタスクを_describe_shops_via_liveに渡す）
+        - TTS再生（1軒目は既存session、2〜5軒目は新規接続）
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
@@ -786,8 +785,8 @@ class LiveAPISession:
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
             await asyncio.sleep(0.3)
 
-            # 4. TTS再生（ショップカード提示後にTTS生成開始）
-            await self._describe_shops_via_live(shops)
+            # 4. TTS再生（1軒目は既存session、2〜5軒目は新規接続）
+            await self._describe_shops_via_live(shops, session=session)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -834,13 +833,13 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    async def _describe_shops_via_live(self, shops: list):
+    async def _describe_shops_via_live(self, shops: list, session=None):
         """
-        ショップ説明をLiveAPIで読み上げ（1軒目ストリーミング → 2〜5軒目並行方式）
+        ショップ説明をLiveAPIで読み上げ（1軒目既存セッション → 2〜5軒目新規接続方式）
 
         【フロー】
-        Phase 1: 場繋ぎ → 1軒目をストリーミング再生（チャンク到着即再生）
-        Phase 2: 1軒目再生中に2〜5軒目を一括生成開始（再生待ち中に接続+生成が進行）
+        Phase 1: 場繋ぎ → 1軒目を既存セッション上でストリーミング（接続コストゼロ）
+        Phase 2: 1軒目再生中に2〜5軒目を新規接続で一括生成開始
         Phase 3: 2軒目以降を順次 await → A2E → emit
         """
         total = len(shops)
@@ -868,15 +867,36 @@ class LiveAPISession:
         wait1 = max(total_bridge_duration - elapsed + 0.3, 0.3)
         await asyncio.sleep(wait1)
 
-        # ── Phase 1: 1軒目をストリーミング再生（チャンク到着即再生）──
-        logger.info(f"[ShopDesc] 1軒目ストリーミング開始")
-        await self._stream_single_shop(shops[0], 1, total)
+        # ── Phase 1: 1軒目を既存セッション上で読み上げ（接続コストゼロ）──
+        if session:
+            shop_context = self._format_shop_for_prompt(shops[0], 1, total)
+            read_text = (
+                f"次のお店の情報を、自然な話し言葉で紹介してください。3〜5文程度で、"
+                f"店名、ジャンル、エリア、特徴、価格帯を含めてください。"
+                f"マークダウン記法は使わないでください。「1軒目は」から始めてください。\n\n"
+                f"{shop_context}"
+            )
+            logger.info(f"[ShopDesc] 1軒目: 既存セッションで読み上げ開始")
+            self._last_stream_pcm_bytes = 0
+            self._stream_start_time = None
+            await session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text=read_text)]
+                ),
+                turn_complete=True
+            )
+            await self._receive_shop_description(session, 1)
+        else:
+            # sessionがない場合はフォールバック（新規接続ストリーミング）
+            logger.info(f"[ShopDesc] 1軒目: セッションなし、新規接続ストリーミング")
+            await self._stream_single_shop(shops[0], 1, total)
 
         # 1軒目の再生時間を算出（ストリーミング送信済みバイト数から）
         audio_duration_1 = self._last_stream_pcm_bytes / 48000 if self._last_stream_pcm_bytes else 0
         stream_elapsed = time.time() - self._stream_start_time if self._stream_start_time else 0
         remaining_play_1 = max(audio_duration_1 - stream_elapsed + 0.3, 0.3)
-        logger.info(f"[ShopDesc] 1軒目ストリーミング完了: 音声{audio_duration_1:.1f}秒, 経過{stream_elapsed:.1f}秒, 残再生{remaining_play_1:.1f}秒")
+        logger.info(f"[ShopDesc] 1軒目完了: 音声{audio_duration_1:.1f}秒, 経過{stream_elapsed:.1f}秒, 残再生{remaining_play_1:.1f}秒")
 
         # ── Phase 2: 1軒目完了直後に2〜5軒目を一括生成開始 ──
         remaining_tasks = []
