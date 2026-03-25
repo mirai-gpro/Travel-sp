@@ -31,7 +31,7 @@ if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
 A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
 A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
-A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）品質優先
+A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
@@ -332,6 +332,8 @@ class LiveAPISession:
         self._a2e_transcript_buffer = ""            # 句読点検出用
         self._a2e_chunk_index = 0                   # expression同期用チャンク識別子
         self._a2e_http_client = httpx.AsyncClient(timeout=10.0)
+        self._a2e_send_queue: asyncio.Queue = asyncio.Queue()
+        self._a2e_worker_task: asyncio.Task | None = None
 
         # 非同期キュー
         self.audio_queue_to_gemini = None
@@ -426,6 +428,7 @@ class LiveAPISession:
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
         self.is_running = True
+        self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
 
         try:
             while self.is_running:
@@ -505,6 +508,9 @@ class LiveAPISession:
         except asyncio.CancelledError:
             pass
         finally:
+            if self._a2e_worker_task:
+                self._a2e_worker_task.cancel()
+                self._a2e_worker_task = None
             self.is_running = False
             logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
@@ -594,6 +600,7 @@ class LiveAPISession:
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
                         # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                         await self._flush_a2e_buffer(force=True, is_final=True)
+                        await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
@@ -608,8 +615,8 @@ class LiveAPISession:
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
-                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
-                        await self._flush_a2e_buffer(force=True, is_final=True)
+                        # ★ A2E: 割り込み時はキュークリア（未送信チャンク破棄）
+                        self._clear_a2e_queue()
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self.ai_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
@@ -637,8 +644,8 @@ class LiveAPISession:
                             self.socketio.emit('ai_transcript',
                                                {'text': text},
                                                room=self.client_sid)
-                            # ★ A2E: 句読点検出フラッシュは廃止（チャンク順序逆転防止）
-                            # self._on_output_transcription(text)
+                            # ★ A2E: 句読点検出フラッシュ（キュー直列化で順序保証済み）
+                            self._on_output_transcription(text)
 
                     # 6. 音声データ
                     if sc.model_turn:
@@ -887,6 +894,7 @@ class LiveAPISession:
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
+        self._clear_a2e_queue()
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
 
@@ -1134,6 +1142,7 @@ class LiveAPISession:
                 if hasattr(sc, 'turn_complete') and sc.turn_complete:
                     # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                     await self._flush_a2e_buffer(force=True, is_final=True)
+                    await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                     self._a2e_chunk_index = 0  # 次ターン用にリセット
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
@@ -1303,14 +1312,34 @@ class LiveAPISession:
             logger.error(f"[A2E] 事前計算エラー: {e}")
         return None
 
+    async def _a2e_send_worker(self):
+        """キューからチャンクを取り出し、直列でA2Eに送信（順序保証）"""
+        try:
+            while True:
+                pcm_data, chunk_index, is_final = await self._a2e_send_queue.get()
+                try:
+                    await self._send_to_a2e(pcm_data, chunk_index, is_final=is_final)
+                except Exception as e:
+                    logger.error(f"[A2E] worker送信エラー: {e}")
+                finally:
+                    self._a2e_send_queue.task_done()
+        except asyncio.CancelledError:
+            pass
+
+    def _clear_a2e_queue(self):
+        """A2E送信キューをクリア（割り込み・リセット時）"""
+        while not self._a2e_send_queue.empty():
+            try:
+                self._a2e_send_queue.get_nowait()
+                self._a2e_send_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        self._a2e_audio_buffer = bytearray()
+
     async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False):
-        """最低バイト数チェック後、非同期でA2E送信（仕様書08 セクション3.3）"""
+        """最低バイト数チェック後、キューに投入してA2E直列送信（仕様書08 セクション3.3）"""
         if len(self._a2e_audio_buffer) == 0:
             return
-
-        # ★ 最終チャンク2秒遅延: 前チャンクのA2Eレスポンス到着を待ち、順序逆転を防止
-        if is_final and self._a2e_chunk_index > 0:
-            await asyncio.sleep(2.0)
 
         # force=Falseの場合、最低バッファサイズをチェック
         if not force and len(self._a2e_audio_buffer) < A2E_MIN_BUFFER_BYTES:
@@ -1322,11 +1351,8 @@ class LiveAPISession:
         chunk_index = self._a2e_chunk_index
         self._a2e_chunk_index += 1
 
-        # 非同期でA2Eに送信
-        try:
-            await self._send_to_a2e(pcm_data, chunk_index, is_final=is_final)
-        except Exception as e:
-            logger.error(f"[A2E] フラッシュエラー: {e}")
+        # キューに投入（ワーカーが直列で送信）
+        await self._a2e_send_queue.put((pcm_data, chunk_index, is_final))
 
     async def _send_to_a2e(self, pcm_data: bytes, chunk_index: int, is_final: bool = False):
         """リサンプリング（24→16kHz）後、A2Eサービスに送信（仕様書08 セクション3.4）
