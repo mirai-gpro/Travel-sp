@@ -689,14 +689,13 @@ class LiveAPISession:
 
                 # ★ tool_responseを先に返す（デッドロック回避）
                 # LiveAPIはtool_responseを受け取るまで次のsend_client_contentに応答しない
-                tool_response = types.LiveClientToolResponse(
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
                 logger.info(f"[LiveAPI] tool_response送信完了（ショップ検索前）")
 
                 # ショップ検索を実行（既存セッションを渡して1軒目の読み上げに使用）
@@ -723,14 +722,13 @@ class LiveAPISession:
                         logger.error(f"[LiveAPI] プロファイル更新エラー: {e}")
 
                 # function responseを返す
-                tool_response = types.LiveClientToolResponse(
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "プロファイルを更新しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
