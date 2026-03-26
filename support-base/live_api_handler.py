@@ -877,7 +877,7 @@ class LiveAPISession:
 
         # ── 冒頭2文のTTS先行開始 ──
         loop = asyncio.get_event_loop()
-        head_tts_task = asyncio.create_task(
+        head_tts_task = asyncio.ensure_future(
             loop.run_in_executor(None, self._synthesize_speech, head_text)
         )
         logger.info(f"[ShopDesc] 1軒目冒頭TTS先行開始: '{head_text}'")
