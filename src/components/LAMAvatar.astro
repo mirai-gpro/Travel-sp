@@ -112,7 +112,10 @@ const {
 </style>
 
 <script define:vars={{ modelUrl }}>
-  window.__lamAvatarConfig = { modelUrl };
+  // localStorageに選択アバターのmodelUrlがあればそちらを優先
+  const mode = window.location.pathname.includes('lesson') ? 'lesson' : 'concierge';
+  const storedUrl = localStorage.getItem('selectedAvatarUrl_' + mode);
+  window.__lamAvatarConfig = { modelUrl: storedUrl || modelUrl };
 </script>
 
 <script>

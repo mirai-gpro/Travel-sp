@@ -2,6 +2,7 @@
 // LessonChat.astro - 会話レッスン・モードUI（Concierge.astroベースに移植）
 // アバター + A2Eリップシンク搭載、ショップ検索・予約機能を除外
 import LAMAvatar from './LAMAvatar.astro';
+import AvatarSelector from './AvatarSelector.astro';
 
 export interface Props {
   apiBaseUrl?: string;
@@ -88,6 +89,8 @@ const { apiBaseUrl = '' } = Astro.props;
     </button>
   </div>
 </div>
+
+<AvatarSelector />
 
 <style>
 /* 全体レイアウト */

@@ -1,0 +1,16 @@
+[
+  {
+    "id": "meruru",
+    "name": "メルル",
+    "modelUrl": "/avatar/meruru.zip",
+    "thumbnail": "/avatar/thumbs/meruru.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda"
+  },
+  {
+    "id": "elf",
+    "name": "エルフ",
+    "modelUrl": "/avatar/elf.zip",
+    "thumbnail": "/avatar/thumbs/elf.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda"
+  }
+]
