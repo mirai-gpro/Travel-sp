@@ -985,10 +985,7 @@ class LiveAPISession:
         is_last = (shop_number == total)
         shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
-        shop_instruction = self.system_prompt + f"""
-
-【現在のタスク：ショップ紹介】
-あなたは今、ユーザーに検索結果のお店を紹介しています。
+        shop_instruction = f"""あなたはお店を紹介するナレーターです。
 
 {shop_context}
 
@@ -1007,7 +1004,7 @@ class LiveAPISession:
 
         config = self._build_config()
         config["system_instruction"] = shop_instruction
-        config.pop("tools", None)
+        config["tools"] = []  # 明示的に空配列
 
         async with self.client.aio.live.connect(
             model=LIVE_API_MODEL,
