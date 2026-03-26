@@ -696,15 +696,14 @@ class LiveAPISession:
                         task.cancel()
                         logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
 
-                # function responseを返す（LiveAPI confirmed syntax）
-                tool_response = types.LiveClientToolResponse(
+                # function responseを返す（LiveAPI SDK: キーワード引数必須）
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
             elif fc.name == "update_user_profile":
                 # ユーザー名登録・変更をDBに永続化
                 updates = fc.args or {}
@@ -720,15 +719,14 @@ class LiveAPISession:
                     except Exception as e:
                         logger.error(f"[LiveAPI] プロファイル更新エラー: {e}")
 
-                # function responseを返す
-                tool_response = types.LiveClientToolResponse(
+                # function responseを返す（LiveAPI SDK: キーワード引数必須）
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "プロファイルを更新しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
@@ -849,18 +847,14 @@ class LiveAPISession:
         if total == 0:
             return
 
-        # ── TTS生成: 全ショップ一括開始（事前生成済みならそれを使う）──
-        if pre_generated_tasks:
-            all_tasks = pre_generated_tasks
-            logger.info(f"[ShopDesc] 事前生成済みTTSタスク {len(all_tasks)}件を使用")
-        else:
-            all_tasks = []
-            for i in range(total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(shops[i], i + 1, total)
-                )
-                all_tasks.append(task)
-            logger.info(f"[ShopDesc] 全{total}件のTTS生成を一括開始")
+        # ── TTS生成: 全ショップ一括開始 ──
+        all_tasks = []
+        for i in range(total):
+            task = asyncio.create_task(
+                self._collect_shop_audio(shops[i], i + 1, total)
+            )
+            all_tasks.append(task)
+        logger.info(f"[ShopDesc] 全{total}件のTTS生成を一括開始")
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
