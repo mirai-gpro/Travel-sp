@@ -875,7 +875,18 @@ class LiveAPISession:
                         response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
-                logger.info(f"[ShopDesc] tool_response送信完了（send_client_content直前）")
+                logger.info(f"[ShopDesc] tool_response送信完了")
+
+                # ★ tool_responseに対するLLMの自動応答ターンを消費・破棄
+                # tool_responseを送ると、LLMが「検索結果を表示した」ことに反応して
+                # 自動的に喋り始めるため、turn_completeまで読み飛ばす
+                turn = session.receive()
+                async for response in turn:
+                    if response.server_content:
+                        sc = response.server_content
+                        if hasattr(sc, 'turn_complete') and sc.turn_complete:
+                            logger.info(f"[ShopDesc] tool_response自動応答ターン破棄完了")
+                            break
             logger.info(f"[ShopDesc] 1軒目: 既存セッションで読み上げ開始")
             self._last_stream_pcm_bytes = 0
             self._stream_start_time = None
