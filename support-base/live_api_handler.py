@@ -326,6 +326,7 @@ class LiveAPISession:
 
         # 再接続時のトリガーメッセージ（§7.1）
         self._resume_message = None
+        self._search_state = "HEARING"  # HEARING → CONFIRMING → SEARCHING（承認ターン判定用）
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -388,13 +389,10 @@ class LiveAPISession:
             },
         }
 
-        # モードに応じたfunction calling定義
-        if self.mode == 'lesson':
-            # lessonモードはショップ検索不要、プロファイル更新のみ
-            config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
-        else:
-            # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+        # 全モード共通: update_user_profileのみ
+        # conciergeのショップ検索はREST API判定方式に移行（search_shopsをtools定義から除去）
+        # → LiveAPIのtools判定負荷を削減し、音声ストリーミング安定化（A2Eリップシンク改善）
+        config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -613,6 +611,10 @@ class LiveAPISession:
                                                room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
 
+                        # 承認ターン判定（conciergeモードのみ）
+                        if self.mode == 'concierge' and self._search_state != "SEARCHING":
+                            await self._handle_search_state(session)
+
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
                         # ★ A2E: 割り込み時はキュークリア（未送信チャンク破棄）
@@ -689,7 +691,7 @@ class LiveAPISession:
 
                 # ショップ検索を実行（既存セッションを渡して1軒目の読み上げに使用）
                 # tool_responseはsend_client_content直前に送信（デッドロック回避+keepalive対策）
-                await self._handle_shop_search(user_request, session, fc)
+                await self._handle_shop_search(user_request, session)
 
                 # 検索完了 → 未再生のタスクをキャンセル
                 for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
@@ -722,7 +724,7 @@ class LiveAPISession:
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
-    async def _handle_shop_search(self, user_request: str, session=None, fc=None):
+    async def _handle_shop_search(self, user_request: str, session=None):
         """
         ショップ検索を実行し、結果をブラウザに送信する
 
@@ -776,7 +778,7 @@ class LiveAPISession:
             await asyncio.sleep(0.3)
 
             # 4. TTS再生（1軒目は既存session、2〜5軒目は新規接続）
-            await self._describe_shops_via_live(shops, session=session, fc=fc)
+            await self._describe_shops_via_live(shops, session=session)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -823,12 +825,90 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    async def _describe_shops_via_live(self, shops: list, session=None, fc=None):
+    async def _handle_search_state(self, session):
+        """承認ターン判定: 検索確認シグナル検出 → REST判定 → 検索実行"""
+        # 直近のAI発言を会話履歴から取得
+        last_ai_text = ""
+        for h in reversed(self.conversation_history):
+            if h['role'] == 'ai':
+                last_ai_text = h['text']
+                break
+
+        if self._search_state == "HEARING":
+            # AIが【検索確認】付きで確認質問した → CONFIRMING
+            if '【検索確認】' in last_ai_text:
+                self._search_state = "CONFIRMING"
+                logger.info(f"[SearchState] HEARING → CONFIRMING（確認質問検出）")
+
+        elif self._search_state == "CONFIRMING":
+            # ユーザーが応答した → REST APIで同意判定
+            logger.info(f"[SearchState] CONFIRMING → REST判定開始")
+            consent_result = await self._judge_search_consent()
+
+            if consent_result and consent_result.get('consent'):
+                self._search_state = "SEARCHING"
+                query = consent_result.get('query', '')
+                logger.info(f"[SearchState] ★検索同意確定: query='{query}'")
+
+                # 検索開始をブラウザに通知
+                self.socketio.emit('shop_search_start', {},
+                                   room=self.client_sid)
+
+                # ショップ検索を実行（既存セッションを渡して1軒目読み上げに使用）
+                await self._handle_shop_search(query, session)
+
+                # 検索完了 → 状態リセット
+                self._search_state = "HEARING"
+            else:
+                reason = consent_result.get('reason', '') if consent_result else 'REST判定エラー'
+                logger.info(f"[SearchState] 検索未同意 → HEARING（{reason}）")
+                self._search_state = "HEARING"
+
+    async def _judge_search_consent(self):
+        """REST APIで検索同意を判定（承認ターンのみ呼ばれる）"""
+        recent_history = self.conversation_history[-6:]  # 直近3往復
+
+        history_text = ""
+        for h in recent_history:
+            role = "ユーザー" if h['role'] == 'user' else "AI"
+            history_text += f"{role}: {h['text']}\n"
+
+        prompt = f"""以下の会話を分析し、ユーザーがショップ検索の実行に同意したか判定してください。
+
+【判定基準】
+- AIが検索条件を提示し、ユーザーが同意（「はい」「お願い」「それで」「うん」等）→ 同意
+- ユーザーが条件を変更・追加した（「やっぱり中華で」「予算上げて」等）→ 未同意
+- ユーザーが拒否・保留した → 未同意
+
+【出力形式】JSONのみ（他のテキスト不要）
+同意の場合: {{"consent": true, "query": "検索条件をスペース区切りで"}}
+未同意の場合: {{"consent": false, "reason": "理由"}}
+
+【会話】
+{history_text}"""
+
+        try:
+            import google.generativeai as genai_legacy
+            model = genai_legacy.GenerativeModel('gemini-2.0-flash')
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, model.generate_content, prompt)
+            import json
+            text = response.text.strip()
+            if text.startswith('```'):
+                text = text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+            result = json.loads(text)
+            logger.info(f"[SearchState] REST判定結果: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"[SearchState] REST判定エラー: {e}")
+            return None
+
+    async def _describe_shops_via_live(self, shops: list, session=None):
         """
         ショップ説明をLiveAPIで読み上げ（1軒目既存セッション → 2〜5軒目新規接続方式）
 
         【フロー】
-        Phase 1: 場繋ぎ → tool_response → 1軒目を既存セッション上でストリーミング（接続コストゼロ）
+        Phase 1: 場繋ぎ → 1軒目を既存セッション上でストリーミング（接続コストゼロ）
         Phase 2: 1軒目再生中に2〜5軒目を新規接続で一括生成開始
         Phase 3: 2軒目以降を順次 await → A2E → emit
         """
@@ -866,21 +946,6 @@ class LiveAPISession:
                 f"マークダウン記法は使わないでください。「1軒目は」から始めてください。\n\n"
                 f"{shop_context}"
             )
-            # ★ tool_responseをsend_client_content直前に送信（デッドロック回避+keepalive対策）
-            if fc:
-                await session.send_tool_response(
-                    function_responses=[types.FunctionResponse(
-                        name=fc.name,
-                        id=fc.id,
-                        response={
-                            "result": "検索結果をショップカードとしてチャット画面に表示済み。"
-                                      "ユーザーはお店の読み上げ紹介を待っています。"
-                                      "このfunction responseに対しては何も発話しないでください。"
-                                      "次のユーザーメッセージでお店情報が送られるので、それを読み上げてください。"
-                        }
-                    )]
-                )
-                logger.info(f"[ShopDesc] tool_response送信完了（応答抑制指示付き）")
             logger.info(f"[ShopDesc] 1軒目: 既存セッションで読み上げ開始")
             self._last_stream_pcm_bytes = 0
             self._stream_start_time = None
@@ -891,7 +956,7 @@ class LiveAPISession:
                 ),
                 turn_complete=True
             )
-            await self._receive_shop_description(session, 1, skip_auto_response=bool(fc))
+            await self._receive_shop_description(session, 1)
         else:
             # sessionがない場合はフォールバック（新規接続ストリーミング）
             logger.info(f"[ShopDesc] 1軒目: セッションなし、新規接続ストリーミング")
