@@ -876,7 +876,7 @@ class LiveAPISession:
 
         # bridge再生完了を待つ
         elapsed = time.time() - bridge_start
-        wait1 = max(total_bridge_duration - elapsed + 1.5, 1.0)
+        wait1 = max(total_bridge_duration - elapsed + 0.7, 1.0)
         await asyncio.sleep(wait1)
 
         # ── 場繋ぎ中に1軒目TTS完了を待つ → A2E事前計算 ──
@@ -888,7 +888,7 @@ class LiveAPISession:
 
         # 場繋ぎ+A2E完了後の余白
         elapsed = time.time() - bridge_start
-        remaining_sleep = max(total_bridge_duration - elapsed + 1.5, 1.0)
+        remaining_sleep = max(total_bridge_duration - elapsed + 0.7, 1.0)
         logger.info(f"[ShopDesc] 場繋ぎ残り待ち: {remaining_sleep:.1f}秒 (経過{elapsed:.1f}秒)")
         await asyncio.sleep(remaining_sleep)
 
@@ -922,7 +922,7 @@ class LiveAPISession:
                         )
 
             await asyncio.gather(
-                asyncio.sleep(audio_duration_1 + 1.5),
+                asyncio.sleep(audio_duration_1 + 0.7),
                 _prepare_shop2()
             )
         else:
@@ -967,7 +967,7 @@ class LiveAPISession:
                                 )
 
                     await asyncio.gather(
-                        asyncio.sleep(audio_duration + 1.5),
+                        asyncio.sleep(audio_duration + 0.7),
                         _prepare_next(i + 1)
                     )
             except Exception as e:
