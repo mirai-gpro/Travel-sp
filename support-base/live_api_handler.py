@@ -229,7 +229,7 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
 
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
-    description="ユーザーの条件に基づいてレストランを検索する。呼び出しタイミングや条件はシステム指示に従うこと。user_requestには会話で確認した全条件を必ず含めること。",
+    description="レストランを検索する。",
     parameters=types.Schema(
         type="OBJECT",
         properties={
