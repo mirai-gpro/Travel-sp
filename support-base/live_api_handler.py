@@ -1287,44 +1287,62 @@ class LiveAPISession:
         self._a2e_chunk_index = 1
 
     async def _precompute_a2e_expressions(self, pcm_data: bytes) -> dict | None:
-        """A2E事前計算: リサンプリング＋HTTP POSTでexpressionデータを取得（emitしない）
+        """A2E事前計算: 分割送信でexpressionデータを取得（emitしない）
 
-        _collect_shop_audio() から呼ばれる。インスタンス変数（_a2e_chunk_index等）に
-        触れず、フロントエンドへのemitも行わない。純粋な計算＋API呼び出しのみ。
+        大きなPCMデータを5秒ごとのチャンクに分割して送信し、
+        全チャンクのframesを結合して返す。タイムアウトリスクを回避。
         """
         try:
+            # 24kHz PCM全体をリサンプル（24→16kHz）
             int16_array = np.frombuffer(pcm_data, dtype=np.int16)
             resampled = resample_poly(int16_array.astype(np.float32), up=2, down=3)
             int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
-            audio_b64 = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
+            resampled_bytes = int16_resampled.tobytes()
 
-            response = await self._a2e_http_client.post(
-                f"{A2E_SERVICE_URL}/api/audio2expression",
-                json={
-                    "audio_base64": audio_b64,
-                    "session_id": self.session_id,
-                    "audio_format": "pcm",
-                    "is_start": True,
-                    "is_final": True,
-                },
-                timeout=10.0
-            )
+            # 16kHz 16bit mono = 32000 bytes/秒 × 5秒 = 160000 bytes/チャンク
+            CHUNK_BYTES_16K = 160000
+            all_expressions = []
+            names = []
+            frame_rate = A2E_EXPRESSION_FPS
+            total_chunks = (len(resampled_bytes) + CHUNK_BYTES_16K - 1) // CHUNK_BYTES_16K
 
-            if response.status_code == 200:
-                result = response.json()
-                frames = result.get('frames', [])
-                names = result.get('names', [])
-                frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
-                if frames:
-                    expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
-                    logger.info(f"[A2E] 事前計算完了: {len(frames)} frames")
-                    return {
-                        'expressions': expressions,
-                        'expression_names': names,
-                        'frame_rate': frame_rate,
-                    }
-            else:
-                logger.warning(f"[A2E] 事前計算エラー: {response.status_code}")
+            for idx in range(total_chunks):
+                start = idx * CHUNK_BYTES_16K
+                end = min(start + CHUNK_BYTES_16K, len(resampled_bytes))
+                chunk = resampled_bytes[start:end]
+                audio_b64 = base64.b64encode(chunk).decode('utf-8')
+
+                response = await self._a2e_http_client.post(
+                    f"{A2E_SERVICE_URL}/api/audio2expression",
+                    json={
+                        "audio_base64": audio_b64,
+                        "session_id": self.session_id,
+                        "audio_format": "pcm",
+                        "is_start": idx == 0,
+                        "is_final": idx == total_chunks - 1,
+                    },
+                    timeout=10.0
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    frames = result.get('frames', [])
+                    if frames:
+                        expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
+                        all_expressions.extend(expressions)
+                    if idx == 0:
+                        names = result.get('names', [])
+                        frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
+                else:
+                    logger.warning(f"[A2E] 事前計算チャンク{idx}エラー: {response.status_code}")
+
+            if all_expressions:
+                logger.info(f"[A2E] 事前計算完了: {len(all_expressions)} frames ({total_chunks}チャンク)")
+                return {
+                    'expressions': all_expressions,
+                    'expression_names': names,
+                    'frame_rate': frame_rate,
+                }
         except Exception as e:
             logger.error(f"[A2E] 事前計算エラー: {e}")
         return None
