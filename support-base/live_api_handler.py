@@ -1054,7 +1054,7 @@ class LiveAPISession:
             model=LIVE_API_MODEL,
             config=config
         ) as session:
-            trigger_text = f"ショップカードとしてチャット画面に表示済みの{shop_number}軒目のお店の説明を、そのまま読み上げてください。"
+            trigger_text = f"上記のショップ情報をもとに、{shop_number}軒目のお店を自然な話し言葉で紹介してください。"
             await session.send_client_content(
                 turns=types.Content(
                     role="user",
