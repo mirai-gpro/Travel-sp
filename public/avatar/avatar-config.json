@@ -22,8 +22,8 @@
     "name": "みづき",
     "modelUrl": "/avatar/mizuki.zip",
     "thumbnail": "/avatar/thumbs/mizuki.png",
-    "voiceModel": "ja-JP-Chirp3-HD-Leda",
-    "liveVoice": "Leda",
+    "voiceModel": "ja-JP-Chirp3-HD-Despina",
+    "liveVoice": "Despina",
     "camera": { "posY": 1.73, "posZ": 0.4, "targetY": 1.62 }
   },
   {
