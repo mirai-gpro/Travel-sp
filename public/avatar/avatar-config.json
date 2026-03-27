@@ -35,6 +35,15 @@
     "liveVoice": "Despina",
     "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
   },
+    {
+    "id": "ryusei",
+    "name": "りゅうせい",
+    "modelUrl": "/avatar/ryusei.zip",
+    "thumbnail": "/avatar/thumbs/ryusei.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Enceladus",
+    "liveVoice": "Enceladus",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
   {
     "id": "okabe",
     "name": "オカベ",
