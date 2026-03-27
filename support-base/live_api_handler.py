@@ -1155,10 +1155,17 @@ class LiveAPISession:
         try:
             tts_client = texttospeech.TextToSpeechClient()
             voice_name = self.voice_model if self.voice_model else "ja-JP-Chirp3-HD-Leda"
-            lang_code = voice_name.rsplit('-', 1)[0].rsplit('-', 1)[0] if '-' in voice_name else "ja-JP"
-            # voice_nameからlanguage_codeを推定（例: ja-JP-Chirp3-HD-Leda → ja-JP）
+            # セッション言語に応じてvoice_nameの言語部分を差し替え
+            # 例: ja-JP-Chirp3-HD-Leda + language='en' → en-US-Chirp3-HD-Leda
+            lang_map = {'ja': 'ja-JP', 'en': 'en-US', 'zh': 'cmn-CN', 'ko': 'ko-KR'}
+            target_lang = lang_map.get(self.language, 'ja-JP')
             parts = voice_name.split('-')
-            lang_code = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else "ja-JP"
+            if len(parts) >= 2:
+                current_lang = f"{parts[0]}-{parts[1]}"
+                if current_lang != target_lang:
+                    voice_name = voice_name.replace(current_lang, target_lang, 1)
+                    logger.info(f"[TTS] 言語差し替え: {current_lang} → {target_lang}, voice={voice_name}")
+            lang_code = target_lang
             voice = texttospeech.VoiceSelectionParams(
                 language_code=lang_code,
                 name=voice_name
