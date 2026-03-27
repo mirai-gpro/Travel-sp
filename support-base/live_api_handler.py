@@ -906,15 +906,17 @@ class LiveAPISession:
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
 
-        # ── 場繋ぎ: bridge再生 ──
+        # ── 場繋ぎ: REST TTSで定型文を生成・再生（アバターの声と統一）──
+        bridge_text = "お待たせしました。それではおすすめのお店をご紹介します。"
         bridge_start = time.time()
         total_bridge_duration = 0.0
 
-        if _CACHED_BRIDGE_PCM:
-            await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
-            dur = len(_CACHED_BRIDGE_PCM) / 48000
+        bridge_pcm = await loop.run_in_executor(None, self._synthesize_speech, bridge_text)
+        if bridge_pcm:
+            await self._emit_cached_audio(bridge_pcm)
+            dur = len(bridge_pcm) / 48000
             total_bridge_duration += dur
-            logger.info(f"[ShopDesc] 場繋ぎ(bridge)再生: {dur:.1f}秒")
+            logger.info(f"[ShopDesc] 場繋ぎ(REST TTS)再生: {dur:.1f}秒")
 
         # bridge再生完了を待つ
         elapsed = time.time() - bridge_start
@@ -1164,6 +1166,7 @@ class LiveAPISession:
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.LINEAR16,
                 sample_rate_hertz=24000,
+                speaking_rate=1.4,
             )
             resp = tts_client.synthesize_speech(
                 input=texttospeech.SynthesisInput(text=text),
