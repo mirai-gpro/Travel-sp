@@ -36,7 +36,7 @@
     "name": "オカベ",
     "modelUrl": "/avatar/okabe.zip",
     "thumbnail": "/avatar/thumbs/okabe.png",
-    "voiceModel": "ja-JP-Chirp3-HD-Charon",
-    "liveVoice": "Charon"
+    "voiceModel": "ja-JP-Chirp3-HD-Algieba",
+    "liveVoice": "Algieba"
   }
 ]
