@@ -12,6 +12,20 @@
     "modelUrl": "/avatar/elf.zip",
     "thumbnail": "/avatar/thumbs/elf.png",
     "voiceModel": "ja-JP-Chirp3-HD-Leda"
+  },
+  {
+    "id": "gakki",
+    "name": "ガッキー",
+    "modelUrl": "/avatar/gakki.zip",
+    "thumbnail": "/avatar/thumbs/gakki.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda"
+  },
+  {
+    "id": "okabe",
+    "name": "オカベ",
+    "modelUrl": "/avatar/okabe.zip",
+    "thumbnail": "/avatar/thumbs/okabe.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda"
   }
     {
     "id": "gakki",
