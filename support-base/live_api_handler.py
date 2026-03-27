@@ -102,7 +102,7 @@ _generate_cached_audio()
 
 
 def build_system_instruction(mode: str, user_profile: dict = None,
-                             system_prompts: dict = None) -> str:
+                             system_prompts: dict = None, language: str = 'ja') -> str:
     """モードに応じたシステムインストラクションを組み立てる
     （03_prompt_modification_spec.md セクション7.1）
 
@@ -125,7 +125,7 @@ def build_system_instruction(mode: str, user_profile: dict = None,
             }
     """
     # GCSプロンプトからベーステキストを取得
-    lang = 'ja'
+    lang = language
     if system_prompts:
         base_prompt = system_prompts.get(mode, {}).get(lang, '')
     else:

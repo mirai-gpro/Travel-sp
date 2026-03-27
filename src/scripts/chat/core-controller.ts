@@ -178,8 +178,20 @@ export class CoreController {
     
     this.els.languageSelect?.addEventListener('change', () => {
       this.currentLanguage = this.els.languageSelect.value as any;
+      localStorage.setItem('selectedLanguage', this.currentLanguage);
       this.updateUILanguage();
+      // 言語変更時はセッションリロードしてバックエンドに反映
+      if (this.isLiveMode) {
+        window.location.reload();
+      }
     });
+
+    // localStorageから前回選択した言語を復元
+    const savedLang = localStorage.getItem('selectedLanguage');
+    if (savedLang && this.els.languageSelect) {
+      this.currentLanguage = savedLang as any;
+      this.els.languageSelect.value = savedLang;
+    }
 
     const floatingButtons = this.container.querySelector('.floating-buttons');
     this.els.userInput?.addEventListener('focus', () => {
