@@ -573,10 +573,12 @@ export class CoreController {
       await this.liveAudioManager.initialize(this.socket);
 
       // サーバーにLiveAPIセッション開始を通知
+      const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
       this.socket.emit('live_start', {
         session_id: this.sessionId,
         mode: this.currentMode,
-        language: this.currentLanguage
+        language: this.currentLanguage,
+        voice_model: voiceModel
       });
 
       this.isLiveMode = true;

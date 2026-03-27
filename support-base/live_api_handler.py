@@ -303,7 +303,8 @@ class LiveAPISession:
 
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
-                 shop_search_callback=None, user_id: str = None):
+                 shop_search_callback=None, user_id: str = None,
+                 voice_model: str = ''):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -311,6 +312,7 @@ class LiveAPISession:
         self.socketio = socketio
         self.client_sid = client_sid
         self._shop_search_callback = shop_search_callback  # v5 §5.5: ショップ検索用コールバック
+        self.voice_model = voice_model  # アバターに紐づく音声モデル名
         self.user_id = user_id  # 長期記憶のプロファイル更新に使用
 
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
@@ -374,9 +376,7 @@ class LiveAPISession:
             "system_instruction": instruction,
             "input_audio_transcription": {},
             "output_audio_transcription": {},
-            "speech_config": {
-                "language_code": self._get_speech_language_code(),
-            },
+            "speech_config": self._get_speech_config(),
             "realtime_input_config": {
                 "automatic_activity_detection": {
                     "disabled": False,
@@ -412,6 +412,20 @@ class LiveAPISession:
             'ko': 'ko-KR',
         }
         return lang_map.get(self.language, 'ja-JP')
+
+    def _get_speech_config(self) -> dict:
+        """speech_config辞書を構築（voice_modelが指定されていれば含める）"""
+        config = {
+            "language_code": self._get_speech_language_code(),
+        }
+        if self.voice_model:
+            config["voice_config"] = {
+                "prebuilt_voice_config": {
+                    "voice_name": self.voice_model
+                }
+            }
+            logger.info(f"[LiveAPI] 音声モデル設定: {self.voice_model}")
+        return config
 
     def enqueue_audio(self, pcm_bytes: bytes):
         """ブラウザから受信したPCMデータをキューに追加"""
@@ -1130,14 +1144,18 @@ class LiveAPISession:
 
         return audio_chunks, transcript
 
-    @staticmethod
-    def _synthesize_speech(text: str) -> bytes | None:
+    def _synthesize_speech(self, text: str) -> bytes | None:
         """Google Cloud TTSでテキストを24kHz 16bit mono PCMに変換"""
         try:
             tts_client = texttospeech.TextToSpeechClient()
+            voice_name = self.voice_model if self.voice_model else "ja-JP-Chirp3-HD-Leda"
+            lang_code = voice_name.rsplit('-', 1)[0].rsplit('-', 1)[0] if '-' in voice_name else "ja-JP"
+            # voice_nameからlanguage_codeを推定（例: ja-JP-Chirp3-HD-Leda → ja-JP）
+            parts = voice_name.split('-')
+            lang_code = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else "ja-JP"
             voice = texttospeech.VoiceSelectionParams(
-                language_code="ja-JP",
-                name="ja-JP-Chirp3-HD-Leda"
+                language_code=lang_code,
+                name=voice_name
             )
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.LINEAR16,

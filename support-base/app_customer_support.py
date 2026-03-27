@@ -753,6 +753,7 @@ def handle_live_start(data):
     session_id = data.get('session_id')
     mode = data.get('mode', 'chat')
     language = data.get('language', 'ja')
+    voice_model = data.get('voice_model', '')
 
     # 既存のLiveAPIセッションがあれば停止
     if client_sid in active_live_sessions:
@@ -882,7 +883,8 @@ def handle_live_start(data):
         socketio=socketio,
         client_sid=client_sid,
         shop_search_callback=shop_search_callback,
-        user_id=user_id
+        user_id=user_id,
+        voice_model=voice_model
     )
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
