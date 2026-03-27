@@ -414,17 +414,14 @@ class LiveAPISession:
         return lang_map.get(self.language, 'ja-JP')
 
     def _get_speech_config(self) -> dict:
-        """speech_config辞書を構築（voice_modelが指定されていれば含める）"""
+        """speech_config辞書を構築"""
         config = {
             "language_code": self._get_speech_language_code(),
         }
+        # voice_modelはREST TTS（ショップ読み上げ）にのみ適用
+        # LiveAPIのspeech_configでのvoice指定は仕様が不明なため含めない
         if self.voice_model:
-            config["voice_config"] = {
-                "prebuilt_voice_config": {
-                    "voice_name": self.voice_model
-                }
-            }
-            logger.info(f"[LiveAPI] 音声モデル設定: {self.voice_model}")
+            logger.info(f"[LiveAPI] voice_model設定あり（REST TTS用）: {self.voice_model}")
         return config
 
     def enqueue_audio(self, pcm_bytes: bytes):
