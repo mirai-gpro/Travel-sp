@@ -152,10 +152,10 @@ export class LAMWebSocketManager {
         }
 
         // === STEP2: 小さすぎる口の動き対策 ===
-        // バイアス: jawOpenが0.005〜0.05の区間を0.05に底上げ（もごもご対策）
-        // 0.005未満は底上げしない（喋り終わりの口閉じを自然に）
+        // バイアス: jawOpenが0.015〜0.05の区間を0.05に底上げ（もごもご対策）
+        // 0.015未満は底上げしない（A2E最終フレームが0.007〜0.013程度で終わるため）
         const jawOpen = result['jawOpen'] ?? 0;
-        if (jawOpen >= 0.005 && jawOpen < 0.05) {
+        if (jawOpen >= 0.015 && jawOpen < 0.05) {
             result['jawOpen'] = 0.05;
         }
 
