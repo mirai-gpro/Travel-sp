@@ -492,6 +492,13 @@ class LiveAPISession:
                             self.socketio.emit('live_reconnecting', {},
                                                room=self.client_sid)
 
+                            # ★ 1008で中断された未処理のユーザー発話を履歴に救済
+                            if self.user_transcript_buffer.strip():
+                                rescued_text = self.user_transcript_buffer.strip()
+                                self._add_to_history("user", rescued_text)
+                                logger.info(f"[LiveAPI] 再接続: 未処理ユーザー発話を履歴に救済: '{rescued_text}'")
+                                self.user_transcript_buffer = ""
+
                             # 1. 会話履歴turnsを再送（turn_complete=False）
                             await self._send_history_on_reconnect(session)
 
