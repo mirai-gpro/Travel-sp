@@ -239,7 +239,7 @@ export class LessonController extends CoreController {
     }
 
     this.els.userInput.value = transcript;
-    this.addMessage('user', transcript);
+    // ユーザー発話はチャット欄に非表示（lessonモード）
 
     // 短すぎる入力チェック
     const textLength = transcript.trim().replace(/\s+/g, '').length;

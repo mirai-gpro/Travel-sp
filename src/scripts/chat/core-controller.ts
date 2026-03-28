@@ -178,8 +178,20 @@ export class CoreController {
     
     this.els.languageSelect?.addEventListener('change', () => {
       this.currentLanguage = this.els.languageSelect.value as any;
+      localStorage.setItem('selectedLanguage', this.currentLanguage);
       this.updateUILanguage();
+      // 言語変更時はセッションリロードしてバックエンドに反映
+      if (this.isLiveMode) {
+        window.location.reload();
+      }
     });
+
+    // localStorageから前回選択した言語を復元
+    const savedLang = localStorage.getItem('selectedLanguage');
+    if (savedLang && this.els.languageSelect) {
+      this.currentLanguage = savedLang as any;
+      this.els.languageSelect.value = savedLang;
+    }
 
     const floatingButtons = this.container.querySelector('.floating-buttons');
     this.els.userInput?.addEventListener('focus', () => {
@@ -342,8 +354,8 @@ export class CoreController {
       console.log('[LiveAPI] turn_complete');
       this.liveAudioManager.onAiResponseEnded();
 
-      // ユーザー発話をチャット欄に確定表示
-      if (this.userTranscriptBuffer.trim()) {
+      // ユーザー発話をチャット欄に確定表示（lessonモードでは非表示）
+      if (this.userTranscriptBuffer.trim() && this.currentMode !== 'lesson') {
         this.addMessage('user', this.userTranscriptBuffer.trim());
       }
       this.userTranscriptBuffer = '';
@@ -573,10 +585,14 @@ export class CoreController {
       await this.liveAudioManager.initialize(this.socket);
 
       // サーバーにLiveAPIセッション開始を通知
+      const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
+      const liveVoice = localStorage.getItem(`selectedLiveVoice_${this.currentMode}`) || '';
       this.socket.emit('live_start', {
         session_id: this.sessionId,
         mode: this.currentMode,
-        language: this.currentLanguage
+        language: this.currentLanguage,
+        voice_model: voiceModel,
+        live_voice: liveVoice
       });
 
       this.isLiveMode = true;

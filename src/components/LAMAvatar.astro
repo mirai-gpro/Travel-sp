@@ -57,6 +57,7 @@ const {
   max-width: 100% !important;
   max-height: 100% !important;
   display: block;
+  transform: scale(1.4);
 }
 
 .lam-avatar-fallback {
@@ -112,7 +113,10 @@ const {
 </style>
 
 <script define:vars={{ modelUrl }}>
-  window.__lamAvatarConfig = { modelUrl };
+  // localStorageに選択アバターのmodelUrlがあればそちらを優先
+  const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
+  const storedUrl = localStorage.getItem('selectedAvatarUrl_' + mode);
+  window.__lamAvatarConfig = { modelUrl: storedUrl || modelUrl };
 </script>
 
 <script>

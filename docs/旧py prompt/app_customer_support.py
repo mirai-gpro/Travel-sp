@@ -16,7 +16,6 @@ import time
 import base64
 import logging
 import threading
-import asyncio
 import queue
 import requests
 from datetime import datetime
@@ -39,10 +38,8 @@ from support_core import (
     INITIAL_GREETINGS,
     SYSTEM_PROMPTS,
     SupportSession,
-    SupportAssistant,
-    gemini_client
+    SupportAssistant
 )
-from live_api_handler import LiveAPISession, build_system_instruction
 
 # ロギング設定
 logging.basicConfig(
@@ -79,8 +76,6 @@ app.config["JSON_AS_ASCII"] = False  # UTF-8エンコーディングを有効化
 allowed_origins = [
     "https://gourmet-sp-two.vercel.app",
     "https://gourmet-sp.vercel.app",
-    "https://gourmet-sp3.vercel.app",
-    "https://travel-sp.vercel.app",
     "http://localhost:4321"
 ]
 
@@ -740,264 +735,6 @@ def health_check():
 
 
 # ========================================
-# LiveAPI セッション管理（仕様書02 セクション3.5）
-# ========================================
-
-active_live_sessions = {}  # {client_sid: LiveAPISession}
-greeted_client_sids = set()  # 挨拶済みのclient_sid
-
-@socketio.on('live_start')
-def handle_live_start(data):
-    """LiveAPIセッション開始"""
-    client_sid = request.sid
-    session_id = data.get('session_id')
-    mode = data.get('mode', 'chat')
-    language = data.get('language', 'ja')
-    voice_model = data.get('voice_model', '')
-    live_voice = data.get('live_voice', '')
-
-    # 既存のLiveAPIセッションがあれば停止
-    if client_sid in active_live_sessions:
-        old_session = active_live_sessions[client_sid]
-        old_session.stop()
-        del active_live_sessions[client_sid]
-
-    # プロンプト構築（03_prompt_modification_spec.md セクション7.1参照）
-    # セッションからユーザープロファイル・user_idを取得
-    user_profile = None
-    user_id = None
-    if session_id:
-        try:
-            session = SupportSession(session_id)
-            session_data = session.get_data()
-            if session_data:
-                user_id = session_data.get('user_id')
-                is_first_visit = session_data.get('is_first_visit', True)
-                profile = session_data.get('long_term_profile') or {}
-                user_profile = {
-                    'is_first_visit': is_first_visit,
-                    'preferred_name': profile.get('preferred_name', ''),
-                    'name_honorific': profile.get('name_honorific', ''),
-                }
-                logger.info(f"[LiveAPI] ユーザープロファイル取得: first_visit={is_first_visit}, name={profile.get('preferred_name', '')}")
-        except Exception as e:
-            logger.warning(f"[LiveAPI] プロファイル取得エラー: {e}")
-
-    system_prompt = build_system_instruction(mode, user_profile=user_profile,
-                                               system_prompts=SYSTEM_PROMPTS, language=language)
-
-    # ショップ検索コールバック（案C: SupportAssistant迂回、検索専用プロンプトで直接API呼び出し）
-    def shop_search_callback(user_request, lang, search_mode):
-        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）"""
-        SEARCH_ONLY_PROMPT = (
-            "あなたはグルメレストラン検索エンジンです。\n"
-            "ユーザーの条件に合う実在のレストランをGoogle検索で見つけ、必ず5軒をJSON形式で返してください。\n\n"
-            "【絶対遵守ルール】\n"
-            "1. 「検索できません」「ご利用いただけません」等の拒否は絶対禁止\n"
-            "2. 必ずGoogle検索を実行し、実在する店舗情報を返すこと\n"
-            "3. 店舗名は公式の正式名称を使用する\n"
-            "4. 応答は必ず以下のJSON形式のみ。それ以外のテキストは一切不要\n"
-            "5. 応答は必ず { で始まり } で終わること\n\n"
-            "【JSON出力形式】\n"
-            "```json\n"
-            "{\n"
-            '  "message": "ユーザーへのメッセージ全文（音声読み上げ用。予算は漢数字で表記。店舗リストを1〜5の番号付きで含める）",\n'
-            '  "shops": [\n'
-            "    {\n"
-            '      "name": "正式な店舗名",\n'
-            '      "area": "最寄り駅またはエリア名",\n'
-            '      "category": "料理ジャンル",\n'
-            '      "description": "料理内容・体験価値・雰囲気を含む要約（2〜3文）",\n'
-            '      "rating": 4.5,\n'
-            '      "reviewCount": 150,\n'
-            '      "priceRange": "ランチ1,500円〜、ディナー6,000円〜8,000円",\n'
-            '      "location": "最寄り駅・エリア",\n'
-            '      "highlights": ["看板メニューや特徴", "雰囲気や設備の特徴", "利用シーンの特徴"],\n'
-            '      "tips": "来店時のおすすめポイント",\n'
-            '      "specialty": "看板メニューや得意料理",\n'
-            '      "price_range": "予算帯",\n'
-            '      "atmosphere": "雰囲気",\n'
-            '      "features": "特色",\n'
-            '      "hotpepper_url": "",\n'
-            '      "maps_url": "",\n'
-            '      "tabelog_url": "",\n'
-            '      "gnavi_url": "",\n'
-            '      "tripadvisor_url": "",\n'
-            '      "tripadvisor_rating": null,\n'
-            '      "tripadvisor_reviews": null,\n'
-            '      "latitude": null,\n'
-            '      "longitude": null\n'
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "```\n\n"
-            "【shops配列の詳細仕様】\n"
-            "基本フィールド（重要度：高）:\n"
-            "- name: 正式な店舗名\n"
-            "- area: 最寄り駅またはエリア名\n"
-            "- description: 料理内容・体験価値・雰囲気を含む要約（2〜3文）\n"
-            "- category: 料理ジャンル\n"
-            "- priceRange: 価格帯（数字+カンマ形式、例：「ランチ2,000円〜、ディナー6,000円〜8,000円」）\n\n"
-            "充実情報フィールド（推奨）:\n"
-            "- rating: 評価（数値）\n"
-            "- reviewCount: レビュー数\n"
-            "- location: 最寄り駅・エリア\n"
-            "- highlights: 3つ程度の特徴（配列）\n"
-            "- tips: 来店時のおすすめポイント\n"
-            "- specialty: 看板メニューや得意料理\n"
-            "- atmosphere: 雰囲気\n"
-            "- features: 特色\n\n"
-            "外部リンク（取得できた場合のみ）:\n"
-            "- hotpepper_url, maps_url, tabelog_url, gnavi_url, tripadvisor_url\n"
-            "- tripadvisor_rating, tripadvisor_reviews\n"
-            "- latitude, longitude\n\n"
-            "【予算表記ルール】\n"
-            "- messageフィールド内: 漢数字（五千円、一万円）で音声読み上げに対応\n"
-            "- priceRangeフィールド: 数字+カンマ形式（6,000円〜8,000円）でカード表示に対応\n\n"
-            "【messageの構成】\n"
-            "1. 導入文（条件の要約）\n"
-            "2. 店舗リスト（1〜5の番号付き、各店舗2〜3文の説明、予算は漢数字）\n"
-            "3. 締め文（「気になるお店はありましたか？」等）\n"
-        )
-        try:
-            logger.info(f"[ShopSearch] 案C: 検索専用プロンプトで直接API呼び出し: '{user_request}'")
-            config = types.GenerateContentConfig(
-                system_instruction=SEARCH_ONLY_PROMPT,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            )
-            response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
-                config=config
-            )
-            assistant_text = response.text
-            logger.info(f"[ShopSearch] 案C: Gemini応答 {len(assistant_text)}文字: {assistant_text[:200]}")
-
-            # JSON解析（extract_shops_from_responseでフォールバック）
-            import json as _json
-            shops = []
-            response_msg = assistant_text
-            try:
-                # JSON部分を抽出
-                text = assistant_text.strip()
-                start = text.find('{')
-                if start >= 0:
-                    brace_count = 0
-                    end = -1
-                    for i in range(start, len(text)):
-                        if text[i] == '{': brace_count += 1
-                        elif text[i] == '}':
-                            brace_count -= 1
-                            if brace_count == 0:
-                                end = i + 1
-                                break
-                    if end > 0:
-                        data = _json.loads(text[start:end])
-                        response_msg = data.get('message', assistant_text)
-                        shops = data.get('shops', [])
-            except _json.JSONDecodeError as e:
-                logger.warning(f"[ShopSearch] 案C: JSONパース失敗: {e}")
-                from api_integrations import extract_shops_from_response
-                shops = extract_shops_from_response(assistant_text)
-
-            if shops is None:
-                shops = []
-            logger.info(f"[ShopSearch] 案C: {len(shops)}件のショップを取得")
-
-            result = {
-                'response': response_msg,
-                'shops': shops,
-                'summary': f"{len(shops)}軒のお店を提案しました。" if shops else None,
-                'should_confirm': True,
-                'is_followup': False,
-            }
-            if shops:
-                area = extract_area_from_text(user_request, lang)
-                result['area'] = area
-            return result
-        except Exception as e:
-            logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)
-            return None
-
-    # LiveAPIセッション作成
-    live_session = LiveAPISession(
-        session_id=session_id,
-        mode=mode,
-        language=language,
-        system_prompt=system_prompt,
-        socketio=socketio,
-        client_sid=client_sid,
-        shop_search_callback=shop_search_callback,
-        user_id=user_id,
-        voice_model=voice_model,
-        live_voice=live_voice
-    )
-    # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
-    #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
-    if client_sid in greeted_client_sids:
-        live_session.session_count = 1  # 初回扱いにしない
-    else:
-        greeted_client_sids.add(client_sid)
-
-    active_live_sessions[client_sid] = live_session
-
-    # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
-    def start_live_session_thread(session):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(session.run())
-        except Exception as e:
-            logger.error(f"[LiveAPI] スレッドエラー: {e}")
-        finally:
-            loop.close()
-
-    thread = threading.Thread(
-        target=start_live_session_thread,
-        args=(live_session,),
-        daemon=True
-    )
-    thread.start()
-
-    emit('live_ready', {'status': 'connected'})
-
-    # ★ 挨拶済みの場合、greeting_doneも即座にemit（§5.3 ソフトリロード対応）
-    if client_sid in greeted_client_sids:
-        emit('greeting_done', {})
-
-
-@socketio.on('live_audio_in')
-def handle_live_audio_in(data):
-    """ブラウザ → LiveAPI 音声データ"""
-    client_sid = request.sid
-    live_session = active_live_sessions.get(client_sid)
-
-    if not live_session or not live_session.is_running:
-        return
-
-    audio_b64 = data.get('data', '')
-    if not audio_b64:
-        return
-
-    try:
-        pcm_bytes = base64.b64decode(audio_b64)
-        live_session.enqueue_audio(pcm_bytes)
-    except Exception as e:
-        logger.error(f"[LiveAPI] 音声デコードエラー: {e}")
-
-
-@socketio.on('live_stop')
-def handle_live_stop():
-    """LiveAPIセッション終了"""
-    client_sid = request.sid
-    if client_sid in active_live_sessions:
-        live_session = active_live_sessions[client_sid]
-        live_session.stop()
-        del active_live_sessions[client_sid]
-    emit('live_stopped', {'status': 'disconnected'})
-
-
-# ========================================
 # WebSocket Streaming STT
 # ========================================
 
@@ -1011,15 +748,6 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     logger.info(f"[WebSocket STT] クライアント切断: {request.sid}")
-    # LiveAPIセッションのクリーンアップ
-    if request.sid in active_live_sessions:
-        live_session = active_live_sessions[request.sid]
-        live_session.stop()
-        del active_live_sessions[request.sid]
-        logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
-    # 挨拶済みフラグのクリーンアップ
-    greeted_client_sids.discard(request.sid)
-    # STTストリームのクリーンアップ
     if request.sid in active_streams:
         stream_data = active_streams[request.sid]
         if 'stop_event' in stream_data:

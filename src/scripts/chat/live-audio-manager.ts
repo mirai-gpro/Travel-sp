@@ -359,6 +359,23 @@ export class LiveAudioManager {
 
     onAiResponseEnded(): void {
         this.isAiSpeaking = false;
+
+        // ★ ターン終了時: 最終フレームのjawOpen関連を0にリセット（口閉じ遅延対策）
+        // A2Eの最終フレームが0.008〜0.013で止まることがあり、口が閉じきらない
+        if (this.expressionFrameBuffer.length > 0) {
+            const lastFrame = this.expressionFrameBuffer[this.expressionFrameBuffer.length - 1];
+            if (lastFrame && lastFrame.values) {
+                // jawOpen(idx=24)を含む口周りのblendshapeを0にリセット
+                const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
+                if (jawOpenIdx >= 0) lastFrame.values[jawOpenIdx] = 0;
+                const jawForwardIdx = this.expressionNames.indexOf('jawForward');
+                if (jawForwardIdx >= 0) lastFrame.values[jawForwardIdx] = 0;
+                const jawLeftIdx = this.expressionNames.indexOf('jawLeft');
+                if (jawLeftIdx >= 0) lastFrame.values[jawLeftIdx] = 0;
+                const jawRightIdx = this.expressionNames.indexOf('jawRight');
+                if (jawRightIdx >= 0) lastFrame.values[jawRightIdx] = 0;
+            }
+        }
     }
 
     // ========================================

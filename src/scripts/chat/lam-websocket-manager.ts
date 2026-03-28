@@ -71,12 +71,18 @@ export class LAMWebSocketManager {
             );
 
             // カメラ位置を調整してアバターの顔サイズ・位置を制御
-            // デフォルト: x=0, y=1.8, z=1
-            // モデルごとにカメラパラメータを切り替え
-            const isElf = config.modelUrl.includes('elf.zip');
-            const camParams = isElf
-                ? { posY: 1.73, posZ: 0.4, targetY: 1.70 }  // elf
-                : { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // meruru: 従来値
+            // avatar-config.json のcameraパラメータをlocalStorageから読み込み
+            const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
+            let camParams = { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // デフォルト
+            try {
+                const storedCamera = localStorage.getItem(`selectedCamera_${mode}`);
+                if (storedCamera) {
+                    const parsed = JSON.parse(storedCamera);
+                    camParams = { posY: parsed.posY ?? 1.73, posZ: parsed.posZ ?? 0.4, targetY: parsed.targetY ?? 1.62 };
+                }
+            } catch (e) {
+                // パース失敗時はデフォルト使用
+            }
 
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
@@ -146,30 +152,31 @@ export class LAMWebSocketManager {
         }
 
         // === STEP2: 小さすぎる口の動き対策 ===
-        // バイアス: jawOpenが0.001〜0.05の区間を0.05に底上げ（0は静止なのでそのまま）
+        // バイアス: jawOpenが0.015〜0.05の区間を0.05に底上げ（もごもご対策）
+        // 0.015未満は底上げしない（A2E最終フレームが0.007〜0.013程度で終わるため）
         const jawOpen = result['jawOpen'] ?? 0;
-        if (jawOpen >= 0.001 && jawOpen < 0.05) {
+        if (jawOpen >= 0.015 && jawOpen < 0.05) {
             result['jawOpen'] = 0.05;
         }
 
-        // スムージング: 口周り全体にフレーム間補間（α=0.3）
-        const MOUTH_SHAPES = [
-            'jawOpen', 'jawForward', 'jawLeft', 'jawRight',
-            'mouthClose', 'mouthFunnel', 'mouthPucker', 'mouthLeft', 'mouthRight',
-            'mouthSmileLeft', 'mouthSmileRight', 'mouthFrownLeft', 'mouthFrownRight',
-            'mouthDimpleLeft', 'mouthDimpleRight', 'mouthStretchLeft', 'mouthStretchRight',
-            'mouthRollLower', 'mouthRollUpper', 'mouthShrugLower', 'mouthShrugUpper',
-            'mouthPressLeft', 'mouthPressRight', 'mouthLowerDownLeft', 'mouthLowerDownRight',
-            'mouthUpperUpLeft', 'mouthUpperUpRight',
-        ];
-        const SMOOTH_ALPHA = 0.45;
-        for (const name of MOUTH_SHAPES) {
-            if (result[name] !== undefined) {
-                const prev = this._prevMouthValues[name] ?? 0;
-                result[name] = prev * (1 - SMOOTH_ALPHA) + result[name] * SMOOTH_ALPHA;
-                this._prevMouthValues[name] = result[name];
-            }
-        }
+        // スムージング: 一時無効化（口閉じ遅延の切り分けテスト）
+        // const MOUTH_SHAPES = [
+        //     'jawOpen', 'jawForward', 'jawLeft', 'jawRight',
+        //     'mouthClose', 'mouthFunnel', 'mouthPucker', 'mouthLeft', 'mouthRight',
+        //     'mouthSmileLeft', 'mouthSmileRight', 'mouthFrownLeft', 'mouthFrownRight',
+        //     'mouthDimpleLeft', 'mouthDimpleRight', 'mouthStretchLeft', 'mouthStretchRight',
+        //     'mouthRollLower', 'mouthRollUpper', 'mouthShrugLower', 'mouthShrugUpper',
+        //     'mouthPressLeft', 'mouthPressRight', 'mouthLowerDownLeft', 'mouthLowerDownRight',
+        //     'mouthUpperUpLeft', 'mouthUpperUpRight',
+        // ];
+        // const SMOOTH_ALPHA = 0.45;
+        // for (const name of MOUTH_SHAPES) {
+        //     if (result[name] !== undefined) {
+        //         const prev = this._prevMouthValues[name] ?? 0;
+        //         result[name] = prev * (1 - SMOOTH_ALPHA) + result[name] * SMOOTH_ALPHA;
+        //         this._prevMouthValues[name] = result[name];
+        //     }
+        // }
 
         // デバッグ: 120フレームごと（約2秒）にログ出力
         this._exprDebugCounter++;

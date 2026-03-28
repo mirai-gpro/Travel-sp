@@ -102,7 +102,7 @@ _generate_cached_audio()
 
 
 def build_system_instruction(mode: str, user_profile: dict = None,
-                             system_prompts: dict = None) -> str:
+                             system_prompts: dict = None, language: str = 'ja') -> str:
     """モードに応じたシステムインストラクションを組み立てる
     （03_prompt_modification_spec.md セクション7.1）
 
@@ -125,7 +125,7 @@ def build_system_instruction(mode: str, user_profile: dict = None,
             }
     """
     # GCSプロンプトからベーステキストを取得
-    lang = 'ja'
+    lang = language
     if system_prompts:
         base_prompt = system_prompts.get(mode, {}).get(lang, '')
     else:
@@ -206,7 +206,10 @@ def _get_lesson_first_visit_context(teacher_name: str = 'Lisa') -> str:
     """レッスンモード: 新規ユーザー用コンテキスト"""
     return f"""## 初期あいさつ（新規ユーザー）
 このユーザーは初めてのレッスンです。
-ユーザーが名前を教えてくれたら、その名前で呼びかけてレッスンを始めてください。"""
+最初の発話で、まず英語で、次に日本語で自己紹介とレッスン案内をしてください。
+英語: "Hi! I'm {teacher_name}, your English teacher. We have two options: travel English lessons, or free talk sessions with me. Which would you like to start with?"
+日本語: 「こんにちは、英会話の先生の{teacher_name}です。旅行で使える英会話レッスンや、私との英語のフリートークレッスンができます。今日は、どちらからやりますか？」
+ユーザーが名前を教えてくれたら、その名前で呼びかけてください。"""
 
 
 def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
@@ -215,7 +218,9 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
     full_name = f"{preferred_name}{name_honorific}"
     return f"""## 初期あいさつ（リピーター）
 このユーザーの名前は「{full_name}」です。
-「{full_name}」と呼びかけてください。"""
+最初の発話で、まず英語で、次に日本語で挨拶とレッスン案内をしてください。
+英語: "Welcome back, {full_name}! Shall we do a travel English lesson today, or would you like a free talk session with me?"
+日本語: 「おかえりなさい、{full_name}。今日は、旅行で使える英会話レッスンか、私との英語のフリートークレッスン、どちらからやりますか？」"""
 
 
 # ============================================================
@@ -298,7 +303,8 @@ class LiveAPISession:
 
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
-                 shop_search_callback=None, user_id: str = None):
+                 shop_search_callback=None, user_id: str = None,
+                 voice_model: str = '', live_voice: str = ''):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -306,6 +312,8 @@ class LiveAPISession:
         self.socketio = socketio
         self.client_sid = client_sid
         self._shop_search_callback = shop_search_callback  # v5 §5.5: ショップ検索用コールバック
+        self.voice_model = voice_model  # REST TTS用音声モデル名（例: ja-JP-Chirp3-HD-Leda）
+        self.live_voice = live_voice    # LiveAPI用音声名（例: Leda）
         self.user_id = user_id  # 長期記憶のプロファイル更新に使用
 
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
@@ -369,9 +377,7 @@ class LiveAPISession:
             "system_instruction": instruction,
             "input_audio_transcription": {},
             "output_audio_transcription": {},
-            "speech_config": {
-                "language_code": self._get_speech_language_code(),
-            },
+            "speech_config": self._get_speech_config(),
             "realtime_input_config": {
                 "automatic_activity_detection": {
                     "disabled": False,
@@ -407,6 +413,23 @@ class LiveAPISession:
             'ko': 'ko-KR',
         }
         return lang_map.get(self.language, 'ja-JP')
+
+    def _get_speech_config(self) -> dict:
+        """speech_config辞書を構築"""
+        config = {
+            "language_code": self._get_speech_language_code(),
+        }
+        # LiveAPI用voice名（Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, Zephyr）
+        if self.live_voice:
+            config["voice_config"] = {
+                "prebuilt_voice_config": {
+                    "voice_name": self.live_voice
+                }
+            }
+            logger.info(f"[LiveAPI] live_voice設定: {self.live_voice}")
+        if self.voice_model:
+            logger.info(f"[LiveAPI] voice_model設定あり（REST TTS用）: {self.voice_model}")
+        return config
 
     def enqueue_audio(self, pcm_bytes: bytes):
         """ブラウザから受信したPCMデータをキューに追加"""
@@ -468,6 +491,13 @@ class LiveAPISession:
                             self._is_initial_greeting_phase = False
                             self.socketio.emit('live_reconnecting', {},
                                                room=self.client_sid)
+
+                            # ★ 1008で中断された未処理のユーザー発話を履歴に救済
+                            if self.user_transcript_buffer.strip():
+                                rescued_text = self.user_transcript_buffer.strip()
+                                self._add_to_history("user", rescued_text)
+                                logger.info(f"[LiveAPI] 再接続: 未処理ユーザー発話を履歴に救済: '{rescued_text}'")
+                                self.user_transcript_buffer = ""
 
                             # 1. 会話履歴turnsを再送（turn_complete=False）
                             await self._send_history_on_reconnect(session)
@@ -613,6 +643,17 @@ class LiveAPISession:
                                                room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
 
+                            # ★ keep-alive: セッション安定化（1008予防）
+                            # greeting_done後、ユーザーがマイクを押す前に空ターンを送信
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text="")]
+                                ),
+                                turn_complete=False
+                            )
+                            logger.info("[LiveAPI] keep-alive送信（greeting後）")
+
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
                         # ★ A2E: 割り込み時はキュークリア（未送信チャンク破棄）
@@ -696,15 +737,14 @@ class LiveAPISession:
                         task.cancel()
                         logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
 
-                # function responseを返す（LiveAPI confirmed syntax）
-                tool_response = types.LiveClientToolResponse(
+                # function responseを返す（LiveAPI SDK: キーワード引数必須）
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
             elif fc.name == "update_user_profile":
                 # ユーザー名登録・変更をDBに永続化
                 updates = fc.args or {}
@@ -720,15 +760,14 @@ class LiveAPISession:
                     except Exception as e:
                         logger.error(f"[LiveAPI] プロファイル更新エラー: {e}")
 
-                # function responseを返す
-                tool_response = types.LiveClientToolResponse(
+                # function responseを返す（LiveAPI SDK: キーワード引数必須）
+                await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "プロファイルを更新しました"}
                     )]
                 )
-                await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
@@ -836,25 +875,48 @@ class LiveAPISession:
 
     async def _describe_shops_via_live(self, shops: list):
         """
-        ショップ説明をLiveAPIで読み上げ（案A: enrich並行方式対応）
+        ショップ説明をREST TTSで読み上げ（1軒目冒頭先行 + A2E並行事前計算）
 
         【フロー】
-        - pre_generated_tasks が渡された場合: TTS生成済みタスクを使用（案A）
-        - 渡されない場合: 従来通りここでTTS並行生成を開始
-        - bridge → please_wait のキャッシュ音声を連続再生で時間を稼ぐ
-        - 1軒目collect完了後、A2E事前計算 → emit
-        - 全ショップ統一のcollect+precompute A2E方式でリップシンク品質を均一化
+        1. 1軒目の冒頭2文だけ先行TTS+A2E（場繋ぎ中に完了）
+        2. 場繋ぎ終了 → 冒頭2文を即再生（ほぼ遅延ゼロ）
+        3. 冒頭再生中に1軒目残り部分のTTS+A2E → 連続再生
+        4. 1軒目再生中に2〜5軒目TTS一括開始 + 2軒目A2E事前計算
+        5. 2軒目以降: 前軒の再生中に次軒のA2E事前計算
         """
         total = len(shops)
         if total == 0:
             return
 
-        # ── TTS生成: ショップ1のみ先行開始 ──
-        task1 = asyncio.create_task(
-            self._collect_shop_audio(shops[0], 1, total)
+        # ── 1軒目のテキストを冒頭2文と残りに分割 ──
+        shop = shops[0]
+        name = shop.get('name', '')
+        area = shop.get('area', '')
+        category = shop.get('category', shop.get('genre', ''))
+        description = shop.get('description', '')
+        price_range = shop.get('priceRange', shop.get('budget', ''))
+        is_last_1 = (1 == total)
+
+        head_text = f"1軒目は、{name}です。"
+        if area and category:
+            head_text += f"{area}にある{category}のお店です。"
+        elif area:
+            head_text += f"{area}にあるお店です。"
+
+        tail_text = ""
+        if description:
+            tail_text += description
+        if price_range:
+            tail_text += f"ご予算は{price_range}です。"
+        if is_last_1:
+            tail_text += f"以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？"
+
+        # ── 冒頭2文のTTS先行開始 ──
+        loop = asyncio.get_event_loop()
+        head_tts_task = asyncio.ensure_future(
+            loop.run_in_executor(None, self._synthesize_speech, head_text)
         )
-        all_tasks = [task1]
-        logger.info(f"[ShopDesc] ショップ1のTTS生成開始")
+        logger.info(f"[ShopDesc] 1軒目冒頭TTS先行開始: '{head_text}'")
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
@@ -862,54 +924,105 @@ class LiveAPISession:
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
 
-        # ── 場繋ぎ: bridge → please_wait を連続再生（約8-9秒）──
+        # ── 場繋ぎ: REST TTSで定型文を生成・再生（アバターの声と統一）──
+        bridge_text = "お待たせしました。それではおすすめのお店をご紹介します。"
         bridge_start = time.time()
         total_bridge_duration = 0.0
 
-        # 1) bridge: 「お待たせしました。それではお薦めのお店をご紹介します。」
-        if _CACHED_BRIDGE_PCM:
-            await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
-            dur = len(_CACHED_BRIDGE_PCM) / 48000
+        bridge_pcm = await loop.run_in_executor(None, self._synthesize_speech, bridge_text)
+        if bridge_pcm:
+            await self._emit_cached_audio(bridge_pcm)
+            dur = len(bridge_pcm) / 48000
             total_bridge_duration += dur
-            logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
+            logger.info(f"[ShopDesc] 場繋ぎ(REST TTS)再生: {dur:.1f}秒")
 
-        # bridge再生完了を待ってからplease_waitへ
+        # bridge再生完了を待つ
         elapsed = time.time() - bridge_start
-        wait1 = max(total_bridge_duration - elapsed + 0.3, 0.3)
+        wait1 = max(total_bridge_duration - elapsed + 0.7, 1.0)
         await asyncio.sleep(wait1)
 
-        # 2) please_wait: コメントアウト（A2Eバッファ衝突切り分け）
-        # if _CACHED_PLEASE_WAIT_PCM:
-        #     await self._emit_cached_audio(_CACHED_PLEASE_WAIT_PCM)
-        #     dur = len(_CACHED_PLEASE_WAIT_PCM) / 48000
-        #     total_bridge_duration += dur
-        #     logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
+        # ── 場繋ぎ中に冒頭TTS完了を待つ → A2E事前計算 ──
+        head_pcm = await head_tts_task
+        head_a2e_result = None
+        if head_pcm:
+            head_a2e_result = await self._precompute_a2e_expressions(head_pcm)
+            logger.info(f"[ShopDesc] 1軒目冒頭A2E完了: {len(head_pcm)} bytes")
 
-        # ── ショップ1のcollect完了を待つ + A2E事前計算 ──
-        next_a2e_task = None
-        audio_chunks_1, transcript_1 = await all_tasks[0]
-        logger.info(f"[ShopDesc] ショップ1生成完了 → 2軒目以降のTTS生成開始")
-        if audio_chunks_1:
-            next_a2e_task = asyncio.create_task(
-                self._precompute_a2e_expressions(b''.join(audio_chunks_1))
-            )
-
-        # ── ショップ1完了後に2軒目以降のTTS生成を開始 ──
-        for i in range(1, total):
-            task = asyncio.create_task(
-                self._collect_shop_audio(shops[i], i + 1, total)
-            )
-            all_tasks.append(task)
-
-        # please_wait再生完了を待つ
+        # 場繋ぎ+冒頭A2E完了後の余白
         elapsed = time.time() - bridge_start
-        remaining_sleep = max(total_bridge_duration - elapsed + 0.3, 0.5)
-        logger.info(f"[ShopDesc] 場繋ぎ残り待ち: {remaining_sleep:.1f}秒 (経過{elapsed:.1f}秒, 場繋ぎ合計{total_bridge_duration:.1f}秒)")
+        remaining_sleep = max(total_bridge_duration - elapsed + 0.7, 0.3)
+        logger.info(f"[ShopDesc] 場繋ぎ残り待ち: {remaining_sleep:.1f}秒 (経過{elapsed:.1f}秒)")
         await asyncio.sleep(remaining_sleep)
-        await asyncio.sleep(0.5)
 
-        # ── 全ショップ: collect済み音声を順次再生（1軒目も同じパス）──
-        for i, task in enumerate(all_tasks):
+        # ── 冒頭2文をA2E付きで即再生 ──
+        if head_pcm:
+            await self._emit_collected_shop([head_pcm], head_text, 1, head_a2e_result)
+            head_duration = len(head_pcm) / 48000
+            logger.info(f"[ShopDesc] ショップ1冒頭再生: {head_duration:.1f}秒")
+
+            # ── 冒頭再生中に残り部分のTTS+A2Eを並行処理 ──
+            tail_pcm = None
+            tail_a2e_result = None
+
+            async def _process_tail():
+                nonlocal tail_pcm, tail_a2e_result
+                if tail_text:
+                    tail_pcm = await loop.run_in_executor(None, self._synthesize_speech, tail_text)
+                    if tail_pcm:
+                        tail_a2e_result = await self._precompute_a2e_expressions(tail_pcm)
+                        logger.info(f"[ShopDesc] 1軒目残りTTS+A2E完了: {len(tail_pcm)} bytes")
+
+            await asyncio.gather(
+                asyncio.sleep(head_duration + 0.7),
+                _process_tail()
+            )
+
+            # ── 残り部分をA2E付きで連続再生 ──
+            tail_duration = 0
+            if tail_pcm:
+                # transcriptは残り部分のみ（冒頭は既にhistoryに追加済み）
+                await self._emit_collected_shop([tail_pcm], tail_text, 1, tail_a2e_result)
+                tail_duration = len(tail_pcm) / 48000
+                logger.info(f"[ShopDesc] ショップ1残り再生: {tail_duration:.1f}秒")
+
+            # ── 1軒目再生中に2〜5軒目TTS一括開始 ──
+            remaining_tasks = []
+            for i in range(1, total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(shops[i], i + 1, total)
+                )
+                remaining_tasks.append(task)
+            if remaining_tasks:
+                logger.info(f"[ShopDesc] 2〜{total}軒目のTTS生成を一括開始（1軒目残り再生中に生成進行）")
+
+            # 残り部分再生中に2軒目のA2E事前計算を並行実行
+            next_a2e_task = None
+
+            async def _prepare_shop2():
+                nonlocal next_a2e_task
+                if remaining_tasks:
+                    next_chunks, _ = await remaining_tasks[0]
+                    if next_chunks:
+                        next_a2e_task = asyncio.create_task(
+                            self._precompute_a2e_expressions(b''.join(next_chunks))
+                        )
+
+            await asyncio.gather(
+                asyncio.sleep(tail_duration + 0.7),
+                _prepare_shop2()
+            )
+        else:
+            # 1軒目失敗時
+            remaining_tasks = []
+            for i in range(1, total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(shops[i], i + 1, total)
+                )
+                remaining_tasks.append(task)
+            next_a2e_task = None
+
+        # ── 2軒目以降: A2E付きで順次再生 ──
+        for i, task in enumerate(remaining_tasks):
             if not self.is_running:
                 break
             try:
@@ -922,30 +1035,50 @@ class LiveAPISession:
                     next_a2e_task = None
 
                 if audio_chunks:
-                    await self._emit_collected_shop(audio_chunks, transcript, i + 1, a2e_result)
+                    shop_number = i + 2
+                    await self._emit_collected_shop(audio_chunks, transcript, shop_number, a2e_result)
 
-                    # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
                     all_pcm = b''.join(audio_chunks)
                     audio_duration = len(all_pcm) / 48000
-                    logger.info(f"[ShopDesc] ショップ{i+1}再生待ち: {audio_duration:.1f}秒")
+                    logger.info(f"[ShopDesc] ショップ{shop_number}再生待ち: {audio_duration:.1f}秒")
 
-                    # 次のショップのA2E事前計算をsleep待ち中に開始
-                    if i + 1 < len(all_tasks):
-                        next_chunks, _ = await all_tasks[i + 1]
-                        if next_chunks:
-                            next_a2e_task = asyncio.create_task(
-                                self._precompute_a2e_expressions(b''.join(next_chunks))
-                            )
+                    # 次のショップのA2E事前計算と再生待ちを並行実行
+                    async def _prepare_next(idx):
+                        nonlocal next_a2e_task
+                        if idx < len(remaining_tasks):
+                            nxt_chunks, _ = await remaining_tasks[idx]
+                            if nxt_chunks:
+                                next_a2e_task = asyncio.create_task(
+                                    self._precompute_a2e_expressions(b''.join(nxt_chunks))
+                                )
 
-                    await asyncio.sleep(audio_duration + 0.3)
+                    await asyncio.gather(
+                        asyncio.sleep(audio_duration + 0.7),
+                        _prepare_next(i + 1)
+                    )
             except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{i+1}生成エラー: {e}")
+                logger.error(f"[ShopDesc] ショップ{i+2}再生エラー: {e}")
 
         # 全ショップ説明完了 → 通常会話に復帰
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
         self._add_to_history("ai", summary)
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
         self.needs_reconnect = True  # 通常会話に復帰するために再接続
+
+    async def _emit_shop_audio_simple(self, audio_chunks: list, transcript: str, shop_number: int):
+        """音声をA2Eなしで直接送信（リップシンクなし・最速再生）"""
+        if transcript:
+            logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
+            self._add_to_history("ai", transcript)
+
+        # expressionリセット（前セグメントの残留防止）
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
+
+        # 音声送信
+        for chunk in audio_chunks:
+            audio_b64 = base64.b64encode(chunk).decode('utf-8')
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
 
     async def _stream_single_shop(self, shop, shop_number: int, total: int):
         """1軒目用: 音声を直接ブラウザにストリーミング"""
@@ -992,74 +1125,84 @@ class LiveAPISession:
             logger.error(f"[ShopDesc] ショップ{shop_number}ストリーミングエラー: {e}")
 
     async def _collect_shop_audio(self, shop, shop_number: int, total: int, delay: float = 0):
-        """2軒目以降用: LiveAPI接続して音声をバッファに収集（ブラウザには送信しない）"""
+        """ショップ説明用: REST TTS（Google Cloud TTS）で音声を生成（LiveAPI接続不要）"""
         if delay > 0:
             await asyncio.sleep(delay)
         is_last = (shop_number == total)
-        shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
-        shop_instruction = self.system_prompt + f"""
+        # ── 読み上げテキストを構成 ──
+        name = shop.get('name', '')
+        area = shop.get('area', '')
+        category = shop.get('category', shop.get('genre', ''))
+        description = shop.get('description', '')
+        price_range = shop.get('priceRange', shop.get('budget', ''))
 
-【現在のタスク：ショップ紹介】
-あなたは今、ユーザーに検索結果のお店を紹介しています。
-
-{shop_context}
-
-【読み上げルール】
-1. このお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
-2. 店名、ジャンル、エリア、特徴、価格帯を含める
-3. マークダウン記法は使わない（音声出力のため）
-4. 「{shop_number}軒目は」から始める
-5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
-"""
+        script = f"{shop_number}軒目は、{name}です。"
+        if area and category:
+            script += f"{area}にある{category}のお店です。"
+        elif area:
+            script += f"{area}にあるお店です。"
+        if description:
+            script += description
+        if price_range:
+            script += f"ご予算は{price_range}です。"
         if is_last:
-            shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
+            script += f"以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？"
 
         audio_chunks = []
-        transcript = ""
+        transcript = script
 
-        config = self._build_config()
-        config["system_instruction"] = shop_instruction
-        config.pop("tools", None)
+        try:
+            # REST TTS（Google Cloud TTS）で音声生成（起動時キャッシュと同じ方式）
+            loop = asyncio.get_event_loop()
+            pcm = await loop.run_in_executor(None, self._synthesize_speech, script)
 
-        async with self.client.aio.live.connect(
-            model=LIVE_API_MODEL,
-            config=config
-        ) as session:
-            trigger_text = f"{shop_number}軒目のお店の説明を読み上げてください。"
-            await session.send_client_content(
-                turns=types.Content(
-                    role="user",
-                    parts=[types.Part(text=trigger_text)]
-                ),
-                turn_complete=True
-            )
+            if pcm:
+                audio_chunks = [pcm]
+                logger.info(f"[ShopDesc] ショップ{shop_number} TTS生成完了: {len(pcm)} bytes, {len(transcript)}文字")
+            else:
+                logger.error(f"[ShopDesc] ショップ{shop_number} TTS生成失敗")
 
-            turn = session.receive()
-            async for response in turn:
-                if not self.is_running:
-                    break
+        except Exception as e:
+            logger.error(f"[ShopDesc] ショップ{shop_number} TTS生成エラー: {e}")
 
-                if response.server_content:
-                    sc = response.server_content
-
-                    if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        break
-
-                    if (hasattr(sc, 'output_transcription')
-                            and sc.output_transcription
-                            and sc.output_transcription.text):
-                        transcript += sc.output_transcription.text
-
-                    if sc.model_turn:
-                        for part in sc.model_turn.parts:
-                            if (hasattr(part, 'inline_data')
-                                    and part.inline_data
-                                    and isinstance(part.inline_data.data, bytes)):
-                                audio_chunks.append(part.inline_data.data)
-
-        logger.info(f"[ShopDesc] ショップ{shop_number}並行生成完了: {len(audio_chunks)}チャンク, {len(transcript)}文字")
         return audio_chunks, transcript
+
+    def _synthesize_speech(self, text: str) -> bytes | None:
+        """Google Cloud TTSでテキストを24kHz 16bit mono PCMに変換"""
+        try:
+            tts_client = texttospeech.TextToSpeechClient()
+            voice_name = self.voice_model if self.voice_model else "ja-JP-Chirp3-HD-Leda"
+            # セッション言語に応じてvoice_nameの言語部分を差し替え
+            # 例: ja-JP-Chirp3-HD-Leda + language='en' → en-US-Chirp3-HD-Leda
+            lang_map = {'ja': 'ja-JP', 'en': 'en-US', 'zh': 'cmn-CN', 'ko': 'ko-KR'}
+            target_lang = lang_map.get(self.language, 'ja-JP')
+            parts = voice_name.split('-')
+            if len(parts) >= 2:
+                current_lang = f"{parts[0]}-{parts[1]}"
+                if current_lang != target_lang:
+                    voice_name = voice_name.replace(current_lang, target_lang, 1)
+                    logger.info(f"[TTS] 言語差し替え: {current_lang} → {target_lang}, voice={voice_name}")
+            lang_code = target_lang
+            voice = texttospeech.VoiceSelectionParams(
+                language_code=lang_code,
+                name=voice_name
+            )
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=24000,
+                speaking_rate=1.2,
+            )
+            resp = tts_client.synthesize_speech(
+                input=texttospeech.SynthesisInput(text=text),
+                voice=voice,
+                audio_config=audio_config,
+            )
+            # LINEAR16レスポンスにはWAVヘッダ(44bytes)が付くので除去
+            return resp.audio_content[44:]
+        except Exception as e:
+            logger.error(f"[TTS] 音声合成エラー: {e}")
+            return None
 
     async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int, a2e_result: dict | None = None):
         """収集済み音声をA2E先行方式で送信（_emit_cached_audioと同パターン）"""
@@ -1218,11 +1361,18 @@ class LiveAPISession:
     def _on_output_transcription(self, text: str):
         """句読点検出でフラッシュ判定（仕様書08 セクション3.3）"""
         self._a2e_transcript_buffer += text
-        # 句読点（。？！）を検出したらフラッシュ
+        # 句読点（。？！）を検出したら、250ms遅延後にフラッシュ
+        # 余韻の無音データがバッファに入ってからフラッシュすることで、
+        # A2Eが口を閉じるための無音区間（7フレーム=233ms以上）を確保する
         flush_triggers = ['。', '？', '！', '?', '!']
         if any(t in text for t in flush_triggers):
-            asyncio.ensure_future(self._flush_a2e_buffer(force=False))
+            asyncio.ensure_future(self._delayed_a2e_flush())
             self._a2e_transcript_buffer = ""
+
+    async def _delayed_a2e_flush(self):
+        """句読点フラッシュの遅延実行（250ms後）"""
+        await asyncio.sleep(0.25)
+        await self._flush_a2e_buffer(force=False)
 
     async def _send_a2e_ahead(self, pcm_data: bytes):
         """A2E先行送信: 音声をフロントに送る前にExpressionを先に届ける
@@ -1242,44 +1392,62 @@ class LiveAPISession:
         self._a2e_chunk_index = 1
 
     async def _precompute_a2e_expressions(self, pcm_data: bytes) -> dict | None:
-        """A2E事前計算: リサンプリング＋HTTP POSTでexpressionデータを取得（emitしない）
+        """A2E事前計算: 分割送信でexpressionデータを取得（emitしない）
 
-        _collect_shop_audio() から呼ばれる。インスタンス変数（_a2e_chunk_index等）に
-        触れず、フロントエンドへのemitも行わない。純粋な計算＋API呼び出しのみ。
+        大きなPCMデータを5秒ごとのチャンクに分割して送信し、
+        全チャンクのframesを結合して返す。タイムアウトリスクを回避。
         """
         try:
+            # 24kHz PCM全体をリサンプル（24→16kHz）
             int16_array = np.frombuffer(pcm_data, dtype=np.int16)
             resampled = resample_poly(int16_array.astype(np.float32), up=2, down=3)
             int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
-            audio_b64 = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
+            resampled_bytes = int16_resampled.tobytes()
 
-            response = await self._a2e_http_client.post(
-                f"{A2E_SERVICE_URL}/api/audio2expression",
-                json={
-                    "audio_base64": audio_b64,
-                    "session_id": self.session_id,
-                    "audio_format": "pcm",
-                    "is_start": True,
-                    "is_final": True,
-                },
-                timeout=10.0
-            )
+            # 16kHz 16bit mono = 32000 bytes/秒 × 5秒 = 160000 bytes/チャンク
+            CHUNK_BYTES_16K = 160000
+            all_expressions = []
+            names = []
+            frame_rate = A2E_EXPRESSION_FPS
+            total_chunks = (len(resampled_bytes) + CHUNK_BYTES_16K - 1) // CHUNK_BYTES_16K
 
-            if response.status_code == 200:
-                result = response.json()
-                frames = result.get('frames', [])
-                names = result.get('names', [])
-                frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
-                if frames:
-                    expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
-                    logger.info(f"[A2E] 事前計算完了: {len(frames)} frames")
-                    return {
-                        'expressions': expressions,
-                        'expression_names': names,
-                        'frame_rate': frame_rate,
-                    }
-            else:
-                logger.warning(f"[A2E] 事前計算エラー: {response.status_code}")
+            for idx in range(total_chunks):
+                start = idx * CHUNK_BYTES_16K
+                end = min(start + CHUNK_BYTES_16K, len(resampled_bytes))
+                chunk = resampled_bytes[start:end]
+                audio_b64 = base64.b64encode(chunk).decode('utf-8')
+
+                response = await self._a2e_http_client.post(
+                    f"{A2E_SERVICE_URL}/api/audio2expression",
+                    json={
+                        "audio_base64": audio_b64,
+                        "session_id": self.session_id,
+                        "audio_format": "pcm",
+                        "is_start": idx == 0,
+                        "is_final": idx == total_chunks - 1,
+                    },
+                    timeout=10.0
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    frames = result.get('frames', [])
+                    if frames:
+                        expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
+                        all_expressions.extend(expressions)
+                    if idx == 0:
+                        names = result.get('names', [])
+                        frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
+                else:
+                    logger.warning(f"[A2E] 事前計算チャンク{idx}エラー: {response.status_code}")
+
+            if all_expressions:
+                logger.info(f"[A2E] 事前計算完了: {len(all_expressions)} frames ({total_chunks}チャンク)")
+                return {
+                    'expressions': all_expressions,
+                    'expression_names': names,
+                    'frame_rate': frame_rate,
+                }
         except Exception as e:
             logger.error(f"[A2E] 事前計算エラー: {e}")
         return None

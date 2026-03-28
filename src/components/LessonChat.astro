@@ -2,6 +2,7 @@
 // LessonChat.astro - 会話レッスン・モードUI（Concierge.astroベースに移植）
 // アバター + A2Eリップシンク搭載、ショップ検索・予約機能を除外
 import LAMAvatar from './LAMAvatar.astro';
+import AvatarSelector from './AvatarSelector.astro';
 
 export interface Props {
   apiBaseUrl?: string;
@@ -68,7 +69,8 @@ const { apiBaseUrl = '' } = Astro.props;
 
   <div class="chat-area" id="chatArea"></div>
 
-  <div class="input-area">
+  <!-- レッスンモードではテキスト入力不要（音声のみ）。CSSで非表示 -->
+  <div class="input-area" style="display:none;">
     <div class="input-group">
       <input type="text" id="userInput" placeholder="メッセージを入力..." />
       <button class="btn btn-send-expanded" id="sendBtn">Send</button>
@@ -88,6 +90,8 @@ const { apiBaseUrl = '' } = Astro.props;
     </button>
   </div>
 </div>
+
+<AvatarSelector />
 
 <style>
 /* 全体レイアウト */
@@ -212,7 +216,7 @@ const { apiBaseUrl = '' } = Astro.props;
 }
 :global(.message.assistant .message-avatar) { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
 :global(.message.user .message-avatar) { background: #e0e7ff; color: #667eea; }
-:global(.message-content) { max-width: 70%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; }
+:global(.message-content) { max-width: 70%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 17px; white-space: pre-wrap; }
 :global(.message.assistant .message-content) { background: white; border: 1px solid #e5e7eb; color: #1f2937; }
 :global(.message.user .message-content) { background: #667eea; color: white; }
 
