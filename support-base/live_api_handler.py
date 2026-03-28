@@ -628,11 +628,7 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # ★ A2E: 残存バッファに無音パディングを追加してからフラッシュ
-                        # turn_complete時点で音声末尾が切れている場合、A2Eが口を閉じきれない。
-                        # 無音（0.1秒分のゼロ埋めPCM）を追加し、A2Eに発話終了を明示する。
-                        silence_padding = bytes(A2E_FIRST_FLUSH_BYTES)  # 0.1秒分の無音（24kHz 16bit mono）
-                        self._a2e_audio_buffer.extend(silence_padding)
+                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
