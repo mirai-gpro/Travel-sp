@@ -343,6 +343,12 @@ class LiveAPISession:
         self._a2e_send_queue: asyncio.Queue = asyncio.Queue()
         self._a2e_worker_task: asyncio.Task | None = None
 
+        # ★ ショップ検索ステートマシン（conciergeモード用）
+        # search_shopsをLiveAPI toolsから除外し、同意ターンでREST LLM判定→検索発火
+        # 状態: idle → awaiting_consent → idle
+        self._search_state = 'idle'
+        self._search_ai_confirmation = ''  # AIの確認質問テキスト
+
         # 非同期キュー
         self.audio_queue_to_gemini = None
         self.is_running = False
@@ -395,12 +401,13 @@ class LiveAPISession:
         }
 
         # モードに応じたfunction calling定義
+        # ★ conciergeモード: search_shopsをtools定義から除外（音声ストリーミング安定化）
+        #   検索はステートマシン（同意ターンでREST LLM判定）で発火する
         if self.mode == 'lesson':
-            # lessonモードはショップ検索不要、プロファイル更新のみ
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
-            # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+            # conciergeモード: プロファイル更新のみ（search_shopsはステートマシンで処理）
+            config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -632,7 +639,7 @@ class LiveAPISession:
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
-                        self._process_turn_complete()
+                        await self._process_turn_complete(session)
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
 
@@ -834,10 +841,11 @@ class LiveAPISession:
                 'shops': [], 'response': '',
             }, room=self.client_sid)
 
-    def _process_turn_complete(self):
+    async def _process_turn_complete(self, session=None):
         """
         ターン完了時の処理
         stt_stream.py:600-644 から移植
+        + conciergeモード: 承認ターン判定ステートマシン（案3）
         """
         user_text = ""
         if self.user_transcript_buffer.strip():
@@ -846,6 +854,7 @@ class LiveAPISession:
             self._add_to_history("user", user_text)
             self.user_transcript_buffer = ""
 
+        ai_text = ""
         if self.ai_transcript_buffer.strip():
             ai_text = self.ai_transcript_buffer.strip()
             logger.info(f"[LiveAPI] AI: {ai_text}")
@@ -872,6 +881,108 @@ class LiveAPISession:
             elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
+
+        # ★ ショップ検索ステートマシン（conciergeモード専用）
+        if self.mode == 'concierge':
+            await self._search_state_machine(ai_text, user_text, session)
+
+    async def _search_state_machine(self, ai_text: str, user_text: str, session):
+        """
+        ショップ検索ステートマシン（ChatGPT案3: 承認ターン判定の軽量版）
+
+        search_shopsをLiveAPI tools定義から除外した代わりに、
+        同意ターンでのみREST LLMに「検索実行の同意が得られたか」を判定させる。
+
+        状態遷移:
+          idle → awaiting_consent: AIが検索確認の疑問文を発話（プロンプトで強制）
+          awaiting_consent + ユーザー発話 → REST LLMで同意判定 → 検索発火 or idle
+        """
+        # --- AIターン: 確認質問をした場合、次のユーザーターンで判定を起動する ---
+        if ai_text and not user_text:
+            # プロンプトで「よろしいでしょうか？」等の確認形式を強制しているので、
+            # その出力形式を検出して状態遷移する（ユーザー入力のキーワード検出ではない）
+            if 'よろしいでしょうか' in ai_text or 'よろしいですか' in ai_text:
+                self._search_state = 'awaiting_consent'
+                self._search_ai_confirmation = ai_text
+                logger.info(f"[SearchSM] idle → awaiting_consent: AI確認質問検出")
+            return
+
+        # --- ユーザーターン: awaiting_consent状態ならREST LLMで同意判定 ---
+        if user_text and self._search_state == 'awaiting_consent':
+            self._search_state = 'idle'  # 判定後は必ずidleに戻す
+            try:
+                result = await self._judge_search_consent(
+                    self._search_ai_confirmation, user_text
+                )
+                self._search_ai_confirmation = ''
+
+                if result and result.get('ready_to_search'):
+                    search_params = result.get('search_params', '')
+                    logger.info(f"[SearchSM] REST LLM判定: 同意あり → 検索発火: '{search_params[:80]}'")
+                    # 検索開始をブラウザに通知
+                    self.socketio.emit('shop_search_start', {},
+                                       room=self.client_sid)
+                    # LiveAPIに検索実行中であることを伝える（応答トリガーなし）
+                    if session:
+                        await session.send_client_content(
+                            turns=types.Content(
+                                role="user",
+                                parts=[types.Part(text="[システム: ショップ検索を実行中です。検索結果はシステムが自動的にユーザーに提示します。あなたは何も発話しないでください。]")]
+                            ),
+                            turn_complete=False
+                        )
+                    await self._handle_shop_search(search_params)
+                else:
+                    logger.info(f"[SearchSM] REST LLM判定: 同意なし or 条件不足")
+            except Exception as e:
+                logger.error(f"[SearchSM] 同意判定エラー: {e}", exc_info=True)
+                self._search_ai_confirmation = ''
+
+    async def _judge_search_consent(self, ai_confirmation: str, user_response: str) -> dict | None:
+        """
+        REST LLMで「ユーザーが検索実行に同意したか」を判定する。
+        キーワード検出ではなく、LLMの言語理解で判断する。
+
+        戻り値: {"ready_to_search": bool, "search_params": str} or None
+        """
+        prompt = (
+            "あなたはレストラン検索システムの同意判定エンジンです。\n"
+            "AIアシスタントがユーザーに検索条件の確認質問をし、ユーザーが応答しました。\n"
+            "ユーザーの応答が「検索を実行してよい」という同意かどうかを判定してください。\n\n"
+            f"【AIの確認質問】\n{ai_confirmation}\n\n"
+            f"【ユーザーの応答】\n{user_response}\n\n"
+            "【判定ルール】\n"
+            "- 「はい」「お願いします」「それでいい」「うん」等の肯定 → ready_to_search: true\n"
+            "- 「いいえ」「やめて」「変更したい」「別の条件で」等の否定・変更要求 → ready_to_search: false\n"
+            "- 曖昧な場合は false\n\n"
+            "【出力形式】JSON のみ、他のテキスト不要:\n"
+            '{"ready_to_search": true, "search_params": "AIの確認質問から抽出した検索条件（エリア ジャンル 予算 人数等）"}\n'
+            "または:\n"
+            '{"ready_to_search": false, "search_params": ""}\n'
+        )
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                )
+            )
+            text = response.text.strip()
+            logger.info(f"[SearchSM] REST LLM応答: {text[:200]}")
+
+            # JSON抽出
+            import json
+            start = text.find('{')
+            if start >= 0:
+                end = text.rfind('}')
+                if end > start:
+                    return json.loads(text[start:end + 1])
+            return None
+        except Exception as e:
+            logger.error(f"[SearchSM] REST LLM呼び出しエラー: {e}")
+            return None
 
     async def _describe_shops_via_live(self, shops: list):
         """
