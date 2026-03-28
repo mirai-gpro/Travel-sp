@@ -11,8 +11,10 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import json
 import os
 import logging
+import re
 import struct
 import time
 import httpx
@@ -224,6 +226,12 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
 
 
 # ============================================================
+# 構造化シグナル検知（SEARCH_EXECUTE方式）
+# ============================================================
+# プロンプト指示によりLLMが出力する [SEARCH_EXECUTE:{...}] を正規表現で検知
+SEARCH_COMMAND_PATTERN = re.compile(r'\[SEARCH_EXECUTE:(\{.*?\})\]')
+
+# ============================================================
 # Function Calling 定義（v5 §5.2）
 # ============================================================
 
@@ -395,12 +403,14 @@ class LiveAPISession:
         }
 
         # モードに応じたfunction calling定義
+        # ★ conciergeモード: search_shopsをtools定義から除外（音声ストリーミング安定化）
+        #   検索はプロンプト指示による構造化シグナル [SEARCH_EXECUTE:{...}] で発火する
         if self.mode == 'lesson':
             # lessonモードはショップ検索不要、プロファイル更新のみ
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
-            # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+            # conciergeモード: プロファイル更新のみ（search_shopsは構造化シグナル方式で処理）
+            config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -618,9 +628,14 @@ class LiveAPISession:
                 if self.needs_reconnect or not self.is_running:
                     return
 
-                # 1. tool_call: search_shops（v5 §5.4）
+                # 1. tool_call: search_shopsはtools定義から除外済み（構造化シグナル方式に移行）
+                #    update_user_profileのみ残存するため、そちらは処理を継続
                 if hasattr(response, 'tool_call') and response.tool_call:
-                    await self._handle_tool_call(response.tool_call, session)
+                    has_search = any(fc.name == 'search_shops' for fc in response.tool_call.function_calls)
+                    if has_search:
+                        logger.info("[LiveAPI] search_shops tool_call受信（構造化シグナル方式に移行済み、スキップ）")
+                    else:
+                        await self._handle_tool_call(response.tool_call, session)
                     continue
 
                 if response.server_content:
@@ -681,10 +696,27 @@ class LiveAPISession:
                             and sc.output_transcription):
                         text = sc.output_transcription.text
                         if text:
+                            # ★ 構造化シグナル検知: [SEARCH_EXECUTE:{...}]
+                            match = SEARCH_COMMAND_PATTERN.search(text)
+                            if match:
+                                try:
+                                    search_params = json.loads(match.group(1))
+                                    logger.info(f"[SearchSignal] 検索シグナル検出: {search_params}")
+                                    # フロントエンドに送るテキストからシグナル部分を除去
+                                    text = SEARCH_COMMAND_PATTERN.sub('', text)
+                                    # 検索を非同期実行（音声ループをブロックしない）
+                                    search_request = self._build_search_request(search_params)
+                                    self.socketio.emit('shop_search_start', {},
+                                                       room=self.client_sid)
+                                    asyncio.create_task(self._handle_shop_search(search_request))
+                                except json.JSONDecodeError:
+                                    logger.error("[SearchSignal] JSONパース失敗: " + match.group(1))
+
                             self.ai_transcript_buffer += text
-                            self.socketio.emit('ai_transcript',
-                                               {'text': text},
-                                               room=self.client_sid)
+                            if text.strip():
+                                self.socketio.emit('ai_transcript',
+                                                   {'text': text},
+                                                   room=self.client_sid)
                             # ★ A2E: 句読点検出フラッシュ（キュー直列化で順序保証済み）
                             self._on_output_transcription(text)
 
@@ -770,6 +802,28 @@ class LiveAPISession:
                 )
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
+
+    def _build_search_request(self, params: dict) -> str:
+        """
+        構造化シグナルのJSONパラメータから、_handle_shop_searchが受け取る
+        user_request文字列を構築する。
+        例: {"location":"渋谷","genre":"イタリアン","budget":5000,"party_size":2}
+        → "渋谷 イタリアン 予算5000円 2名"
+        """
+        parts = []
+        if params.get('location'):
+            parts.append(str(params['location']))
+        if params.get('genre'):
+            parts.append(str(params['genre']))
+        if params.get('budget') and params.get('budget') != 'null':
+            parts.append(f"予算{params['budget']}円")
+        if params.get('party_size') and params.get('party_size') != 'null':
+            parts.append(f"{params['party_size']}名")
+        if params.get('other') and params.get('other') != 'null':
+            parts.append(str(params['other']))
+        result = ' '.join(parts) if parts else str(params)
+        logger.info(f"[SearchSignal] 検索リクエスト構築: '{result}'")
+        return result
 
     async def _handle_shop_search(self, user_request: str):
         """
