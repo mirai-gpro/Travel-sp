@@ -399,8 +399,10 @@ class LiveAPISession:
             # lessonモードはショップ検索不要、プロファイル更新のみ
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
-            # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+            # SEARCH_SHOPS_DECLARATION を削除し、プロンプト指示（同意取得）に専念させる
+            config["tools"] = [types.Tool(function_declarations=[
+                UPDATE_USER_PROFILE_DECLARATION
+            ])]
 
         return config
 
@@ -618,11 +620,10 @@ class LiveAPISession:
                 if self.needs_reconnect or not self.is_running:
                     return
 
-                # 1. tool_call: search_shops（v5 §5.4）
+                # 1. tool_call (コンシェルジュモードでは使用しないためスキップ)
                 if hasattr(response, 'tool_call') and response.tool_call:
-                    await self._handle_tool_call(response.tool_call, session)
+                    logger.info("Tool call received but skipped in favor of REST flow.")
                     continue
-
                 if response.server_content:
                     sc = response.server_content
 
@@ -705,48 +706,14 @@ class LiveAPISession:
 
     async def _handle_tool_call(self, tool_call, session):
         """
-        LLMからのfunction calling応答を処理する（v5 §5.4）
-        search_shops の場合、ショップ検索を実行する。
+        LLMからのfunction calling応答を処理する
+        ※ search_shopsは外部REST APIで発火するため、ここでは処理しない。
         """
         for fc in tool_call.function_calls:
-            if fc.name == "search_shops":
-                user_request = fc.args.get("user_request", "")
-                logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
-
-                # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
-                self.socketio.emit('shop_search_start', {},
-                                   room=self.client_sid)
-
-                # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
-                # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
-                # searching_task = asyncio.ensure_future(
-                #     self._delayed_cached_audio(_CACHED_SEARCHING_PCM, delay=0.5)
-                # )
-                # please_wait_task = asyncio.ensure_future(
-                #     self._delayed_cached_audio(_CACHED_PLEASE_WAIT_PCM, delay=6.5)
-                # )
-                searching_task = asyncio.ensure_future(asyncio.sleep(0))
-                please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
-
-                # ショップ検索を実行
-                await self._handle_shop_search(user_request)
-
-                # 検索完了 → 未再生のタスクをキャンセル
-                for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
-                    if not task.done():
-                        task.cancel()
-                        logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
-
-                # function responseを返す（LiveAPI SDK: キーワード引数必須）
-                await session.send_tool_response(
-                    function_responses=[types.FunctionResponse(
-                        name=fc.name,
-                        id=fc.id,
-                        response={"result": "検索結果をユーザーに表示しました"}
-                    )]
-                )
-            elif fc.name == "update_user_profile":
-                # ユーザー名登録・変更をDBに永続化
+            # --- search_shops の分岐を丸ごと削除 ---
+            
+            if fc.name == "update_user_profile":
+                # ユーザー名登録・変更をDBに永続化（この機能は維持する場合）
                 updates = fc.args or {}
                 if updates and self.user_id:
                     try:
@@ -754,13 +721,11 @@ class LiveAPISession:
                         ltm = LongTermMemory()
                         success = ltm.update_profile(self.user_id, updates)
                         if success:
-                            logger.info(f"[LiveAPI] プロファイル更新成功: updates={updates}, user_id={self.user_id}")
-                        else:
-                            logger.error(f"[LiveAPI] プロファイル更新失敗: updates={updates}, user_id={self.user_id}")
+                            logger.info(f"[LiveAPI] プロファイル更新成功: updates={updates}")
                     except Exception as e:
                         logger.error(f"[LiveAPI] プロファイル更新エラー: {e}")
 
-                # function responseを返す（LiveAPI SDK: キーワード引数必須）
+                # レスポンスを返さないとLLMが待機状態になるため、応答は必須
                 await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
