@@ -159,24 +159,24 @@ export class LAMWebSocketManager {
             result['jawOpen'] = 0.05;
         }
 
-        // スムージング: 口周り全体にフレーム間補間（α=0.3）
-        const MOUTH_SHAPES = [
-            'jawOpen', 'jawForward', 'jawLeft', 'jawRight',
-            'mouthClose', 'mouthFunnel', 'mouthPucker', 'mouthLeft', 'mouthRight',
-            'mouthSmileLeft', 'mouthSmileRight', 'mouthFrownLeft', 'mouthFrownRight',
-            'mouthDimpleLeft', 'mouthDimpleRight', 'mouthStretchLeft', 'mouthStretchRight',
-            'mouthRollLower', 'mouthRollUpper', 'mouthShrugLower', 'mouthShrugUpper',
-            'mouthPressLeft', 'mouthPressRight', 'mouthLowerDownLeft', 'mouthLowerDownRight',
-            'mouthUpperUpLeft', 'mouthUpperUpRight',
-        ];
-        const SMOOTH_ALPHA = 0.45;
-        for (const name of MOUTH_SHAPES) {
-            if (result[name] !== undefined) {
-                const prev = this._prevMouthValues[name] ?? 0;
-                result[name] = prev * (1 - SMOOTH_ALPHA) + result[name] * SMOOTH_ALPHA;
-                this._prevMouthValues[name] = result[name];
-            }
-        }
+        // スムージング: 一時無効化（口閉じ遅延の切り分けテスト）
+        // const MOUTH_SHAPES = [
+        //     'jawOpen', 'jawForward', 'jawLeft', 'jawRight',
+        //     'mouthClose', 'mouthFunnel', 'mouthPucker', 'mouthLeft', 'mouthRight',
+        //     'mouthSmileLeft', 'mouthSmileRight', 'mouthFrownLeft', 'mouthFrownRight',
+        //     'mouthDimpleLeft', 'mouthDimpleRight', 'mouthStretchLeft', 'mouthStretchRight',
+        //     'mouthRollLower', 'mouthRollUpper', 'mouthShrugLower', 'mouthShrugUpper',
+        //     'mouthPressLeft', 'mouthPressRight', 'mouthLowerDownLeft', 'mouthLowerDownRight',
+        //     'mouthUpperUpLeft', 'mouthUpperUpRight',
+        // ];
+        // const SMOOTH_ALPHA = 0.45;
+        // for (const name of MOUTH_SHAPES) {
+        //     if (result[name] !== undefined) {
+        //         const prev = this._prevMouthValues[name] ?? 0;
+        //         result[name] = prev * (1 - SMOOTH_ALPHA) + result[name] * SMOOTH_ALPHA;
+        //         this._prevMouthValues[name] = result[name];
+        //     }
+        // }
 
         // デバッグ: 120フレームごと（約2秒）にログ出力
         this._exprDebugCounter++;
