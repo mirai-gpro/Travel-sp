@@ -343,12 +343,6 @@ class LiveAPISession:
         self._a2e_send_queue: asyncio.Queue = asyncio.Queue()
         self._a2e_worker_task: asyncio.Task | None = None
 
-        # ★ ショップ検索ステートマシン（conciergeモード用）
-        # search_shopsをLiveAPI toolsから除外し、turn_completeベースで検索発火
-        # 状態: idle → awaiting_consent → searching
-        self._search_state = 'idle'
-        self._search_ai_confirmation = ''  # AIの確認質問テキスト（検索条件抽出用）
-
         # 非同期キュー
         self.audio_queue_to_gemini = None
         self.is_running = False
@@ -401,14 +395,12 @@ class LiveAPISession:
         }
 
         # モードに応じたfunction calling定義
-        # ★ conciergeモード: search_shopsをtools定義から除外（音声ストリーミング安定化）
-        #   検索はステートマシン（turn_completeベース同意検出）で発火する
         if self.mode == 'lesson':
             # lessonモードはショップ検索不要、プロファイル更新のみ
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
-            # conciergeモード: プロファイル更新のみ（search_shopsはステートマシンで処理）
-            config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
+            # conciergeモード等はショップ検索 + プロファイル更新
+            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -640,25 +632,9 @@ class LiveAPISession:
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
-                        search_request = self._process_turn_complete()
+                        self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
-
-                        # ★ ステートマシン: ユーザー同意検出 → ショップ検索発火
-                        if search_request:
-                            logger.info(f"[SearchSM] 検索発火: '{search_request[:80]}'")
-                            # 検索開始をブラウザに通知
-                            self.socketio.emit('shop_search_start', {},
-                                               room=self.client_sid)
-                            # LiveAPIに検索実行中であることを伝える（コンテキスト注入、応答トリガーなし）
-                            await session.send_client_content(
-                                turns=types.Content(
-                                    role="user",
-                                    parts=[types.Part(text="[システム: ショップ検索を実行中です。検索結果はシステムが自動的にユーザーに提示します。あなたは何も発話しないでください。]")]
-                                ),
-                                turn_complete=False
-                            )
-                            await self._handle_shop_search(search_request)
 
                         # 初期あいさつフェーズ終了（仕様書02 セクション4.5.5）
                         if self._is_initial_greeting_phase:
@@ -858,12 +834,10 @@ class LiveAPISession:
                 'shops': [], 'response': '',
             }, room=self.client_sid)
 
-    def _process_turn_complete(self) -> str | None:
+    def _process_turn_complete(self):
         """
         ターン完了時の処理
         stt_stream.py:600-644 から移植
-
-        戻り値: ショップ検索を発火すべき場合は検索条件文字列、それ以外はNone
         """
         user_text = ""
         if self.user_transcript_buffer.strip():
@@ -872,7 +846,6 @@ class LiveAPISession:
             self._add_to_history("user", user_text)
             self.user_transcript_buffer = ""
 
-        ai_text = ""
         if self.ai_transcript_buffer.strip():
             ai_text = self.ai_transcript_buffer.strip()
             logger.info(f"[LiveAPI] AI: {ai_text}")
@@ -899,120 +872,6 @@ class LiveAPISession:
             elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
-
-        # ★ ショップ検索ステートマシン（conciergeモード専用）
-        search_request = self._check_search_state_machine(ai_text, user_text)
-        return search_request
-
-    def _check_search_state_machine(self, ai_text: str, user_text: str) -> str | None:
-        """
-        ショップ検索ステートマシン（conciergeモード専用）
-
-        search_shopsをLiveAPI tools定義から除外した代わりに、
-        turn_completeタイミングでAIの確認質問→ユーザー同意を検出して検索発火する。
-
-        状態遷移:
-          idle → awaiting_consent: AIが検索確認の疑問文を発話
-          awaiting_consent → searching: ユーザーが同意（idle経由でsearch_request返却）
-          awaiting_consent → idle: ユーザーが拒否・別の話題
-
-        戻り値: 検索発火時は検索条件文字列、それ以外はNone
-        """
-        if self.mode != 'concierge':
-            return None
-
-        # --- AIの発話ターン: 確認質問を検出 ---
-        if ai_text and not user_text:
-            # AIが確認の疑問形で終わっているか判定
-            # プロンプトで「よろしいでしょうか？」「よろしいですか？」を強制している
-            confirmation_patterns = [
-                'よろしいでしょうか',
-                'よろしいですか',
-                'いかがでしょうか',
-                'いかがですか',
-                '検索しましょうか',
-                'お探ししましょうか',
-                'お調べしましょうか',
-            ]
-            # 検索関連キーワードも含んでいるか（「お天気はいかがですか」等の誤発火防止）
-            search_context_keywords = [
-                '検索', 'お探し', 'お調べ', 'お店', 'レストラン',
-                'イタリアン', 'フレンチ', '和食', '中華', '焼肉', '寿司',
-                '居酒屋', 'カフェ', 'ラーメン', '予算', 'エリア',
-            ]
-
-            has_confirmation = any(p in ai_text for p in confirmation_patterns)
-            has_search_context = any(k in ai_text for k in search_context_keywords)
-
-            if has_confirmation and has_search_context:
-                self._search_state = 'awaiting_consent'
-                self._search_ai_confirmation = ai_text
-                logger.info(f"[SearchSM] idle → awaiting_consent: AI確認質問検出")
-                logger.info(f"[SearchSM] 確認テキスト: {ai_text[:100]}")
-            return None
-
-        # --- ユーザーの発話ターン: 同意を検出 ---
-        if user_text and self._search_state == 'awaiting_consent':
-            # ユーザーの同意パターン
-            consent_patterns = [
-                'はい', 'うん', 'ええ', 'お願い', 'そうで', 'いいよ', 'いいで',
-                'それで', 'オーケー', 'OK', 'ok', 'Yes', 'yes', 'よろしく',
-                '頼む', '探して', '検索して', 'お調べ', 'お探し',
-            ]
-            # 拒否パターン
-            reject_patterns = [
-                'いいえ', 'いや', 'ちがう', '違う', 'やめ', 'キャンセル',
-                'ちょっと待', 'まだ', '変更', '別の', '他の',
-            ]
-
-            user_lower = user_text.strip()
-            has_consent = any(p in user_lower for p in consent_patterns)
-            has_reject = any(p in user_lower for p in reject_patterns)
-
-            if has_consent and not has_reject:
-                # 同意検出 → 検索発火
-                # AIの確認質問テキストから検索条件を抽出
-                search_request = self._extract_search_conditions(self._search_ai_confirmation)
-                logger.info(f"[SearchSM] awaiting_consent → searching: ユーザー同意検出")
-                logger.info(f"[SearchSM] ユーザー: '{user_text}' → 検索条件: '{search_request}'")
-                self._search_state = 'idle'
-                self._search_ai_confirmation = ''
-                return search_request
-            else:
-                # 拒否 or 別の話題 → idle に戻る
-                logger.info(f"[SearchSM] awaiting_consent → idle: 同意なし (user='{user_text[:50]}')")
-                self._search_state = 'idle'
-                self._search_ai_confirmation = ''
-                return None
-
-        return None
-
-    def _extract_search_conditions(self, ai_confirmation_text: str) -> str:
-        """
-        AIの確認質問テキストから検索条件を抽出する。
-
-        例: 「渋谷でイタリアン、予算5000円、2名様で検索してよろしいでしょうか？」
-        → 「渋谷 イタリアン 予算5000円 2名」
-
-        完全な抽出は難しいため、確認テキスト全体をuser_requestとして渡す。
-        SEARCH_ONLY_PROMPTが条件を解釈してくれる。
-        """
-        # 確認パターンの末尾部分を除去して、条件部分だけ渡す
-        text = ai_confirmation_text
-        # 末尾の疑問部分を除去
-        for suffix in ['よろしいでしょうか？', 'よろしいですか？', 'いかがでしょうか？',
-                       'いかがですか？', '検索しましょうか？', 'お探ししましょうか？',
-                       'お調べしましょうか？', 'よろしいでしょうか', 'よろしいですか']:
-            if text.endswith(suffix):
-                text = text[:-len(suffix)]
-                break
-        # 先頭の接続詞等を除去
-        for prefix in ['それでは、', 'それでは', 'では、', 'では', 'かしこまりました。',
-                       'かしこまりました、', 'はい、', 'はい。']:
-            if text.startswith(prefix):
-                text = text[len(prefix):]
-                break
-        return text.strip() if text.strip() else ai_confirmation_text
 
     async def _describe_shops_via_live(self, shops: list):
         """
