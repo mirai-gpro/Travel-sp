@@ -1364,7 +1364,7 @@ class LiveAPISession:
         # 句読点（。？！）を検出したら、250ms遅延後にフラッシュ
         # 余韻の無音データがバッファに入ってからフラッシュすることで、
         # A2Eが口を閉じるための無音区間（7フレーム=233ms以上）を確保する
-        flush_triggers = ['。', '？', '！', '?', '!']
+        flush_triggers = ['。', '？', '！', '?', '!', '、', '，', ',']
         if any(t in text for t in flush_triggers):
             asyncio.ensure_future(self._delayed_a2e_flush())
             self._a2e_transcript_buffer = ""
