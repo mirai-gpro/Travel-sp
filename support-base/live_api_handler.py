@@ -30,6 +30,7 @@ A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-417509
 if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
 A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
+A2E_PUNCTUATION_MIN_BYTES = 1000 # 句読点フラッシュ時の緩い閾値（初期あいさつ冒頭の空振り防止）
 A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
 A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）
 A2E_EXPRESSION_FPS = 30
@@ -319,7 +320,6 @@ class LiveAPISession:
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
-        self._greeting_pcm_buffer = bytearray()  # 初期あいさつ用PCM蓄積（A2E先行方式）
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -629,16 +629,9 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # ★ 初期あいさつ: A2E先行方式で一括処理
-                        if self._is_initial_greeting_phase and self._greeting_pcm_buffer:
-                            greeting_pcm = bytes(self._greeting_pcm_buffer)
-                            self._greeting_pcm_buffer = bytearray()
-                            logger.info(f"[A2E] 初期あいさつA2E先行送信: {len(greeting_pcm)} bytes")
-                            await self._send_a2e_ahead(greeting_pcm)
-                        else:
-                            # 通常ターン: 残存バッファを強制フラッシュ（最終チャンク）
-                            await self._flush_a2e_buffer(force=True, is_final=True)
-                            await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
+                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
+                        await self._flush_a2e_buffer(force=True, is_final=True)
+                        await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
@@ -709,11 +702,7 @@ class LiveAPISession:
                                                        {'data': audio_b64},
                                                        room=self.client_sid)
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
-                                    if self._is_initial_greeting_phase:
-                                        # 初期あいさつ: A2E先行方式用に別バッファに蓄積
-                                        self._greeting_pcm_buffer.extend(part.inline_data.data)
-                                    else:
-                                        self._buffer_for_a2e(part.inline_data.data)
+                                    self._buffer_for_a2e(part.inline_data.data)
 
     async def _handle_tool_call(self, tool_call, session):
         """
@@ -1384,7 +1373,7 @@ class LiveAPISession:
     async def _delayed_a2e_flush(self):
         """句読点フラッシュの遅延実行（250ms後）"""
         await asyncio.sleep(0.25)
-        await self._flush_a2e_buffer(force=False)
+        await self._flush_a2e_buffer(force=False, is_punctuation=True)
 
     async def _send_a2e_ahead(self, pcm_data: bytes):
         """A2E先行送信: 音声をフロントに送る前にExpressionを先に届ける
@@ -1488,13 +1477,15 @@ class LiveAPISession:
                 break
         self._a2e_audio_buffer = bytearray()
 
-    async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False):
+    async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False, is_punctuation: bool = False):
         """最低バイト数チェック後、キューに投入してA2E直列送信（仕様書08 セクション3.3）"""
         if len(self._a2e_audio_buffer) == 0:
             return
 
         # force=Falseの場合、最低バッファサイズをチェック
-        if not force and len(self._a2e_audio_buffer) < A2E_MIN_BUFFER_BYTES:
+        # 句読点トリガー時は緩い閾値を使用（初期あいさつ冒頭の空振り防止）
+        min_bytes = A2E_PUNCTUATION_MIN_BYTES if is_punctuation else A2E_MIN_BUFFER_BYTES
+        if not force and len(self._a2e_audio_buffer) < min_bytes:
             return
 
         # バッファを取得してクリア
