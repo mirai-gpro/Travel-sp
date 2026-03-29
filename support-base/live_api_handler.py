@@ -30,6 +30,7 @@ A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-417509
 if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
 A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
+A2E_PUNCTUATION_MIN_BYTES = 1000 # 句読点フラッシュ時の緩い閾値（初期あいさつ冒頭の空振り防止）
 A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
 A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）
 A2E_EXPRESSION_FPS = 30
@@ -1372,7 +1373,7 @@ class LiveAPISession:
     async def _delayed_a2e_flush(self):
         """句読点フラッシュの遅延実行（250ms後）"""
         await asyncio.sleep(0.25)
-        await self._flush_a2e_buffer(force=False)
+        await self._flush_a2e_buffer(force=False, is_punctuation=True)
 
     async def _send_a2e_ahead(self, pcm_data: bytes):
         """A2E先行送信: 音声をフロントに送る前にExpressionを先に届ける
@@ -1476,13 +1477,15 @@ class LiveAPISession:
                 break
         self._a2e_audio_buffer = bytearray()
 
-    async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False):
+    async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False, is_punctuation: bool = False):
         """最低バイト数チェック後、キューに投入してA2E直列送信（仕様書08 セクション3.3）"""
         if len(self._a2e_audio_buffer) == 0:
             return
 
         # force=Falseの場合、最低バッファサイズをチェック
-        if not force and len(self._a2e_audio_buffer) < A2E_MIN_BUFFER_BYTES:
+        # 句読点トリガー時は緩い閾値を使用（初期あいさつ冒頭の空振り防止）
+        min_bytes = A2E_PUNCTUATION_MIN_BYTES if is_punctuation else A2E_MIN_BUFFER_BYTES
+        if not force and len(self._a2e_audio_buffer) < min_bytes:
             return
 
         # バッファを取得してクリア
