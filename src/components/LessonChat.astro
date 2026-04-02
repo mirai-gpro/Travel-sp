@@ -170,6 +170,12 @@ const { apiBaseUrl = '' } = Astro.props;
 
 .gourmet-chat-container.mode-lesson .avatar-stage {
   background: linear-gradient(to bottom, #d1fae5, #a7f3d0);
+  height: 400px;
+}
+
+/* レッスンモード: アバター本体を2倍サイズに */
+.gourmet-chat-container.mode-lesson .avatar-container :global(canvas) {
+  transform: scale(2.8);
 }
 
 .avatar-container {
@@ -288,7 +294,7 @@ input:checked + .slider:before { transform: translateX(20px); }
 
 /* モバイル対応 */
 @media (max-width: 768px) {
-  .avatar-stage { height: 150px; }
+  .avatar-stage { height: 300px; }
   .avatar-container { width: 100%; height: 100%; }
   .floating-buttons { bottom: 80px; right: 16px; gap: 8px; }
   .btn-floating { width: 52px; height: 52px; }
