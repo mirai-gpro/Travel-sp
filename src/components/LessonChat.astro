@@ -112,6 +112,7 @@ const { apiBaseUrl = '' } = Astro.props;
 
 .gourmet-chat-container.mode-lesson {
   border: 2px solid #10b981;
+  max-height: none;
 }
 
 /* ヘッダーエリア */
@@ -173,10 +174,11 @@ const { apiBaseUrl = '' } = Astro.props;
   height: 400px;
 }
 
-/* レッスンモード: アバター本体を2倍サイズに */
+/* レッスンモード: アバター本体を拡大 */
 .gourmet-chat-container.mode-lesson .avatar-container :global(canvas) {
-  transform: scale(2.8);
+  transform: scale(1.43);
 }
+
 
 .avatar-container {
   width: 100%;
