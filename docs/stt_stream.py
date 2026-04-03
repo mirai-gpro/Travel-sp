@@ -27,7 +27,7 @@ from google.cloud import texttospeech
 GEMINI_API_KEY_OVERRIDE = "AIza******************"
 
 # GCP Project ID（TTS用）
-GCP_PROJECT_ID = "ai-meet-486502"
+GCP_PROJECT_ID = "ai-avator-492205"
 
 # Voicemeeter デバイス設定
 INPUT_DEVICE_NAME = "Voicemeeter Out B1 (VB-Audio Vo"
