@@ -25,7 +25,7 @@ from google.cloud import texttospeech
 logger = logging.getLogger(__name__)
 
 # A2E (Audio2Expression) サービス設定
-A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-417509577941.us-central1.run.app")
+A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-281169010109.us-central1.run.app")
 # プロトコルが省略された場合に自動補完
 if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
