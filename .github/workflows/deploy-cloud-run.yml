@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 env:
-  PROJECT_ID: ai-meet-486502
+  PROJECT_ID: ai-avator-492205
   SERVICE_NAME: travel-sp-base
   REGION: us-central1
   GAR_LOCATION: us-central1-docker.pkg.dev
