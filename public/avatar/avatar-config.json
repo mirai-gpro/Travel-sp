@@ -1,0 +1,56 @@
+[
+  {
+    "id": "meruru",
+    "name": "メルル",
+    "modelUrl": "/avatar/meruru.zip",
+    "thumbnail": "/avatar/thumbs/meruru.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+  {
+    "id": "elf",
+    "name": "エルフ",
+    "modelUrl": "/avatar/elf.zip",
+    "thumbnail": "/avatar/thumbs/elf.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.73, "posZ": 0.4, "targetY": 1.70 }
+  },
+  {
+    "id": "mizuki",
+    "name": "みづき",
+    "modelUrl": "/avatar/mizuki.zip",
+    "thumbnail": "/avatar/thumbs/mizuki.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Despina",
+    "liveVoice": "Despina",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+  {
+    "id": "nao",
+    "name": "ナオ",
+    "modelUrl": "/avatar/nao.zip",
+    "thumbnail": "/avatar/thumbs/nao.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Despina",
+    "liveVoice": "Despina",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+    {
+    "id": "ryusei",
+    "name": "りゅうせい",
+    "modelUrl": "/avatar/ryusei.zip",
+    "thumbnail": "/avatar/thumbs/ryusei.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Enceladus",
+    "liveVoice": "Enceladus",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+  {
+    "id": "okabe",
+    "name": "オカベ",
+    "modelUrl": "/avatar/okabe.zip",
+    "thumbnail": "/avatar/thumbs/okabe.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Algieba",
+    "liveVoice": "Algieba",
+    "camera": { "posY": 1.82, "posZ": 0.45, "targetY": 1.68 }
+  }
+]

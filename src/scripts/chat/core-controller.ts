@@ -26,7 +26,7 @@ export class CoreController {
   protected preGeneratedAcks: Map<string, string> = new Map();
   protected isAISpeaking = false;
   protected currentAISpeech = "";
-  protected currentMode: 'chat' | 'concierge' = 'chat';
+  protected currentMode: 'chat' | 'concierge' | 'lesson' = 'chat';
 
   // ★ LiveAPI状態変数（仕様書02 セクション4.4.2）
   protected isLiveMode = false;
@@ -142,7 +142,7 @@ export class CoreController {
     this.els.sendBtn.disabled = true;
     this.els.micBtn.disabled = true;
     this.els.speakerBtn.disabled = true;
-    this.els.reservationBtn.classList.remove('visible');
+    this.els.reservationBtn?.classList.remove('visible');
 
     this.currentShops = [];
     this.sessionId = null;
@@ -178,8 +178,20 @@ export class CoreController {
     
     this.els.languageSelect?.addEventListener('change', () => {
       this.currentLanguage = this.els.languageSelect.value as any;
+      localStorage.setItem('selectedLanguage', this.currentLanguage);
       this.updateUILanguage();
+      // 言語変更時はセッションリロードしてバックエンドに反映
+      if (this.isLiveMode) {
+        window.location.reload();
+      }
     });
+
+    // localStorageから前回選択した言語を復元
+    const savedLang = localStorage.getItem('selectedLanguage');
+    if (savedLang && this.els.languageSelect) {
+      this.currentLanguage = savedLang as any;
+      this.els.languageSelect.value = savedLang;
+    }
 
     const floatingButtons = this.container.querySelector('.floating-buttons');
     this.els.userInput?.addEventListener('focus', () => {
@@ -342,8 +354,8 @@ export class CoreController {
       console.log('[LiveAPI] turn_complete');
       this.liveAudioManager.onAiResponseEnded();
 
-      // ユーザー発話をチャット欄に確定表示
-      if (this.userTranscriptBuffer.trim()) {
+      // ユーザー発話をチャット欄に確定表示（lessonモードでは非表示）
+      if (this.userTranscriptBuffer.trim() && this.currentMode !== 'lesson') {
         this.addMessage('user', this.userTranscriptBuffer.trim());
       }
       this.userTranscriptBuffer = '';
@@ -396,7 +408,7 @@ export class CoreController {
       const shops = data?.shops || [];
       if (shops.length > 0) {
         this.currentShops = shops;
-        this.els.reservationBtn.classList.add('visible');
+        this.els.reservationBtn?.classList.add('visible');
         document.dispatchEvent(new CustomEvent('displayShops', {
           detail: { shops: shops, language: this.currentLanguage }
         }));
@@ -444,7 +456,7 @@ export class CoreController {
       this.els.micBtn.disabled = false;
       this.els.speakerBtn.disabled = false;
       this.els.speakerBtn.classList.remove('disabled');
-      this.els.reservationBtn.classList.remove('visible');
+      this.els.reservationBtn?.classList.remove('visible');
 
       // 3. ★ LiveAPIで初期挨拶を開始（仕様書02 セクション4.4.2）
       //    REST API挨拶 + GCP TTS の処理は全て削除
@@ -573,10 +585,14 @@ export class CoreController {
       await this.liveAudioManager.initialize(this.socket);
 
       // サーバーにLiveAPIセッション開始を通知
+      const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
+      const liveVoice = localStorage.getItem(`selectedLiveVoice_${this.currentMode}`) || '';
       this.socket.emit('live_start', {
         session_id: this.sessionId,
         mode: this.currentMode,
-        language: this.currentLanguage
+        language: this.currentLanguage,
+        voice_model: voiceModel,
+        live_voice: liveVoice
       });
 
       this.isLiveMode = true;
@@ -793,7 +809,7 @@ export class CoreController {
       
       if (data.shops && data.shops.length > 0) {
         this.currentShops = data.shops;
-        this.els.reservationBtn.classList.add('visible');
+        this.els.reservationBtn?.classList.add('visible');
         this.els.userInput.value = '';
         document.dispatchEvent(new CustomEvent('displayShops', { 
           detail: { shops: data.shops, language: this.currentLanguage } 
@@ -932,7 +948,7 @@ export class CoreController {
           const extractedShops = this.extractShopsFromResponse(data.response);
           if (extractedShops.length > 0) {
             this.currentShops = extractedShops;
-            this.els.reservationBtn.classList.add('visible');
+            this.els.reservationBtn?.classList.add('visible');
             document.dispatchEvent(new CustomEvent('displayShops', { 
               detail: { shops: extractedShops, language: this.currentLanguage } 
             }));
@@ -1229,7 +1245,7 @@ export class CoreController {
     this.els.micBtn.title = this.t('btnVoiceInput');
     this.els.speakerBtn.title = this.isTTSEnabled ? this.t('btnTTSOn') : this.t('btnTTSOff');
     this.els.sendBtn.textContent = this.t('btnSend');
-    this.els.reservationBtn.innerHTML = this.t('btnReservation');
+    if (this.els.reservationBtn) this.els.reservationBtn.innerHTML = this.t('btnReservation');
     
     const pageTitle = document.getElementById('pageTitle');
     if (pageTitle) pageTitle.innerHTML = `<img src="/pwa-152x152.png" alt="Logo" class="app-logo" /> ${this.t('pageTitle')}`;

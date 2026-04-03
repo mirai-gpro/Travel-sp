@@ -192,8 +192,8 @@ export class ConciergeController extends CoreController {
   private toggleMode() {
     const isChecked = this.els.modeSwitch?.checked;
     if (!isChecked) {
-      // チャットモードへページ遷移
-      console.log('[ConciergeController] Switching to Chat mode...');
+      // レッスンモードへページ遷移
+      console.log('[ConciergeController] Switching to Lesson mode...');
       window.location.href = '/';
     }
     // コンシェルジュモードは既に現在のページなので何もしない

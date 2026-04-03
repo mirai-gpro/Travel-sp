@@ -3,6 +3,7 @@
 // ★ LAMAvatar コンポーネント追加（仕様書08 セクション6.3）
 import ReservationModal from './ReservationModal.astro';
 import LAMAvatar from './LAMAvatar.astro';
+import AvatarSelector from './AvatarSelector.astro';
 
 export interface Props {
   apiBaseUrl?: string;
@@ -53,7 +54,7 @@ const { apiBaseUrl = '' } = Astro.props;
   <div class="avatar-stage" id="avatarStage">
     <div class="avatar-container">
       <!-- ★ LAMAvatar: Gaussian Splatting 3Dアバター（仕様書08 セクション6.3） -->
-      <LAMAvatar modelUrl="/avatar/concierge.zip" />
+      <LAMAvatar modelUrl="/avatar/elf.zip" />
     </div>
   </div>
 
@@ -86,6 +87,7 @@ const { apiBaseUrl = '' } = Astro.props;
 </div>
 
 <ReservationModal apiBaseUrl={apiBaseUrl} />
+<AvatarSelector />
 
 <style>
 /* 全体レイアウト */
