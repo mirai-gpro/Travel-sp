@@ -90,8 +90,7 @@ export class CoreController {
         }
     }, 10000);
 
-    await this.initializeSession();
-    this.updateUILanguage();
+    await this.resetAppContent();
 
     setTimeout(() => {
       if (this.els.splashOverlay) {
@@ -101,6 +100,9 @@ export class CoreController {
     }, 2000);
 
     console.log('[Core] Initialization completed');
+
+    // ★ 初期起動完了後にソフトリセットを自動実行（リップシンク正常化）
+    await this.resetAppContent();
   }
 
   protected getUserId(): string {
