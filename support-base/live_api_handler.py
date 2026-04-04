@@ -15,6 +15,7 @@ import os
 import logging
 import struct
 import time
+import threading
 import httpx
 from scipy.signal import resample_poly
 import numpy as np
@@ -321,6 +322,9 @@ class LiveAPISession:
         self._is_initial_greeting_phase = True
         self._greeting_pcm_buffer = bytearray()  # 初期あいさつ用PCM蓄積（A2E先行方式）
 
+        # ★ 案B: アバター準備完了待ちイベント（threading.Event: Flask threadからset()される）
+        self._greeting_trigger_event: threading.Event = threading.Event()
+
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key)
@@ -440,6 +444,11 @@ class LiveAPISession:
             except asyncio.QueueFull:
                 pass  # キューが満杯の場合はドロップ
 
+    def on_greeting_trigger(self):
+        """フロントエンドのアバター準備完了通知を受信"""
+        self._greeting_trigger_event.set()
+        logger.info("[LiveAPI] greeting_trigger受信: アバター準備完了")
+
     def stop(self):
         """セッションを停止"""
         self.is_running = False
@@ -473,8 +482,18 @@ class LiveAPISession:
                     ) as session:
 
                         if self.session_count == 1:
-                            # 初回接続: ダミーメッセージで初期あいさつを発火
+                            # 初回接続: live_readyを先に送信し、アバター準備完了を待ってからgreeting発火
                             self._is_initial_greeting_phase = True
+                            self.socketio.emit('live_ready', {}, room=self.client_sid)
+                            logger.info("[LiveAPI] live_ready送信 → greeting_trigger待機")
+
+                            # ★ 案B: アバター準備完了を待つ（最大30秒、threading.Event）
+                            triggered = await asyncio.get_event_loop().run_in_executor(
+                                None, self._greeting_trigger_event.wait, 30.0
+                            )
+                            if not triggered:
+                                logger.warning("[LiveAPI] greeting_trigger タイムアウト（30秒）、greeting発火します")
+
                             trigger_msgs = self.INITIAL_GREETING_TRIGGERS
                             mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
                             dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])

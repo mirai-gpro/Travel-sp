@@ -51,6 +51,12 @@ export class ConciergeController extends CoreController {
       try {
         await controller.initialize(this.liveAudioManager);
         console.log('[ConciergeController] LAMAvatar連携完了');
+
+        // ★ 案B: アバター準備完了をサーバーに通知 → greeting発火を許可
+        if (this.socket && this.socket.connected) {
+          this.socket.emit('greeting_trigger');
+          console.log('[ConciergeController] greeting_trigger送信');
+        }
       } catch (e) {
         console.error('[ConciergeController] LAMAvatar連携エラー:', e);
       }
