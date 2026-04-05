@@ -18,6 +18,15 @@
     "camera": { "posY": 1.73, "posZ": 0.4, "targetY": 1.70 }
   },
   {
+    "id": "lisa",
+    "name": "リサ",
+    "modelUrl": "/avatar/lisa.zip",
+    "thumbnail": "/avatar/thumbs/lisa.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Despina",
+    "liveVoice": "Despina",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+  {
     "id": "mizuki",
     "name": "みづき",
     "modelUrl": "/avatar/mizuki.zip",
