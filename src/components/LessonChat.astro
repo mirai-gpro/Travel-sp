@@ -112,7 +112,8 @@ const { apiBaseUrl = '' } = Astro.props;
 
 .gourmet-chat-container.mode-lesson {
   border: 2px solid #10b981;
-  max-height: none;
+  max-height: 100vh;
+  height: 100vh;
 }
 
 /* ヘッダーエリア */
@@ -208,9 +209,16 @@ const { apiBaseUrl = '' } = Astro.props;
 .chat-area {
   flex: 1;
   overflow-y: auto;
-  padding: 20px;
+  overflow-x: hidden;
+  padding: 10px 16px;
   background: #f7f9fc;
   min-height: 0;
+  max-height: 210px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.chat-area::-webkit-scrollbar {
+  display: none;
 }
 
 /* メッセージスタイル */
@@ -297,8 +305,9 @@ input:checked + .slider:before { transform: translateX(20px); }
 /* モバイル対応 */
 @media (max-width: 768px) {
   .avatar-stage { height: 300px; }
+  .chat-area { max-height: 180px; padding: 8px 12px; }
   .avatar-container { width: 100%; height: 100%; }
-  .floating-buttons { bottom: 80px; right: 16px; gap: 8px; }
+  .floating-buttons { bottom: 10px; right: 16px; gap: 8px; }
   .btn-floating { width: 52px; height: 52px; }
   .btn-speaker-float .speaker-icon { width: 22px; height: 22px; }
   .btn-mic-float img { width: 52px; height: 52px; }
