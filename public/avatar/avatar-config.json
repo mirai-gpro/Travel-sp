@@ -2,6 +2,7 @@
   {
     "id": "meruru",
     "name": "メルル",
+    "teacherName": "Meruru",
     "modelUrl": "/avatar/meruru.zip",
     "thumbnail": "/avatar/thumbs/meruru.png",
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
@@ -11,6 +12,7 @@
   {
     "id": "elf",
     "name": "エルフ",
+    "teacherName": "Elfi",
     "modelUrl": "/avatar/elf.zip",
     "thumbnail": "/avatar/thumbs/elf.png",
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
@@ -20,6 +22,7 @@
   {
     "id": "mizuki",
     "name": "みづき",
+    "teacherName": "Mizuki",
     "modelUrl": "/avatar/mizuki.zip",
     "thumbnail": "/avatar/thumbs/mizuki.png",
     "voiceModel": "ja-JP-Chirp3-HD-Despina",
@@ -29,6 +32,7 @@
   {
     "id": "nao",
     "name": "ナオ",
+    "teacherName": "Nao",
     "modelUrl": "/avatar/nao.zip",
     "thumbnail": "/avatar/thumbs/nao.png",
     "voiceModel": "ja-JP-Chirp3-HD-Despina",
@@ -38,6 +42,7 @@
     {
     "id": "ryusei",
     "name": "りゅうせい",
+    "teacherName": "Ryusei",
     "modelUrl": "/avatar/ryusei.zip",
     "thumbnail": "/avatar/thumbs/ryusei.png",
     "voiceModel": "ja-JP-Chirp3-HD-Enceladus",
@@ -47,6 +52,7 @@
   {
     "id": "okabe",
     "name": "オカベ",
+    "teacherName": "Okabe",
     "modelUrl": "/avatar/okabe.zip",
     "thumbnail": "/avatar/thumbs/okabe.png",
     "voiceModel": "ja-JP-Chirp3-HD-Algieba",

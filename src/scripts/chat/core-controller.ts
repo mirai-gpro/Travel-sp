@@ -3,6 +3,7 @@
 import { i18n } from '../../constants/i18n';
 import { AudioManager } from './audio-manager';
 import { LiveAudioManager } from './live-audio-manager';
+import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
 
 declare const io: any;
 
@@ -586,15 +587,20 @@ export class CoreController {
       // LiveAudioManager初期化（マイク取得 + AudioWorklet設定）
       await this.liveAudioManager.initialize(this.socket);
 
+      // ★ 新規ユーザー対応: デフォルトアバター情報をlocalStorageに確実に設定
+      await ensureDefaultAvatarInStorage(this.currentMode);
+
       // サーバーにLiveAPIセッション開始を通知
       const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
       const liveVoice = localStorage.getItem(`selectedLiveVoice_${this.currentMode}`) || '';
+      const teacherName = localStorage.getItem(`selectedTeacherName_${this.currentMode}`) || '';
       this.socket.emit('live_start', {
         session_id: this.sessionId,
         mode: this.currentMode,
         language: this.currentLanguage,
         voice_model: voiceModel,
-        live_voice: liveVoice
+        live_voice: liveVoice,
+        teacher_name: teacherName
       });
 
       this.isLiveMode = true;
