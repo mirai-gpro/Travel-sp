@@ -11,6 +11,7 @@ export interface CameraParams {
 export interface AvatarDef {
   id: string;
   name: string;       // メニュー表示名
+  teacherName?: string; // AI講師の呼び名（プロンプト内の{teacher_name}に使用）
   modelUrl: string;   // public/avatar/ 配下のzipパス
   thumbnail?: string; // サムネイル画像パス（なければファイル名表示）
   voiceModel: string; // REST TTS用音声モデル名（例: ja-JP-Chirp3-HD-Leda）
@@ -62,8 +63,20 @@ export function setSelectedAvatar(mode: string, avatar: AvatarDef): void {
   localStorage.setItem(`selectedAvatarUrl_${mode}`, avatar.modelUrl);
   localStorage.setItem(`selectedVoiceModel_${mode}`, avatar.voiceModel);
   localStorage.setItem(`selectedLiveVoice_${mode}`, avatar.liveVoice || '');
+  localStorage.setItem(`selectedTeacherName_${mode}`, avatar.teacherName || '');
   if (avatar.camera) {
     localStorage.setItem(`selectedCamera_${mode}`, JSON.stringify(avatar.camera));
+  }
+}
+
+/** 新規ユーザー時: モードのデフォルトアバターのlocalStorageを初期化 */
+export async function ensureDefaultAvatarInStorage(mode: string): Promise<void> {
+  if (localStorage.getItem(`selectedCamera_${mode}`)) return; // 既に設定済み
+  const avatars = await loadAvatarConfig();
+  const defaultId = MODE_DEFAULT_AVATAR[mode] || 'meruru';
+  const avatar = getAvatarById(avatars, defaultId);
+  if (avatar) {
+    setSelectedAvatar(mode, avatar);
   }
 }
 

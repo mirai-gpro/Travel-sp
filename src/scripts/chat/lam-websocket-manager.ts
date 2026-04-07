@@ -14,6 +14,7 @@
 
 import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
 import type { ExpressionFrame } from './live-audio-manager';
+import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -59,6 +60,10 @@ export class LAMWebSocketManager {
      */
     async initialize(config: LAMConfig): Promise<void> {
         try {
+            // ★ 新規ユーザー対応: モードのデフォルトアバター情報をlocalStorageに確実に設定
+            const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
+            await ensureDefaultAvatarInStorage(mode);
+
             this.renderer = await GaussianSplats3D.GaussianSplatRenderer.getInstance(
                 config.containerElement,
                 config.modelUrl,
@@ -72,7 +77,6 @@ export class LAMWebSocketManager {
 
             // カメラ位置を調整してアバターの顔サイズ・位置を制御
             // avatar-config.json のcameraパラメータをlocalStorageから読み込み
-            const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
             let camParams = { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // デフォルト
             try {
                 const storedCamera = localStorage.getItem(`selectedCamera_${mode}`);
