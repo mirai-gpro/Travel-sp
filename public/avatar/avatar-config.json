@@ -2,7 +2,7 @@
   {
     "id": "meruru",
     "name": "メルル",
-    "teacherName": "Meruru",
+    "teacherName": "Lisa",
     "modelUrl": "/avatar/meruru.zip",
     "thumbnail": "/avatar/thumbs/meruru.png",
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
@@ -12,7 +12,7 @@
   {
     "id": "elf",
     "name": "エルフ",
-    "teacherName": "Elfi",
+    "teacherName": "Lisa",
     "modelUrl": "/avatar/elf.zip",
     "thumbnail": "/avatar/thumbs/elf.png",
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
@@ -22,6 +22,7 @@
   {
     "id": "lisa",
     "name": "リサ",
+    "teacherName": "Lisa",
     "modelUrl": "/avatar/lisa.zip",
     "thumbnail": "/avatar/thumbs/lisa.png",
     "voiceModel": "ja-JP-Chirp3-HD-Despina",
@@ -61,6 +62,7 @@
   {
     "id": "nicolas",
     "name": "ニコラス",
+    "teacherName": "Nico",
     "modelUrl": "/avatar/nicolas.zip",
     "thumbnail": "/avatar/thumbs/nicolas.png",
     "voiceModel": "ja-JP-Chirp3-HD-Enceladus",
