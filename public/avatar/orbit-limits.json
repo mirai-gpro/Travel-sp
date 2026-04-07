@@ -1,0 +1,16 @@
+{
+  "minPolarAngle": 1.17,
+  "maxPolarAngle": 1.87,
+  "minAzimuthAngle": -1.05,
+  "maxAzimuthAngle": 1.05,
+  "minDistance": 0.25,
+  "maxDistance": 0.8,
+  "_comment": {
+    "minPolarAngle": "上方向の制限（ラジアン）。π/2(=1.57)が水平、小さいほど見上げる。1.17 ≈ 67度",
+    "maxPolarAngle": "下方向の制限（ラジアン）。1.87 ≈ 107度（やや見下ろし）",
+    "minAzimuthAngle": "左方向の水平回転制限（ラジアン）。-1.05 ≈ -60度",
+    "maxAzimuthAngle": "右方向の水平回転制限（ラジアン）。1.05 ≈ +60度",
+    "minDistance": "カメラのズームイン上限（顔のアップ）",
+    "maxDistance": "カメラのズームアウト上限（上半身が見える程度）"
+  }
+}
