@@ -1,8 +1,8 @@
 {
-  "minPolarAngle": 1.17,
+  "minPolarAngle": 1.07,
   "_minPolarAngle_説明": "上方向の制限（ラジアン）。π/2(=1.57)が水平、小さいほど上を向く。1.17 ≈ 67度（顔をやや見上げる位置まで）",
 
-  "maxPolarAngle": 1.47,
+  "maxPolarAngle": 1.85,
   "_maxPolarAngle_説明": "下方向の制限（ラジアン）。1.57 ≈ 107度（顔をやや見下ろす位置まで）。これより大きくすると頭頂や後頭部が見えてしまう",
 
   "minAzimuthAngle": -0.55,
