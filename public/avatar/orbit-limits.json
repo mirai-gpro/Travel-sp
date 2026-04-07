@@ -5,10 +5,10 @@
   "maxPolarAngle": 1.67,
   "_maxPolarAngle_説明": "下方向の制限（ラジアン）。1.57 ≈ 107度（顔をやや見下ろす位置まで）。これより大きくすると頭頂や後頭部が見えてしまう",
 
-  "minAzimuthAngle": -0.95,
+  "minAzimuthAngle": -0.75,
   "_minAzimuthAngle_説明": "左方向の水平回転制限（ラジアン）。-0.75 ≈ -60度（左横顔まで）",
 
-  "maxAzimuthAngle": 0.95,
+  "maxAzimuthAngle": 0.75,
   "_maxAzimuthAngle_説明": "右方向の水平回転制限（ラジアン）。0.75 ≈ +60度（右横顔まで）。これを超えると顔の裏側が見えてしまう",
 
   "minDistance": 0.25,
