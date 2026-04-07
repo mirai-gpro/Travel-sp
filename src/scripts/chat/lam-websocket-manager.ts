@@ -97,6 +97,24 @@ export class LAMWebSocketManager {
                 const controls = this.renderer.viewer.controls;
                 if (controls) {
                     controls.target.set(0, camParams.targetY, 0);
+
+                    // ★ カーソル操作の可動域制限（orbit-limits.jsonから読み込み）
+                    try {
+                        const resp = await fetch('/avatar/orbit-limits.json');
+                        if (resp.ok) {
+                            const limits = await resp.json();
+                            if (typeof limits.minPolarAngle === 'number') controls.minPolarAngle = limits.minPolarAngle;
+                            if (typeof limits.maxPolarAngle === 'number') controls.maxPolarAngle = limits.maxPolarAngle;
+                            if (typeof limits.minAzimuthAngle === 'number') controls.minAzimuthAngle = limits.minAzimuthAngle;
+                            if (typeof limits.maxAzimuthAngle === 'number') controls.maxAzimuthAngle = limits.maxAzimuthAngle;
+                            if (typeof limits.minDistance === 'number') controls.minDistance = limits.minDistance;
+                            if (typeof limits.maxDistance === 'number') controls.maxDistance = limits.maxDistance;
+                            console.log('[LAMWebSocketManager] orbit-limits適用:', limits);
+                        }
+                    } catch (e) {
+                        console.warn('[LAMWebSocketManager] orbit-limits.json読み込み失敗、制限なし', e);
+                    }
+
                     controls.update();
                 }
 
