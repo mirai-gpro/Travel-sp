@@ -59,6 +59,16 @@
     "liveVoice": "Enceladus",
     "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
   },
+      {
+    "id": "fumiya",
+    "name": "フミヤ",
+    "teacherName": "fumiya",
+    "modelUrl": "/avatar/fumiya.zip",
+    "thumbnail": "/avatar/thumbs/fumiya.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Enceladus",
+    "liveVoice": "Enceladus",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
   {
     "id": "nicolas",
     "name": "ニコラス",
