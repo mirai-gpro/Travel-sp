@@ -9,6 +9,16 @@
     "liveVoice": "Leda",
     "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
   },
+    {
+    "id": "yui",
+    "name": "YUI",
+    "teacherName": "Yui",
+    "modelUrl": "/avatar/yui.zip",
+    "thumbnail": "/avatar/thumbs/yui.png",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
   {
     "id": "elf",
     "name": "エルフ",
