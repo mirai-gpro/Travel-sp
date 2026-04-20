@@ -115,13 +115,13 @@ export class LAMWebSocketManager {
                         console.warn('[LAMWebSocketManager] orbit-limits.json読み込み失敗、制限なし', e);
                     }
 
-                    // 初期カメラ角度を10°下向きに補正（カーソルで下にドラッグしたのと同等）
+                    // 初期カメラ角度を8°下向きに補正（カーソルで下にドラッグしたのと同等）
                     // 症状: アバターの視線がカメラ上方を向き、おでこ～頭頂部の面積が小さい
                     // 仕組み: 内蔵OrbitControls に setPolarAngle は無いため、camera.position を
                     //         target まわりに球面座標で回転させる。次フレームの update() が
                     //         position から spherical を再計算するので結果が維持される。
                     // 方向: ドラッグ下=phi減少=カメラが上側に回る=額が大きく見える
-                    //       → 現 phi から 10° 引く
+                    //       → 現 phi から 8° 引く
                     {
                         const tx = controls.target.x, ty = controls.target.y, tz = controls.target.z;
                         const dx = camera.position.x - tx;
@@ -131,7 +131,7 @@ export class LAMWebSocketManager {
                         const horiz = Math.sqrt(dx * dx + dz * dz);
                         const currentPhi = Math.atan2(horiz, dy);       // polar angle (0=真上, π/2=水平, π=真下)
                         const currentTheta = Math.atan2(dx, dz);        // azimuth
-                        const newPhi = currentPhi - (10 * Math.PI / 180);
+                        const newPhi = currentPhi - (8 * Math.PI / 180);
                         // 球面座標 → 直交座標
                         const sinPhi = Math.sin(newPhi);
                         const newDx = radius * sinPhi * Math.sin(currentTheta);
