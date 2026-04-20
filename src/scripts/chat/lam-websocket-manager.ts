@@ -115,6 +115,23 @@ export class LAMWebSocketManager {
                         console.warn('[LAMWebSocketManager] orbit-limits.json読み込み失敗、制限なし', e);
                     }
 
+                    // 初期カメラ角度を上方向に15°オフセット（顔の上下向き補正）
+                    // 症状: アバターの視線がカメラ上方を向き、おでこ～頭頂部の面積が小さい
+                    // 対策: polarAngle を小さくしてカメラを上側に回し、額が大きく見えるようにする
+                    //       方向が逆だった場合は `-` を `+` に反転
+                    if (typeof (controls as any).getPolarAngle === 'function' &&
+                        typeof (controls as any).setPolarAngle === 'function') {
+                        const currentPolar = (controls as any).getPolarAngle();
+                        const deltaRad = 15 * Math.PI / 180;
+                        const newPolar = currentPolar - deltaRad;
+                        (controls as any).setPolarAngle(newPolar);
+                        console.log('[LAMWebSocketManager] polarAngle調整:',
+                                    currentPolar.toFixed(3), '→', newPolar.toFixed(3),
+                                    `(${(currentPolar * 180 / Math.PI).toFixed(1)}° → ${(newPolar * 180 / Math.PI).toFixed(1)}°)`);
+                    } else {
+                        console.warn('[LAMWebSocketManager] controls.get/setPolarAngle 未対応');
+                    }
+
                     controls.update();
                 }
 
