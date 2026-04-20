@@ -115,21 +115,33 @@ export class LAMWebSocketManager {
                         console.warn('[LAMWebSocketManager] orbit-limits.json読み込み失敗、制限なし', e);
                     }
 
-                    // 初期カメラ角度を上方向に15°オフセット（顔の上下向き補正）
+                    // 初期カメラ角度を15°下向きに補正（カーソルで下にドラッグしたのと同等）
                     // 症状: アバターの視線がカメラ上方を向き、おでこ～頭頂部の面積が小さい
-                    // 対策: polarAngle を小さくしてカメラを上側に回し、額が大きく見えるようにする
-                    //       方向が逆だった場合は `-` を `+` に反転
-                    if (typeof (controls as any).getPolarAngle === 'function' &&
-                        typeof (controls as any).setPolarAngle === 'function') {
-                        const currentPolar = (controls as any).getPolarAngle();
-                        const deltaRad = 15 * Math.PI / 180;
-                        const newPolar = currentPolar - deltaRad;
-                        (controls as any).setPolarAngle(newPolar);
-                        console.log('[LAMWebSocketManager] polarAngle調整:',
-                                    currentPolar.toFixed(3), '→', newPolar.toFixed(3),
-                                    `(${(currentPolar * 180 / Math.PI).toFixed(1)}° → ${(newPolar * 180 / Math.PI).toFixed(1)}°)`);
-                    } else {
-                        console.warn('[LAMWebSocketManager] controls.get/setPolarAngle 未対応');
+                    // 仕組み: 内蔵OrbitControls に setPolarAngle は無いため、camera.position を
+                    //         target まわりに球面座標で回転させる。次フレームの update() が
+                    //         position から spherical を再計算するので結果が維持される。
+                    // 方向: ドラッグ下=phi減少=カメラが上側に回る=額が大きく見える
+                    //       → 現 phi から 15° 引く
+                    {
+                        const tx = controls.target.x, ty = controls.target.y, tz = controls.target.z;
+                        const dx = camera.position.x - tx;
+                        const dy = camera.position.y - ty;
+                        const dz = camera.position.z - tz;
+                        const radius = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                        const horiz = Math.sqrt(dx * dx + dz * dz);
+                        const currentPhi = Math.atan2(horiz, dy);       // polar angle (0=真上, π/2=水平, π=真下)
+                        const currentTheta = Math.atan2(dx, dz);        // azimuth
+                        const newPhi = currentPhi - (15 * Math.PI / 180);
+                        // 球面座標 → 直交座標
+                        const sinPhi = Math.sin(newPhi);
+                        const newDx = radius * sinPhi * Math.sin(currentTheta);
+                        const newDy = radius * Math.cos(newPhi);
+                        const newDz = radius * sinPhi * Math.cos(currentTheta);
+                        camera.position.set(tx + newDx, ty + newDy, tz + newDz);
+                        console.log('[LAMWebSocketManager] 初期phi調整:',
+                                    `${(currentPhi * 180 / Math.PI).toFixed(1)}° → ${(newPhi * 180 / Math.PI).toFixed(1)}°`,
+                                    'radius=', radius.toFixed(3),
+                                    'newPos=', camera.position.x.toFixed(3), camera.position.y.toFixed(3), camera.position.z.toFixed(3));
                     }
 
                     controls.update();
