@@ -89,9 +89,13 @@
   gap: 12px;
 }
 
-/* 以下は <script> 内で動的生成される要素のため、Astro scoped styleが効かない。
-   親 .avatar-modal-body は静的なので、そこから :global() で子に当てる。 */
-.avatar-modal-body :global(.avatar-option) {
+</style>
+
+<!-- 動的生成される要素用のグローバルスタイル
+     <script> 内で document.createElement で作られる要素には Astro の scoped style が
+     当たらないため、別ブロックで is:global として定義する。 -->
+<style is:global>
+.avatar-modal-body .avatar-option {
   border: 2px solid #ddd;
   border-radius: 12px;
   padding: 8px;
@@ -99,26 +103,28 @@
   text-align: center;
   transition: border-color 0.2s, transform 0.2s;
 }
-.avatar-modal-body :global(.avatar-option:hover) {
+.avatar-modal-body .avatar-option:hover {
   border-color: #666;
   transform: scale(1.05);
 }
-.avatar-modal-body :global(.avatar-option.selected) {
+.avatar-modal-body .avatar-option.selected {
   border-color: #4A90D9;
   background: #EBF5FF;
 }
-.avatar-modal-body :global(.avatar-option img) {
+.avatar-modal-body .avatar-option img {
   width: 80px;
   height: 80px;
   object-fit: cover;
   border-radius: 8px;
+  display: block;
+  margin: 0 auto;
 }
-.avatar-modal-body :global(.avatar-option .avatar-name) {
+.avatar-modal-body .avatar-option .avatar-name {
   font-size: 12px;
   margin-top: 4px;
   color: #333;
 }
-.avatar-modal-body :global(.avatar-option .avatar-id) {
+.avatar-modal-body .avatar-option .avatar-id {
   font-size: 11px;
   color: #888;
 }
