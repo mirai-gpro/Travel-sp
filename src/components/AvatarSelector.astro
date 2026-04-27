@@ -2,9 +2,11 @@
 // AvatarSelector.astro - アバター切り替えモーダル
 ---
 
-<!-- アバター切り替えボタン -->
+<!-- アバター切り替えボタン: 現在選択中アバターのサムネ + 🔄バッジ -->
 <button class="btn-floating btn-avatar-switch" id="avatarSwitchBtn" title="アバター切替">
-  👤
+  <img id="avatarSwitchThumb" class="btn-avatar-switch-thumb hidden" alt="" />
+  <span id="avatarSwitchFallback" class="btn-avatar-switch-fallback">👤</span>
+  <span class="btn-avatar-switch-badge">🔄</span>
 </button>
 
 <!-- モーダル -->
@@ -26,20 +28,55 @@
   top: 12px;
   right: 12px;
   z-index: 100;
-  width: 44px;
-  height: 44px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
-  border: 2px solid rgba(255,255,255,0.3);
-  background: rgba(0,0,0,0.5);
-  color: white;
-  font-size: 20px;
+  border: 2px solid white;
+  background: white;
+  color: #333;
+  font-size: 22px;
+  padding: 0;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  overflow: visible;
 }
 .btn-avatar-switch:hover {
-  background: rgba(0,0,0,0.7);
+  transform: scale(1.05);
+}
+.btn-avatar-switch-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  display: block;
+}
+.btn-avatar-switch-thumb.hidden {
+  display: none;
+}
+.btn-avatar-switch-fallback {
+  font-size: 24px;
+  line-height: 1;
+}
+.btn-avatar-switch-fallback.hidden {
+  display: none;
+}
+.btn-avatar-switch-badge {
+  position: absolute;
+  bottom: -4px;
+  right: -4px;
+  width: 22px;
+  height: 22px;
+  background: #4A90D9;
+  border: 2px solid white;
+  border-radius: 50%;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
 }
 
 .avatar-modal-overlay {
@@ -136,8 +173,30 @@
   const overlay = document.getElementById('avatarModalOverlay');
   const closeBtn = document.getElementById('avatarModalClose');
   const body = document.getElementById('avatarModalBody');
+  const switchThumb = document.getElementById('avatarSwitchThumb') as HTMLImageElement | null;
+  const switchFallback = document.getElementById('avatarSwitchFallback');
 
   const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
+
+  // 起動時: 現在選択中アバターのサムネをボタンに表示
+  (async () => {
+    if (!switchThumb || !switchFallback) return;
+    const avatars = await loadAvatarConfig();
+    const currentId = getSelectedAvatarId(mode);
+    const current = avatars.find(a => a.id === currentId);
+    if (current?.thumbnail) {
+      switchThumb.src = current.thumbnail;
+      switchThumb.onload = () => {
+        switchThumb.classList.remove('hidden');
+        switchFallback.classList.add('hidden');
+      };
+      switchThumb.onerror = () => {
+        // サムネ無し → 👤 フォールバック維持
+        switchThumb.classList.add('hidden');
+        switchFallback.classList.remove('hidden');
+      };
+    }
+  })();
 
   btn?.addEventListener('click', async () => {
     const avatars = await loadAvatarConfig();
