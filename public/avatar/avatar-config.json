@@ -37,7 +37,7 @@
     "thumbnail": "/avatar/thumbs/lisa.png",
     "voiceModel": "ja-JP-Chirp3-HD-Despina",
     "liveVoice": "Despina",
-    "camera": { "posY": 1.73, "posZ": 0.4, "targetY": 1.7 }
+    "camera": { "posY": 1.73, "posZ": 0.43, "targetY": 1.7 }
   },
   {
     "id": "mizuki",
