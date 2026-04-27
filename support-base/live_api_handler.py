@@ -503,16 +503,13 @@ class LiveAPISession:
                             # 1. 会話履歴turnsを再送（turn_complete=False）
                             await self._send_history_on_reconnect(session)
 
-                            # 2. トリガーメッセージ（turn_complete=True）
+                            # 2. トリガーメッセージ
+                            # Gemini 3.1 Live: send_client_content は initial seeding 専用。
+                            # 会話途中（再接続後の resume を含む）の user content は
+                            # send_realtime_input(text=...) を使う必要がある。
                             resume_text = self._resume_message or "続きをお願いします"
                             self._resume_message = None
-                            await session.send_client_content(
-                                turns=types.Content(
-                                    role="user",
-                                    parts=[types.Part(text=resume_text)]
-                                ),
-                                turn_complete=True
-                            )
+                            await session.send_realtime_input(text=resume_text)
                             logger.info("[LiveAPI] 再接続: 履歴再送+トリガー送信完了")
                             self.socketio.emit('live_reconnected', {},
                                                room=self.client_sid)
@@ -650,17 +647,10 @@ class LiveAPISession:
                             self.socketio.emit('greeting_done', {},
                                                room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
-
-                            # ★ keep-alive: セッション安定化（1008予防）
-                            # greeting_done後、ユーザーがマイクを押す前に空ターンを送信
-                            await session.send_client_content(
-                                turns=types.Content(
-                                    role="user",
-                                    parts=[types.Part(text="")]
-                                ),
-                                turn_complete=False
-                            )
-                            logger.info("[LiveAPI] keep-alive送信（greeting後）")
+                            # 注: 旧モデル(2.5)では 1008 予防の keep-alive 空ターンを
+                            #     送っていたが、Gemini 3.1 Live では send_client_content
+                            #     を会話途中で使うのは不可（initial seeding 専用）。
+                            #     3.1 では keep-alive 自体不要のため削除。
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
