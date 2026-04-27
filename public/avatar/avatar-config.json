@@ -13,18 +13,8 @@
     "id": "yui",
     "name": "YUI",
     "teacherName": "Yui",
-    "modelUrl": "/avatar/yui.zip",
-    "thumbnail": "/avatar/thumbs/yui.png",
-    "voiceModel": "ja-JP-Chirp3-HD-Leda",
-    "liveVoice": "Leda",
-    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
-  },
-      {
-    "id": "yui2",
-    "name": "YUI2",
-    "teacherName": "Yui2",
     "modelUrl": "/avatar/yui2.zip",
-    "thumbnail": "/avatar/thumbs/yui2.png",
+    "thumbnail": "/avatar/thumbs/yui.png",
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
     "liveVoice": "Leda",
     "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
@@ -47,7 +37,7 @@
     "thumbnail": "/avatar/thumbs/lisa.png",
     "voiceModel": "ja-JP-Chirp3-HD-Despina",
     "liveVoice": "Despina",
-    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+    "camera": { "posY": 1.73, "posZ": 0.43, "targetY": 1.68 }
   },
   {
     "id": "mizuki",
