@@ -870,7 +870,7 @@ def handle_live_start(data):
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             )
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite-preview",
                 contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
                 config=config
             )

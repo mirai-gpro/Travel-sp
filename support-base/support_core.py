@@ -31,7 +31,7 @@ except Exception as e:
 # Gemini クライアント初期化
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 genai_legacy.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai_legacy.GenerativeModel('gemini-2.5-flash')
+model = genai_legacy.GenerativeModel('gemini-3.1-flash-lite-preview')
 
 # ========================================
 # RAMベースのセッション管理 (Firestore完全廃止)
@@ -685,7 +685,7 @@ class SupportAssistant:
             )
 
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite-preview",
                 contents=history,
                 config=config
             )
@@ -779,7 +779,7 @@ class SupportAssistant:
         try:
             logger.info("[Assistant] Generating final summary")
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite-preview",
                 contents=summary_prompt
             )
             summary = response.text
@@ -901,7 +901,7 @@ class SupportAssistant:
         try:
             logger.info("[Assistant] Generating summary")
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite-preview",
                 contents=summary_prompt
             )
             return response.text
