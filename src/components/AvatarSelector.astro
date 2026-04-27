@@ -88,8 +88,13 @@
   grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
   gap: 12px;
 }
+</style>
 
-.avatar-option {
+<!-- 動的生成される要素用のグローバルスタイル
+     <script> 内で document.createElement で作られる要素には Astro の scoped style が
+     当たらないため、別ブロックで is:global として定義する。 -->
+<style is:global>
+.avatar-modal-body .avatar-option {
   border: 2px solid #ddd;
   border-radius: 12px;
   padding: 8px;
@@ -97,26 +102,28 @@
   text-align: center;
   transition: border-color 0.2s, transform 0.2s;
 }
-.avatar-option:hover {
+.avatar-modal-body .avatar-option:hover {
   border-color: #666;
   transform: scale(1.05);
 }
-.avatar-option.selected {
+.avatar-modal-body .avatar-option.selected {
   border-color: #4A90D9;
   background: #EBF5FF;
 }
-.avatar-option img {
+.avatar-modal-body .avatar-option img {
   width: 80px;
   height: 80px;
   object-fit: cover;
   border-radius: 8px;
+  display: block;
+  margin: 0 auto;
 }
-.avatar-option .avatar-name {
+.avatar-modal-body .avatar-option .avatar-name {
   font-size: 12px;
   margin-top: 4px;
   color: #333;
 }
-.avatar-option .avatar-id {
+.avatar-modal-body .avatar-option .avatar-id {
   font-size: 11px;
   color: #888;
 }
