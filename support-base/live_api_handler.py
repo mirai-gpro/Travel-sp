@@ -35,7 +35,7 @@ A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
-LIVE_API_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_API_MODEL = "gemini-3.1-flash-live-preview"
 MAX_AI_CHARS_BEFORE_RECONNECT = 800
 LONG_SPEECH_THRESHOLD = 500
 
