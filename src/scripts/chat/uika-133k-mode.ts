@@ -57,6 +57,8 @@ export interface UikaModeStatus {
     hHeadIsIdentity: boolean;
     ready: boolean;
     gateReported: boolean;
+    userInteracted: boolean;
+    orbitEnabled: boolean;
     splatCount: number | null;
     bsCount: number | null;
     cameraApplied: boolean;
@@ -200,15 +202,58 @@ function applyUikaCamera(renderer: any): string[] {
     return errs;
 }
 
-/** OrbitControls が camera pose を上書きしないようにする。 */
-function neutralizeControls(renderer: any): boolean {
-    const controls = renderer?.viewer?.controls;
+/**
+ * OrbitControls の扱い。
+ *
+ * 初期フレームでは camera pose を meta のまま保ちたいので `update()` を
+ * 止めておき、**ユーザーが pointer / touch / wheel で触った瞬間に本来の
+ * `update()` へ戻す**。以降は OrbitControls が camera を持ち、
+ * 上下左右の orbit と zoom ができる。
+ *
+ * `Viewer.update()` は `controls.enabled` に関係なく `controls.update()` を
+ * 呼び (`:138815-138816`)、`OrbitControls.update()` の末尾は
+ * `object.lookAt(target)` (`:59121`) なので、固定したい間は update 自体を
+ * 止めるしかない。
+ *
+ * orbit target は meta.json の `look_at` = [0,0,0]。これは UIKA native の
+ * yaw スイープ (`scripts/identity_probe.py:113-117`) が周回する中心そのもので、
+ * UIKA canonical 空間で顔を見る際の回転中心である。ここを target にすることで
+ * 初期 pose (`position = look_at + [0,0,radius]`, `lookAt(look_at)`) が
+ * OrbitControls の状態と矛盾せず、1 フレーム目で pose が動かない。
+ */
+function setupControls(renderer: any, status: UikaModeStatus): boolean {
+    const v = renderer?.viewer;
+    const controls = v?.controls;
     if (!controls) return false;
+
     controls.target.set(UIKA_META_CAMERA.lookAt[0], UIKA_META_CAMERA.lookAt[1], UIKA_META_CAMERA.lookAt[2]);
-    controls.enabled = false;
-    if (!controls.__uikaNeutralized) {
-        controls.update = function () { /* UIKA mode: camera pose を上書きしない */ };
-        controls.__uikaNeutralized = true;
+    controls.enabled = true;                 // 入力は受け付ける
+
+    if (!controls.__uikaSetup) {
+        controls.__uikaSetup = true;
+        controls.__uikaOriginalUpdate = controls.update;
+        // 初回操作までは pose を動かさない
+        controls.update = function () { /* UIKA mode: 初回操作まで camera pose を保持 */ };
+
+        // zoom が破綻しないよう、meta の radius を基準に可動域を決める
+        const R = UIKA_META_CAMERA.radius;
+        controls.minDistance = R * 0.35;
+        controls.maxDistance = R * 3.0;
+
+        const dom = v.renderer?.domElement;
+        const release = () => {
+            if (status.userInteracted) return;
+            status.userInteracted = true;
+            status.orbitEnabled = true;
+            controls.update = controls.__uikaOriginalUpdate;
+            (window as any).__uikaOrbitReleased = true;
+        };
+        if (dom) {
+            dom.addEventListener('pointerdown', release, { passive: true });
+            dom.addEventListener('touchstart', release, { passive: true });
+            dom.addEventListener('wheel', release, { passive: true });
+        }
+        (controls as any).__uikaRelease = release;
     }
     return true;
 }
@@ -225,6 +270,8 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
         hHeadIsIdentity: false,
         ready: false,
         gateReported: false,
+        userInteracted: false,
+        orbitEnabled: false,
         splatCount: null,
         bsCount: null,
         cameraApplied: false,
@@ -237,9 +284,14 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
     const apply = () => {
         status.errors.push(...stopSkeletalAnimation(renderer));
         status.animationStopped = true;
-        status.controlsNeutralized = neutralizeControls(renderer);
-        status.errors.push(...applyUikaCamera(renderer));
-        status.cameraApplied = true;
+        status.controlsNeutralized = setupControls(renderer, status);
+        // 初回操作までは meta camera を毎フレーム当て直す。操作後は
+        // OrbitControls に camera を渡し、pose には触らない
+        // (projection は常に meta のままロックされたまま)。
+        if (!status.userInteracted) {
+            status.errors.push(...applyUikaCamera(renderer));
+            status.cameraApplied = true;
+        }
 
         const sm = renderer?.viewer?.splatMesh;
         const { skeleton, headIndex } = getSkeletonAndHeadIndex(sm);
