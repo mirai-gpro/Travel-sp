@@ -51,6 +51,11 @@ const {
 }
 
 /* ライブラリが生成するcanvasをコンテナ内に収める（:globalで動的要素に適用） */
+/* UIKA Native 133K hidden PoC のときだけ等倍表示にする */
+.lam-avatar-container.uika-133k :global(canvas) {
+  transform: none !important;
+}
+
 .lam-avatar-container :global(canvas) {
   width: 100% !important;
   height: 100% !important;
@@ -166,10 +171,23 @@ const {
 
       // Gaussian Splat レンダラーを初期化（公式API: getInstance）
       const config = (window as any).__lamAvatarConfig || {};
+      // UIKA Native 133K hidden PoC: ?uika133k=1 のときだけ UIKA ZIP を使う。
+      // avatar-config には載せないので、通常利用者はこの ZIP を取得しない。
+      let uika133k = false;
+      try {
+        uika133k = new URLSearchParams(location.search).get('uika133k') === '1';
+      } catch (e) { /* noop */ }
+      if (uika133k) {
+        // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
+        // meta.json の camera ではない。UIKA mode では等倍にする。
+        this.containerEl.classList.add('uika-133k');
+      }
       try {
         await this.lamManager.initialize({
           containerElement: this.containerEl,
-          modelUrl: config.modelUrl || '/avatar/meruru.zip',
+          modelUrl: uika133k
+            ? '/avatar/uika-gakki-133k.zip'
+            : (config.modelUrl || '/avatar/meruru.zip'),
         });
 
         if (this.lamManager.isLoaded()) {
