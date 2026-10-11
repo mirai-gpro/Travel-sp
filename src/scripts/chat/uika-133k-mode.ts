@@ -332,15 +332,9 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
     v.__uikaSortHooked = true;
 
     const orig = v.runSplatSort;                 // arrow property。bind 不要
-    const camera = v.camera;
-    const V3 = camera.position.constructor;
-    const Q = camera.quaternion.constructor;
-    const lastPos = new V3().copy(camera.position);
-    const lastQuat = new Q().copy(camera.quaternion);
-    const EPS = 0.0001;                          // module.js:138722 の changeEpsilon と同値
     let firstDone = false;
     let lastAcceptedAt = -Infinity;
-    let pointerUntil = 0;                        // 操作中は必ず sort する窓
+    let pointerUntil = 0;                        // ユーザー操作中だけ開く窓
 
     const dom = v.renderer?.domElement;
     if (dom) {
@@ -353,16 +347,8 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
         dom.addEventListener('wheel', mark, { passive: true });
     }
 
-    const cameraMoved = () => {
-        const p = camera.position, q = camera.quaternion;
-        return Math.abs(p.x - lastPos.x) > EPS || Math.abs(p.y - lastPos.y) > EPS ||
-               Math.abs(p.z - lastPos.z) > EPS ||
-               Math.abs(q.x - lastQuat.x) > EPS || Math.abs(q.y - lastQuat.y) > EPS ||
-               Math.abs(q.z - lastQuat.z) > EPS || Math.abs(q.w - lastQuat.w) > EPS;
-    };
     const accept = (force: any, forceSortAll: any) => {
         lastAcceptedAt = performance.now();
-        lastPos.copy(camera.position); lastQuat.copy(camera.quaternion);
         status.sortsAccepted++;
         return orig(force, forceSortAll);
     };
@@ -374,7 +360,12 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
         if (status.sortMode === '10fps') {
             allow = (now - lastAcceptedAt) >= 100;          // 最大 10Hz
         } else {                                            // 'camera'
-            allow = cameraMoved() || now < pointerUntil;
+            // `v.camera` は idleMode='rigid' のとき head compensation 後の
+            // C_render になっており、A2E / idle head motion だけで毎フレーム
+            // 変化する。これを「camera 移動」と誤認しないよう、camera mode の
+            // 判定は C_orbit を動かす要因 = ユーザー操作だけを見る
+            // (初回 sort は上の firstDone で常に通す)。
+            allow = now < pointerUntil;
         }
         if (!allow) { status.sortsSkipped++; return Promise.resolve(false); }
         return accept(force, forceSortAll);
@@ -446,7 +437,11 @@ function makeBlinker(seed: number) {
     };
 }
 
-function setupIdleBlink(renderer: any, status: UikaModeStatus): boolean {
+function setupIdleBlink(
+    renderer: any,
+    status: UikaModeStatus,
+    getChatState?: () => string,
+): boolean {
     if (renderer.__uikaBlinkHooked) return true;
     const orig = renderer.getExpressionData;
     if (typeof orig !== 'function') return false;
@@ -458,7 +453,11 @@ function setupIdleBlink(renderer: any, status: UikaModeStatus): boolean {
     renderer.getExpressionData = function () {
         const out = orig.call(this);
         try {
-            if (renderer.chatState !== 'Responding') {        // いまは Idle 中のみ
+            // chatState は renderer の内部 property ではなく、
+            // LAMWebSocketManager から渡された getter で読む。
+            // getter が無い場合は blink しない (推測で判定しない)。
+            const chatState = typeof getChatState === 'function' ? getChatState() : null;
+            if (chatState !== null && chatState !== 'Responding') {   // いまは Idle 中のみ
                 const [l, r] = b.value(performance.now());
                 if (l > 0 || r > 0) {
                     out.eyeBlinkLeft  = Math.min(1, Math.max(out.eyeBlinkLeft  || 0, l));
@@ -591,7 +590,19 @@ function setupHeadCompensation(renderer: any, status: UikaModeStatus): boolean {
  * UIKA mode を適用し、毎フレーム状態を維持しつつ H_head を実測する。
  * 返り値の status は `window.__uikaStatus` にも出す (検証用)。
  */
-export function applyUika133kMode(renderer: any): UikaModeStatus {
+export interface Uika133kModeOptions {
+    /**
+     * 現在の chatState を返す getter。Travel-sp では
+     * `LAMWebSocketManager.chatState` を `() => this.chatState` で渡す。
+     * blink の Idle 判定にだけ使う。
+     */
+    getChatState?: () => string;
+}
+
+export function applyUika133kMode(
+    renderer: any,
+    options: Uika133kModeOptions = {},
+): UikaModeStatus {
     const status: UikaModeStatus = {
         enabled: true,
         headBoneIndex: -1,
@@ -628,7 +639,7 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
         } else {
             status.animationStopped = false;
             status.headCompHooked = setupHeadCompensation(renderer, status);
-            status.blinkEnabled = setupIdleBlink(renderer, status);
+            status.blinkEnabled = setupIdleBlink(renderer, status, options.getChatState);
         }
         status.controlsNeutralized = setupControls(renderer, status);
         status.sortHooked = setupSortMode(renderer, status);
