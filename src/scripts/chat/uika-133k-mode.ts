@@ -95,6 +95,8 @@ export interface UikaModeStatus {
     splatCount: number | null;
     bsCount: number | null;
     cameraApplied: boolean;
+    /** meta camera pose を一度確定したか (以後 pose は meta へ再固定しない)。 */
+    posePinned: boolean;
     controlsNeutralized: boolean;
     animationStopped: boolean;
     frames: number;
@@ -179,16 +181,23 @@ function stopSkeletalAnimation(renderer: any): string[] {
     return errs;
 }
 
-/** meta.json の intrinsics から projection matrix を作って camera に入れる。 */
-function applyUikaCamera(renderer: any, poseOnlyIfNeeded = true): string[] {
+/**
+ * meta.json の intrinsics から projection matrix を作って camera に入れる。
+ *
+ * `applyPose = true` のときだけ camera の **pose** (position / lookAt) も
+ * meta の値に合わせる。pose を誰が持つかは呼び出し側が決める:
+ *   - 初期化時の 1 回目: ここで meta pose を確定する (head compensation /
+ *     OrbitControls はこの pose を基準に初期化される)
+ *   - idleMode='rigid' の 2 回目以降: head compensation が C_orbit / C_render を
+ *     管理するので pose には触らない (intrinsics だけ維持)
+ *   - ユーザーが操作した後: OrbitControls が pose を持つので触らない
+ * intrinsics / projection は常に meta のまま維持する。
+ */
+function applyUikaCamera(renderer: any, applyPose: boolean): string[] {
     const errs: string[] = [];
     const v = renderer?.viewer;
     const camera = v?.camera;
     if (!camera) { errs.push('camera が見つからない'); return errs; }
-    // head compensation が動いている間、camera pose は
-    // setupHeadCompensation() が C_orbit / C_render を管理するので触らない。
-    // (intrinsics と controls.target は毎回入れ直してよい)
-    const skipPose = poseOnlyIfNeeded && v.__uikaHeadCompHooked === true;
 
     const M = UIKA_META_CAMERA;
     const el = v.renderer?.domElement;
@@ -218,7 +227,7 @@ function applyUikaCamera(renderer: any, poseOnlyIfNeeded = true): string[] {
     const bottom = ((cy - H) * M.near) / fy;
 
     camera.up.set(M.up[0], M.up[1], M.up[2]);
-    if (!skipPose) {
+    if (applyPose) {
         camera.position.set(M.lookAt[0], M.lookAt[1], M.lookAt[2] + M.radius);
         camera.lookAt(M.lookAt[0], M.lookAt[1], M.lookAt[2]);
     }
@@ -234,7 +243,7 @@ function applyUikaCamera(renderer: any, poseOnlyIfNeeded = true): string[] {
     }
     camera.updateMatrixWorld(true);
     (window as any).__uikaCameraIntrinsics = {
-        canvas: [W, H], scale, fx, fy, cx, cy,
+        canvas: [W, H], scale, fx, fy, cx, cy, poseApplied: applyPose,
         isotropic: fx === fy,
         frustum: { left, right, top, bottom, near: M.near, far: M.far },
         P00: camera.projectionMatrix.elements[0],
@@ -626,6 +635,7 @@ export function applyUika133kMode(
         splatCount: null,
         bsCount: null,
         cameraApplied: false,
+        posePinned: false,
         controlsNeutralized: false,
         animationStopped: false,
         frames: 0,
@@ -633,6 +643,23 @@ export function applyUika133kMode(
     };
 
     const apply = () => {
+        // ===== camera を最初に確定する =====
+        // 初期化の 1 回目で meta camera の pose (position = look_at + [0,0,radius],
+        // lookAt(look_at)) と projection を確定し、**その pose を基準に**
+        // setupControls() / setupHeadCompensation() を初期化する。
+        // 2 回目以降は pose を meta へ再固定せず、intrinsics だけ維持する:
+        //   - idleMode='rigid' : head compensation の C_orbit → C_render 管理に任せる
+        //   - idleMode='off'   : head compensation が無いので、初回操作までは
+        //                        pose を保持し続ける (0257113 と同じ挙動)
+        //   - ユーザー操作後    : OrbitControls が pose を持つので触らない
+        const pinPose = !status.posePinned
+                     || (status.idleMode === 'off' && !status.userInteracted);
+        status.errors.push(...applyUikaCamera(renderer, pinPose));
+        status.cameraApplied = true;
+        status.posePinned = true;
+
+        status.controlsNeutralized = setupControls(renderer, status);
+
         if (status.idleMode === 'off') {
             status.errors.push(...stopSkeletalAnimation(renderer));
             status.animationStopped = true;
@@ -641,15 +668,7 @@ export function applyUika133kMode(
             status.headCompHooked = setupHeadCompensation(renderer, status);
             status.blinkEnabled = setupIdleBlink(renderer, status, options.getChatState);
         }
-        status.controlsNeutralized = setupControls(renderer, status);
         status.sortHooked = setupSortMode(renderer, status);
-        // 初回操作までは meta camera を毎フレーム当て直す。操作後は
-        // OrbitControls に camera を渡し、pose には触らない
-        // (projection は常に meta のままロックされたまま)。
-        if (!status.userInteracted) {
-            status.errors.push(...applyUikaCamera(renderer));
-            status.cameraApplied = true;
-        }
 
         const sm = renderer?.viewer?.splatMesh;
         const { skeleton, headIndex } = getSkeletonAndHeadIndex(sm);
