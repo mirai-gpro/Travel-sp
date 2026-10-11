@@ -50,6 +50,17 @@ export const UIKA_META_CAMERA = {
 /** H_head が恒等とみなせる上限。指示どおりの gate。 */
 export const H_HEAD_IDENTITY_TOL = 1e-6;
 
+export type UikaSortMode = 'full' | '10fps' | 'camera';
+
+/** `?sortMode=` を読む。既定は現状どおり `full`。 */
+export function getUikaSortMode(): UikaSortMode {
+    try {
+        const m = new URLSearchParams(window.location.search).get('sortMode');
+        if (m === '10fps' || m === 'camera') return m;
+    } catch { /* noop */ }
+    return 'full';
+}
+
 export interface UikaModeStatus {
     enabled: boolean;
     headBoneIndex: number;
@@ -59,6 +70,10 @@ export interface UikaModeStatus {
     gateReported: boolean;
     userInteracted: boolean;
     orbitEnabled: boolean;
+    sortMode: UikaSortMode;
+    sortHooked: boolean;
+    sortsAccepted: number;
+    sortsSkipped: number;
     splatCount: number | null;
     bsCount: number | null;
     cameraApplied: boolean;
@@ -259,6 +274,106 @@ function setupControls(renderer: any, status: UikaModeStatus): boolean {
 }
 
 /**
+ * depth sort の A/B。**UIKA mode のみ**。
+ *
+ * `Viewer.update()` は毎フレーム `this.runSplatSort(true, true)` を呼ぶ
+ * (`module.js:138826`)。`force = true` なので、ライブラリ自身が持っている
+ * 「視線角・位置がほとんど変わっていなければ sort しない」早期 return
+ * (`module.js:139121-139128`) が**毎回バイパスされる**。
+ * つまり 133,541 splat の sort が毎フレーム走る。
+ *
+ * ここでは `viewer.runSplatSort` を instance-level で差し替え、
+ * モードに応じて**呼び出しそのものを間引く**。
+ *
+ *   full   … 何もしない (現状のまま)
+ *   10fps  … 直前に通した sort から 100ms 未満なら飛ばす
+ *   camera … 初回 sort 以降は、camera の position / quaternion が
+ *            変化したときと、pointer / wheel 操作中だけ通す。
+ *            **A2E の expression 変化だけでは sort しない。**
+ *
+ * 飛ばすのは depth sort だけで、expression による Gaussian center の変形と
+ * 描画は従来どおり毎フレーム行われる (morph は `runMorphUpdate()` と
+ * shader 側の bsCount ループで、sort とは別経路)。
+ *
+ * 飛ばすときは `Promise.resolve(false)` を返す。これは元の実装が
+ * 早期 return で返すのと同じ値 (`module.js:139127`)。
+ */
+function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
+    const v = renderer?.viewer;
+    if (!v || typeof v.runSplatSort !== 'function') return false;
+    if (v.__uikaSortHooked) return true;
+    if (status.sortMode === 'full') { v.__uikaSortHooked = true; return true; }
+    v.__uikaSortHooked = true;
+
+    const orig = v.runSplatSort;                 // arrow property。bind 不要
+    const camera = v.camera;
+    const V3 = camera.position.constructor;
+    const Q = camera.quaternion.constructor;
+    const lastPos = new V3().copy(camera.position);
+    const lastQuat = new Q().copy(camera.quaternion);
+    const EPS = 0.0001;                          // module.js:138722 の changeEpsilon と同値
+    let firstDone = false;
+    let lastAcceptedAt = -Infinity;
+    let pointerUntil = 0;                        // 操作中は必ず sort する窓
+
+    const dom = v.renderer?.domElement;
+    if (dom) {
+        const mark = () => { pointerUntil = performance.now() + 400; };
+        dom.addEventListener('pointerdown', mark, { passive: true });
+        dom.addEventListener('pointermove', () => { if (pointerUntil > 0) mark(); }, { passive: true });
+        dom.addEventListener('pointerup', mark, { passive: true });
+        dom.addEventListener('touchstart', mark, { passive: true });
+        dom.addEventListener('touchmove', mark, { passive: true });
+        dom.addEventListener('wheel', mark, { passive: true });
+    }
+
+    const cameraMoved = () => {
+        const p = camera.position, q = camera.quaternion;
+        return Math.abs(p.x - lastPos.x) > EPS || Math.abs(p.y - lastPos.y) > EPS ||
+               Math.abs(p.z - lastPos.z) > EPS ||
+               Math.abs(q.x - lastQuat.x) > EPS || Math.abs(q.y - lastQuat.y) > EPS ||
+               Math.abs(q.z - lastQuat.z) > EPS || Math.abs(q.w - lastQuat.w) > EPS;
+    };
+    const accept = (force: any, forceSortAll: any) => {
+        lastAcceptedAt = performance.now();
+        lastPos.copy(camera.position); lastQuat.copy(camera.quaternion);
+        status.sortsAccepted++;
+        return orig(force, forceSortAll);
+    };
+
+    v.runSplatSort = function (force?: any, forceSortAll?: any) {
+        if (!firstDone) { firstDone = true; return accept(force, forceSortAll); }
+        const now = performance.now();
+        let allow: boolean;
+        if (status.sortMode === '10fps') {
+            allow = (now - lastAcceptedAt) >= 100;          // 最大 10Hz
+        } else {                                            // 'camera'
+            allow = cameraMoved() || now < pointerUntil;
+        }
+        if (!allow) { status.sortsSkipped++; return Promise.resolve(false); }
+        return accept(force, forceSortAll);
+    };
+    return true;
+}
+
+/** テスト用の小さなモード表示。UIKA debug URL のときだけ出す。 */
+function showSortModeBadge(status: UikaModeStatus): void {
+    if (typeof document === 'undefined') return;
+    if (document.getElementById('uikaSortBadge')) return;
+    const el = document.createElement('div');
+    el.id = 'uikaSortBadge';
+    el.textContent = 'UIKA / SORT ' + status.sortMode.toUpperCase();
+    el.style.cssText = [
+        'position:fixed', 'top:6px', 'right:8px', 'z-index:2147483647',
+        'font:600 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace',
+        'letter-spacing:.04em', 'color:#fff', 'background:rgba(0,0,0,.62)',
+        'padding:3px 7px', 'border-radius:4px', 'pointer-events:none',
+        'user-select:none',
+    ].join(';');
+    document.body.appendChild(el);
+}
+
+/**
  * UIKA mode を適用し、毎フレーム状態を維持しつつ H_head を実測する。
  * 返り値の status は `window.__uikaStatus` にも出す (検証用)。
  */
@@ -272,6 +387,10 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
         gateReported: false,
         userInteracted: false,
         orbitEnabled: false,
+        sortMode: getUikaSortMode(),
+        sortHooked: false,
+        sortsAccepted: 0,
+        sortsSkipped: 0,
         splatCount: null,
         bsCount: null,
         cameraApplied: false,
@@ -285,6 +404,7 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
         status.errors.push(...stopSkeletalAnimation(renderer));
         status.animationStopped = true;
         status.controlsNeutralized = setupControls(renderer, status);
+        status.sortHooked = setupSortMode(renderer, status);
         // 初回操作までは meta camera を毎フレーム当て直す。操作後は
         // OrbitControls に camera を渡し、pose には触らない
         // (projection は常に meta のままロックされたまま)。
@@ -311,6 +431,7 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
     };
 
     apply();
+    showSortModeBadge(status);
 
     // 毎フレーム維持する。Runtime 側のループが再度 pose / camera を動かしても
     // 次のフレームで戻す。
