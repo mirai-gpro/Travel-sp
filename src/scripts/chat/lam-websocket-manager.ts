@@ -15,6 +15,7 @@
 import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
 import type { ExpressionFrame } from './live-audio-manager';
 import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
+import { isUika133kMode, applyUika133kMode } from './uika-133k-mode';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -62,7 +63,12 @@ export class LAMWebSocketManager {
         try {
             // ★ 新規ユーザー対応: モードのデフォルトアバター情報をlocalStorageに確実に設定
             const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
-            await ensureDefaultAvatarInStorage(mode);
+            // UIKA Native 133K hidden PoC (?uika133k=1) では avatar-config を触らない。
+            // 通常利用者の localStorage / ZIP 取得に一切影響させないため。
+            const uikaMode = isUika133kMode();
+            if (!uikaMode) {
+                await ensureDefaultAvatarInStorage(mode);
+            }
 
             this.renderer = await GaussianSplats3D.GaussianSplatRenderer.getInstance(
                 config.containerElement,
@@ -74,6 +80,19 @@ export class LAMWebSocketManager {
                     alpha: 0.0,
                 }
             );
+
+            if (uikaMode) {
+                // ===== UIKA Native 133K hidden PoC =====
+                // 通常の avatar-config camera / orbit-limits / 初期6° polar 補正は
+                // 一切適用しない。meta.json の camera と H_head = 恒等だけを使う。
+                // gate の判定は splat mesh が揃ってから uika-133k-mode 側が出す。
+                applyUika133kMode(this.renderer);
+                console.log('[LAMWebSocketManager][UIKA133K] mode 適用開始 '
+                            + '(gate 判定は window.__uikaStatus を参照)');
+                this.isModelLoaded = true;
+                console.log('[LAMWebSocketManager] モデルロード完了 (UIKA133K)');
+                return;
+            }
 
             // カメラ位置を調整してアバターの顔サイズ・位置を制御
             // avatar-config.json のcameraパラメータをlocalStorageから読み込み
