@@ -61,6 +61,17 @@ export function getUikaSortMode(): UikaSortMode {
     return 'full';
 }
 
+export type UikaIdleMode = 'off' | 'rigid';
+
+/** `?idleMode=` を読む。既定は `rigid` (animation.glb を camera へ合成)。 */
+export function getUikaIdleMode(): UikaIdleMode {
+    try {
+        const m = new URLSearchParams(window.location.search).get('idleMode');
+        if (m === 'off') return 'off';
+    } catch { /* noop */ }
+    return 'rigid';
+}
+
 export interface UikaModeStatus {
     enabled: boolean;
     headBoneIndex: number;
@@ -71,6 +82,13 @@ export interface UikaModeStatus {
     userInteracted: boolean;
     orbitEnabled: boolean;
     sortMode: UikaSortMode;
+    idleMode: UikaIdleMode;
+    headCompHooked: boolean;
+    headNeutralized: boolean;
+    hHeadMaxAbsDiffFromIdentityApplied: number;
+    projParityMaxDiff: number;
+    blinkEnabled: boolean;
+    blinkCount: number;
     sortHooked: boolean;
     sortsAccepted: number;
     sortsSkipped: number;
@@ -119,6 +137,8 @@ function getSkeletonAndHeadIndex(splatMesh: any): { skeleton: any; headIndex: nu
  */
 function stopSkeletalAnimation(renderer: any): string[] {
     const errs: string[] = [];
+    // idleMode=rigid では animation.glb をそのまま再生する。
+    // splat 側へ H_head を掛けないのは setupHeadCompensation() の責務。
     try {
         if (renderer?.mixer) {
             renderer.mixer.stopAllAction();
@@ -160,11 +180,15 @@ function stopSkeletalAnimation(renderer: any): string[] {
 }
 
 /** meta.json の intrinsics から projection matrix を作って camera に入れる。 */
-function applyUikaCamera(renderer: any): string[] {
+function applyUikaCamera(renderer: any, poseOnlyIfNeeded = true): string[] {
     const errs: string[] = [];
     const v = renderer?.viewer;
     const camera = v?.camera;
     if (!camera) { errs.push('camera が見つからない'); return errs; }
+    // head compensation が動いている間、camera pose は
+    // setupHeadCompensation() が C_orbit / C_render を管理するので触らない。
+    // (intrinsics と controls.target は毎回入れ直してよい)
+    const skipPose = poseOnlyIfNeeded && v.__uikaHeadCompHooked === true;
 
     const M = UIKA_META_CAMERA;
     const el = v.renderer?.domElement;
@@ -194,8 +218,10 @@ function applyUikaCamera(renderer: any): string[] {
     const bottom = ((cy - H) * M.near) / fy;
 
     camera.up.set(M.up[0], M.up[1], M.up[2]);
-    camera.position.set(M.lookAt[0], M.lookAt[1], M.lookAt[2] + M.radius);
-    camera.lookAt(M.lookAt[0], M.lookAt[1], M.lookAt[2]);
+    if (!skipPose) {
+        camera.position.set(M.lookAt[0], M.lookAt[1], M.lookAt[2] + M.radius);
+        camera.lookAt(M.lookAt[0], M.lookAt[1], M.lookAt[2]);
+    }
     camera.near = M.near;
     camera.far = M.far;
     camera.projectionMatrix.makePerspective(left, right, top, bottom, M.near, M.far);
@@ -306,15 +332,9 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
     v.__uikaSortHooked = true;
 
     const orig = v.runSplatSort;                 // arrow property。bind 不要
-    const camera = v.camera;
-    const V3 = camera.position.constructor;
-    const Q = camera.quaternion.constructor;
-    const lastPos = new V3().copy(camera.position);
-    const lastQuat = new Q().copy(camera.quaternion);
-    const EPS = 0.0001;                          // module.js:138722 の changeEpsilon と同値
     let firstDone = false;
     let lastAcceptedAt = -Infinity;
-    let pointerUntil = 0;                        // 操作中は必ず sort する窓
+    let pointerUntil = 0;                        // ユーザー操作中だけ開く窓
 
     const dom = v.renderer?.domElement;
     if (dom) {
@@ -327,16 +347,8 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
         dom.addEventListener('wheel', mark, { passive: true });
     }
 
-    const cameraMoved = () => {
-        const p = camera.position, q = camera.quaternion;
-        return Math.abs(p.x - lastPos.x) > EPS || Math.abs(p.y - lastPos.y) > EPS ||
-               Math.abs(p.z - lastPos.z) > EPS ||
-               Math.abs(q.x - lastQuat.x) > EPS || Math.abs(q.y - lastQuat.y) > EPS ||
-               Math.abs(q.z - lastQuat.z) > EPS || Math.abs(q.w - lastQuat.w) > EPS;
-    };
     const accept = (force: any, forceSortAll: any) => {
         lastAcceptedAt = performance.now();
-        lastPos.copy(camera.position); lastQuat.copy(camera.quaternion);
         status.sortsAccepted++;
         return orig(force, forceSortAll);
     };
@@ -348,7 +360,12 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
         if (status.sortMode === '10fps') {
             allow = (now - lastAcceptedAt) >= 100;          // 最大 10Hz
         } else {                                            // 'camera'
-            allow = cameraMoved() || now < pointerUntil;
+            // `v.camera` は idleMode='rigid' のとき head compensation 後の
+            // C_render になっており、A2E / idle head motion だけで毎フレーム
+            // 変化する。これを「camera 移動」と誤認しないよう、camera mode の
+            // 判定は C_orbit を動かす要因 = ユーザー操作だけを見る
+            // (初回 sort は上の firstDone で常に通す)。
+            allow = now < pointerUntil;
         }
         if (!allow) { status.sortsSkipped++; return Promise.resolve(false); }
         return accept(force, forceSortAll);
@@ -362,7 +379,8 @@ function showSortModeBadge(status: UikaModeStatus): void {
     if (document.getElementById('uikaSortBadge')) return;
     const el = document.createElement('div');
     el.id = 'uikaSortBadge';
-    el.textContent = 'UIKA / SORT ' + status.sortMode.toUpperCase();
+    el.textContent = 'UIKA / SORT ' + status.sortMode.toUpperCase()
+                   + ' / IDLE ' + status.idleMode.toUpperCase();
     el.style.cssText = [
         'position:fixed', 'top:6px', 'right:8px', 'z-index:2147483647',
         'font:600 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace',
@@ -373,11 +391,218 @@ function showSortModeBadge(status: UikaModeStatus): void {
     document.body.appendChild(el);
 }
 
+const IDENTITY16 = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+
+/**
+ * Idle blink レイヤー (最小の補助機能)。
+ *
+ * `animation.glb` には morph (`weights`) トラックが 1 本も無いことを実データで
+ * 確認済みなので、通常 LAM にも blink の源は A2E しか無い。Idle 中に
+ * 「生きて見える」ために、**`eyeBlinkLeft` / `eyeBlinkRight` だけ**を
+ * 独立レイヤーとして足す。眉・頬・口へはランダムノイズを入れない。
+ *
+ * - 固定周期にしない。次の blink までを 2.6〜6.4 秒で散らす
+ * - 1 回の blink は 180ms 程度 (閉じ 80ms / 開き 100ms) で左右ほぼ同時
+ *   (右目を 8ms 遅らせる程度)
+ * - A2E が blink を出しているときは競合させない:
+ *     final = clamp(max(a2eBlink, procedural), 0, 1)
+ * - いまは Idle 中のみ (`chatState !== 'Responding'`)
+ * - 乱数は seed 可能 (`?blinkSeed=` / 既定 1)
+ */
+function makeBlinker(seed: number) {
+    let st = (seed >>> 0) || 1;
+    const rnd = () => {                       // mulberry32
+        st |= 0; st = (st + 0x6D2B79F5) | 0;
+        let t = Math.imul(st ^ (st >>> 15), 1 | st);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const CLOSE_MS = 80, OPEN_MS = 100, GAP_MIN = 2600, GAP_MAX = 6400, R_DELAY = 8;
+    let next = -1, count = 0;
+    const shape = (dt: number) => {
+        if (dt < 0 || dt > CLOSE_MS + OPEN_MS) return 0;
+        const x = dt < CLOSE_MS ? dt / CLOSE_MS : 1 - (dt - CLOSE_MS) / OPEN_MS;
+        return 0.5 - 0.5 * Math.cos(Math.PI * Math.min(Math.max(x, 0), 1));  // smoothstep 的
+    };
+    return {
+        get count() { return count; },
+        value(now: number): [number, number] {
+            if (next < 0) { next = now + GAP_MIN + rnd() * (GAP_MAX - GAP_MIN); return [0, 0]; }
+            const dt = now - next;
+            if (dt > CLOSE_MS + OPEN_MS) {
+                next = now + GAP_MIN + rnd() * (GAP_MAX - GAP_MIN); count++; return [0, 0];
+            }
+            return [shape(dt), shape(dt - R_DELAY)];
+        },
+    };
+}
+
+function setupIdleBlink(
+    renderer: any,
+    status: UikaModeStatus,
+    getChatState?: () => string,
+): boolean {
+    if (renderer.__uikaBlinkHooked) return true;
+    const orig = renderer.getExpressionData;
+    if (typeof orig !== 'function') return false;
+    renderer.__uikaBlinkHooked = true;
+    let seed = 1;
+    try { seed = parseInt(new URLSearchParams(window.location.search).get('blinkSeed') || '1', 10) || 1; }
+    catch { /* noop */ }
+    const b = makeBlinker(seed);
+    renderer.getExpressionData = function () {
+        const out = orig.call(this);
+        try {
+            // chatState は renderer の内部 property ではなく、
+            // LAMWebSocketManager から渡された getter で読む。
+            // getter が無い場合は blink しない (推測で判定しない)。
+            const chatState = typeof getChatState === 'function' ? getChatState() : null;
+            if (chatState !== null && chatState !== 'Responding') {   // いまは Idle 中のみ
+                const [l, r] = b.value(performance.now());
+                if (l > 0 || r > 0) {
+                    out.eyeBlinkLeft  = Math.min(1, Math.max(out.eyeBlinkLeft  || 0, l));
+                    out.eyeBlinkRight = Math.min(1, Math.max(out.eyeBlinkRight || 0, r));
+                }
+                status.blinkCount = b.count;
+            }
+        } catch { /* noop */ }
+        return out;
+    };
+    return true;
+}
+
+/**
+ * head rigid motion を **camera 側へ**合成する (idleMode = 'rigid')。
+ *
+ * ## なぜ camera か
+ * shader (`module.js:61785-61809`) は `head` bone の skinning 行列 `H_head(t)` を
+ * **全 splat の center** に掛ける。一方 covariance は
+ * `transformModelViewMatrix` だけから作られ (`module.js:62413/62439`)、
+ * `H_head` を受けない。そのため splat 側に H を掛けると
+ * 「center は動くが楕円の向きが追従しない」不整合が出る。
+ *
+ * `H_head` は全 splat に共通で掛かる **rigid transform** である
+ * (`animation.glb` 全 12 clip で実測: 特異値 [0.999999, 1.000000] /
+ *  det [+0.999998, +1.000000] / max|AᵀA−I| = 1.610e-06)。
+ * rigid なら「全点に H を掛ける」ことと「camera に等価変換を掛ける」ことは
+ * 描画として等価で、かつ camera 経由なら center と covariance が
+ * **同じ view 変換**を受けるため上記の不整合が起きない。
+ *
+ * ## 行列の向き
+ * three.js は column-vector / column-major (`projectionMatrix * modelViewMatrix * position`,
+ * `viewMatrix = camera.matrixWorldInverse`)。通常 LAM の投影は
+ *
+ *     clip = P · V · H · p
+ *
+ * なので、splat 側に H を掛けない UIKA でこれと一致させるには
+ *
+ *     V_render = V_orbit · H      ⟹      C_render = inverse(H) · C_orbit
+ *
+ * である。**`H · C_orbit` ではない。**
+ *
+ * ## C_orbit と C_render の分離
+ * OrbitControls が次フレームで `C_render` を基準にしてしまうとドリフトするので、
+ * - `viewer.update()` の**先頭**で camera を `C_orbit` に戻してから
+ *   `controls.update()` にユーザー操作を反映させ、
+ * - `runMorphUpdate()` の**直後** (= `skeleton.update()` の後、
+ *   `runSplatSort` と `render` の前) に `C_orbit` を控えてから `C_render` を書く。
+ * これで OrbitControls は `C_render` を一度も見ない。
+ */
+function setupHeadCompensation(renderer: any, status: UikaModeStatus): boolean {
+    const v = renderer?.viewer;
+    if (!v || status.idleMode !== 'rigid') return false;
+    if (v.__uikaHeadCompHooked) return true;
+    if (typeof v.runMorphUpdate !== 'function' || typeof v.update !== 'function') return false;
+    v.__uikaHeadCompHooked = true;
+
+    const camera = v.camera;
+    const M4 = camera.matrixWorld.constructor;
+    const H = new M4(), Hinv = new M4(), Crender = new M4();
+    const orbitWorld = new M4().copy(camera.matrixWorld);
+    let haveOrbit = false;
+
+    const origUpdate = v.update.bind(v);
+    const origMorph = v.runMorphUpdate.bind(v);
+
+    v.update = function (...a: any[]) {
+        // フレーム先頭: controls が触る前に C_orbit へ戻す
+        if (haveOrbit) {
+            orbitWorld.decompose(camera.position, camera.quaternion, camera.scale);
+            camera.updateMatrixWorld(true);
+        }
+        return origUpdate(...a);
+    };
+
+    v.runMorphUpdate = function (...a: any[]) {
+        const z = origMorph(...a);                 // この中で skeleton.update() が走る
+        try {
+            const sm = v.splatMesh;
+            const { skeleton, headIndex } = getSkeletonAndHeadIndex(sm);
+            if (!skeleton?.boneMatrices || headIndex < 0) return z;
+            const off = headIndex * 16;
+            H.fromArray(skeleton.boneMatrices as any, off);
+
+            // splat 側には H を掛けない。shader が読む head スロットを恒等にする。
+            // (headBoneIndex を負にすると `skinned` が 0 のままになり全点が原点へ
+            //  潰れるので、スロットの中身を恒等にする方法を採る)
+            for (let i = 0; i < 16; i++) skeleton.boneMatrices[off + i] = IDENTITY16[i];
+            if (skeleton.boneTexture) skeleton.boneTexture.needsUpdate = true;
+            status.headNeutralized = true;
+            status.hHeadMaxAbsDiffFromIdentityApplied = (() => {
+                let mx = 0; const e = H.elements;
+                for (let i = 0; i < 16; i++) { const d = Math.abs(e[i] - IDENTITY16[i]); if (d > mx) mx = d; }
+                return mx;
+            })();
+
+            // C_orbit を控えて C_render = inverse(H) · C_orbit を書く
+            camera.updateMatrixWorld(true);
+            orbitWorld.copy(camera.matrixWorld); haveOrbit = true;
+            Hinv.copy(H).invert();
+            Crender.multiplyMatrices(Hinv, orbitWorld);
+            Crender.decompose(camera.position, camera.quaternion, camera.scale);
+            camera.updateMatrixWorld(true);
+        } catch (e: any) { status.errors.push('headComp:' + e?.message); }
+        return z;
+    };
+
+    // 投影一致の数値検証: P·V_orbit·H·p  と  P·V_render·p
+    (window as any).__uikaVerifyProjection = () => {
+        const V3 = camera.position.constructor;
+        const pts = [[0,0,0],[0.1,0,0],[0,0.1,0],[0,0,0.1],[0.115407,0.133521,0.060738],[-0.207022,-0.177291,-0.207337]];
+        const Vorbit = new M4().copy(orbitWorld).invert();
+        const Vrender = new M4().copy(camera.matrixWorldInverse);
+        const P = camera.projectionMatrix;
+        let worst = 0; const rows: any[] = [];
+        for (const q of pts) {
+            const a = new V3(q[0], q[1], q[2]).applyMatrix4(H).applyMatrix4(Vorbit).applyMatrix4(P);
+            const b = new V3(q[0], q[1], q[2]).applyMatrix4(Vrender).applyMatrix4(P);
+            const d = Math.max(Math.abs(a.x-b.x), Math.abs(a.y-b.y), Math.abs(a.z-b.z));
+            if (d > worst) worst = d;
+            rows.push({ p: q, lam: [a.x, a.y, a.z], uika: [b.x, b.y, b.z], diff: d });
+        }
+        status.projParityMaxDiff = worst;
+        return { maxAbsDiff: worst, rows, H: Array.from(H.elements) };
+    };
+    return true;
+}
+
 /**
  * UIKA mode を適用し、毎フレーム状態を維持しつつ H_head を実測する。
  * 返り値の status は `window.__uikaStatus` にも出す (検証用)。
  */
-export function applyUika133kMode(renderer: any): UikaModeStatus {
+export interface Uika133kModeOptions {
+    /**
+     * 現在の chatState を返す getter。Travel-sp では
+     * `LAMWebSocketManager.chatState` を `() => this.chatState` で渡す。
+     * blink の Idle 判定にだけ使う。
+     */
+    getChatState?: () => string;
+}
+
+export function applyUika133kMode(
+    renderer: any,
+    options: Uika133kModeOptions = {},
+): UikaModeStatus {
     const status: UikaModeStatus = {
         enabled: true,
         headBoneIndex: -1,
@@ -388,6 +613,13 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
         userInteracted: false,
         orbitEnabled: false,
         sortMode: getUikaSortMode(),
+        idleMode: getUikaIdleMode(),
+        headCompHooked: false,
+        headNeutralized: false,
+        hHeadMaxAbsDiffFromIdentityApplied: Number.NaN,
+        projParityMaxDiff: Number.NaN,
+        blinkEnabled: false,
+        blinkCount: 0,
         sortHooked: false,
         sortsAccepted: 0,
         sortsSkipped: 0,
@@ -401,8 +633,14 @@ export function applyUika133kMode(renderer: any): UikaModeStatus {
     };
 
     const apply = () => {
-        status.errors.push(...stopSkeletalAnimation(renderer));
-        status.animationStopped = true;
+        if (status.idleMode === 'off') {
+            status.errors.push(...stopSkeletalAnimation(renderer));
+            status.animationStopped = true;
+        } else {
+            status.animationStopped = false;
+            status.headCompHooked = setupHeadCompensation(renderer, status);
+            status.blinkEnabled = setupIdleBlink(renderer, status, options.getChatState);
+        }
         status.controlsNeutralized = setupControls(renderer, status);
         status.sortHooked = setupSortMode(renderer, status);
         // 初回操作までは meta camera を毎フレーム当て直す。操作後は

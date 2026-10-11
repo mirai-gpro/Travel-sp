@@ -86,7 +86,7 @@ export class LAMWebSocketManager {
                 // 通常の avatar-config camera / orbit-limits / 初期6° polar 補正は
                 // 一切適用しない。meta.json の camera と H_head = 恒等だけを使う。
                 // gate の判定は splat mesh が揃ってから uika-133k-mode 側が出す。
-                applyUika133kMode(this.renderer);
+                applyUika133kMode(this.renderer, { getChatState: () => this.chatState });
                 console.log('[LAMWebSocketManager][UIKA133K] mode 適用開始 '
                             + '(gate 判定は window.__uikaStatus を参照)');
                 this.isModelLoaded = true;
