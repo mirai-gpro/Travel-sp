@@ -548,6 +548,63 @@ function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
     return true;
 }
 
+/**
+ * 画面上の診断パネル。DevTools を開かずに A/B の数値を読めるようにする。
+ * UIKA mode のときだけ出し、通常 LAM には一切出さない。
+ * 値は `window.__uikaA2EStats` (lam-websocket-manager が集計) と
+ * `window.__uikaMainGap` (core-controller の heartbeat が集計) を読むだけで、
+ * 同期ロジック・描画・A2E 値には触らない。
+ */
+function updateDiagHud(status: UikaModeStatus): void {
+    if (typeof document === 'undefined' || !document.body) return;
+    let el = document.getElementById('uikaDiagHud') as HTMLDivElement | null;
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'uikaDiagHud';
+        el.style.cssText = [
+            'position:fixed', 'top:6px', 'left:8px', 'z-index:2147483647',
+            'font:600 11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace',
+            'color:#fff', 'background:rgba(0,0,0,.72)', 'padding:6px 9px',
+            'border-radius:5px', 'pointer-events:none', 'user-select:none',
+            'white-space:pre', 'max-width:60vw',
+        ].join(';');
+        document.body.appendChild(el);
+    }
+    const w = window as any;
+    const a = w.__uikaA2EStats;
+    const g = w.__uikaMainGap || { count: 0, maxMs: 0 };
+    const f = (x: any, n = 0) => (typeof x === 'number' ? x.toFixed(n) : '-');
+
+    let iv50 = '-', iv95 = '-', ivMax = '-', frames = 0;
+    if (a && a.renderTimes && a.renderTimes.length > 2) {
+        const t = a.renderTimes;
+        frames = t.length;
+        const d: number[] = [];
+        for (let i = 1; i < t.length; i++) d.push(t[i] - t[i - 1]);
+        d.sort((x, y) => x - y);
+        const q = (pp: number) => d[Math.min(d.length - 1, Math.floor(pp * d.length))].toFixed(1);
+        iv50 = q(0.5); iv95 = q(0.95); ivMax = d[d.length - 1].toFixed(1);
+    }
+    const st = a && a.last;
+    const openMs = a && a.clampOpenAt !== null && a.clampOpenAt !== undefined
+        ? performance.now() - a.clampOpenAt : 0;
+
+    el.textContent =
+        'UIKA DIAG  exprPath=' + (a ? a.exprPath : (status.enabled ? '(待機)' : '-')) + '\n'
+        + 'playback ' + f(st && st.playbackMs) + 'ms  coverage ' + f(st && (st.bufferFrames / st.fps * 1000))
+        + 'ms  buf ' + f(st && st.bufferFrames) + '\n'
+        + 'req ' + f(st && st.requestedFrame) + ' -> sel ' + f(st && st.selectedFrame)
+        + '  clamped ' + (st ? String(st.clamped) : '-') + '\n'
+        + 'clamp  回数 ' + f(a && a.clampCount) + '  累計 ' + f(a && a.clampTotalMs)
+        + 'ms  最長 ' + f(a && Math.max(a.clampMaxMs, openMs)) + 'ms\n'
+        + 'maxLag ' + f(a && a.maxLag) + ' frames'
+        + '  初回expr pb ' + f(a && a.firstExprPlaybackMs) + 'ms / cov ' + f(a && a.firstExprCoverageMs) + 'ms\n'
+        + 'render ' + frames + ' 回  p50 ' + iv50 + '  p95 ' + iv95 + '  max ' + ivMax + 'ms\n'
+        + 'MAIN GAP 回数 ' + g.count + '  最大 ' + f(g.maxMs, 1) + 'ms\n'
+        + 'sort ' + status.sortMode + ' / idle ' + idleModeLabel(status.idleMode)
+        + ' / blink ' + status.blinkMode + (status.morphFast ? ' / fast' : '');
+}
+
 /** テスト用の小さなモード表示。UIKA debug URL のときだけ出す。 */
 function showSortModeBadge(status: UikaModeStatus): void {
     if (typeof document === 'undefined') return;
@@ -944,8 +1001,12 @@ export function applyUika133kMode(
 
     // 毎フレーム維持する。Runtime 側のループが再度 pose / camera を動かしても
     // 次のフレームで戻す。
+    let hudAt = 0;
     const tick = () => {
         apply();
+        // 画面パネルは 5Hz まで (毎フレーム DOM を触らない)
+        const nowHud = performance.now();
+        if (nowHud - hudAt >= 200) { hudAt = nowHud; try { updateDiagHud(status); } catch { /* noop */ } }
         if (status.ready && !status.gateReported) {
             status.gateReported = true;
             if (status.hHeadIsIdentity) {

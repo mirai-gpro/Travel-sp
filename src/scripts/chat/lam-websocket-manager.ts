@@ -235,6 +235,41 @@ export class LAMWebSocketManager {
             try {
                 const st = this.exprTrace.getState();
                 const now = performance.now();
+
+                // --- 画面表示用の集計 (DevTools を開かずに読めるようにする) ---
+                const w = window as any;
+                let agg = w.__uikaA2EStats;
+                if (!agg || agg.exprPath !== this.exprTrace.path) {
+                    agg = w.__uikaA2EStats = {
+                        exprPath: this.exprTrace.path,
+                        renderTimes: [] as number[],
+                        clampCount: 0, clampTotalMs: 0, clampMaxMs: 0,
+                        clampOpenAt: null as number | null,
+                        maxLag: 0,
+                        firstExprPlaybackMs: null as number | null,
+                        firstExprCoverageMs: null as number | null,
+                        catchUpPlaybackMs: null as number | null,
+                        last: null as any,
+                    };
+                }
+                agg.renderTimes.push(now);
+                if (agg.renderTimes.length > 4000) agg.renderTimes.shift();
+                const lag = st.requestedFrame - st.selectedFrame;
+                if (lag > agg.maxLag) agg.maxLag = lag;
+                if (st.bufferFrames > 0 && agg.firstExprPlaybackMs === null) {
+                    agg.firstExprPlaybackMs = st.playbackMs;
+                    agg.firstExprCoverageMs = st.bufferFrames / st.fps * 1000;
+                }
+                if (st.clamped && agg.clampOpenAt === null && st.bufferFrames > 0) {
+                    agg.clampOpenAt = now; agg.clampCount++;
+                } else if (!st.clamped && agg.clampOpenAt !== null) {
+                    const dur = now - agg.clampOpenAt;
+                    agg.clampTotalMs += dur;
+                    if (dur > agg.clampMaxMs) agg.clampMaxMs = dur;
+                    agg.clampOpenAt = null;
+                    if (agg.catchUpPlaybackMs === null) agg.catchUpPlaybackMs = st.playbackMs;
+                }
+                agg.last = st;
                 if (this._shouldTrace(now, this._traceRenderAt, this._traceRenderSel,
                                       this._traceRenderClamped, st.selectedFrame, st.clamped)) {
                     this._traceRenderAt = now;
