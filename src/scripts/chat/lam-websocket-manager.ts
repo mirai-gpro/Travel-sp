@@ -79,6 +79,17 @@ export class LAMWebSocketManager {
         };
     } | null = null;
 
+    // ===== 診断専用: 人工 morph プローブ (?morphProbe=1) =====
+    // A2E / Socket.IO / AudioContext / expression buffer / provider・cache を
+    // すべて外し、performance.now() から直接作った jawOpen だけを renderer へ渡す。
+    // 通常 LAM と UIKA が **この同じ分岐**を通るので、違うのはモデルだけになる。
+    private readonly morphProbe: boolean = (() => {
+        try { return new URLSearchParams(window.location.search).get('morphProbe') === '1'; }
+        catch { return false; }
+    })();
+    private _probeTimes: number[] = [];
+    private _probeLogAt = 0;
+
     // トレース間引き用 (console spam を避ける)
     private _traceRenderAt = 0;
     private _traceRenderSel = -1;
@@ -221,6 +232,46 @@ export class LAMWebSocketManager {
      */
     private _getExpressionData(): Record<string, number> {
         const result: Record<string, number> = {};
+
+        // ===== 診断専用: 人工 morph プローブ =====
+        // `?morphProbe=1` のときだけ、A2E 経路を一切通さず
+        // performance.now() から毎フレーム直接 jawOpen を算出して返す。
+        // 累積カウンタや setInterval は使わないので、描画フレームが飛んでも
+        // 「その時刻に対応する正しい jawOpen」になる。
+        // 日本語口形補正や A2E 後処理はこの経路では通さない (両モデルへ同一値を入れる)。
+        if (this.morphProbe) {
+            const now = performance.now();
+            for (const name of this.expressionNames) result[name] = 0;
+            const phase = (now % 1000) / 1000;
+            const jawOpen = 0.4 - 0.4 * Math.cos(phase * Math.PI * 2);
+            result.jawOpen = jawOpen;
+
+            // renderer の呼び出し間隔だけを測る (直近 120 サンプル、2 秒ごとに 1 行)
+            this._probeTimes.push(now);
+            if (this._probeTimes.length > 120) this._probeTimes.shift();
+            if (now - this._probeLogAt >= 2000) {
+                this._probeLogAt = now;
+                const t = this._probeTimes;
+                if (t.length > 2) {
+                    const d: number[] = [];
+                    for (let i = 1; i < t.length; i++) d.push(t[i] - t[i - 1]);
+                    d.sort((a, b) => a - b);
+                    const q = (pp: number) => d[Math.min(d.length - 1, Math.floor(pp * d.length))];
+                    const p50 = q(0.5);
+                    console.log(
+                        '[MORPH PROBE]'
+                        + ' avatar=' + (isUika133kMode() ? 'UIKA' : 'LAM')
+                        + ' samples=' + t.length
+                        + ' p50Ms=' + p50.toFixed(1)
+                        + ' p95Ms=' + q(0.95).toFixed(1)
+                        + ' maxMs=' + d[d.length - 1].toFixed(1)
+                        + ' approxFps=' + (p50 > 0 ? (1000 / p50).toFixed(1) : '-')
+                        + ' jawOpen=' + jawOpen.toFixed(3)
+                    );
+                }
+            }
+            return result;
+        }
 
         // frame の取得元だけが通常 LAM と UIKA で違う。
         // provider があれば描画瞬間に直接引く (古い cache を使わない)。
