@@ -90,6 +90,14 @@ export function getUikaSortMode(): UikaSortMode {
     return 'camera';
 }
 
+/** `?morphFast=off` で無効化できる。既定は有効。 */
+export function getUikaMorphFast(): boolean {
+    try {
+        return new URLSearchParams(window.location.search).get('morphFast') !== 'off';
+    } catch { /* noop */ }
+    return true;
+}
+
 export type UikaBlinkMode = 'idle' | 'always';
 
 /**
@@ -149,6 +157,10 @@ export interface UikaModeStatus {
     blinkEnabled: boolean;
     blinkMode: UikaBlinkMode;
     blinkCount: number;
+    morphFast: boolean;
+    morphFastHooked: boolean;
+    morphFullRuns: number;
+    morphFastFrames: number;
     sortHooked: boolean;
     sortsAccepted: number;
     sortsSkipped: number;
@@ -393,6 +405,79 @@ function setupControls(renderer: any, status: UikaModeStatus): boolean {
  * 飛ばすときは `Promise.resolve(false)` を返す。これは元の実装が
  * 早期 return で返すのと同じ値 (`module.js:139127`)。
  */
+/**
+ * `runMorphUpdate()` の毎フレーム全量再構築をやめる (UIKA mode 限定)。
+ *
+ * ## 何が無駄か (実測)
+ * `module.js:139478-139524` の `runMorphUpdate()` は毎フレーム
+ *   1. `new Float32Array(position.array)` = 133,541 × 3 float = **1.60 MB を新規確保**
+ *   2. `fillSplatCenterArray` で 133,541 点を詰め替え
+ *   3. center/color texture を**全量再アップロード**
+ * を行う。しかし UIKA mode では `baseData.centers` のハッシュが
+ * **全フレーム同一** (`761531216`、`idleMode=rigidPivot` / `off` ともに実測)。
+ * 理由は構造的で、`position` attribute は `cano_nose90` で固定、`sceneTransform` も
+ * 固定、head bone slot は毎フレーム恒等に上書きしており、A2E morph は shader 側で
+ * `flameModelTexture` + `bsWeight` から加算される経路なので center には入らない。
+ * つまり**毎フレーム同じ結果を作り直して送り直している**。
+ *
+ * ## 何が必要か
+ * A2E を GPU へ渡すのに必要なのは `bsWeight` (51 float) だけで、それは
+ * `splatMesh.updateBoneMatrixTexture()` (`module.js:64775-64808`) が単独で行う
+ * (小さい `boneMatrix` texture に書いて `needsUpdate` を立て、uniform を貼り直す。
+ *  center/color texture には触らない)。
+ * head compensation のために `skeleton.update()` も必要。
+ *
+ * ## 初回だけ完全実行する理由
+ * 元の `runMorphUpdate()` は初回に
+ *   - `splatMesh.bonesNum = 5` (bsWeight の書き込みオフセットに使われる)
+ *   - `skinIndex` / `skinWeight` の InstancedBufferAttribute コピー
+ *     (`setSkinAttibutes` ガード付き。`splatIndex` attribute が出来てからでないと走らない)
+ *   - `splatMesh.morphedMesh` と centers の初回アップロード
+ * を行うので、それらが揃うまでは完全実行する。
+ *
+ * renderer package には一切触らない。`?morphFast=off` で元の挙動に戻せる。
+ */
+function setupMorphFastPath(renderer: any, status: UikaModeStatus): boolean {
+    const v = renderer?.viewer;
+    if (!v || typeof v.runMorphUpdate !== 'function') return false;
+    if (!status.morphFast) return false;
+    if (v.__uikaMorphFastHooked) return true;
+    v.__uikaMorphFastHooked = true;
+
+    const origMorph = v.runMorphUpdate.bind(v);
+    const MIN_FULL_RUNS = 30;        // 初期化が揃うまでの余裕 (起動時のみのコスト)
+    let fullRuns = 0;
+    let ready = false;
+
+    (window as any).__uikaForceFullMorph = () => { ready = false; fullRuns = 0; };
+
+    v.runMorphUpdate = function (...a: any[]) {
+        if (!ready) {
+            const z = origMorph(...a);
+            fullRuns++;
+            status.morphFullRuns = fullRuns;
+            const initDone = v.setSkinAttibutes === true
+                && v.splatMesh?.splatDataTextures?.['flameModel'] !== undefined;
+            if (initDone && fullRuns >= MIN_FULL_RUNS) ready = true;
+            return z;
+        }
+        // 以降は centers を作り直さない。skeleton と bsWeight だけ更新する。
+        try {
+            if (v.useFlame === false) {
+                v.skinModel?.skeleton?.update?.();
+                v.boneRoot?.updateMatrixWorld?.(true);
+            }
+            v.splatMesh?.updateBoneMatrixTexture?.(v.useFlame === true);
+            status.morphFastFrames++;
+        } catch (e: any) {
+            status.errors.push('morphFast:' + e?.message);
+            ready = false;        // 失敗したら完全実行へ戻す
+        }
+        return undefined;
+    };
+    return true;
+}
+
 function setupSortMode(renderer: any, status: UikaModeStatus): boolean {
     const v = renderer?.viewer;
     if (!v || typeof v.runSplatSort !== 'function') return false;
@@ -450,7 +535,8 @@ function showSortModeBadge(status: UikaModeStatus): void {
     el.id = 'uikaSortBadge';
     el.textContent = 'UIKA / SORT ' + status.sortMode.toUpperCase()
                    + ' / IDLE ' + idleModeLabel(status.idleMode)
-                   + ' / BLINK ' + status.blinkMode.toUpperCase();
+                   + ' / BLINK ' + status.blinkMode.toUpperCase()
+                   + (status.morphFast ? ' / FAST' : ' / FAST OFF');
     el.style.cssText = [
         'position:fixed', 'top:6px', 'right:8px', 'z-index:2147483647',
         'font:600 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace',
@@ -765,6 +851,10 @@ export function applyUika133kMode(
         blinkEnabled: false,
         blinkMode: getUikaBlinkMode(),
         blinkCount: 0,
+        morphFast: getUikaMorphFast(),
+        morphFastHooked: false,
+        morphFullRuns: 0,
+        morphFastFrames: 0,
         sortHooked: false,
         sortsAccepted: 0,
         sortsSkipped: 0,
@@ -795,6 +885,11 @@ export function applyUika133kMode(
         status.posePinned = true;
 
         status.controlsNeutralized = setupControls(renderer, status);
+
+        // head compensation より先に入れる。
+        // 結果の呼び出し順は headComp wrapper → fastPath → (skeleton.update + bsWeight)
+        // → headComp が H を読んで head slot を恒等化 → camera を書く、となる。
+        status.morphFastHooked = setupMorphFastPath(renderer, status);
 
         if (status.idleMode === 'off') {
             status.errors.push(...stopSkeletalAnimation(renderer));
