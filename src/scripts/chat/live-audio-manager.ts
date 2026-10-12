@@ -46,6 +46,60 @@ export interface ExpressionFrame {
     values: number[];  // ARKit 52 ブレンドシェイプ値
 }
 
+// ============================================================
+// AV coordinated scheduler のチューニング定数
+// ============================================================
+
+/**
+ * segment の最初の音声を、実時間で何秒遅らせて鳴らし始めるか (pre-roll)。
+ *
+ * Audio は Expression coverage を超えて schedule しないので、coverage が
+ * 伸びる前に音声が鳴り終わると再生が途切れる。segment 先頭を LEAD だけ
+ * 後ろにずらすと、以降すべての drain 点が実時間で LEAD だけ後ろにずれ、
+ * その分が A2E 到着の揺らぎ吸収になる。
+ *
+ * この値そのものが重要なのではなく、「Audio が Expression buffer を
+ * 追い越した状態で再生されない」ことが重要。0 にすると pre-roll 無しになる。
+ */
+export const A2E_LEAD_SEC = 0.20;
+
+/**
+ * Expression がまったく届かないときに、Audio を解放するまでの待ち時間。
+ *
+ * A2E サービス障害 (例: 503 Engine is still loading) で expression が
+ * 1 フレームも来ない場合、これが無いと音声が永久に鳴らない。
+ * 通常再生では発火しない。発火した segment は underrun として警告を出す。
+ */
+export const A2E_WAIT_TIMEOUT_SEC = 1.0;
+
+/** AudioContext へ渡す前の、まだ schedule していない音声チャンク。 */
+interface PendingAudioChunk {
+    buffer: AudioBuffer;
+    durationSec: number;
+    enqueuedAt: number;      // AudioContext 時刻
+}
+
+/** 実際に AudioBufferSourceNode.start() した 1 チャンクの時間対応。 */
+interface ScheduledEntry {
+    wallStart: number;       // start() に渡した AudioContext 時刻 (= master origin)
+    contentStart: number;    // segment 内のコンテンツ時刻 [sec]
+    durationSec: number;
+}
+
+/**
+ * 1 つの発話 segment。Expression frame と、その segment の
+ * コンテンツ時刻 → AudioContext 時刻の対応表を持つ。
+ */
+interface AvSegment {
+    id: number;
+    frames: ExpressionFrame[];
+    fps: number;
+    contentSec: number;      // この segment で schedule 済みのコンテンツ長 [sec]
+    entries: ScheduledEntry[];
+    started: boolean;
+    stalled: boolean;        // A2E 不着で解放済み (degraded)
+}
+
 export class LiveAudioManager {
     private audioContext: AudioContext | null = null;
     private mediaStream: MediaStream | null = null;
@@ -56,16 +110,31 @@ export class LiveAudioManager {
     public isAiSpeaking: boolean = false;
     private isStreaming: boolean = false;
 
-    // PCM再生（24kHz）- 即時スケジューリング方式
+    // PCM再生（24kHz）
     private nextPlayTime: number = 0;
     private scheduledSources: AudioBufferSourceNode[] = [];  // interrupt時にstop()用
 
-    // ★ Expression同期機能（仕様書08 セクション4.1）
-    private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
-    private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームデータ
-    public expressionFrameRate: number = 30;           // fps（デフォルト30）
+    // ===== AV coordinated scheduler =====
+    // live_audio は即 schedule せず pending queue に積み、
+    // Expression coverage が足りた分だけ _pumpAvScheduler() が AudioContext に渡す。
+    private pendingAudio: PendingAudioChunk[] = [];
+    private segments: AvSegment[] = [];
+    private segmentSeq: number = 0;
+    private pumpTimer: any = null;
+
+    // master origin = 最初の AudioBufferSourceNode.start() に渡した startTime
+    private audioTimelineStart: number | null = null;
+
+    public expressionFrameRate: number = 30;           // fps（A2E 受信値。既定30）
     public expressionNames: string[] = [];             // ARKit ブレンドシェイプ名
     private _a2eDebugCounter: number = 0;              // デバッグログ間引き用
+
+    // invariant 検証用カウンタ (read-only で外へ出すだけ)
+    private _underrunCount: number = 0;        // requested frame が buffer に無かった回数
+    private _interpCount: number = 0;          // 2 frame 間を補間した回数
+    private _tailSampleCount: number = 0;      // 補間相手が無く requested frame をそのまま返した回数
+    private _stallReleaseCount: number = 0;    // A2E 不着で音声を解放した回数
+    private _lastSample: { i0: number; i1: number; t: number } | null = null;
 
     // ========================================
     // セッション開始時に1度だけ呼ぶ
@@ -185,11 +254,6 @@ export class LiveAudioManager {
     playPcmAudio(pcmBase64: string): void {
         if (!this.audioContext) return;
 
-        // ★ 最初のチャンク時にfirstChunkStartTimeを記録（仕様書08 セクション4.2）
-        if (this.firstChunkStartTime === 0) {
-            this.firstChunkStartTime = this.audioContext.currentTime;
-        }
-
         const pcmBytes = base64ToArrayBuffer(pcmBase64);
         // PCM 24kHz 16bit mono → Float32
         const int16 = new Int16Array(pcmBytes);
@@ -201,21 +265,104 @@ export class LiveAudioManager {
         const buffer = this.audioContext.createBuffer(1, float32.length, 24000);
         buffer.copyToChannel(float32, 0);
 
-        // ★ 即時スケジューリング: チャンク到着時に未来時刻へ予約
-        // onended待ちの隙間が発生しないため、ブツブツ切れを防止
-        this._scheduleBuffer(buffer);
+        // ★ 即時 schedule はしない。Expression coverage を見て解放する。
+        this.pendingAudio.push({
+            buffer,
+            durationSec: buffer.duration,
+            enqueuedAt: this.audioContext.currentTime,
+        });
+        this._pumpAvScheduler();
     }
 
-    private _scheduleBuffer(buffer: AudioBuffer): void {
+    // ========================================
+    // AV coordinated scheduler
+    // ========================================
+
+    /**
+     * Expression coverage が存在する分だけ Audio を AudioContext へ渡す。
+     *
+     *   scheduledAudioEnd <= expressionCoverage
+     *
+     * を満たさないチャンクは pending に留める。これにより
+     * 「Audio が Expression buffer を追い越す」状態を作らない。
+     * segment の 1 本目だけ A2E_LEAD_SEC ぶん実時間で後ろにずらし、
+     * 以降の drain 点を同じだけ後ろへ送る (A2E 到着揺らぎの吸収)。
+     */
+    private _pumpAvScheduler(): void {
         if (!this.audioContext) return;
+        this._clearPumpTimer();
 
-        const source = this.audioContext.createBufferSource();
+        while (this.pendingAudio.length > 0) {
+            const seg = this._currentSegment();
+            const chunk = this.pendingAudio[0];
+            const fps = seg.fps > 0 ? seg.fps : 30;
+            const coverageSec = seg.frames.length / fps;
+            const scheduledEnd = seg.contentSec + chunk.durationSec;
+            // 浮動小数の端 (2.4000000000000004 > 2.4) で 1 チャンク取り残さない
+            const EPS = 1e-6;
+
+            if (!seg.stalled && scheduledEnd > coverageSec + EPS) {
+                const waited = this.audioContext.currentTime - chunk.enqueuedAt;
+                if (waited >= A2E_WAIT_TIMEOUT_SEC) {
+                    // A2E が来ない (サービス障害など)。無音のままにはできないので解放する。
+                    // stalled は一時的: 次の live_expression 到着で gate は再有効になる。
+                    seg.stalled = true;
+                    this._stallReleaseCount++;
+                    console.warn(
+                        `[AV] expression underrun: A2E が ${waited.toFixed(2)}s 届かないため音声を解放 `
+                        + `(segment=${seg.id} coverage=${coverageSec.toFixed(2)}s scheduledEnd=${scheduledEnd.toFixed(2)}s)`
+                    );
+                    continue;
+                }
+                // まだ待つ。expression 到着でも再度 pump されるが、
+                // 発話末尾のように追加到着が無い場合に備えてタイマーも張る。
+                this._armPumpTimer();
+                return;
+            }
+
+            this.pendingAudio.shift();
+            // segment の 1 本目だけ pre-roll ぶん後ろにずらす (揺らぎ吸収)
+            const minDelaySec = seg.entries.length === 0 ? A2E_LEAD_SEC : 0.005;
+            const wallStart = this._scheduleBuffer(chunk.buffer, minDelaySec);
+            seg.entries.push({
+                wallStart,
+                contentStart: seg.contentSec,
+                durationSec: chunk.durationSec,
+            });
+            seg.contentSec = scheduledEnd;
+            seg.started = true;
+
+            // ★ master origin は「実際に start() した startTime」
+            if (this.audioTimelineStart === null) {
+                this.audioTimelineStart = wallStart;
+            }
+        }
+    }
+
+    private _armPumpTimer(): void {
+        if (this.pumpTimer !== null) return;
+        this.pumpTimer = setTimeout(() => {
+            this.pumpTimer = null;
+            this._pumpAvScheduler();
+        }, 50);
+    }
+
+    private _clearPumpTimer(): void {
+        if (this.pumpTimer !== null) {
+            clearTimeout(this.pumpTimer);
+            this.pumpTimer = null;
+        }
+    }
+
+    /** 実際に AudioContext へ渡す。戻り値は start() に渡した startTime。 */
+    private _scheduleBuffer(buffer: AudioBuffer, minDelaySec: number = 0.005): number {
+        const source = this.audioContext!.createBufferSource();
         source.buffer = buffer;
-        source.connect(this.audioContext.destination);
+        source.connect(this.audioContext!.destination);
 
-        const now = this.audioContext.currentTime;
-        // 少なくとも now + 0.005s 後に再生開始（スケジューリングマージン）
-        const startTime = Math.max(now + 0.005, this.nextPlayTime);
+        const now = this.audioContext!.currentTime;
+        // 少なくとも now + minDelaySec 後に再生開始（スケジューリングマージン / pre-roll）
+        const startTime = Math.max(now + minDelaySec, this.nextPlayTime);
         source.start(startTime);
         this.nextPlayTime = startTime + buffer.duration;
 
@@ -225,27 +372,125 @@ export class LiveAudioManager {
             const idx = this.scheduledSources.indexOf(source);
             if (idx !== -1) this.scheduledSources.splice(idx, 1);
         };
+        return startTime;
     }
 
     // ========================================
-    // ★ Expression同期メソッド（仕様書08 セクション4.1, 4.3）
+    // segment lifecycle
     // ========================================
 
     /**
-     * 現在の再生オフセット（ms）を計算
+     * 新しい正常 segment を開始する。
+     * schedule 済みの音声は止めない (自然に鳴り終わり、新 segment はその後ろに並ぶ)。
+     */
+    beginSegment(): void {
+        this._clearPumpTimer();
+        this.pendingAudio = [];
+        this.segments.push({
+            id: ++this.segmentSeq,
+            frames: [],
+            fps: this.expressionFrameRate,
+            contentSec: 0,
+            entries: [],
+            started: false,
+            stalled: false,
+        });
+        this._pruneSegments();
+        this._a2eDebugCounter = 0;
+        console.log(`[AV] beginSegment id=${this.segmentSeq}`);
+    }
+
+    /**
+     * 本当に即時停止が必要な場合のみ (ユーザー割り込み等)。
+     * schedule 済み source を止め、キューと timeline を捨てる。
+     */
+    interrupt(): void {
+        this._clearPumpTimer();
+        this.pendingAudio = [];
+        for (const source of this.scheduledSources) {
+            try { source.stop(); } catch (_) { /* already stopped */ }
+        }
+        this.scheduledSources = [];
+        this.nextPlayTime = 0;
+        this.audioTimelineStart = null;
+        this.segments = [];
+        console.log('[AV] interrupt: scheduled audio 停止 + timeline クリア');
+    }
+
+    private _currentSegment(): AvSegment {
+        if (this.segments.length === 0) {
+            this.segments.push({
+                id: ++this.segmentSeq,
+                frames: [],
+                fps: this.expressionFrameRate,
+                contentSec: 0,
+                entries: [],
+                started: false,
+                stalled: false,
+            });
+        }
+        return this.segments[this.segments.length - 1];
+    }
+
+    /** 鳴り終わった古い segment を落とす (最後の segment は常に残す)。 */
+    private _pruneSegments(): void {
+        if (!this.audioContext || this.segments.length <= 1) return;
+        const now = this.audioContext.currentTime;
+        const keep: AvSegment[] = [];
+        for (let i = 0; i < this.segments.length; i++) {
+            const seg = this.segments[i];
+            const isLast = i === this.segments.length - 1;
+            if (isLast) { keep.push(seg); continue; }
+            const last = seg.entries[seg.entries.length - 1];
+            const endsAt = last ? last.wallStart + last.durationSec : -Infinity;
+            if (endsAt > now - 1.0) keep.push(seg);
+        }
+        this.segments = keep;
+    }
+
+    // ========================================
+    // master playhead → Expression sampling
+    // ========================================
+
+    /**
+     * 「実際に schedule した Audio」から、いま鳴っているコンテンツ時刻を求める。
+     *
+     * - entry の中にいる → contentStart + 経過
+     * - entry が鳴り終わっていて後続 entry が未開始 (gap) → その entry の終端
+     * - schedule 済み音声の末尾より後 (= 無音) → null (全0 = 口を閉じる)
+     * - まだ 1 つも鳴り始めていない → null
+     */
+    private _resolvePlayhead(): { seg: AvSegment; contentSec: number } | null {
+        if (!this.audioContext) return null;
+        const now = this.audioContext.currentTime;
+        for (let si = this.segments.length - 1; si >= 0; si--) {
+            const seg = this.segments[si];
+            for (let i = seg.entries.length - 1; i >= 0; i--) {
+                const e = seg.entries[i];
+                if (now < e.wallStart) continue;
+                const into = now - e.wallStart;
+                if (into < e.durationSec) {
+                    return { seg, contentSec: e.contentStart + into };
+                }
+                const isGlobalLast = (i === seg.entries.length - 1) && (si === this.segments.length - 1);
+                if (isGlobalLast) return null;
+                return { seg, contentSec: e.contentStart + e.durationSec };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 現在の再生オフセット（ms）。
+     * 基準は firstChunkStartTime ではなく、実際に start() した startTime。
      */
     getCurrentPlaybackOffset(): number {
-        if (!this.audioContext || this.firstChunkStartTime === 0) return 0;
-        return (this.audioContext.currentTime - this.firstChunkStartTime) * 1000;
+        const p = this._resolvePlayhead();
+        return p ? p.contentSec * 1000 : 0;
     }
 
     /**
-     * 【診断専用・read-only】同期状態のスナップショットを返す。
-     *
-     * `getCurrentExpressionFrame()` の判定式 (下記) をそのまま再計算するだけで、
-     * 状態は一切変更しない (`_a2eDebugCounter` も進めない)。
-     * 同期アルゴリズム / `firstChunkStartTime` / `expressionFrameBuffer` /
-     * fps / clamp 方式には手を付けていない。
+     * 【診断専用・read-only】同期状態のスナップショット。状態は変更しない。
      */
     getExpressionSyncDebugState(): {
         playbackMs: number;
@@ -255,53 +500,125 @@ export class LiveAudioManager {
         selectedFrame: number;
         clamped: boolean;
     } {
-        const playbackMs = this.getCurrentPlaybackOffset();
-        const bufferFrames = this.expressionFrameBuffer.length;
-        const fps = this.expressionFrameRate;
-        const requestedFrame = Math.floor((playbackMs / 1000) * fps);
-        const selectedFrame = Math.min(requestedFrame, bufferFrames - 1);
+        const p = this._resolvePlayhead();
+        const seg = this.segments.length > 0 ? this.segments[this.segments.length - 1] : null;
+        const fps = seg && seg.fps > 0 ? seg.fps : this.expressionFrameRate;
+        const bufferFrames = seg ? seg.frames.length : 0;
+        if (!p) {
+            return { playbackMs: 0, bufferFrames, fps, requestedFrame: -1, selectedFrame: -1, clamped: false };
+        }
+        const requestedFrame = Math.floor(p.contentSec * (p.seg.fps > 0 ? p.seg.fps : fps));
         return {
-            playbackMs,
-            bufferFrames,
-            fps,
+            playbackMs: p.contentSec * 1000,
+            bufferFrames: p.seg.frames.length,
+            fps: p.seg.fps > 0 ? p.seg.fps : fps,
             requestedFrame,
-            selectedFrame,
-            clamped: requestedFrame >= bufferFrames,
+            selectedFrame: requestedFrame,   // clamp しないので常に一致
+            clamped: requestedFrame >= p.seg.frames.length,   // underrun 指標 (通常は false)
         };
     }
 
     /**
-     * 現在のフレームインデックスからexpressionフレームを取得
+     * 【read-only】invariant 検証用の内部状態。
      */
-    getCurrentExpressionFrame(): ExpressionFrame | null {
-        if (this.expressionFrameBuffer.length === 0) return null;
-
-        // ★ 音声と同じ時間ベース（firstChunkStartTime）を使用
-        // expressionフレームは音声の特定時点に対応するため、音声基準で正確に同期
-        const offsetMs = this.getCurrentPlaybackOffset();
-        const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
-        const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
-
-        if (clampedIndex < 0) return null;
-
-        const frame = this.expressionFrameBuffer[clampedIndex];
-
-        // デバッグ: 60フレームごと（約1秒）にログ出力
-        this._a2eDebugCounter++;
-        if (this._a2eDebugCounter % 60 === 0) {
-            const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
-            const jawVal = jawOpenIdx >= 0 && frame.values[jawOpenIdx] !== undefined
-                ? frame.values[jawOpenIdx].toFixed(3) : 'N/A';
-            console.log(
-                `[A2E Sync] offsetMs=${offsetMs.toFixed(0)}, frameIdx=${clampedIndex}/${this.expressionFrameBuffer.length}, jawOpen=${jawVal}`
-            );
+    getAvDebugState(): {
+        timelineStart: number | null;
+        firstEntryWallStart: number | null;
+        pendingChunks: number;
+        segments: number;
+        currentSegmentFrames: number;
+        currentSegmentContentSec: number;
+        underrunCount: number;
+        interpCount: number;
+        tailSampleCount: number;
+        stallReleaseCount: number;
+        lastSample: { i0: number; i1: number; t: number } | null;
+    } {
+        let firstEntryWallStart: number | null = null;
+        for (const seg of this.segments) {
+            if (seg.entries.length > 0) { firstEntryWallStart = seg.entries[0].wallStart; break; }
         }
-
-        return frame;
+        const seg = this.segments.length > 0 ? this.segments[this.segments.length - 1] : null;
+        return {
+            timelineStart: this.audioTimelineStart,
+            firstEntryWallStart,
+            pendingChunks: this.pendingAudio.length,
+            segments: this.segments.length,
+            currentSegmentFrames: seg ? seg.frames.length : 0,
+            currentSegmentContentSec: seg ? seg.contentSec : 0,
+            underrunCount: this._underrunCount,
+            interpCount: this._interpCount,
+            tailSampleCount: this._tailSampleCount,
+            stallReleaseCount: this._stallReleaseCount,
+            lastSample: this._lastSample,
+        };
     }
 
     /**
-     * Socket.IO live_expression イベントデータをフレームバッファに追加
+     * 描画時刻に対応する expression を返す。
+     *
+     * - A2E 本体の smoothing は足さない。30fps 離散信号を描画時刻へ
+     *   resampling するための隣接 2 frame 線形補間だけを行う。
+     * - clamp to last frame はしない。requested frame が buffer に無ければ
+     *   それは underrun であり、null (全0) を返す。
+     */
+    getCurrentExpressionFrame(): ExpressionFrame | null {
+        const p = this._resolvePlayhead();
+        if (!p) return null;
+
+        const seg = p.seg;
+        const total = seg.frames.length;
+        if (total === 0) return null;
+
+        const fps = seg.fps > 0 ? seg.fps : 30;
+        const framePos = p.contentSec * fps;
+        const i0 = Math.floor(framePos);
+        if (i0 < 0) return null;
+        if (i0 >= total) {
+            // Audio scheduler が正しければ起きない。保持はせず口を閉じる。
+            this._underrunCount++;
+            this._lastSample = { i0, i1: -1, t: 0 };
+            return null;
+        }
+
+        const f0 = seg.frames[i0];
+        const i1 = i0 + 1;
+        let out: ExpressionFrame;
+        if (i1 >= total) {
+            // segment 末尾の 1 frame 区間のみ: 補間相手が無いので requested frame をそのまま使う
+            this._tailSampleCount++;
+            this._lastSample = { i0, i1: -1, t: 0 };
+            out = f0;
+        } else {
+            const f1 = seg.frames[i1];
+            const t = framePos - i0;
+            const n = Math.min(f0.values.length, f1.values.length);
+            const values = new Array<number>(n);
+            for (let k = 0; k < n; k++) {
+                values[k] = f0.values[k] * (1 - t) + f1.values[k] * t;
+            }
+            this._interpCount++;
+            this._lastSample = { i0, i1, t };
+            out = { values };
+        }
+
+        // デバッグ: 60回ごとにログ出力
+        this._a2eDebugCounter++;
+        if (this._a2eDebugCounter % 60 === 0) {
+            const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
+            const jawVal = jawOpenIdx >= 0 && out.values[jawOpenIdx] !== undefined
+                ? out.values[jawOpenIdx].toFixed(3) : 'N/A';
+            console.log(
+                `[A2E Sync] seg=${seg.id} playbackMs=${(p.contentSec * 1000).toFixed(0)}, `
+                + `frame=${framePos.toFixed(2)}/${total}, jawOpen=${jawVal}`
+            );
+        }
+
+        return out;
+    }
+
+    /**
+     * Socket.IO live_expression イベントデータを現 segment のバッファに追加
      */
     onExpressionReceived(data: {
         expressions: number[][];
@@ -315,9 +632,17 @@ export class LiveAudioManager {
             this.expressionNames = data.expression_names;
         }
 
-        // フレームデータをバッファに追加
+        const seg = this._currentSegment();
+        if (data.frame_rate) seg.fps = data.frame_rate;
+
         for (const values of data.expressions) {
-            this.expressionFrameBuffer.push({ values });
+            seg.frames.push({ values });
+        }
+
+        // A2E が復帰したので gate を再度有効にする (stall は一時的な状態)
+        if (seg.stalled && data.expressions.length > 0) {
+            seg.stalled = false;
+            console.log(`[AV] expression 復帰: gate を再有効化 (segment=${seg.id})`);
         }
 
         // デバッグ: バッファ状態とjawOpen値を出力
@@ -325,67 +650,50 @@ export class LiveAudioManager {
             const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
             const firstFrame = data.expressions[0];
             const lastFrame = data.expressions[data.expressions.length - 1];
+            const fps = seg.fps > 0 ? seg.fps : 30;
             console.log(
-                `[A2E Buffer] chunk=${data.chunk_index}, +${data.expressions.length}frames, total=${this.expressionFrameBuffer.length}, ` +
-                `jawOpenIdx=${jawOpenIdx}, jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}], ` +
-                `firstChunkStartTime=${this.firstChunkStartTime.toFixed(3)}`
+                `[A2E Buffer] seg=${seg.id} chunk=${data.chunk_index}, +${data.expressions.length}frames, `
+                + `total=${seg.frames.length} (coverage=${(seg.frames.length / fps).toFixed(2)}s, `
+                + `scheduled=${seg.contentSec.toFixed(2)}s, pending=${this.pendingAudio.length}), `
+                + `jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}]`
             );
         }
+
+        // coverage が増えたので、待っていた Audio を解放できるか見る
+        this._pumpAvScheduler();
     }
 
     // ========================================
     // 再生キューをクリア（割り込み時）
     // ========================================
     clearPlaybackQueue(): void {
-        this.nextPlayTime = 0;
-        // スケジュール済みの全ソースを停止
-        for (const source of this.scheduledSources) {
-            try { source.stop(); } catch (_) { /* already stopped */ }
-        }
-        this.scheduledSources = [];
-        // ★ expressionバッファもクリア
-        this.expressionFrameBuffer = [];
-        this.firstChunkStartTime = 0;
+        this.interrupt();
     }
 
     // ========================================
     // フラグ切り替え
     // ========================================
     onAiResponseStarted(): void {
-        // ★ 新しいAI応答ターンの最初のチャンクのみリセット（仕様書08 セクション4.4）
+        // ★ 新しいAI応答ターンの最初のチャンクのみ segment を切る
         if (!this.isAiSpeaking) {
-            this.firstChunkStartTime = 0;
-            this.expressionFrameBuffer = [];
-            this._a2eDebugCounter = 0;
+            this.beginSegment();
         }
         this.isAiSpeaking = true;
     }
 
     /**
-     * 新音声セグメント開始前のリセット（live_expression_reset用）（仕様書12 §6.2）
+     * 新音声セグメント開始（live_expression_reset 用）
      *
-     * A2E先行方式: resetForNewSegment() → live_expression → live_audio の順で到着するため、
-     * isAiSpeaking = true を維持して onAiResponseStarted() のリセットを抑制し、
-     * A2E先行で追加されたExpressionフレームを保持する。
+     * A2E先行方式: resetForNewSegment() → live_expression → live_audio の順で届くため、
+     * isAiSpeaking = true を維持して onAiResponseStarted() の segment 切りを抑制し、
+     * A2E先行で追加された Expression フレームを保持する。
+     *
+     * ここでは schedule 済み音声を停止しない (停止が必要なのは interrupt() だけ)。
+     * 新 segment の音声は前 segment の音声の後ろに並ぶので、重なりも途切れも起きない。
      */
     resetForNewSegment(): void {
-        // 再生キューをクリア（前セグメントの残音声を停止）
-        this.nextPlayTime = 0;
-        for (const source of this.scheduledSources) {
-            try { source.stop(); } catch (_) { /* already stopped */ }
-        }
-        this.scheduledSources = [];
-
-        // Expressionバッファクリア + タイムスタンプリセット
-        this.expressionFrameBuffer = [];
-        this.firstChunkStartTime = 0;
-
-        // ★ isAiSpeaking = true を維持
-        // → 次の live_audio で onAiResponseStarted() のリセットが走らない
-        // → A2E先行で追加されたフレームが保持される
+        this.beginSegment();
         this.isAiSpeaking = true;
-
-        console.log('[LiveAudioManager] resetForNewSegment: バッファクリア, isAiSpeaking=true維持');
     }
 
     onAiResponseEnded(): void {
@@ -393,18 +701,14 @@ export class LiveAudioManager {
 
         // ★ ターン終了時: 最終フレームのjawOpen関連を0にリセット（口閉じ遅延対策）
         // A2Eの最終フレームが0.008〜0.013で止まることがあり、口が閉じきらない
-        if (this.expressionFrameBuffer.length > 0) {
-            const lastFrame = this.expressionFrameBuffer[this.expressionFrameBuffer.length - 1];
+        const seg = this.segments.length > 0 ? this.segments[this.segments.length - 1] : null;
+        if (seg && seg.frames.length > 0) {
+            const lastFrame = seg.frames[seg.frames.length - 1];
             if (lastFrame && lastFrame.values) {
-                // jawOpen(idx=24)を含む口周りのblendshapeを0にリセット
-                const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
-                if (jawOpenIdx >= 0) lastFrame.values[jawOpenIdx] = 0;
-                const jawForwardIdx = this.expressionNames.indexOf('jawForward');
-                if (jawForwardIdx >= 0) lastFrame.values[jawForwardIdx] = 0;
-                const jawLeftIdx = this.expressionNames.indexOf('jawLeft');
-                if (jawLeftIdx >= 0) lastFrame.values[jawLeftIdx] = 0;
-                const jawRightIdx = this.expressionNames.indexOf('jawRight');
-                if (jawRightIdx >= 0) lastFrame.values[jawRightIdx] = 0;
+                for (const name of ['jawOpen', 'jawForward', 'jawLeft', 'jawRight']) {
+                    const idx = this.expressionNames.indexOf(name);
+                    if (idx >= 0) lastFrame.values[idx] = 0;
+                }
             }
         }
     }
