@@ -61,6 +61,21 @@ export function getUikaSortMode(): UikaSortMode {
     return 'full';
 }
 
+export type UikaBlinkMode = 'idle' | 'always';
+
+/**
+ * `?blinkMode=` を読む。既定は `idle` (現状どおり Idle 中のみ)。
+ * `always` は chatState を問わず procedural blink を A2E blink と
+ * `max()` 合成する (発話中の瞬き A/B 用)。
+ */
+export function getUikaBlinkMode(): UikaBlinkMode {
+    try {
+        const m = new URLSearchParams(window.location.search).get('blinkMode');
+        if (m === 'always') return m;
+    } catch { /* noop */ }
+    return 'idle';
+}
+
 export type UikaIdleMode = 'off' | 'rigid';
 
 /** `?idleMode=` を読む。既定は `rigid` (animation.glb を camera へ合成)。 */
@@ -88,6 +103,7 @@ export interface UikaModeStatus {
     hHeadMaxAbsDiffFromIdentityApplied: number;
     projParityMaxDiff: number;
     blinkEnabled: boolean;
+    blinkMode: UikaBlinkMode;
     blinkCount: number;
     sortHooked: boolean;
     sortsAccepted: number;
@@ -389,7 +405,8 @@ function showSortModeBadge(status: UikaModeStatus): void {
     const el = document.createElement('div');
     el.id = 'uikaSortBadge';
     el.textContent = 'UIKA / SORT ' + status.sortMode.toUpperCase()
-                   + ' / IDLE ' + status.idleMode.toUpperCase();
+                   + ' / IDLE ' + status.idleMode.toUpperCase()
+                   + ' / BLINK ' + status.blinkMode.toUpperCase();
     el.style.cssText = [
         'position:fixed', 'top:6px', 'right:8px', 'z-index:2147483647',
         'font:600 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace',
@@ -466,7 +483,12 @@ function setupIdleBlink(
             // LAMWebSocketManager から渡された getter で読む。
             // getter が無い場合は blink しない (推測で判定しない)。
             const chatState = typeof getChatState === 'function' ? getChatState() : null;
-            if (chatState !== null && chatState !== 'Responding') {   // いまは Idle 中のみ
+            // blinkMode='always' は chatState を問わず合成する (発話中 blink の A/B)。
+            // 合成は常に max(a2eBlink, proceduralBlink) で 0〜1 clamp。
+            const allowBlink = status.blinkMode === 'always'
+                ? true
+                : (chatState !== null && chatState !== 'Responding');
+            if (allowBlink) {
                 const [l, r] = b.value(performance.now());
                 if (l > 0 || r > 0) {
                     out.eyeBlinkLeft  = Math.min(1, Math.max(out.eyeBlinkLeft  || 0, l));
@@ -628,6 +650,7 @@ export function applyUika133kMode(
         hHeadMaxAbsDiffFromIdentityApplied: Number.NaN,
         projParityMaxDiff: Number.NaN,
         blinkEnabled: false,
+        blinkMode: getUikaBlinkMode(),
         blinkCount: 0,
         sortHooked: false,
         sortsAccepted: 0,
