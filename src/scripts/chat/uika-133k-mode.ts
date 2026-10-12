@@ -47,6 +47,23 @@ export const UIKA_META_CAMERA = {
     far: 100.0,
 } as const;
 
+/**
+ * UIKA canonical (`cano_nose90`, 原点中心) → LAM 骨格 bind 空間 の translation。
+ *
+ * `docs/UIKA_NATIVE_133K_DEFORM_PREFLIGHT.md` §2/§4 の実測値 (フル精度)。
+ * 両 ZIP の `skin.glb` POSITION 重心の差:
+ *   LAM  (20,018 点) 重心 = [-0.00046714589244861276, 1.6701843360406747,  0.04134637168342093]
+ *   UIKA (133,541 点) 重心 = [-0.00018298009111780735, -0.012531577479376211, -0.0251610800968702]
+ * `H_head` は bind 空間 (頭の重心 y ≈ 1.67) の点に当てる前提の行列なので、
+ * 原点中心の cano にそのまま当てると回転成分がほぼ効かず平行移動だけが残る
+ * (実測で通常 LAM の 4.75 倍)。この d を挟むと 1.01 倍になる。
+ */
+export const UIKA_CANO_TO_LAM_BIND: readonly [number, number, number] = [
+    -0.00028416580133080538,
+    1.6827159135200509,
+    0.066507451780291132,
+];
+
 /** H_head が恒等とみなせる上限。指示どおりの gate。 */
 export const H_HEAD_IDENTITY_TOL = 1e-6;
 
@@ -61,15 +78,41 @@ export function getUikaSortMode(): UikaSortMode {
     return 'full';
 }
 
-export type UikaIdleMode = 'off' | 'rigid';
+export type UikaBlinkMode = 'idle' | 'always';
 
-/** `?idleMode=` を読む。既定は `rigid` (animation.glb を camera へ合成)。 */
+/**
+ * `?blinkMode=` を読む。既定は `idle` (現状どおり Idle 中のみ)。
+ * `always` は chatState を問わず procedural blink を A2E blink と
+ * `max()` 合成する (発話中の瞬き A/B 用)。
+ */
+export function getUikaBlinkMode(): UikaBlinkMode {
+    try {
+        const m = new URLSearchParams(window.location.search).get('blinkMode');
+        if (m === 'always') return m;
+    } catch { /* noop */ }
+    return 'idle';
+}
+
+export type UikaIdleMode = 'off' | 'rigid' | 'rigidPivot';
+
+/**
+ * `?idleMode=` を読む。既定は `rigid` (従来どおり)。
+ *   - `off`        : skeletal animation を止めて H_head = 恒等
+ *   - `rigid`      : H_head をそのまま camera へ合成 (比較用に温存)
+ *   - `rigidPivot` : H_pivot = T(-d) · H_head · T(d) を camera へ合成
+ */
 export function getUikaIdleMode(): UikaIdleMode {
     try {
-        const m = new URLSearchParams(window.location.search).get('idleMode');
+        const m = (new URLSearchParams(window.location.search).get('idleMode') || '').toLowerCase();
         if (m === 'off') return 'off';
+        if (m === 'rigidpivot') return 'rigidPivot';
     } catch { /* noop */ }
     return 'rigid';
+}
+
+/** badge / ログ用の表示名。 */
+function idleModeLabel(m: UikaIdleMode): string {
+    return m === 'rigidPivot' ? 'RIGID-PIVOT' : m.toUpperCase();
 }
 
 export interface UikaModeStatus {
@@ -86,8 +129,13 @@ export interface UikaModeStatus {
     headCompHooked: boolean;
     headNeutralized: boolean;
     hHeadMaxAbsDiffFromIdentityApplied: number;
+    /** rigidPivot のとき true。H_pivot = T(-d)·H_head·T(d) を適用している。 */
+    pivotApplied: boolean;
+    /** 適用した H_pivot の max|H−I| (rigidPivot のときだけ値が入る)。 */
+    hPivotMaxAbsDiffFromIdentity: number;
     projParityMaxDiff: number;
     blinkEnabled: boolean;
+    blinkMode: UikaBlinkMode;
     blinkCount: number;
     sortHooked: boolean;
     sortsAccepted: number;
@@ -389,7 +437,8 @@ function showSortModeBadge(status: UikaModeStatus): void {
     const el = document.createElement('div');
     el.id = 'uikaSortBadge';
     el.textContent = 'UIKA / SORT ' + status.sortMode.toUpperCase()
-                   + ' / IDLE ' + status.idleMode.toUpperCase();
+                   + ' / IDLE ' + idleModeLabel(status.idleMode)
+                   + ' / BLINK ' + status.blinkMode.toUpperCase();
     el.style.cssText = [
         'position:fixed', 'top:6px', 'right:8px', 'z-index:2147483647',
         'font:600 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace',
@@ -466,7 +515,12 @@ function setupIdleBlink(
             // LAMWebSocketManager から渡された getter で読む。
             // getter が無い場合は blink しない (推測で判定しない)。
             const chatState = typeof getChatState === 'function' ? getChatState() : null;
-            if (chatState !== null && chatState !== 'Responding') {   // いまは Idle 中のみ
+            // blinkMode='always' は chatState を問わず合成する (発話中 blink の A/B)。
+            // 合成は常に max(a2eBlink, proceduralBlink) で 0〜1 clamp。
+            const allowBlink = status.blinkMode === 'always'
+                ? true
+                : (chatState !== null && chatState !== 'Responding');
+            if (allowBlink) {
                 const [l, r] = b.value(performance.now());
                 if (l > 0 || r > 0) {
                     out.eyeBlinkLeft  = Math.min(1, Math.max(out.eyeBlinkLeft  || 0, l));
@@ -519,16 +573,36 @@ function setupIdleBlink(
  */
 function setupHeadCompensation(renderer: any, status: UikaModeStatus): boolean {
     const v = renderer?.viewer;
-    if (!v || status.idleMode !== 'rigid') return false;
+    if (!v || (status.idleMode !== 'rigid' && status.idleMode !== 'rigidPivot')) return false;
     if (v.__uikaHeadCompHooked) return true;
     if (typeof v.runMorphUpdate !== 'function' || typeof v.update !== 'function') return false;
     v.__uikaHeadCompHooked = true;
 
     const camera = v.camera;
     const M4 = camera.matrixWorld.constructor;
-    const H = new M4(), Hinv = new M4(), Crender = new M4();
+    const H = new M4(), Happ = new M4(), Hinv = new M4(), Crender = new M4();
     const orbitWorld = new M4().copy(camera.matrixWorld);
     let haveOrbit = false;
+
+    // T(d) / T(-d)。three.js は column-major なので translation は elements[12..14]。
+    const usePivot = status.idleMode === 'rigidPivot';
+    const d = UIKA_CANO_TO_LAM_BIND;
+    const Td = new M4(), Tmd = new M4();          // new Matrix4() は恒等
+    Td.elements[12] = d[0];  Td.elements[13] = d[1];  Td.elements[14] = d[2];
+    Tmd.elements[12] = -d[0]; Tmd.elements[13] = -d[1]; Tmd.elements[14] = -d[2];
+    status.pivotApplied = usePivot;
+
+    /**
+     * 実際に camera へ合成する行列を H から作る。
+     *   rigid      : H_app = H_head
+     *   rigidPivot : H_app = T(-d) · H_head · T(d)
+     * (Matrix4.multiply(m) は this·m なので下の 2 行で T(-d)·H·T(d))
+     */
+    const toApplied = () => {
+        if (!usePivot) return Happ.copy(H);
+        Happ.multiplyMatrices(Tmd, H).multiply(Td);
+        return Happ;
+    };
 
     const origUpdate = v.update.bind(v);
     const origMorph = v.runMorphUpdate.bind(v);
@@ -563,10 +637,16 @@ function setupHeadCompensation(renderer: any, status: UikaModeStatus): boolean {
                 return mx;
             })();
 
-            // C_orbit を控えて C_render = inverse(H) · C_orbit を書く
+            // C_orbit を控えて C_render = inverse(H_app) · C_orbit を書く
             camera.updateMatrixWorld(true);
             orbitWorld.copy(camera.matrixWorld); haveOrbit = true;
-            Hinv.copy(H).invert();
+            const Ha = toApplied();
+            if (usePivot) {
+                let mx = 0; const e = Ha.elements;
+                for (let i = 0; i < 16; i++) { const df = Math.abs(e[i] - IDENTITY16[i]); if (df > mx) mx = df; }
+                status.hPivotMaxAbsDiffFromIdentity = mx;
+            }
+            Hinv.copy(Ha).invert();
             Crender.multiplyMatrices(Hinv, orbitWorld);
             Crender.decompose(camera.position, camera.quaternion, camera.scale);
             camera.updateMatrixWorld(true);
@@ -581,16 +661,57 @@ function setupHeadCompensation(renderer: any, status: UikaModeStatus): boolean {
         const Vorbit = new M4().copy(orbitWorld).invert();
         const Vrender = new M4().copy(camera.matrixWorldInverse);
         const P = camera.projectionMatrix;
+        const Ha = toApplied();
         let worst = 0; const rows: any[] = [];
         for (const q of pts) {
-            const a = new V3(q[0], q[1], q[2]).applyMatrix4(H).applyMatrix4(Vorbit).applyMatrix4(P);
+            const a = new V3(q[0], q[1], q[2]).applyMatrix4(Ha).applyMatrix4(Vorbit).applyMatrix4(P);
             const b = new V3(q[0], q[1], q[2]).applyMatrix4(Vrender).applyMatrix4(P);
             const d = Math.max(Math.abs(a.x-b.x), Math.abs(a.y-b.y), Math.abs(a.z-b.z));
             if (d > worst) worst = d;
             rows.push({ p: q, lam: [a.x, a.y, a.z], uika: [b.x, b.y, b.z], diff: d });
         }
         status.projParityMaxDiff = worst;
-        return { maxAbsDiff: worst, rows, H: Array.from(H.elements) };
+        return {
+            maxAbsDiff: worst, rows,
+            H: Array.from(H.elements),
+            Happlied: Array.from(toApplied().elements),
+            idleMode: status.idleMode,
+            d: [d[0], d[1], d[2]],
+        };
+    };
+
+    /**
+     * 検証用: 現フレームの H_head / H_app を cano 頂点に当てたときの変位統計。
+     * `avatarMesh.geometry.attributes.position` は cano_nose90 そのもの
+     * (`module.js:139478-139480` が毎フレームこれを splat center の素にしている)。
+     */
+    (window as any).__uikaPivotStats = (stride = 37) => {
+        const pos = v.avatarMesh?.geometry?.attributes?.position?.array;
+        if (!pos) return { error: 'position attribute が無い' };
+        const Ha = toApplied();
+        const e = H.elements, a = Ha.elements;
+        let nRaw = 0, sRaw = 0, mxRaw = 0, sApp = 0, mxApp = 0, bad = 0;
+        for (let i = 0; i + 2 < pos.length; i += 3 * stride) {
+            const x = pos[i], y = pos[i + 1], z = pos[i + 2];
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) { bad++; continue; }
+            const rx = e[0] * x + e[4] * y + e[8] * z + e[12] - x;
+            const ry = e[1] * x + e[5] * y + e[9] * z + e[13] - y;
+            const rz = e[2] * x + e[6] * y + e[10] * z + e[14] - z;
+            const ax = a[0] * x + a[4] * y + a[8] * z + a[12] - x;
+            const ay = a[1] * x + a[5] * y + a[9] * z + a[13] - y;
+            const az = a[2] * x + a[6] * y + a[10] * z + a[14] - z;
+            const lr = Math.sqrt(rx * rx + ry * ry + rz * rz);
+            const la = Math.sqrt(ax * ax + ay * ay + az * az);
+            sRaw += lr; sApp += la;
+            if (lr > mxRaw) mxRaw = lr;
+            if (la > mxApp) mxApp = la;
+            nRaw++;
+        }
+        return {
+            idleMode: status.idleMode, samples: nRaw, nonFinite: bad,
+            meanAbsDispRawH: nRaw ? sRaw / nRaw : null, maxAbsDispRawH: mxRaw,
+            meanAbsDispApplied: nRaw ? sApp / nRaw : null, maxAbsDispApplied: mxApp,
+        };
     };
     return true;
 }
@@ -626,8 +747,11 @@ export function applyUika133kMode(
         headCompHooked: false,
         headNeutralized: false,
         hHeadMaxAbsDiffFromIdentityApplied: Number.NaN,
+        pivotApplied: false,
+        hPivotMaxAbsDiffFromIdentity: Number.NaN,
         projParityMaxDiff: Number.NaN,
         blinkEnabled: false,
+        blinkMode: getUikaBlinkMode(),
         blinkCount: 0,
         sortHooked: false,
         sortsAccepted: 0,
