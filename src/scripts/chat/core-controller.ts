@@ -93,6 +93,11 @@ export class CoreController {
           last = now;
           if (gap > 250) {
             console.warn(`[TRACE MAIN GAP] ${gap.toFixed(1)}ms`);
+            // 画面表示用に集計 (DevTools を開かずに読めるようにする)
+            const w = window as any;
+            const g = w.__uikaMainGap || (w.__uikaMainGap = { count: 0, maxMs: 0 });
+            g.count++;
+            if (gap > g.maxMs) g.maxMs = gap;
           }
         }, 100);
         console.log('[TRACE] UIKA mode: main thread heartbeat 開始 (100ms, >250ms で警告)');
