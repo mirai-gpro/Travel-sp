@@ -16,6 +16,7 @@ import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
 import type { ExpressionFrame } from './live-audio-manager';
 import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
 import { isUika133kMode, applyUika133kMode } from './uika-133k-mode';
+import { getDiagMode, createA2EReplayPlayer, A2EReplayPlayer } from './a2e-replay';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -83,12 +84,17 @@ export class LAMWebSocketManager {
     // A2E / Socket.IO / AudioContext / expression buffer / provider・cache を
     // すべて外し、performance.now() から直接作った jawOpen だけを renderer へ渡す。
     // 通常 LAM と UIKA が **この同じ分岐**を通るので、違うのはモデルだけになる。
-    private readonly morphProbe: boolean = (() => {
-        try { return new URLSearchParams(window.location.search).get('morphProbe') === '1'; }
-        catch { return false; }
-    })();
+    private readonly morphProbe: boolean = getDiagMode() === 'morphProbe';
     private _probeTimes: number[] = [];
     private _probeLogAt = 0;
+
+    // ===== 診断専用: 実 A2E 固定リプレイ (?a2eReplay=1) =====
+    // morphProbe とは完全に別モード (同時指定は a2e-replay.ts 側で両方無効化)。
+    // frame の取得元だけを固定データに差し替え、name マッピング / 日本語口形補正 /
+    // renderer への受け渡しは本番とまったく同じ経路を通す。
+    private readonly a2eReplay: boolean = getDiagMode() === 'a2eReplay';
+    private replayPlayer: A2EReplayPlayer | null = null;
+    private replayInitTried = false;
 
     // トレース間引き用 (console spam を避ける)
     private _traceRenderAt = 0;
@@ -276,13 +282,28 @@ export class LAMWebSocketManager {
         // frame の取得元だけが通常 LAM と UIKA で違う。
         // provider があれば描画瞬間に直接引く (古い cache を使わない)。
         // 以降の処理 (全0 の静止状態 / 日本語口形補正) は両経路で完全に同じ。
-        const frame = this.expressionProvider
-            ? this.expressionProvider()
-            : this.currentExpression;
+        let frame: ExpressionFrame | null;
+        if (this.a2eReplay) {
+            // ?a2eReplay=1: Live 通信を一切使わず、保存済みの実 A2E シーケンスから
+            // 「現在時刻に対応する frame」を選ぶ。以降の処理は本番と同一。
+            if (!this.replayInitTried) {
+                this.replayInitTried = true;
+                this.replayPlayer = createA2EReplayPlayer();
+                if (this.replayPlayer) {
+                    // name マッピングも本番と同じにするため capture 時の名前順をそのまま使う
+                    this.setExpressionNames(this.replayPlayer.expressionNames);
+                }
+            }
+            frame = this.replayPlayer ? this.replayPlayer.getFrame() : null;
+        } else {
+            frame = this.expressionProvider
+                ? this.expressionProvider()
+                : this.currentExpression;
+        }
 
         // ===== 診断ログ (TRACE A2E RENDER) =====
         // renderer が expression を読んだ瞬間の同期状態。frame の選び方は変えていない。
-        if (this.exprTrace) {
+        if (this.exprTrace && !this.a2eReplay) {
             try {
                 const st = this.exprTrace.getState();
                 const now = performance.now();

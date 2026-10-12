@@ -4,6 +4,7 @@ import { i18n } from '../../constants/i18n';
 import { AudioManager } from './audio-manager';
 import { LiveAudioManager } from './live-audio-manager';
 import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
+import { captureLiveExpression } from './a2e-replay';
 
 declare const io: any;
 
@@ -353,6 +354,10 @@ export class CoreController {
       if (!this.isLiveMode) return;
       console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
       this.liveAudioManager.onExpressionReceived(data);
+
+      // ===== 診断専用: ?a2eCapture=1 のときだけ受信データをそのまま保存 =====
+      // 既存の処理には一切介入しない (保存するだけ)。
+      captureLiveExpression(data);
 
       // ★ A2Eのブレンドシェイプ名順序をLAMレンダラーに反映（名前インデックス同期）
       if (data.expression_names && data.expression_names.length > 0) {
