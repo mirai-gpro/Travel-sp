@@ -107,6 +107,15 @@ export class LAMWebSocketManager {
     // チャット状態（Idle / Listening / Thinking / Responding）
     private chatState: string = 'Idle';
 
+    // ===== A2E name -> モデル morph target 名の対応 (起動時に 1 度だけ監査) =====
+    // A2E は ARKit 52、LAM/UIKA の skin.glb は 51 morph target なので、
+    // 位置ではなく名前で突き合わせる。対応表と落ちる名前を明示する。
+    private _mappingAudited = false;
+    private expressionNameMapping: {
+        a2eCount: number; modelCount: number;
+        mapped: string[]; a2eOnly: string[]; modelOnly: string[];
+    } | null = null;
+
     // ブレンドシェイプ名マッピング
     private expressionNames: string[] = ARKIT_BLENDSHAPE_NAMES;
 
@@ -367,6 +376,9 @@ export class LAMWebSocketManager {
             return result;
         }
 
+        // A2E name と モデル morph target の対応を 1 度だけ監査する
+        this._auditExpressionNameMapping();
+
         const values = frame.values;
         for (let i = 0; i < Math.min(values.length, this.expressionNames.length); i++) {
             result[this.expressionNames[i]] = values[i];
@@ -515,11 +527,50 @@ export class LAMWebSocketManager {
     }
 
     /**
+     * A2E の expression_names と、ロードしたモデルの morph target 名を突き合わせる。
+     * 1 度だけ実行し、対応表と「落ちる名前」を console と getter に出す。
+     */
+    private _auditExpressionNameMapping(): void {
+        if (this._mappingAudited) return;
+        const dict = (this.renderer as any)?.viewer?.splatMesh?.morphTargetDictionary;
+        if (!dict) return;   // モデルがまだロード中
+        this._mappingAudited = true;
+
+        const modelNames: string[] = Object.keys(dict);
+        const mapped: string[] = [];
+        const a2eOnly: string[] = [];
+        for (const name of this.expressionNames) {
+            if (dict[name] !== undefined) mapped.push(name);
+            else a2eOnly.push(name);
+        }
+        const modelOnly = modelNames.filter((n) => this.expressionNames.indexOf(n) < 0);
+
+        this.expressionNameMapping = {
+            a2eCount: this.expressionNames.length,
+            modelCount: modelNames.length,
+            mapped, a2eOnly, modelOnly,
+        };
+        console.log(
+            `[BS Map] A2E ${this.expressionNames.length} names -> model ${modelNames.length} morph targets: `
+            + `対応=${mapped.length}, A2E側のみ(モデルに無く捨てられる)=[${a2eOnly.join(', ') || 'なし'}], `
+            + `model側のみ(常に0)=[${modelOnly.join(', ') || 'なし'}]`
+        );
+    }
+
+    /** 【read-only】A2E name → モデル morph target 名の対応表 */
+    getExpressionNameMapping() {
+        return this.expressionNameMapping;
+    }
+
+    /**
      * ブレンドシェイプ名リストを設定
      */
     setExpressionNames(names: string[]): void {
         if (names && names.length > 0) {
+            const changed = names.length !== this.expressionNames.length
+                || names.some((n, i) => n !== this.expressionNames[i]);
             this.expressionNames = names;
+            if (changed) this._mappingAudited = false;   // 対応表を再監査する
         }
     }
 
