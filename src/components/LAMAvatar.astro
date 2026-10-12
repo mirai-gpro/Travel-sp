@@ -181,6 +181,15 @@ const {
         // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
         // meta.json の camera ではない。UIKA mode では等倍にする。
         this.containerEl.classList.add('uika-133k');
+        // UIKA mode だけ expression を描画瞬間に直接引く。
+        // 通常 LAM の AudioSyncPlayer 経路 (上の setExpressionCallback) は
+        // そのまま動き続けるが、UIKA では参照されない。
+        // (UIKA は 133,541 点で render レートが低く、cache 経路だと
+        //  rAF が回っていない間の古い frame を描いてしまうため)
+        this.lamManager.setExpressionProvider(
+          () => liveAudioManager.getCurrentExpressionFrame()
+        );
+        console.log('[LAMAvatar][UIKA133K] expression を描画時刻へ直接同期 (provider 経路)');
       }
       try {
         await this.lamManager.initialize({

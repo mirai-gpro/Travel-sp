@@ -47,7 +47,24 @@ export class LAMWebSocketManager {
     private _prevMouthValues: Record<string, number> = {};  // スムージング用前フレーム値
 
     // 現在適用中の expression フレーム
+    // (通常 LAM 経路: AudioSyncPlayer の rAF が updateExpression() で更新する cache)
     private currentExpression: ExpressionFrame | null = null;
+
+    /**
+     * expression フレームの直接取得関数 (UIKA mode 専用、任意)。
+     *
+     * 通常 LAM は
+     *   AudioSyncPlayer の rAF
+     *     → LiveAudioManager.getCurrentExpressionFrame()
+     *     → updateExpression() → currentExpression cache
+     *     → renderer.getExpressionData()
+     * という経路で、描画が間引かれると **cache に残った古いフレーム**を使う。
+     *
+     * これが設定されている場合は `_getExpressionData()` がこの関数を直接呼び、
+     * **その描画瞬間の AudioContext.currentTime に対応するフレーム**を使う。
+     * UIKA mode だけ `() => liveAudioManager.getCurrentExpressionFrame()` を渡す。
+     */
+    private expressionProvider: (() => ExpressionFrame | null) | null = null;
 
     // チャット状態（Idle / Listening / Thinking / Responding）
     private chatState: string = 'Idle';
@@ -184,7 +201,14 @@ export class LAMWebSocketManager {
     private _getExpressionData(): Record<string, number> {
         const result: Record<string, number> = {};
 
-        if (!this.currentExpression) {
+        // frame の取得元だけが通常 LAM と UIKA で違う。
+        // provider があれば描画瞬間に直接引く (古い cache を使わない)。
+        // 以降の処理 (全0 の静止状態 / 日本語口形補正) は両経路で完全に同じ。
+        const frame = this.expressionProvider
+            ? this.expressionProvider()
+            : this.currentExpression;
+
+        if (!frame) {
             // 静止状態: 全て0
             for (const name of this.expressionNames) {
                 result[name] = 0;
@@ -192,7 +216,7 @@ export class LAMWebSocketManager {
             return result;
         }
 
-        const values = this.currentExpression.values;
+        const values = frame.values;
         for (let i = 0; i < Math.min(values.length, this.expressionNames.length); i++) {
             result[this.expressionNames[i]] = values[i];
         }
@@ -267,9 +291,19 @@ export class LAMWebSocketManager {
 
     /**
      * expression フレームを更新
+     * (通常 LAM 経路。AudioSyncPlayer の rAF から呼ばれる)
      */
     updateExpression(frame: ExpressionFrame | null): void {
         this.currentExpression = frame;
+    }
+
+    /**
+     * expression フレームの直接取得関数を設定する (UIKA mode 専用)。
+     * 設定すると `_getExpressionData()` は cache ではなくこの関数を使う。
+     * `null` を渡すと通常 LAM 経路 (cache) に戻る。
+     */
+    setExpressionProvider(provider: (() => ExpressionFrame | null) | null): void {
+        this.expressionProvider = provider;
     }
 
     /**
@@ -310,5 +344,6 @@ export class LAMWebSocketManager {
         this.renderer = null;
         this.isModelLoaded = false;
         this.currentExpression = null;
+        this.expressionProvider = null;
     }
 }

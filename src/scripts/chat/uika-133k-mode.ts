@@ -69,13 +69,25 @@ export const H_HEAD_IDENTITY_TOL = 1e-6;
 
 export type UikaSortMode = 'full' | '10fps' | 'camera';
 
-/** `?sortMode=` を読む。既定は現状どおり `full`。 */
+/**
+ * `?sortMode=` を読む。**UIKA mode の既定は `camera`**。
+ *
+ * `full` は `viewer.update()` が毎フレーム呼ぶ
+ * `runSplatSort(true, true)` (force + forceSortAll, `module.js:138826`) を
+ * そのまま通すため、133,541 点を毎フレーム全ソートする。計測では
+ * render 間隔 p50 が 4277 ms (full) に対し 20.3 ms (10fps) で、sort が
+ * 支配的コストだった (`docs/UIKA_NATIVE_133K_LIPSYNC_SMOOTHNESS.md` §2)。
+ * リップシンク更新レートは render レートと一致するため、既定を `camera`
+ * にして sort を初回 + ユーザー操作中だけに限る。`?sortMode=full` で従来比較可。
+ *
+ * 通常 LAM はこの関数を呼ばないので影響しない。
+ */
 export function getUikaSortMode(): UikaSortMode {
     try {
         const m = new URLSearchParams(window.location.search).get('sortMode');
-        if (m === '10fps' || m === 'camera') return m;
+        if (m === '10fps' || m === 'camera' || m === 'full') return m;
     } catch { /* noop */ }
-    return 'full';
+    return 'camera';
 }
 
 export type UikaBlinkMode = 'idle' | 'always';
