@@ -165,24 +165,10 @@ const {
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
 
-      // expression 更新コールバックを設定 (exprPath=cache のときだけ使われる)
+      // expression 更新コールバックを設定
       this.syncPlayer.setExpressionCallback((frame: ExpressionFrame | null) => {
         this.lamManager.updateExpression(frame);
       });
-
-      // ===== Render fps と LipSync fps を分離する =====
-      // renderer が描画するたびに、実 AudioContext playhead から
-      // fractional A2E frame position を計算して expression を取る。
-      // 別 rAF のキャッシュ経由にしない (renderer の fps を A2E timeline にしない)。
-      // 通常 LAM / UIKA の区別なく同じ経路。`?exprPath=cache` で旧経路に戻せる。
-      const exprPath = getUikaExprPath();
-      if (exprPath === 'provider') {
-        this.lamManager.setExpressionProvider(
-          () => liveAudioManager.getCurrentExpressionFrame()
-        );
-      } else {
-        this.lamManager.setExpressionProvider(null);
-      }
 
       // Gaussian Splat レンダラーを初期化（公式API: getInstance）
       const config = (window as any).__lamAvatarConfig || {};
@@ -196,6 +182,22 @@ const {
         // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
         // meta.json の camera ではない。UIKA mode では等倍にする。
         this.containerEl.classList.add('uika-133k');
+        // ===== 診断用 A/B: expression frame の取得経路だけを切り替える =====
+        //   exprPath=provider (既定 / 現状維持):
+        //     renderer の getExpressionData() から
+        //     liveAudioManager.getCurrentExpressionFrame() を直接呼ぶ
+        //   exprPath=cache:
+        //     provider を設定せず、通常 LAM と同じ
+        //     AudioSyncPlayer rAF → updateExpression() → currentExpression 経路にする
+        // モデル / 描画条件 / A2E 値 / 口形補正は一切変えていない。
+        const exprPath = getUikaExprPath();
+        if (exprPath === 'provider') {
+          this.lamManager.setExpressionProvider(
+            () => liveAudioManager.getCurrentExpressionFrame()
+          );
+        } else {
+          this.lamManager.setExpressionProvider(null);
+        }
         // 診断ログを有効化 (UIKA のときだけ。通常 LAM では設定しない)
         this.lamManager.setExpressionTrace(
           exprPath,
