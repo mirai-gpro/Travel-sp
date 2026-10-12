@@ -63,20 +63,10 @@ export interface ExpressionFrame {
  */
 export const A2E_LEAD_SEC = 0.20;
 
-/**
- * Expression がまったく届かないときに、Audio を解放するまでの待ち時間。
- *
- * A2E サービス障害 (例: 503 Engine is still loading) で expression が
- * 1 フレームも来ない場合、これが無いと音声が永久に鳴らない。
- * 通常再生では発火しない。発火した segment は underrun として警告を出す。
- */
-export const A2E_WAIT_TIMEOUT_SEC = 1.0;
-
 /** AudioContext へ渡す前の、まだ schedule していない音声チャンク。 */
 interface PendingAudioChunk {
     buffer: AudioBuffer;
     durationSec: number;
-    enqueuedAt: number;      // AudioContext 時刻
 }
 
 /** 実際に AudioBufferSourceNode.start() した 1 チャンクの時間対応。 */
@@ -97,7 +87,10 @@ interface AvSegment {
     contentSec: number;      // この segment で schedule 済みのコンテンツ長 [sec]
     entries: ScheduledEntry[];
     started: boolean;
-    stalled: boolean;        // A2E 不着で解放済み (degraded)
+    /** server から turn_complete が来た = これ以上 Audio が追加されない */
+    serverEnded: boolean;
+    /** まだ再生中 (未 onended) の AudioBufferSourceNode 数 */
+    activeSources: number;
 }
 
 export class LiveAudioManager {
@@ -120,7 +113,6 @@ export class LiveAudioManager {
     private pendingAudio: PendingAudioChunk[] = [];
     private segments: AvSegment[] = [];
     private segmentSeq: number = 0;
-    private pumpTimer: any = null;
 
     // master origin = 最初の AudioBufferSourceNode.start() に渡した startTime
     private audioTimelineStart: number | null = null;
@@ -133,7 +125,6 @@ export class LiveAudioManager {
     private _underrunCount: number = 0;        // requested frame が buffer に無かった回数
     private _interpCount: number = 0;          // 2 frame 間を補間した回数
     private _tailSampleCount: number = 0;      // 補間相手が無く requested frame をそのまま返した回数
-    private _stallReleaseCount: number = 0;    // A2E 不着で音声を解放した回数
     private _lastSample: { i0: number; i1: number; t: number } | null = null;
 
     // ========================================
@@ -269,7 +260,6 @@ export class LiveAudioManager {
         this.pendingAudio.push({
             buffer,
             durationSec: buffer.duration,
-            enqueuedAt: this.audioContext.currentTime,
         });
         this._pumpAvScheduler();
     }
@@ -290,7 +280,6 @@ export class LiveAudioManager {
      */
     private _pumpAvScheduler(): void {
         if (!this.audioContext) return;
-        this._clearPumpTimer();
 
         while (this.pendingAudio.length > 0) {
             const seg = this._currentSegment();
@@ -301,29 +290,14 @@ export class LiveAudioManager {
             // 浮動小数の端 (2.4000000000000004 > 2.4) で 1 チャンク取り残さない
             const EPS = 1e-6;
 
-            if (!seg.stalled && scheduledEnd > coverageSec + EPS) {
-                const waited = this.audioContext.currentTime - chunk.enqueuedAt;
-                if (waited >= A2E_WAIT_TIMEOUT_SEC) {
-                    // A2E が来ない (サービス障害など)。無音のままにはできないので解放する。
-                    // stalled は一時的: 次の live_expression 到着で gate は再有効になる。
-                    seg.stalled = true;
-                    this._stallReleaseCount++;
-                    console.warn(
-                        `[AV] expression underrun: A2E が ${waited.toFixed(2)}s 届かないため音声を解放 `
-                        + `(segment=${seg.id} coverage=${coverageSec.toFixed(2)}s scheduledEnd=${scheduledEnd.toFixed(2)}s)`
-                    );
-                    continue;
-                }
-                // まだ待つ。expression 到着でも再度 pump されるが、
-                // 発話末尾のように追加到着が無い場合に備えてタイマーも張る。
-                this._armPumpTimer();
-                return;
-            }
+            // Expression coverage が無い音声は例外なく pending に留める。
+            // A2E が来なければ Audio も進めない (Audio-only 再生で A2E 障害を隠さない)。
+            if (scheduledEnd > coverageSec + EPS) return;
 
             this.pendingAudio.shift();
             // segment の 1 本目だけ pre-roll ぶん後ろにずらす (揺らぎ吸収)
             const minDelaySec = seg.entries.length === 0 ? A2E_LEAD_SEC : 0.005;
-            const wallStart = this._scheduleBuffer(chunk.buffer, minDelaySec);
+            const wallStart = this._scheduleBuffer(chunk.buffer, minDelaySec, seg);
             seg.entries.push({
                 wallStart,
                 contentStart: seg.contentSec,
@@ -339,23 +313,8 @@ export class LiveAudioManager {
         }
     }
 
-    private _armPumpTimer(): void {
-        if (this.pumpTimer !== null) return;
-        this.pumpTimer = setTimeout(() => {
-            this.pumpTimer = null;
-            this._pumpAvScheduler();
-        }, 50);
-    }
-
-    private _clearPumpTimer(): void {
-        if (this.pumpTimer !== null) {
-            clearTimeout(this.pumpTimer);
-            this.pumpTimer = null;
-        }
-    }
-
     /** 実際に AudioContext へ渡す。戻り値は start() に渡した startTime。 */
-    private _scheduleBuffer(buffer: AudioBuffer, minDelaySec: number = 0.005): number {
+    private _scheduleBuffer(buffer: AudioBuffer, minDelaySec: number = 0.005, seg: AvSegment | null = null): number {
         const source = this.audioContext!.createBufferSource();
         source.buffer = buffer;
         source.connect(this.audioContext!.destination);
@@ -368,9 +327,13 @@ export class LiveAudioManager {
 
         // interrupt用にソースを追跡、終了時に自動除去
         this.scheduledSources.push(source);
+        if (seg) seg.activeSources++;
         source.onended = () => {
             const idx = this.scheduledSources.indexOf(source);
             if (idx !== -1) this.scheduledSources.splice(idx, 1);
+            if (seg) seg.activeSources = Math.max(0, seg.activeSources - 1);
+            // ★ 実際の再生終了はここで判定する (server の turn_complete ではない)
+            this._maybeFinishSpeaking();
         };
         return startTime;
     }
@@ -384,7 +347,6 @@ export class LiveAudioManager {
      * schedule 済みの音声は止めない (自然に鳴り終わり、新 segment はその後ろに並ぶ)。
      */
     beginSegment(): void {
-        this._clearPumpTimer();
         this.pendingAudio = [];
         this.segments.push({
             id: ++this.segmentSeq,
@@ -393,7 +355,8 @@ export class LiveAudioManager {
             contentSec: 0,
             entries: [],
             started: false,
-            stalled: false,
+            serverEnded: false,
+            activeSources: 0,
         });
         this._pruneSegments();
         this._a2eDebugCounter = 0;
@@ -405,7 +368,6 @@ export class LiveAudioManager {
      * schedule 済み source を止め、キューと timeline を捨てる。
      */
     interrupt(): void {
-        this._clearPumpTimer();
         this.pendingAudio = [];
         for (const source of this.scheduledSources) {
             try { source.stop(); } catch (_) { /* already stopped */ }
@@ -414,6 +376,7 @@ export class LiveAudioManager {
         this.nextPlayTime = 0;
         this.audioTimelineStart = null;
         this.segments = [];
+        this.isAiSpeaking = false;
         console.log('[AV] interrupt: scheduled audio 停止 + timeline クリア');
     }
 
@@ -426,7 +389,8 @@ export class LiveAudioManager {
                 contentSec: 0,
                 entries: [],
                 started: false,
-                stalled: false,
+                serverEnded: false,
+                activeSources: 0,
             });
         }
         return this.segments[this.segments.length - 1];
@@ -531,7 +495,9 @@ export class LiveAudioManager {
         underrunCount: number;
         interpCount: number;
         tailSampleCount: number;
-        stallReleaseCount: number;
+        serverEnded: boolean;
+        activeSources: number;
+        isAiSpeaking: boolean;
         lastSample: { i0: number; i1: number; t: number } | null;
     } {
         let firstEntryWallStart: number | null = null;
@@ -549,7 +515,9 @@ export class LiveAudioManager {
             underrunCount: this._underrunCount,
             interpCount: this._interpCount,
             tailSampleCount: this._tailSampleCount,
-            stallReleaseCount: this._stallReleaseCount,
+            serverEnded: seg ? seg.serverEnded : false,
+            activeSources: seg ? seg.activeSources : 0,
+            isAiSpeaking: this.isAiSpeaking,
             lastSample: this._lastSample,
         };
     }
@@ -639,12 +607,6 @@ export class LiveAudioManager {
             seg.frames.push({ values });
         }
 
-        // A2E が復帰したので gate を再度有効にする (stall は一時的な状態)
-        if (seg.stalled && data.expressions.length > 0) {
-            seg.stalled = false;
-            console.log(`[AV] expression 復帰: gate を再有効化 (segment=${seg.id})`);
-        }
-
         // デバッグ: バッファ状態とjawOpen値を出力
         if (data.expressions.length > 0) {
             const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
@@ -696,12 +658,18 @@ export class LiveAudioManager {
         this.isAiSpeaking = true;
     }
 
+    /**
+     * server の turn_complete。
+     * 「これ以上 server から Audio が追加されない」という意味だけ。
+     * この時点では pending / scheduled Audio が残っているので
+     * isAiSpeaking はここでは false にしない。
+     */
     onAiResponseEnded(): void {
-        this.isAiSpeaking = false;
+        const seg = this.segments.length > 0 ? this.segments[this.segments.length - 1] : null;
+        if (seg) seg.serverEnded = true;
 
         // ★ ターン終了時: 最終フレームのjawOpen関連を0にリセット（口閉じ遅延対策）
         // A2Eの最終フレームが0.008〜0.013で止まることがあり、口が閉じきらない
-        const seg = this.segments.length > 0 ? this.segments[this.segments.length - 1] : null;
         if (seg && seg.frames.length > 0) {
             const lastFrame = seg.frames[seg.frames.length - 1];
             if (lastFrame && lastFrame.values) {
@@ -711,6 +679,27 @@ export class LiveAudioManager {
                 }
             }
         }
+
+        // 既に全部鳴り終わっていた場合はここで確定する
+        this._maybeFinishSpeaking();
+    }
+
+    /**
+     * 実際の再生終了判定。
+     *   server が turn_complete を出した (serverEnded)
+     *   かつ pending Audio = 0
+     *   かつ その segment の AudioBufferSourceNode が全て onended 済み
+     * を満たしたときだけ isAiSpeaking = false にする。
+     * source.onended から再判定される。
+     */
+    private _maybeFinishSpeaking(): void {
+        if (!this.isAiSpeaking) return;
+        const seg = this.segments.length > 0 ? this.segments[this.segments.length - 1] : null;
+        if (!seg || !seg.serverEnded) return;
+        if (this.pendingAudio.length > 0) return;
+        if (seg.activeSources > 0) return;
+        this.isAiSpeaking = false;
+        console.log(`[AV] 再生終了: segment=${seg.id} -> isAiSpeaking=false`);
     }
 
     // ========================================
