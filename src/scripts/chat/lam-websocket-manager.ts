@@ -66,6 +66,27 @@ export class LAMWebSocketManager {
      */
     private expressionProvider: (() => ExpressionFrame | null) | null = null;
 
+    /**
+     * 【診断専用】UIKA 診断 URL のときだけ設定される。
+     * `exprPath` と、`LiveAudioManager` の read-only 同期スナップショット取得関数。
+     * 通常 LAM では設定されないので、ログも出ない。
+     */
+    private exprTrace: {
+        path: string;
+        getState: () => {
+            playbackMs: number; bufferFrames: number; fps: number;
+            requestedFrame: number; selectedFrame: number; clamped: boolean;
+        };
+    } | null = null;
+
+    // トレース間引き用 (console spam を避ける)
+    private _traceRenderAt = 0;
+    private _traceRenderSel = -1;
+    private _traceRenderClamped: boolean | null = null;
+    private _traceCacheAt = 0;
+    private _traceCacheSel = -1;
+    private _traceCacheClamped: boolean | null = null;
+
     // チャット状態（Idle / Listening / Thinking / Responding）
     private chatState: string = 'Idle';
 
@@ -208,6 +229,29 @@ export class LAMWebSocketManager {
             ? this.expressionProvider()
             : this.currentExpression;
 
+        // ===== 診断ログ (TRACE A2E RENDER) =====
+        // renderer が expression を読んだ瞬間の同期状態。frame の選び方は変えていない。
+        if (this.exprTrace) {
+            try {
+                const st = this.exprTrace.getState();
+                const now = performance.now();
+                if (this._shouldTrace(now, this._traceRenderAt, this._traceRenderSel,
+                                      this._traceRenderClamped, st.selectedFrame, st.clamped)) {
+                    this._traceRenderAt = now;
+                    this._traceRenderSel = st.selectedFrame;
+                    this._traceRenderClamped = st.clamped;
+                    console.log(
+                        `[TRACE A2E RENDER] exprPath=${this.exprTrace.path} `
+                        + `perfMs=${now.toFixed(1)} playbackMs=${st.playbackMs.toFixed(1)} `
+                        + `fps=${st.fps} bufferFrames=${st.bufferFrames} `
+                        + `coverageMs=${(st.bufferFrames / st.fps * 1000).toFixed(1)} `
+                        + `requestedFrame=${st.requestedFrame} selectedFrame=${st.selectedFrame} `
+                        + `clamped=${st.clamped} frame=${frame ? 'yes' : 'null'}`
+                    );
+                }
+            } catch (e) { /* noop */ }
+        }
+
         if (!frame) {
             // 静止状態: 全て0
             for (const name of this.expressionNames) {
@@ -295,6 +339,29 @@ export class LAMWebSocketManager {
      */
     updateExpression(frame: ExpressionFrame | null): void {
         this.currentExpression = frame;
+
+        // ===== 診断ログ (TRACE A2E CACHE) =====
+        // AudioSyncPlayer の rAF が cache を更新した瞬間。代入処理は変えていない。
+        if (this.exprTrace) {
+            try {
+                const st = this.exprTrace.getState();
+                const now = performance.now();
+                if (this._shouldTrace(now, this._traceCacheAt, this._traceCacheSel,
+                                      this._traceCacheClamped, st.selectedFrame, st.clamped)) {
+                    this._traceCacheAt = now;
+                    this._traceCacheSel = st.selectedFrame;
+                    this._traceCacheClamped = st.clamped;
+                    console.log(
+                        `[TRACE A2E CACHE] exprPath=${this.exprTrace.path} `
+                        + `perfMs=${now.toFixed(1)} playbackMs=${st.playbackMs.toFixed(1)} `
+                        + `fps=${st.fps} bufferFrames=${st.bufferFrames} `
+                        + `coverageMs=${(st.bufferFrames / st.fps * 1000).toFixed(1)} `
+                        + `requestedFrame=${st.requestedFrame} selectedFrame=${st.selectedFrame} `
+                        + `clamped=${st.clamped} frame=${frame ? 'yes' : 'null'}`
+                    );
+                }
+            } catch (e) { /* noop */ }
+        }
     }
 
     /**
@@ -304,6 +371,33 @@ export class LAMWebSocketManager {
      */
     setExpressionProvider(provider: (() => ExpressionFrame | null) | null): void {
         this.expressionProvider = provider;
+    }
+
+    /**
+     * 【診断専用】トレースを有効にする。UIKA 診断 URL からのみ呼ばれる。
+     */
+    setExpressionTrace(
+        path: string,
+        getState: () => {
+            playbackMs: number; bufferFrames: number; fps: number;
+            requestedFrame: number; selectedFrame: number; clamped: boolean;
+        },
+    ): void {
+        this.exprTrace = { path, getState };
+    }
+
+    /**
+     * 間引き判定: 250ms 経過 / clamped の変化 / selectedFrame が 10 フレーム超飛んだ
+     * のいずれかで true。
+     */
+    private _shouldTrace(
+        now: number, lastAt: number, prevSel: number, prevClamped: boolean | null,
+        sel: number, clamped: boolean,
+    ): boolean {
+        if (now - lastAt >= 250) return true;
+        if (prevClamped !== clamped) return true;
+        if (prevSel >= 0 && Math.abs(sel - prevSel) > 10) return true;
+        return false;
     }
 
     /**
@@ -345,5 +439,6 @@ export class LAMWebSocketManager {
         this.isModelLoaded = false;
         this.currentExpression = null;
         this.expressionProvider = null;
+        this.exprTrace = null;
     }
 }
