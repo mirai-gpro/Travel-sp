@@ -90,6 +90,27 @@ export function getUikaSortMode(): UikaSortMode {
     return 'camera';
 }
 
+export type UikaExprPath = 'provider' | 'cache';
+
+/**
+ * 【診断用】UIKA の expression frame 取得経路を選ぶ。既定は現状維持の `provider`。
+ *
+ *   provider : renderer の `getExpressionData()` から
+ *              `liveAudioManager.getCurrentExpressionFrame()` を直接呼ぶ (commit 9714965 以降)
+ *   cache    : provider を設定せず、通常 LAM と同じ
+ *              `AudioSyncPlayer rAF → updateExpression() → currentExpression` 経路にする
+ *
+ * `?uika133k=1` だけのときは `provider` (= 現在の挙動) を維持する。
+ * 通常 LAM はこの関数を呼ばないので無影響。
+ */
+export function getUikaExprPath(): UikaExprPath {
+    try {
+        const m = new URLSearchParams(window.location.search).get('exprPath');
+        if (m === 'cache') return 'cache';
+    } catch { /* noop */ }
+    return 'provider';
+}
+
 /** `?morphFast=off` で無効化できる。既定は有効。 */
 export function getUikaMorphFast(): boolean {
     try {

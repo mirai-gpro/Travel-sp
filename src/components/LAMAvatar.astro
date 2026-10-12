@@ -128,6 +128,7 @@ const {
   import { LAMWebSocketManager } from '../scripts/chat/lam-websocket-manager';
   import { AudioSyncPlayer } from '../scripts/chat/audio-sync-player';
   import type { LiveAudioManager, ExpressionFrame } from '../scripts/chat/live-audio-manager';
+  import { getUikaExprPath } from '../scripts/chat/uika-133k-mode';
 
   /**
    * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
@@ -181,15 +182,33 @@ const {
         // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
         // meta.json の camera ではない。UIKA mode では等倍にする。
         this.containerEl.classList.add('uika-133k');
-        // UIKA mode だけ expression を描画瞬間に直接引く。
-        // 通常 LAM の AudioSyncPlayer 経路 (上の setExpressionCallback) は
-        // そのまま動き続けるが、UIKA では参照されない。
-        // (UIKA は 133,541 点で render レートが低く、cache 経路だと
-        //  rAF が回っていない間の古い frame を描いてしまうため)
-        this.lamManager.setExpressionProvider(
-          () => liveAudioManager.getCurrentExpressionFrame()
+        // ===== 診断用 A/B: expression frame の取得経路だけを切り替える =====
+        //   exprPath=provider (既定 / 現状維持):
+        //     renderer の getExpressionData() から
+        //     liveAudioManager.getCurrentExpressionFrame() を直接呼ぶ
+        //   exprPath=cache:
+        //     provider を設定せず、通常 LAM と同じ
+        //     AudioSyncPlayer rAF → updateExpression() → currentExpression 経路にする
+        // モデル / 描画条件 / A2E 値 / 口形補正は一切変えていない。
+        const exprPath = getUikaExprPath();
+        if (exprPath === 'provider') {
+          this.lamManager.setExpressionProvider(
+            () => liveAudioManager.getCurrentExpressionFrame()
+          );
+        } else {
+          this.lamManager.setExpressionProvider(null);
+        }
+        // 診断ログを有効化 (UIKA のときだけ。通常 LAM では設定しない)
+        this.lamManager.setExpressionTrace(
+          exprPath,
+          () => liveAudioManager.getExpressionSyncDebugState()
         );
-        console.log('[LAMAvatar][UIKA133K] expression を描画時刻へ直接同期 (provider 経路)');
+        console.log(
+          `[TRACE] UIKA exprPath=${exprPath}`
+          + (exprPath === 'provider'
+              ? ' (renderer 直接取得 = 現状維持)'
+              : ' (AudioSyncPlayer cache = 通常 LAM と同じ timeline)')
+        );
       }
       try {
         await this.lamManager.initialize({
