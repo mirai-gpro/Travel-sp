@@ -4,6 +4,11 @@
 export const UIKA_NATIVE_V1_GAUSSIAN_COUNT = 133_541;
 export const UIKA_NATIVE_V1_BASIS_COUNT = 51;
 
+export interface UikaNativeBounds {
+    min: [number, number, number];
+    max: [number, number, number];
+}
+
 export interface UikaNativeBasis {
     names: string[];
     /** One VEC3 displacement array per basis channel. Each length = gaussianCount * 3. */
@@ -12,9 +17,12 @@ export interface UikaNativeBasis {
 
 export interface UikaNativeAsset {
     sourceUrl: string;
+    sourceByteLength: number;
+    sourceSha256: string;
     gaussianCount: number;
     canonicalPly: Blob;
     canonicalPositions: Float32Array;
+    canonicalBounds: UikaNativeBounds;
     basis: UikaNativeBasis;
     ignoredCompatibilityEntries: string[];
 }
