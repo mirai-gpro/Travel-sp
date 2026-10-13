@@ -2,6 +2,7 @@
 // Migration loader: reads the existing verified 133K compatibility ZIP as DATA ONLY.
 // It never instantiates skin/skeleton/animation semantics.
 
+import { validateUikaBasis } from './uika-basis-validator';
 import { parseUikaSkinGlb } from './glb-reader';
 import { reconstructCanonicalPly } from './ply-reconstruct';
 import {
@@ -129,6 +130,27 @@ export async function loadUikaNativeMigrationAsset(sourceUrl: string): Promise<U
     }
     const canonicalBounds = measureBounds(canonical.canonicalPositions);
     assertBounds(canonicalBounds);
+
+    // Phase 1 source-of-truth: verify the extracted 133K D_UIKA field itself before rendering.
+    const basisValidation = validateUikaBasis(skin.basis, canonical.canonicalPositions);
+    if (!basisValidation.pass) fail('D_UIKA Phase 1 reference validation failed');
+
+    console.log('[UIKA NATIVE V1] asset gates PASS', {
+        sourceByteLength: archive.byteLength,
+        sourceSha256,
+        gaussianCount: skin.gaussianCount,
+        basisCount: skin.basis.names.length,
+        canonicalBounds,
+        referenceChannels: basisValidation.channels
+            .filter((channel) => channel.expectedMaxDisplacement !== undefined)
+            .map((channel) => ({
+                name: channel.name,
+                maxDisplacement: channel.maxDisplacement,
+                expected: channel.expectedMaxDisplacement,
+                diff: channel.maxDiff,
+            })),
+        pairSigns: basisValidation.pairSigns,
+    });
 
     return {
         sourceUrl,
