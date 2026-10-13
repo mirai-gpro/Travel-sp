@@ -5,12 +5,11 @@
  * `gaussian-splat-renderer-for-lam@0.0.9-alpha.1` の実際の ESM export surface を
  * 確認する read-only diagnostic。
  *
- * compile probes:
- *   1. Viewer
- *   2. SplatMesh
+ * Confirmed compile probe:
+ *   - Viewer: named import build PASS
  *
- * Vite/Rollup build が成功すれば、pinned package が両方を public export
- * していることを compile-time に確定できる。
+ * `SplatMesh` named import は直前の単独 probe で build FAIL したため、
+ * この green-baseline commit では import しない。A/B の復帰確認に使う。
  *
  * やらないこと:
  *   - renderer instance を生成しない
@@ -20,13 +19,12 @@
  */
 
 import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
-import { SplatMesh, Viewer } from 'gaussian-splat-renderer-for-lam';
+import { Viewer } from 'gaussian-splat-renderer-for-lam';
 
 export interface RendererApiAuditResult {
     expectedPackageVersion: '0.0.9-alpha.1';
     compileProbe: {
         ViewerNamedExport: true;
-        SplatMeshNamedExport: true;
     };
     exportNames: string[];
     capabilities: {
@@ -55,19 +53,15 @@ export function auditRendererApi(): RendererApiAuditResult {
     const moduleObject = GaussianSplats3D as unknown as Record<string, unknown>;
     const exportNames = Object.keys(moduleObject).sort();
 
-    // Reference named imports so Rollup cannot discard the compile probes as unused.
+    // Reference named import so Rollup cannot discard the compile probe as unused.
     if (typeof Viewer !== 'function') {
         throw new Error('Gate 0: Viewer named export exists but is not a constructor/function');
-    }
-    if (typeof SplatMesh !== 'function') {
-        throw new Error('Gate 0: SplatMesh named export exists but is not a constructor/function');
     }
 
     return {
         expectedPackageVersion: '0.0.9-alpha.1',
         compileProbe: {
             ViewerNamedExport: true,
-            SplatMeshNamedExport: true,
         },
         exportNames,
         capabilities: {
