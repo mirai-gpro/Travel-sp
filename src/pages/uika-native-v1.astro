@@ -1,5 +1,5 @@
 ---
-// UIKA Native Runtime Architecture Correction v1.0 — Gate 1 only.
+// UIKA Native Runtime Architecture Correction v1.0 — Gate 1 / Gate 2 only.
 // Completely isolated from LAMAvatar / LAMWebSocketManager / LiveAudioManager.
 ---
 
@@ -8,7 +8,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>UIKA Native v1 — Gate 1</title>
+  <title>UIKA Native v1 — Gate 1/2</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -37,6 +37,20 @@
       height: 100% !important;
       display: block;
     }
+    #controls {
+      width: min(720px, calc(100vw - 32px));
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 8px 10px;
+      border: 1px solid #555;
+      background: #222;
+      color: #eee;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
     #status {
       width: min(720px, calc(100vw - 32px));
       min-height: 180px;
@@ -50,8 +64,16 @@
   </style>
 </head>
 <body>
-  <h1>UIKA Native v1 — Gate 1 neutral render</h1>
+  <h1>UIKA Native v1 — Gate 1 neutral / Gate 2 deterministic morph</h1>
   <div id="viewer"></div>
+  <div id="controls">
+    <button data-neutral disabled>neutral</button>
+    <button data-morph="jawOpen" disabled>jawOpen 1.0</button>
+    <button data-morph="mouthSmileLeft" disabled>smile L 1.0</button>
+    <button data-morph="mouthSmileRight" disabled>smile R 1.0</button>
+    <button data-morph="eyeBlinkLeft" disabled>blink L 1.0</button>
+    <button data-morph="eyeBlinkRight" disabled>blink R 1.0</button>
+  </div>
   <pre id="status">initializing...</pre>
 
   <script>
@@ -59,29 +81,65 @@
 
     const container = document.getElementById('viewer');
     const statusEl = document.getElementById('status');
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('#controls button'));
 
     if (!(container instanceof HTMLElement) || !(statusEl instanceof HTMLElement)) {
-      throw new Error('UIKA Native Gate 1: page elements missing');
+      throw new Error('UIKA Native Gate 1/2: page elements missing');
     }
 
     const driver = new UikaNativeDriver(container);
     (window as any).__uikaNativeV1Driver = driver;
+    let gate2Report: unknown = null;
+    let busy = true;
+
+    const setControls = () => {
+      for (const button of buttons) button.disabled = busy || !driver.status.ready;
+    };
 
     const renderStatus = () => {
       statusEl.textContent = JSON.stringify({
         runtime: driver.status,
         asset: driver.getAssetDebugInfo(),
+        gate2: gate2Report,
       }, null, 2);
+      setControls();
     };
+
+    const run = async (operation: () => Promise<unknown>) => {
+      if (busy) return;
+      busy = true;
+      renderStatus();
+      try {
+        gate2Report = await operation();
+      } catch (error: any) {
+        gate2Report = { error: error?.message || String(error) };
+        console.error('[UIKA NATIVE V1 GATE2]', error);
+      } finally {
+        busy = false;
+        renderStatus();
+      }
+    };
+
+    for (const button of buttons) {
+      const morph = button.dataset.morph;
+      if (morph) {
+        button.addEventListener('click', () => run(() => driver.renderSingleBasis(morph, 1.0)));
+      } else if (button.hasAttribute('data-neutral')) {
+        button.addEventListener('click', () => run(() => driver.renderNeutralAgain()));
+      }
+    }
 
     renderStatus();
     const timer = window.setInterval(renderStatus, 250);
 
     driver.initializeNeutral()
       .then(() => {
+        busy = false;
         renderStatus();
       })
       .catch((error) => {
+        gate2Report = { gate1Error: error?.message || String(error) };
+        busy = false;
         renderStatus();
         console.error('[UIKA NATIVE V1 PAGE]', error);
       });
