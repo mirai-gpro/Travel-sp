@@ -218,6 +218,12 @@ const {
             : (config.modelUrl || '/avatar/meruru.zip'),
         });
 
+        // UIKA 133K のときだけ、renderer と初期 morph warm-up の完了を待つ。
+        // 通常 LAM はこの wait を通らない。
+        if (uika133k && this.lamManager.isLoaded()) {
+          await this.waitForUikaReadyForLive();
+        }
+
         if (this.lamManager.isLoaded()) {
           this.loadingEl.classList.add('hidden');
           this.syncPlayer.start();
@@ -230,6 +236,47 @@ const {
         console.error('[LAMAvatar] 初期化エラー:', error);
         this._showFallback();
       }
+    }
+
+    /**
+     * UIKA 133K の実 READY を待つ (UIKA mode 専用)。
+     *
+     * READY 判定の Source of Truth は `window.__uikaStatus` だけ。
+     * 新しい状態管理は作らない。固定時間 sleep も使わず rAF でポーリングする。
+     *
+     *   必須: ready === true / splatCount === 133541 / bsCount === 51
+     *   morphFast === true のときは morphFastFrames > 0 まで待つ
+     *     (初回 full runMorphUpdate → skin/texture/centers 初期化 →
+     *      fast path へ実際に移行したことの証明)
+     *   morphFast === false (?morphFast=off の診断モード) は上記必須条件まで
+     */
+    private async waitForUikaReadyForLive(): Promise<void> {
+      console.log('[UIKA INIT] waiting for renderer warm-up');
+      const isReady = () => {
+        const st = (window as any).__uikaStatus;
+        if (!st) return null;
+        if (st.ready !== true) return null;
+        if (st.splatCount !== 133541) return null;
+        if (st.bsCount !== 51) return null;
+        if (st.morphFast === true && !(st.morphFastFrames > 0)) return null;
+        return st;
+      };
+      const st = await new Promise<any>((resolve) => {
+        const tick = () => {
+          const s = isReady();
+          if (s) {
+            // READY になった同じ描画フレーム内で Live 開始まで進ませない
+            requestAnimationFrame(() => resolve(s));
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+      console.log(
+        `[UIKA INIT] READY splatCount=${st.splatCount} bsCount=${st.bsCount} `
+        + `fullRuns=${st.morphFullRuns} fastFrames=${st.morphFastFrames}`
+      );
     }
 
     /**
