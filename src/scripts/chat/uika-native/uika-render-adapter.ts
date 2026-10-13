@@ -29,7 +29,7 @@ export class UikaRenderAdapter {
         private readonly status: UikaNativeRuntimeStatus,
     ) {}
 
-    async loadNeutralPly(ply: Blob): Promise<void> {
+    async loadPly(ply: Blob): Promise<void> {
         if (this.viewer) throw new Error('UIKA Native Renderer: already initialized');
 
         this.status.phase = 'loading-renderer';
