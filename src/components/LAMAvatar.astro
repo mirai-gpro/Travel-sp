@@ -165,24 +165,10 @@ const {
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
 
-      // expression 更新コールバックを設定 (exprPath=cache のときだけ使われる)
+      // expression 更新コールバックを設定
       this.syncPlayer.setExpressionCallback((frame: ExpressionFrame | null) => {
         this.lamManager.updateExpression(frame);
       });
-
-      // ===== Render fps と LipSync fps を分離する =====
-      // renderer が描画するたびに、実 AudioContext playhead から
-      // fractional A2E frame position を計算して expression を取る。
-      // 別 rAF のキャッシュ経由にしない (renderer の fps を A2E timeline にしない)。
-      // 通常 LAM / UIKA の区別なく同じ経路。`?exprPath=cache` で旧経路に戻せる。
-      const exprPath = getUikaExprPath();
-      if (exprPath === 'provider') {
-        this.lamManager.setExpressionProvider(
-          () => liveAudioManager.getCurrentExpressionFrame()
-        );
-      } else {
-        this.lamManager.setExpressionProvider(null);
-      }
 
       // Gaussian Splat レンダラーを初期化（公式API: getInstance）
       const config = (window as any).__lamAvatarConfig || {};
@@ -196,6 +182,22 @@ const {
         // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
         // meta.json の camera ではない。UIKA mode では等倍にする。
         this.containerEl.classList.add('uika-133k');
+        // ===== 診断用 A/B: expression frame の取得経路だけを切り替える =====
+        //   exprPath=provider (既定 / 現状維持):
+        //     renderer の getExpressionData() から
+        //     liveAudioManager.getCurrentExpressionFrame() を直接呼ぶ
+        //   exprPath=cache:
+        //     provider を設定せず、通常 LAM と同じ
+        //     AudioSyncPlayer rAF → updateExpression() → currentExpression 経路にする
+        // モデル / 描画条件 / A2E 値 / 口形補正は一切変えていない。
+        const exprPath = getUikaExprPath();
+        if (exprPath === 'provider') {
+          this.lamManager.setExpressionProvider(
+            () => liveAudioManager.getCurrentExpressionFrame()
+          );
+        } else {
+          this.lamManager.setExpressionProvider(null);
+        }
         // 診断ログを有効化 (UIKA のときだけ。通常 LAM では設定しない)
         this.lamManager.setExpressionTrace(
           exprPath,
@@ -216,6 +218,12 @@ const {
             : (config.modelUrl || '/avatar/meruru.zip'),
         });
 
+        // UIKA 133K のときだけ、renderer と初期 morph warm-up の完了を待つ。
+        // 通常 LAM はこの wait を通らない。
+        if (uika133k && this.lamManager.isLoaded()) {
+          await this.waitForUikaReadyForLive();
+        }
+
         if (this.lamManager.isLoaded()) {
           this.loadingEl.classList.add('hidden');
           this.syncPlayer.start();
@@ -228,6 +236,47 @@ const {
         console.error('[LAMAvatar] 初期化エラー:', error);
         this._showFallback();
       }
+    }
+
+    /**
+     * UIKA 133K の実 READY を待つ (UIKA mode 専用)。
+     *
+     * READY 判定の Source of Truth は `window.__uikaStatus` だけ。
+     * 新しい状態管理は作らない。固定時間 sleep も使わず rAF でポーリングする。
+     *
+     *   必須: ready === true / splatCount === 133541 / bsCount === 51
+     *   morphFast === true のときは morphFastFrames > 0 まで待つ
+     *     (初回 full runMorphUpdate → skin/texture/centers 初期化 →
+     *      fast path へ実際に移行したことの証明)
+     *   morphFast === false (?morphFast=off の診断モード) は上記必須条件まで
+     */
+    private async waitForUikaReadyForLive(): Promise<void> {
+      console.log('[UIKA INIT] waiting for renderer warm-up');
+      const isReady = () => {
+        const st = (window as any).__uikaStatus;
+        if (!st) return null;
+        if (st.ready !== true) return null;
+        if (st.splatCount !== 133541) return null;
+        if (st.bsCount !== 51) return null;
+        if (st.morphFast === true && !(st.morphFastFrames > 0)) return null;
+        return st;
+      };
+      const st = await new Promise<any>((resolve) => {
+        const tick = () => {
+          const s = isReady();
+          if (s) {
+            // READY になった同じ描画フレーム内で Live 開始まで進ませない
+            requestAnimationFrame(() => resolve(s));
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+      console.log(
+        `[UIKA INIT] READY splatCount=${st.splatCount} bsCount=${st.bsCount} `
+        + `fullRuns=${st.morphFullRuns} fastFrames=${st.morphFastFrames}`
+      );
     }
 
     /**

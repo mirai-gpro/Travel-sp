@@ -3,6 +3,7 @@
 // src/scripts/chat/concierge-controller.ts
 import { CoreController } from './core-controller';
 import { AudioManager } from './audio-manager';
+import { isUika133kMode } from './uika-133k-mode';
 
 declare const io: any;
 
@@ -63,8 +64,25 @@ export class ConciergeController extends CoreController {
   // 🎯 セッション初期化をオーバーライド（LiveAPI統一）
   // （仕様書02 セクション4.4.3）
   // ========================================
+  private async prepareUikaAvatarBeforeLive(): Promise<void> {
+    if (!isUika133kMode()) return;
+
+    const controller = (window as any).__lamAvatarController;
+    if (!controller) {
+      throw new Error('UIKA: LAMAvatarController が見つかりません');
+    }
+    this.lamAvatarController = controller;
+
+    console.log('[UIKA INIT] avatar preparation before Live start');
+    await controller.initialize(this.liveAudioManager);
+    console.log('[UIKA INIT] avatar READY; Live start permitted');
+  }
+
   protected async initializeSession() {
     try {
+      // UIKA 133K のみ: renderer + 初期 morph warm-up 完了まで Live を開始しない
+      await this.prepareUikaAvatarBeforeLive();
+
       if (this.sessionId) {
         try {
           await fetch(`${this.apiBase}/api/session/end`, {
