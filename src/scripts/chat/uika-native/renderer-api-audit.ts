@@ -3,12 +3,11 @@
  * UIKA Native Runtime Architecture Correction v1.0 — Gate 0
  *
  * `gaussian-splat-renderer-for-lam@0.0.9-alpha.1` の実際の ESM export surface を
- * 実行時に列挙するだけの read-only diagnostic。
+ * 確認する read-only diagnostic。
  *
- * 目的:
- *   - low-level Viewer / DropInViewer / SplatMesh 等が public export かを確認する
- *   - `GaussianSplatRenderer.getInstance()` の LAM OAC lifecycle を経由せずに
- *     UIKA Native renderer adapter を作れるか判断するための事実を取る
+ * この commit では `Viewer` だけを named import する。
+ * Vite/Rollup build が成功すれば、pinned package が `Viewer` を public export
+ * していることを compile-time に確定できる。
  *
  * やらないこと:
  *   - renderer instance を生成しない
@@ -18,9 +17,13 @@
  */
 
 import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
+import { Viewer } from 'gaussian-splat-renderer-for-lam';
 
 export interface RendererApiAuditResult {
     expectedPackageVersion: '0.0.9-alpha.1';
+    compileProbe: {
+        ViewerNamedExport: true;
+    };
     exportNames: string[];
     capabilities: {
         GaussianSplatRenderer: boolean;
@@ -45,13 +48,19 @@ function matching(names: string[], token: string): string[] {
 }
 
 export function auditRendererApi(): RendererApiAuditResult {
-    // Dynamic key lookup only. A missing named export must not make the build fail:
-    // absence itself is the Gate 0 result we need to observe.
     const moduleObject = GaussianSplats3D as unknown as Record<string, unknown>;
     const exportNames = Object.keys(moduleObject).sort();
 
+    // Reference the named import so Rollup cannot discard the compile probe as unused.
+    if (typeof Viewer !== 'function') {
+        throw new Error('Gate 0: Viewer named export exists but is not a constructor/function');
+    }
+
     return {
         expectedPackageVersion: '0.0.9-alpha.1',
+        compileProbe: {
+            ViewerNamedExport: true,
+        },
         exportNames,
         capabilities: {
             GaussianSplatRenderer: typeof moduleObject.GaussianSplatRenderer === 'function',
