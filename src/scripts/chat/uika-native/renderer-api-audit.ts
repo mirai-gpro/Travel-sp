@@ -8,8 +8,11 @@
  * Confirmed compile probe:
  *   - Viewer: named import build PASS
  *
- * `SplatMesh` named import は直前の単独 probe で build FAIL したため、
- * この green-baseline commit では import しない。A/B の復帰確認に使う。
+ * Current compile probe:
+ *   - SceneFormat: Blob URL から canonical PLY を直接 Viewer へ渡すために必要
+ *
+ * `SplatMesh` named import は単独で build FAILし、Viewer-onlyへ戻すと再PASSした。
+ * よって新Runtimeは `SplatMesh` public export を前提にしない。
  *
  * やらないこと:
  *   - renderer instance を生成しない
@@ -19,12 +22,13 @@
  */
 
 import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
-import { Viewer } from 'gaussian-splat-renderer-for-lam';
+import { SceneFormat, Viewer } from 'gaussian-splat-renderer-for-lam';
 
 export interface RendererApiAuditResult {
     expectedPackageVersion: '0.0.9-alpha.1';
     compileProbe: {
         ViewerNamedExport: true;
+        SceneFormatNamedExport: true;
     };
     exportNames: string[];
     capabilities: {
@@ -32,6 +36,7 @@ export interface RendererApiAuditResult {
         Viewer: boolean;
         DropInViewer: boolean;
         SplatMesh: boolean;
+        SceneFormat: boolean;
         PlyLoader: boolean;
         PlyParser: boolean;
         INRIAV1PlyParser: boolean;
@@ -53,15 +58,18 @@ export function auditRendererApi(): RendererApiAuditResult {
     const moduleObject = GaussianSplats3D as unknown as Record<string, unknown>;
     const exportNames = Object.keys(moduleObject).sort();
 
-    // Reference named import so Rollup cannot discard the compile probe as unused.
     if (typeof Viewer !== 'function') {
         throw new Error('Gate 0: Viewer named export exists but is not a constructor/function');
+    }
+    if (!SceneFormat || typeof SceneFormat !== 'object') {
+        throw new Error('Gate 0: SceneFormat named export is unavailable');
     }
 
     return {
         expectedPackageVersion: '0.0.9-alpha.1',
         compileProbe: {
             ViewerNamedExport: true,
+            SceneFormatNamedExport: true,
         },
         exportNames,
         capabilities: {
@@ -69,6 +77,7 @@ export function auditRendererApi(): RendererApiAuditResult {
             Viewer: typeof moduleObject.Viewer === 'function',
             DropInViewer: typeof moduleObject.DropInViewer === 'function',
             SplatMesh: typeof moduleObject.SplatMesh === 'function',
+            SceneFormat: typeof moduleObject.SceneFormat === 'object',
             PlyLoader: typeof moduleObject.PlyLoader === 'function',
             PlyParser: typeof moduleObject.PlyParser === 'function',
             INRIAV1PlyParser: typeof moduleObject.INRIAV1PlyParser === 'function',
