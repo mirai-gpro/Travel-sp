@@ -122,16 +122,41 @@ function parseVertexLayout(bytes: Uint8Array): PlyVertexLayout {
     return { count: vertexCount, dataOffset, stride, xOffset, yOffset, zOffset };
 }
 
+/**
+ * Returns a byte-for-byte copy of the source PLY except for the x/y/z fields.
+ * This is used by Gate 2 to render deterministic single-basis deformations while
+ * keeping color/opacity/scale/rotation and every other property unchanged.
+ */
+export function rewritePlyPositions(sourcePly: Uint8Array, positions: Float32Array): Uint8Array {
+    const layout = parseVertexLayout(sourcePly);
+    if (positions.length !== layout.count * 3) {
+        fail(`position length=${positions.length}, expected=${layout.count * 3}`);
+    }
+
+    const out = new Uint8Array(sourcePly);
+    const outView = new DataView(out.buffer, out.byteOffset, out.byteLength);
+    for (let i = 0; i < layout.count; i++) {
+        const x = positions[i * 3];
+        const y = positions[i * 3 + 1];
+        const z = positions[i * 3 + 2];
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+            fail(`non-finite replacement position at vertex ${i}`);
+        }
+        const p = layout.dataOffset + i * layout.stride;
+        outView.setFloat32(p + layout.xOffset, x, true);
+        outView.setFloat32(p + layout.yOffset, y, true);
+        outView.setFloat32(p + layout.zOffset, z, true);
+    }
+    return out;
+}
+
 export function reconstructCanonicalPly(offsetPly: Uint8Array, basePositions: Float32Array): ReconstructedPly {
     const layout = parseVertexLayout(offsetPly);
     if (basePositions.length !== layout.count * 3) {
         fail(`base position length=${basePositions.length}, expected=${layout.count * 3}`);
     }
 
-    // Preserve every byte from the source PLY and replace only x/y/z.
-    const out = new Uint8Array(offsetPly);
     const inView = new DataView(offsetPly.buffer, offsetPly.byteOffset, offsetPly.byteLength);
-    const outView = new DataView(out.buffer, out.byteOffset, out.byteLength);
     const canonicalPositions = new Float32Array(layout.count * 3);
 
     for (let i = 0; i < layout.count; i++) {
@@ -151,10 +176,10 @@ export function reconstructCanonicalPly(offsetPly: Uint8Array, basePositions: Fl
         canonicalPositions[i * 3] = x;
         canonicalPositions[i * 3 + 1] = y;
         canonicalPositions[i * 3 + 2] = z;
-        outView.setFloat32(p + layout.xOffset, x, true);
-        outView.setFloat32(p + layout.yOffset, y, true);
-        outView.setFloat32(p + layout.zOffset, z, true);
     }
 
-    return { bytes: out, canonicalPositions };
+    return {
+        bytes: rewritePlyPositions(offsetPly, canonicalPositions),
+        canonicalPositions,
+    };
 }
