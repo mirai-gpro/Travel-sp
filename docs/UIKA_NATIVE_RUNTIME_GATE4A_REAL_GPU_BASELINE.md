@@ -220,37 +220,68 @@ Basis for calling it a candidate, from the two valid tests only: Test B has
 so neither sorting nor CPU work accounts for the frame time in that run. GPU sort adds
 ~6.8 ms p50 in Test C. No cause beyond that is asserted here.
 
-### 6.2 Run 2 — clean real-GPU rerun (PENDING)
+### 6.2 Run 2 — clean real-GPU rerun, 2026-10-14 (FAIL)
 
-Run 1 cannot carry a formal Gate 4A PASS/FAIL because Test A is invalid. A clean rerun of
-the same page, with no code change and no optimization, is required first.
-
-Conditions for Run 2, as instructed:
+The user reran the same page on the real GPU and set the verdict. Hardware and run as
+reported:
 
 ```text
-same route            /uika-native-benchmark , harness unchanged
-DevTools              closed
-tab                   never hidden, never switched away from, window never minimised
-required outcome      Test A, B and C all valid: true , visibilityLostMs = 0
-then                  Export JSON
+GPU            AMD Radeon(TM) 860M Graphics
+browser / OS   Chrome 154 / Windows
+drawingBuffer  1138 x 1138
+DPR            1.5
 ```
-
-Also to be recorded from Run 2, without changing the harness for it: whether the
-anomalous GPU timer sample `184467.440737 ms` — one occurrence in Test A and one in
-Test B of Run 1 — appears again.
-
-Judgement for Run 2 uses `effectiveFPS`, wall-clock frame interval p95/p99 and GPU timer
-p50/p95/p99 — not mean and not max — then the rules already implemented in §4.
 
 ```text
-Test C   effectiveFPS >= 30 and p95 <= 33.3 ms and p99 <= 50 ms   PASS
-Test C   effectiveFPS < 30                                        FAIL
-Test C   fps >= 30 but p95/p99 over                               BORDERLINE
+Test A  neutral (51 weights at zero, the shader still evaluates every channel)
+  effectiveFPS      13.51
+  sortRuns          0
+  GPU draw p50      73.16 ms
+  GPU draw p95      75.04 ms
 
-GATE4A (Run 2) = PENDING
+Test B  fixed pose (fixture frame 20 held)
+  effectiveFPS      13.16
+  sortRuns          0
+  GPU draw p50      74.67 ms
+  GPU draw p95      77.70 ms
+
+Test C  real A2E replay (192 frames, 30 fps, time based)
+  effectiveFPS      13.03
+  GPU draw p50      74.03 ms
+  GPU draw p95      76.97 ms
+  GPU sort  p50      6.85 ms
+  GPU sort  p95      7.44 ms
+
+CPU mapper / weight upload / submission   approx. 0 - 0.2 ms
 ```
 
-No Gate 4B optimization and no Live work until Run 2 is judged.
+Verdict, as set by the user:
+
+```text
+GATE4A = FAIL
+
+PRIMARY BOTTLENECK = GPU draw path
+
+NOT PRIMARY        = CPU
+                     mapper
+                     weight upload
+                     JS submission
+                     sort alone
+```
+
+Test C is 13.03 fps against the §4 requirement of 30 fps, so the rule that applies is
+"effectiveFPS < 30 → FAIL". The three tests land within 1.6 ms of each other on GPU draw
+p50 while the expression workload between them differs completely, and Test A — every
+weight zero, no sort in the measured window — is already at 73.16 ms, which is why the
+draw path and not the expression pipeline carries the verdict.
+
+Fields the user did not quote for this run (per-test `visibilityLostMs` and `valid`,
+wall-clock percentiles, expression diagnostics, GL and page errors, OAC-free, and whether
+the anomalous GPU timer sample `184467.440737 ms` recurred) are not reproduced here and
+were not inferred. Gate 4B-1 §8 adds the exclusion rule for such samples; see
+`UIKA_NATIVE_RUNTIME_GATE4B1_DRAW_ISOLATION.md`.
+
+The split of the ~74 ms draw time is Gate 4B-1, not Gate 4A.
 
 ---
 
