@@ -2,7 +2,14 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2B-0.
 Route: `/uika-native-predeform-benchmark`, fourth button — **Run DPR1 Tail Isolation**.
-Status: Run A and Run B measured on the real GPU —
+Status: complete. All four runs measured on the real GPU with
+`lifecycleInvariantFailures = 0`: the sort pipeline accounts for 36.98 % of Run A's exact
+wall p95, split 29.87 % distance/fence/readback, 6.01 % CPU depth sort, 1.09 % index
+update (§10.7). `classification = SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL`. The
+per-stage measurements leave 14.7 ms of the 16.4 ms B→C cost unaccounted for (§10.8),
+which is what Gate 4B-2B-1 investigates.
+
+Earlier status, kept: Run A and Run B measured on the real GPU —
 **`SORT_PIPELINE_TAIL_CONFIRMED`**, 46.8% of Run A's exact wall p95 (§10.1). Not
 concluded: that the sort is the sole source, because Run B is still 1.70 ms over target
 (§10.2). One instrumentation bug found and fixed — `totalLifecycleMs` timed the latest
@@ -361,15 +368,67 @@ C -> D   CPU DepthSorter contribution
 D -> A   updateRenderIndexes / full-completion contribution
 ```
 
-### 10.7 Stage isolation — PENDING (real GPU)
+### 10.7 Stage isolation — result (real GPU)
+
+All four runs, with `lifecycleInvariantFailures = 0` in every one, so the lifecycle
+timings in this run are trustworthy.
 
 ```text
-Run C  exact wall p95, fence wait, readback, total lifecycle        PENDING
-Run D  exact wall p95, cpu sort, total lifecycle                    PENDING
-B -> C / C -> D / D -> A shares                                      PENDING
-lifecycleInvariantFailures (must be 0)                               PENDING
-CLASSIFICATION                                                       PENDING
+Run B  no sort                        exact p95 34.6 ms    FPS 52.90
+Run C  distance + fence + readback    exact p95 51.0 ms    FPS 48.60
+Run D  C + CPU DepthSorter            exact p95 54.3 ms    FPS 47.62
+Run A  full pipeline                  exact p95 54.9 ms    FPS 47.92
 ```
+
+```text
+B -> C   +16.4 ms     distance / fence / readback
+C -> D    +3.3 ms     CPU DepthSorter
+D -> A    +0.6 ms     render-index update
+```
+
+As a share of Run A's exact wall p95:
+
+```text
+distance / fence / readback   29.87 %
+CPU DepthSorter                6.01 %
+render-index update            1.09 %
+whole sort pipeline           36.98 %
+```
+
+```text
+SORT_PIPELINE_TAIL_CONFIRMED = true
+classification = SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL
+```
+
+The three stage deltas sum to 20.3 ms, which is exactly Run A minus Run B, so the split is
+internally consistent. Run B is 1.3 ms above the 33.3 ms target in this run, which is why
+the classification keeps the residual qualifier.
+
+These Run A and Run B figures are from a later run than §10.1's (A p95 65.80, B p95 35.00);
+both are kept. The stage shares are taken from this run, where all four runs were measured
+together.
+
+### 10.8 What the stage split does not explain
+
+In Run C the measured stage work is:
+
+```text
+GPU distance p95   ~0.80 ms
+submit CPU   p95    0.20 ms
+readback     p95    0.70 ms
+                   -------
+                    1.70 ms
+```
+
+against a B -> C wall p95 cost of +16.4 ms, leaving **14.7 ms unaccounted for by the
+per-stage measurements**. The fence elapsed p95 of 112.0 ms does not close that gap either,
+because it is wall-clock elapsed across asynchronous polls and not main-thread blocking
+time (§10.5).
+
+So the priority target is the **distance / fence / GPU-to-CPU completion path**, not the
+CPU depth sort (6.01 %) and not the render-index update (1.09 %). That is Gate 4B-2B-1
+(`UIKA_NATIVE_RUNTIME_GATE4B2B1_FENCE_COMPLETION_ISOLATION.md`), and until it has measured
+something, no cause is named for the 14.7 ms.
 
 Nothing above is estimated or extrapolated.
 

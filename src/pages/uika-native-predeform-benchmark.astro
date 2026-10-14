@@ -62,6 +62,7 @@
     <button id="investigate" disabled>Run Difference Investigation</button>
     <button id="sweep" disabled>Run 192-Frame Sweep</button>
     <button id="tail" disabled>Run DPR1 Tail Isolation</button>
+    <button id="fence" disabled>Run Fence Poll Isolation</button>
     <button id="stop" disabled>Stop</button>
     <button id="export" disabled>Export JSON</button>
     <button id="copy" disabled>Copy Results</button>
@@ -108,6 +109,7 @@
       investigate: document.getElementById('investigate') as HTMLButtonElement,
       sweep: document.getElementById('sweep') as HTMLButtonElement,
       tail: document.getElementById('tail') as HTMLButtonElement,
+      fence: document.getElementById('fence') as HTMLButtonElement,
       stop: document.getElementById('stop') as HTMLButtonElement,
       export: document.getElementById('export') as HTMLButtonElement,
       copy: document.getElementById('copy') as HTMLButtonElement,
@@ -290,7 +292,7 @@
           <tr><th>tail run</th><th>buffer</th><th>fps</th><th>exact p50</th><th>exact p95</th>
               <th>exact p99</th><th>polled p95</th><th>fence p95</th><th>readback p95</th>
               <th>cpu sort p95</th><th>index p95</th><th>total p95</th><th>inv fail</th>
-              <th>req/sub/done/skip</th><th>valid</th></tr>
+              <th>poll</th><th>polls p50</th><th>req/sub/done/skip</th><th>valid</th></tr>
           ${report.runs.map((x: any) => `<tr>
             <td>${x.name}</td>
             <td>${x.buffer.drawingBufferWidth}×${x.buffer.drawingBufferHeight}</td>
@@ -305,14 +307,17 @@
             <td>${num(x.sortLifecycle.indexUpdateMs.p95)}</td>
             <td>${num(x.sortLifecycle.totalLifecycleMs.p95)}</td>
             <td class="${x.sortLifecycle.lifecycleInvariantFailures === 0 ? 'ok' : 'bad'}">${x.sortLifecycle.lifecycleInvariantFailures}</td>
-            <td>${x.sortCounters.sortRequestedCount}/${x.sortCounters.sortSubmittedCount}/${x.sortCounters.sortCompletedCount}/${x.sortCounters.sortPendingSkipCount}</td>
+            <td>${x.fencePollStrategy}</td>
+            <td>${x.sortLifecycle.fencePolls.p50}</td>
+            <td class="${x.completionPathExercised === false ? 'bad' : ''}">${x.sortCounters.sortRequestedCount}/${x.sortCounters.sortSubmittedCount}/${x.sortCounters.sortCompletedCount}/${x.sortCounters.sortPendingSkipCount}</td>
             <td class="${x.valid ? 'ok' : 'bad'}">${x.valid ? 'yes' : 'no'}</td>
           </tr>`).join('')}
         </table>
         <p class="note">classification: <b>${report.classification}</b>
           &middot; sort pipeline tail confirmed: ${report.sortPipelineTailConfirmed === null ? '—' : (report.sortPipelineTailConfirmed ? 'yes' : 'no')}
           &middot; residual above target: ${num(report.residualTailAboveTargetMs)} ms
-          &middot; lifecycle invariant failures: ${(report.runs || []).reduce((s: number, x: any) => s + x.sortLifecycle.lifecycleInvariantFailures, 0)}</p>`;
+          &middot; lifecycle invariant failures: ${(report.runs || []).reduce((s: number, x: any) => s + x.sortLifecycle.lifecycleInvariantFailures, 0)}
+          ${report.analysis && report.analysis.closedShare !== undefined ? `<br>no-sort ${num(report.analysis.noSortP95)} / C0 ${num(report.analysis.c0P95)} / best ${report.analysis.bestPollRun ?? '—'} ${num(report.analysis.bestPollP95)} ms &middot; gap ${num(report.analysis.originalGapMs)} closed ${num(report.analysis.closedByPollingMs)} residual ${num(report.analysis.residualGapMs)} ms &middot; C0 spread ${num(report.analysis.c0RepeatabilityMs)} ms` : ''}</p>`;
       }
       tablesEl.innerHTML = html;
     };
@@ -331,6 +336,7 @@
       btn.investigate.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.sweep.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.tail.disabled = !runtime.report.ready || busy || !replay.getFixture();
+      btn.fence.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.stop.disabled = !busy;
       btn.export.disabled = !report;
       btn.copy.disabled = !report;
@@ -386,6 +392,19 @@
       } catch (error: any) {
         lastError = error?.message || String(error);
         console.error('[UIKA GATE4B2B0]', error);
+      }
+      renderStatus();
+    });
+
+    btn.fence.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await tail.runFenceIsolation(tailOptionsFromUrl());
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4B2B1]', error);
       }
       renderStatus();
     });

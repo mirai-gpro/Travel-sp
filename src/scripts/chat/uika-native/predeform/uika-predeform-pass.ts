@@ -64,6 +64,18 @@ export interface UikaPredeformGpuTimer {
  * Gate 4B-2B-0 §4. The fence and the buffer readback live in this pass, so this is where
  * they are timed. Optional and null on every route that does not install a diagnostic.
  */
+/**
+ * Gate 4B-2B-1 §5. How the fence is polled for completion. Diagnostic only — the distance
+ * shader, the fence itself and getBufferSubData are identical in every strategy; only the
+ * scheduling of `clientWaitSync` differs.
+ *
+ *   immediate   setTimeout(checkSync) with no delay — the current behaviour
+ *   frame       at most one poll per rendered frame, driven by pollFenceOnFrame()
+ *   timer8      setTimeout(checkSync, 8)
+ *   timer16     setTimeout(checkSync, 16)
+ */
+export type UikaFencePollStrategy = 'immediate' | 'frame' | 'timer8' | 'timer16';
+
 export interface UikaDistanceLifecycleRecorder {
     fenceWaitStart?(at: number): void;
     fenceWaitEnd?(at: number, polls: number): void;
@@ -202,6 +214,8 @@ export class UikaPredeformPass {
     private layout: UikaPredeformLayout | null = null;
     private gpuTimer: UikaPredeformGpuTimer | null = null;
     private distanceLifecycle: UikaDistanceLifecycleRecorder | null = null;
+    private fencePollStrategy: UikaFencePollStrategy = 'immediate';
+    private framePoll: (() => void) | null = null;
     private dirty = true;
     private stats: UikaPredeformStats = {
         passCount: 0, weightChangeCount: 0, lastPassMs: 0,
@@ -239,6 +253,42 @@ export class UikaPredeformPass {
     /** Gate 4B-2B-0 diagnostic only. */
     setDistanceLifecycleRecorder(recorder: UikaDistanceLifecycleRecorder | null): void {
         this.distanceLifecycle = recorder;
+    }
+
+    /** Gate 4B-2B-1 diagnostic only. 'immediate' is the production behaviour. */
+    setFencePollStrategy(strategy: UikaFencePollStrategy): void {
+        this.fencePollStrategy = strategy;
+    }
+
+    getFencePollStrategy(): UikaFencePollStrategy {
+        return this.fencePollStrategy;
+    }
+
+    /**
+     * Gate 4B-2B-1, 'frame' strategy only: run at most one pending fence poll. The
+     * diagnostic calls this once per rendered frame. A no-op under every other strategy
+     * and whenever no poll is pending.
+     */
+    pollFenceOnFrame(): void {
+        const poll = this.framePoll;
+        if (!poll) return;
+        this.framePoll = null;
+        poll();
+    }
+
+    /**
+     * One sort is in flight at a time (the viewer's sortPending guard), so a single
+     * pending slot is enough. Under 'frame' the callback waits for the next rendered
+     * frame instead of a timer.
+     */
+    private scheduleFencePoll(poll: () => void): void {
+        if (this.fencePollStrategy === 'frame') {
+            this.framePoll = poll;
+            return;
+        }
+        const delay = this.fencePollStrategy === 'timer8' ? 8
+            : this.fencePollStrategy === 'timer16' ? 16 : 0;
+        this.syncTimeout = setTimeout(poll, delay);
     }
 
     resetStats(): void {
@@ -474,7 +524,7 @@ export class UikaPredeformPass {
                     polls++;
                     const status = gl.clientWaitSync(sync!, 0, 0);
                     if (status === gl.TIMEOUT_EXPIRED) {
-                        this.syncTimeout = setTimeout(checkSync);
+                        this.scheduleFencePoll(checkSync);
                         return;
                     }
                     if (status === gl.WAIT_FAILED) fail('clientWaitSync reported WAIT_FAILED');
@@ -493,7 +543,7 @@ export class UikaPredeformPass {
                     this.stats.lastDistanceMs = performance.now() - started;
                     resolve();
                 };
-                this.syncTimeout = setTimeout(checkSync);
+                this.scheduleFencePoll(checkSync);
             });
 
             if (previousProgram && previousProgramDeleted !== true) gl.useProgram(previousProgram);
@@ -505,6 +555,7 @@ export class UikaPredeformPass {
     dispose(): void {
         const gl = this.gl;
         if (this.syncTimeout) { clearTimeout(this.syncTimeout); this.syncTimeout = null; }
+        this.framePoll = null;
         if (gl) {
             if (this.distanceProgram) gl.deleteProgram(this.distanceProgram);
             if (this.distanceVao) gl.deleteVertexArray(this.distanceVao);
