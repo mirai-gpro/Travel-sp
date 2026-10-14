@@ -46,6 +46,19 @@ export interface UikaFrameTiming {
     totalMs: number;
 }
 
+/**
+ * Instrumentation only (Gate 4A). The benchmark owns the GL query objects; the viewer
+ * just marks where the distance/sort submission and the draw submission begin and end.
+ * It changes no rendering behaviour and is null outside the benchmark.
+ */
+export interface UikaGpuTimer {
+    beginSort(): void;
+    endSort(): void;
+    beginDraw(): void;
+    endDraw(): void;
+    frameDone(): void;
+}
+
 export interface UikaGaussianRenderer {
     loadCanonicalPly(ply: Blob): Promise<void>;
     setExpressionBasis(deltas: Float32Array[], basisNames: readonly string[]): UikaBasisLayout;
@@ -132,6 +145,8 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     // A larger depth key from the distance shader means farther from the camera; see
     // uika-native-v1.astro's reported `sortKeyProbe` for the measurement that fixes this.
     private sortFarthestFirst = true;
+    private gpuTimer: UikaGpuTimer | null = null;
+    private sortRuns = 0;
     private sortPending = false;
     private sortDirty = true;
     private lastTiming: UikaFrameTiming = { sortMs: 0, drawMs: 0, totalMs: 0 };
@@ -142,6 +157,16 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         private readonly container: HTMLElement,
         private readonly meta: UikaCameraMeta,
     ) {}
+
+    /** Instrumentation only (Gate 4A): install or clear the GPU timer hooks. */
+    setGpuTimer(timer: UikaGpuTimer | null): void {
+        this.gpuTimer = timer;
+    }
+
+    /** Instrumentation only: how many times the depth sort has actually been submitted. */
+    getSortRuns(): number {
+        return this.sortRuns;
+    }
 
     /** Diagnostic only: the raw depth keys produced by the last GPU distance pass. */
     getDebugDistances(): Float32Array | null {
@@ -158,6 +183,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return {
             splatCount: this.splatCount,
             renderedFrames: this.renderedFrames,
+            sortRuns: this.sortRuns,
             basisCount: this.splatMesh ? this.splatMesh.uikaBasisCount : 0,
             glErrorCount: this.glErrorCount,
             timing: { ...this.lastTiming },
@@ -292,8 +318,12 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
 
         this.sortPending = true;
         this.sortDirty = false;
+        this.sortRuns++;
         const distances = this.distances!;
-        this.splatMesh.computeDistancesOnGPU(this.mvpMatrix, distances)
+        this.gpuTimer?.beginSort();
+        const sortPromise = this.splatMesh.computeDistancesOnGPU(this.mvpMatrix, distances);
+        this.gpuTimer?.endSort();
+        sortPromise
             .then(() => {
                 this.sorter.sort(distances, this.splatCount, this.sortedIndexes!, this.sortFarthestFirst);
                 this.splatMesh.updateRenderIndexes(this.sortedIndexes!, this.splatCount);
@@ -321,7 +351,9 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         const sortMs = performance.now() - sortStarted;
 
         const drawStarted = performance.now();
+        this.gpuTimer?.beginDraw();
         this.renderer.render(this.scene, this.camera);
+        this.gpuTimer?.endDraw();
         const drawMs = performance.now() - drawStarted;
 
         const gl = this.renderer.getContext();
@@ -330,6 +362,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
 
         this.renderedFrames++;
         this.lastTiming = { sortMs, drawMs, totalMs: performance.now() - started };
+        this.gpuTimer?.frameDone();
     }
 
     dispose(): void {

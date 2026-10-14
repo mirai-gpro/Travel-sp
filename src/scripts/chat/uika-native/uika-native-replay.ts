@@ -175,6 +175,9 @@ export interface UikaReplayStats {
     maxFrameJump: number;
     maxHoldMs: number;
     watchedWeights: Record<string, number>;
+    /** Gate 4A instrumentation: CPU cost of each stage, in ms. */
+    selectMs: { count: number; p50: number; p95: number; max: number };
+    mapMs: { count: number; p50: number; p95: number; max: number };
     uploadMs: { count: number; p50: number; p95: number; max: number };
     errors: string[];
 }
@@ -307,6 +310,8 @@ export class UikaNativeReplay {
 
     private lastSelected = -1;
     private lastUploadAt = 0;
+    private readonly selectMsSamples: number[] = [];
+    private readonly mapMsSamples: number[] = [];
     private readonly uploadMs: number[] = [];
     private readonly stats: UikaReplayStats = {
         running: false,
@@ -323,6 +328,8 @@ export class UikaNativeReplay {
         maxFrameJump: 0,
         maxHoldMs: 0,
         watchedWeights: {},
+        selectMs: { count: 0, p50: 0, p95: 0, max: 0 },
+        mapMs: { count: 0, p50: 0, p95: 0, max: 0 },
         uploadMs: { count: 0, p50: 0, p95: 0, max: 0 },
         errors: [],
     };
@@ -356,17 +363,24 @@ export class UikaNativeReplay {
 
     /** Returns a snapshot, so a caller can diff two reads. */
     getStats(): UikaReplayStats {
-        const sorted = [...this.uploadMs].sort((a, b) => a - b);
-        this.stats.running = this.running;
-        this.stats.uploadMs = {
-            count: this.uploadMs.length,
-            p50: percentile(sorted, 0.5),
-            p95: percentile(sorted, 0.95),
-            max: sorted.length ? sorted[sorted.length - 1] : 0,
+        const summarise = (samples: number[]) => {
+            const sorted = [...samples].sort((a, b) => a - b);
+            return {
+                count: samples.length,
+                p50: percentile(sorted, 0.5),
+                p95: percentile(sorted, 0.95),
+                max: sorted.length ? sorted[sorted.length - 1] : 0,
+            };
         };
+        this.stats.running = this.running;
+        this.stats.selectMs = summarise(this.selectMsSamples);
+        this.stats.mapMs = summarise(this.mapMsSamples);
+        this.stats.uploadMs = summarise(this.uploadMs);
         return {
             ...this.stats,
             watchedWeights: { ...this.stats.watchedWeights },
+            selectMs: { ...this.stats.selectMs },
+            mapMs: { ...this.stats.mapMs },
             uploadMs: { ...this.stats.uploadMs },
             errors: [...this.stats.errors],
         };
@@ -500,6 +514,47 @@ export class UikaNativeReplay {
         return this.mapping;
     }
 
+    /**
+     * Visual verification only: map one real fixture frame and push its weights, without
+     * the clock. Needed because the software rasteriser takes seconds per frame, so a
+     * screenshot taken during the replay shows an earlier frame than the weights just
+     * written. The frame and its weights come from the fixture through the production
+     * mapper; nothing is synthesised. This is not part of the replay path.
+     */
+    holdFrame(index: number): { frame: number; weights: number[] } {
+        if (!this.data) fail('load a fixture first');
+        if (this.basisNames.length === 0) fail('bindBasis() has not run');
+        if (!Number.isInteger(index) || index < 0 || index >= this.data.frames.length) {
+            fail(`frame ${index} is outside 0..${this.data.frames.length - 1}`);
+        }
+        this.running = false;
+        const mapped = mapA2eToUikaBasis(
+            { names: this.data.expression_names, values: this.data.frames[index] },
+            this.basisNames,
+        );
+        this.applyWeights(mapped.weights);
+        this.lastSelected = index;
+        return { frame: index, weights: Array.from(mapped.weights) };
+    }
+
+    private recordSelectMs(ms: number): void {
+        this.selectMsSamples.push(ms);
+        if (this.selectMsSamples.length > 4000) this.selectMsSamples.shift();
+    }
+
+    /** Gate 4A: clear the accumulated samples and counters after warm-up. */
+    resetInstrumentation(): void {
+        this.selectMsSamples.length = 0;
+        this.mapMsSamples.length = 0;
+        this.uploadMs.length = 0;
+        this.stats.duplicateFrameRenders = 0;
+        this.stats.skippedExpressionFrames = 0;
+        this.stats.maxFrameJump = 0;
+        this.stats.maxHoldMs = 0;
+        this.stats.mappedFrameCount = 0;
+        this.stats.weightUploadCount = 0;
+    }
+
     start_(): void {
         if (!this.data) fail('load a fixture first');
         if (this.basisNames.length === 0) fail('bindBasis() has not run');
@@ -521,6 +576,7 @@ export class UikaNativeReplay {
     tick(): void {
         if (!this.running || !this.data) return;
 
+        const selectStarted = performance.now();
         const elapsed = performance.now() - this.start;
         const loop = Math.floor(elapsed / this.periodMs);
         const t = elapsed - loop * this.periodMs;
@@ -539,6 +595,7 @@ export class UikaNativeReplay {
         this.stats.selectedFrame = selected;
 
         if (selected === this.lastSelected) {
+            this.recordSelectMs(performance.now() - selectStarted);
             this.stats.duplicateFrameRenders++;
             const held = performance.now() - this.lastUploadAt;
             if (held > this.stats.maxHoldMs) this.stats.maxHoldMs = held;
@@ -555,16 +612,20 @@ export class UikaNativeReplay {
         const values = selected < 0
             ? new Array(this.data.expression_names.length).fill(0)
             : this.data.frames[selected];
+        this.recordSelectMs(performance.now() - selectStarted);
 
-        const t0 = performance.now();
+        const mapStarted = performance.now();
         const mapped = mapA2eToUikaBasis(
             { names: this.data.expression_names, values },
             this.basisNames,
         );
+        const mapDone = performance.now();
         this.applyWeights(mapped.weights);
-        const dt = performance.now() - t0;
+        const uploadDone = performance.now();
 
-        this.uploadMs.push(dt);
+        this.mapMsSamples.push(mapDone - mapStarted);
+        if (this.mapMsSamples.length > 4000) this.mapMsSamples.shift();
+        this.uploadMs.push(uploadDone - mapDone);
         if (this.uploadMs.length > 4000) this.uploadMs.shift();
 
         this.lastSelected = selected;
