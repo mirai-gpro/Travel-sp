@@ -86,7 +86,8 @@ export interface UikaDrawingBufferInfo {
  * -> the CPU counting sort -> the render-index update -> completed.
  */
 export interface UikaSortLifecycleRecorder {
-    requested?(at: number): void;
+    /** A counter only: runSort() is entered even while a sort is in flight. */
+    requested?(): void;
     pendingSkip?(at: number): void;
     submitStart?(at: number): void;
     submitEnd?(at: number): void;
@@ -774,7 +775,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     /** Recompute view depths on the GPU, then order the splats back to front. */
     private runSort(): void {
         if (!this.splatMesh || !this.renderer || !this.camera) return;
-        this.sortLifecycle?.requested?.(performance.now());
+        this.sortLifecycle?.requested?.();
         if (this.sortPending) {
             this.sortLifecycle?.pendingSkip?.(performance.now());
             return;

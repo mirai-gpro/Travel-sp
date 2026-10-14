@@ -2,8 +2,13 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2B-0.
 Route: `/uika-native-predeform-benchmark`, fourth button — **Run DPR1 Tail Isolation**.
-Status: instrumentation delivered and self-tested. The measurement has to be taken on the
-machine with the real GPU, so §6 is PENDING until that run comes back.
+Status: Run A and Run B measured on the real GPU —
+**`SORT_PIPELINE_TAIL_CONFIRMED`**, 46.8% of Run A's exact wall p95 (§10.1). Not
+concluded: that the sort is the sole source, because Run B is still 1.70 ms over target
+(§10.2). One instrumentation bug found and fixed — `totalLifecycleMs` timed the latest
+sort *request* instead of the submitted sort, so that one field from the earlier run is
+void and nothing else is (§10.3, §10.4). Runs C and D now always execute; the stage
+isolation is PENDING (§10.7).
 
 ---
 
@@ -202,9 +207,9 @@ scene.
 Shares are taken against Run A's exact wall p95, each step removing exactly one stage:
 
 ```text
-A -> B   the whole sort            sortShareOfP95
-A -> D   the render-index update   indexUpdateShareOfP95
-D -> C   the CPU counting sort     cpuSortShareOfP95
+A -> B   the whole sort                sortShareOfP95
+A -> D   the render-index update       indexUpdateShareOfP95
+D -> C   the CPU counting sort         cpuSortShareOfP95
 C -> B   distance + fence + readback   readbackShareOfP95
 ```
 
@@ -214,9 +219,15 @@ sort share >= 0.3, C and D not run                SORT_PIPELINE_TAIL_CONFIRMED
 one stage >= 0.5 and >= 2x the next                READBACK_SYNC_DOMINANT
                                                    CPU_DEPTH_SORT_DOMINANT
                                                    INDEX_UPDATE_DOMINANT
-otherwise                                          MIXED_SORT_COMPLETION
+otherwise, no residual tail                        MIXED_SORT_COMPLETION
+otherwise, Run B still above target                SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL
 Run A or B produced no valid sample                UNRESOLVED
 ```
+
+`sortPipelineTailConfirmed`, `residualTailAboveTargetMs` and `sortIsSoleSourceOfTail` are
+reported as their own fields, so the confirmed finding cannot be lost in the wording of a
+later run's classification, and `sortIsSoleSourceOfTail` is never asserted true while a
+residual tail remains.
 
 The 0.3, 0.5 and 2x figures are decision rules chosen for this gate, not measured
 quantities. Nothing outside the measured stages is named as a cause.
@@ -237,24 +248,127 @@ do not render a valid result.
 
 ---
 
-## 10. Results — PENDING (real GPU)
+## 10. Results
+
+### 10.1 Run A and Run B — real GPU (valid)
 
 ```text
-GPU / browser / drawingBuffer                                      PENDING
+Run A  normal            effectiveFPS 42.63    exact wall p95 65.80 ms
+Run B  sort suspended    effectiveFPS 46.10    exact wall p95 35.00 ms
 
-Run A  fps, exact p50/p90/p95/p99/max, polled p95                  PENDING
-Run B  the same                                                    PENDING
-Run C  the same                                                    PENDING
-Run D  the same                                                    PENDING
+p95 improvement          30.80 ms
+share of Run A's p95     46.8 %
 
-sort lifecycle per run  submit / fence / readback / cpu sort /
-                        index update / total, each p50-p95-p99      PENDING
-sort counters           requested / submitted / completed / skipped PENDING
-pending duration        p50 / p95 / p99 / max                       PENDING
-frame correlation       with vs without sort completion             PENDING
-GL errors / page errors / visibilityLostMs                          PENDING
+CLASSIFICATION = SORT_PIPELINE_TAIL_CONFIRMED
+```
 
-CLASSIFICATION                                                      PENDING
+The sort pipeline is a major contributor to the tail. That finding stands and is not
+retracted by anything below; the report carries it as its own field,
+`sortPipelineTailConfirmed`.
+
+Arithmetic on those figures: 42.63 fps is 23.46 ms per frame, so Run A's p95 is 2.80x its
+own mean, and removing the sort takes 30.80 ms of that away.
+
+### 10.2 What is NOT concluded (§11)
+
+```text
+Run B exact wall p95        35.00 ms
+target                      33.3 ms
+residual above target        1.70 ms
+```
+
+With no sort at all the p95 is still 1.70 ms over. So **"the sort is the sole source of
+the tail" is not concluded**, and neither is "fixing the sort necessarily passes the
+gate". The report states this as `residualTailAboveTargetMs` and
+`sortIsSoleSourceOfTail: false`, and the classification
+`SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL` exists for exactly this shape of result.
+A 30.80 ms improvement still makes the sort pipeline the first thing to investigate.
+
+### 10.3 `totalLifecycleMs` was mis-instrumented (§1 - §3)
+
+```text
+fenceWait        p50 100.2 ms
+totalLifecycle   p50   2.9 ms
+```
+
+Those cannot both describe one lifecycle: the fence wait happens inside it. The cause was
+in the collector:
+
+```ts
+requested(at) { ...; this.lifecycleStartedAt = at; }   // wrong
+```
+
+`runSort()` is entered on every frame whose weights changed, including while a sort is
+still in flight — in that run, 4 requests for 2 submissions with 2 pending skips per
+window. Each of those later requests overwrote `lifecycleStartedAt`, so by the time the
+submitted sort completed the field pointed at the most recent *request*.
+`totalLifecycleMs` therefore measured "latest sort request -> completion", not
+"submitted sort -> completion".
+
+Fixed: the lifecycle starts in `submitStart()`, with the sort that is actually submitted;
+`requested()` is a counter and writes no timestamp; `pendingSkip()` writes none either.
+
+An invariant now guards it. For each completed sort, if
+
+```text
+totalLifecycle + 0.5 ms < fenceWait
+```
+
+the sample is counted in `lifecycleInvariantFailures` — which must be 0 — and the first 16
+offending pairs are listed in `lifecycleInvariantDetails`. The 0.5 ms epsilon covers timer
+granularity and the submit boundary and is a decision rule, not a measurement.
+
+### 10.4 Which of the earlier results survive (§4)
+
+Valid, and kept:
+
+```text
+Run A / Run B exact frame intervals
+effectiveFPS
+sort requested / submitted / completed / pendingSkip
+frame-to-sort-completion correlation
+the individual readback / cpuSort / indexUpdate timings
+SORT_PIPELINE_TAIL_CONFIRMED
+```
+
+Void, and only this:
+
+```text
+totalLifecycleMs
+```
+
+The rest of the run is not invalidated.
+
+### 10.5 How fenceWaitMs is read (§10)
+
+`fenceWaitMs` is wall-clock elapsed from the fence being created after `drawArrays` to the
+poll that finds it signalled. The polling is asynchronous `setTimeout`, so this is **not**
+main-thread blocking time and is not reported as such. What it does say, as arithmetic: at
+42.63 fps a 100.2 ms p50 fence wait spans about 4.27 rendered frames, which is consistent
+with the sort completing several frames after it was submitted and with the pending-skip
+count. How much of it lands on the wall interval is what Run C measures — that is the
+question, not the assumption.
+
+### 10.6 Runs C and D now always execute (§5)
+
+The earlier build ran C and D only when Run B had brought the p95 inside the target, which
+on the real GPU it did not (35.00 ms against 33.3 ms) — so the stage split, which is the
+point of the gate, would have been skipped. C and D now run by default; `?cd=0` skips them.
+
+```text
+B -> C   distance + fence + readback contribution
+C -> D   CPU DepthSorter contribution
+D -> A   updateRenderIndexes / full-completion contribution
+```
+
+### 10.7 Stage isolation — PENDING (real GPU)
+
+```text
+Run C  exact wall p95, fence wait, readback, total lifecycle        PENDING
+Run D  exact wall p95, cpu sort, total lifecycle                    PENDING
+B -> C / C -> D / D -> A shares                                      PENDING
+lifecycleInvariantFailures (must be 0)                               PENDING
+CLASSIFICATION                                                       PENDING
 ```
 
 Nothing above is estimated or extrapolated.
@@ -272,8 +386,9 @@ Nothing above is estimated or extrapolated.
 5. When it finishes, click Export JSON.
 ```
 
-Two runs of 36 s if Run B does not clear the tail, four if it does — about 2.5 minutes at
-most. The page switches to pixelRatio 1.0 itself and restores everything afterwards.
+Four runs of 36 s, about 2.5 minutes. The page switches to pixelRatio 1.0 itself and
+restores everything afterwards. Use `?cd=1` (or nothing — C and D are the default now) for
+all four; `?cd=0` runs only A and B.
 
 ---
 
@@ -330,6 +445,32 @@ noise), and the report says so in `classificationBasis` instead of treating a ne
 share as a stage cost; `SORT_PIPELINE_NOT_PRIMARY` was returned because the sort share is
 below the 0.3 rule, and the `>= 0.5` guard means a negative share can never be named
 dominant.
+
+---
+
+### 12.1 Self-test of the 0.1 fix
+
+`?allowSoftware=1&warmupMs=3000&measureMs=12000` on this container, with C and D now
+running by default.
+
+```text
+all four runs executed            A, B, C, D
+lifecycleInvariantFailures        0 in every run
+totalLifecycle >= fenceWait       holds in every run that has samples
+  A   total p50 3947.4 ms   fence p50 3911.0 ms
+  C   total p50 3692.2 ms   fence p50 3691.8 ms
+  D   total p50 136435.8 ms fence p50 136435.6 ms
+B   fence 0 samples, total 0 samples, 0 submitted, 0 completed — the truncation holds
+frameRecords                      populated in all four runs
+GL errors 0, pageErrors 0, pageerror events 0, finishedAt set
+```
+
+Before the fix the same shape of run produced a total *below* the fence wait; now the
+total brackets it in every case, which is the invariant §3 asks for. The absolute values
+are SwiftShader's and are not evidence — Run D's 136 s fence is a fence on a starved
+software rasteriser, and it is reported as measured rather than filtered, because
+`fenceWaitMs` is wall-clock elapsed across asynchronous polls and a long one is a fact
+about this renderer, not an invalid sample.
 
 ---
 
