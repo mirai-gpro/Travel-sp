@@ -29,6 +29,12 @@ import {
 } from './uika-native-benchmark';
 import { UikaPredeformPass } from './predeform/uika-predeform-pass';
 
+/**
+ * §3: how far below the fence wait a lifecycle total may fall before it is recorded as an
+ * instrumentation error rather than a measurement. A decision rule for this gate.
+ */
+export const LIFECYCLE_INVARIANT_EPSILON_MS = 0.5;
+
 /** §11: the target is unchanged; only the instrument is new. */
 export const TAIL_TARGET = { minFps: 30, maxExactWallP95Ms: 33.3 } as const;
 
@@ -109,6 +115,9 @@ export interface UikaTailRun {
         indexUpdateMs: UikaStageStats;
         totalLifecycleMs: UikaStageStats;
         fencePolls: UikaStageStats;
+        /** §3: must be 0. Non-zero means the lifecycle timing is wrong, not the GPU slow. */
+        lifecycleInvariantFailures: number;
+        lifecycleInvariantDetails: Array<{ totalMs: number; fenceMs: number }>;
     };
     /** §5: how often a sort was wanted, started, finished, or could not start. */
     sortCounters: {
@@ -151,6 +160,11 @@ export type UikaTailClassification =
     | 'CPU_DEPTH_SORT_DOMINANT'
     | 'INDEX_UPDATE_DOMINANT'
     | 'MIXED_SORT_COMPLETION'
+    /**
+     * §9 / §11: the sort pipeline carries the tail, and removing it entirely still leaves
+     * the exact wall p95 above the target — so fixing the sort is not by itself a pass.
+     */
+    | 'SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL'
     | 'UNRESOLVED';
 
 export interface UikaTailReport {
@@ -173,6 +187,16 @@ export interface UikaTailReport {
         indexUpdateShareOfP95: number | null;
     } | null;
     classification: UikaTailClassification;
+    /**
+     * Reported separately from `classification` so the finding already established on the
+     * real GPU is never retracted by a later run's wording: the sort pipeline is a major
+     * contributor to the tail (46.8% of Run A's p95 measured).
+     */
+    sortPipelineTailConfirmed: boolean | null;
+    /** How far Run B's p95 still sits above the target. Positive means a residual tail. */
+    residualTailAboveTargetMs: number | null;
+    /** Never asserted true: Run B above the target means the sort is not the sole source. */
+    sortIsSoleSourceOfTail: boolean | null;
     classificationBasis: string[];
     notes: string[];
 }
@@ -180,7 +204,12 @@ export interface UikaTailReport {
 export interface UikaTailOptions {
     warmupMs: number;
     measureMs: number;
-    /** null = run C and D only when Run B removed the tail. */
+    /**
+     * §5: C and D now run by default. The earlier "only when Run B cleared the target"
+     * rule would have skipped them on the real-GPU run, where Run B landed at 35.00 ms
+     * against a 33.3 ms target — and the stage split is what the gate is for. `?cd=0`
+     * still skips them.
+     */
     forceCD: boolean | null;
     allowSoftware: boolean;
     maxFrameRecords: number;
@@ -240,9 +269,17 @@ class LifecycleCollector {
     indexUpdateSinceFrame = false;
     sortCompletedSinceFrame = false;
 
+    /**
+     * §3: an instrumentation invariant. The fence wait happens inside the lifecycle, so
+     * a total below it means the lifecycle was mis-timed, not that the GPU was fast.
+     */
+    lifecycleInvariantFailures = 0;
+    readonly lifecycleInvariantDetails: Array<{ totalMs: number; fenceMs: number }> = [];
+
     private collecting = false;
     private submitStartedAt = 0;
     private lifecycleStartedAt = 0;
+    private currentFenceWaitMs: number | null = null;
     private fenceStartedAt = 0;
     private readbackStartedAt = 0;
     private cpuSortStartedAt = 0;
@@ -252,18 +289,28 @@ class LifecycleCollector {
     setCollecting(on: boolean): void { this.collecting = on; }
 
     // --- viewer side -----------------------------------------------------
-    requested(at: number): void {
+    /**
+     * §1 / §2: a counter and nothing else. runSort() is entered on every frame whose
+     * weights changed, including while a sort is still in flight, so writing a lifecycle
+     * timestamp here made `totalLifecycleMs` measure "latest request -> completion"
+     * instead of "submitted sort -> completion". That is what produced a total of 2.9 ms
+     * p50 alongside a 100.2 ms p50 fence wait, which cannot both describe one lifecycle.
+     */
+    requested(): void {
         if (this.collecting) this.sortRequestedCount++;
-        this.lifecycleStartedAt = at;
     }
+    /** Counts, and measures how long the in-flight sort had been pending. Never a start. */
     pendingSkip(at: number): void {
         if (!this.collecting) return;
         this.sortPendingSkipCount++;
         if (this.pendingSince !== null) this.pendingDurationMs.push(at - this.pendingSince);
     }
     submitStart(at: number): void {
+        // The lifecycle starts here, with the sort that is actually submitted.
+        this.lifecycleStartedAt = at;
         this.submitStartedAt = at;
         this.pendingSince = at;
+        this.currentFenceWaitMs = null;
         if (this.collecting) this.sortSubmittedCount++;
     }
     submitEnd(at: number): void {
@@ -285,16 +332,29 @@ class LifecycleCollector {
         this.pendingSince = null;
         if (!this.collecting) return;
         this.sortCompletedCount++;
-        this.totalLifecycleMs.push(at - this.lifecycleStartedAt);
+        const total = at - this.lifecycleStartedAt;
+        this.totalLifecycleMs.push(total);
+        // §3: the fence wait is contained in the lifecycle. EPSILON covers the timer
+        // granularity and the submit/CPU boundaries; it is a decision rule, not a measurement.
+        if (this.currentFenceWaitMs !== null
+            && total + LIFECYCLE_INVARIANT_EPSILON_MS < this.currentFenceWaitMs) {
+            this.lifecycleInvariantFailures++;
+            if (this.lifecycleInvariantDetails.length < 16) {
+                this.lifecycleInvariantDetails.push({ totalMs: total, fenceMs: this.currentFenceWaitMs });
+            }
+        }
+        this.currentFenceWaitMs = null;
         this.sortCompletedSinceFrame = true;
     }
-    failed(): void { this.pendingSince = null; }
+    failed(): void { this.pendingSince = null; this.currentFenceWaitMs = null; }
 
     // --- pass side -------------------------------------------------------
     fenceWaitStart(at: number): void { this.fenceStartedAt = at; }
     fenceWaitEnd(at: number, polls: number): void {
+        const elapsed = at - this.fenceStartedAt;
+        this.currentFenceWaitMs = elapsed;
         if (!this.collecting) return;
-        this.fenceWaitMs.push(at - this.fenceStartedAt);
+        this.fenceWaitMs.push(elapsed);
         this.fencePolls.push(polls);
     }
     readbackStart(at: number): void { this.readbackStartedAt = at; }
@@ -354,6 +414,9 @@ export class UikaTailIsolation {
             runs: [],
             analysis: null,
             classification: 'UNRESOLVED',
+            sortPipelineTailConfirmed: null,
+            residualTailAboveTargetMs: null,
+            sortIsSoleSourceOfTail: null,
             classificationBasis: [],
             notes: [
                 'pixelRatio 1.0, pre-deformed, real A2E only; full DPR is not re-measured '
@@ -361,6 +424,11 @@ export class UikaTailIsolation {
                 'Runs B, C and D are diagnostic truncations of the sort pipeline and are not '
                 + 'valid for any visual or correctness judgement',
                 'measurement only: no algorithm, threading, frequency or upload change',
+                'fenceWaitMs is wall-clock elapsed across asynchronous setTimeout polls. It is '
+                + 'NOT main-thread blocking time, and it is not read as such: how much of it '
+                + 'lands on the wall interval is what Run C measures',
+                'totalLifecycleMs is measured from the SUBMITTED sort, not from the latest '
+                + 'request; the earlier build timed the latter and its totalLifecycleMs is void',
             ],
         };
         const r = this.report;
@@ -391,20 +459,14 @@ export class UikaTailIsolation {
             r.runs.push(await this.measureRun('A-normal', 'full', false, options));
             if (!this.abort) r.runs.push(await this.measureRun('B-sort-suspended', 'full', true, options));
 
-            const a = r.runs.find((x) => x.name === 'A-normal');
-            const b = r.runs.find((x) => x.name === 'B-sort-suspended');
-            const tailRemoved = !!a && !!b && a.exactFrameInterval.p95 > 0
-                && b.exactFrameInterval.p95 <= TAIL_TARGET.maxExactWallP95Ms;
-            const runCD = options.forceCD ?? tailRemoved;
+            const runCD = options.forceCD ?? true;
             if (runCD && !this.abort) {
                 r.runs.push(await this.measureRun('C-distance-readback-only', 'distance', false, options));
                 if (!this.abort) {
                     r.runs.push(await this.measureRun('D-distance-plus-cpu-sort', 'distance+cpuSort', false, options));
                 }
-            } else if (!runCD) {
-                r.notes.push('Runs C and D were not executed: Run B did not bring the exact wall '
-                    + 'p95 inside the target, so the stall is not localised to the post-distance '
-                    + 'stages that C and D separate');
+            } else {
+                r.notes.push('Runs C and D were skipped by request (?cd=0)');
             }
 
             r.analysis = this.analyse();
@@ -452,7 +514,7 @@ export class UikaTailIsolation {
 
         const collector = new LifecycleCollector();
         viewer.setSortLifecycleRecorder({
-            requested: (at: number) => collector.requested(at),
+            requested: () => collector.requested(),
             pendingSkip: (at: number) => collector.pendingSkip(at),
             submitStart: (at: number) => collector.submitStart(at),
             submitEnd: (at: number) => collector.submitEnd(at),
@@ -628,6 +690,8 @@ export class UikaTailIsolation {
                 indexUpdateMs: summariseStage(collector.indexUpdateMs),
                 totalLifecycleMs: summariseStage(collector.totalLifecycleMs),
                 fencePolls: summariseStage(collector.fencePolls),
+                lifecycleInvariantFailures: collector.lifecycleInvariantFailures,
+                lifecycleInvariantDetails: collector.lifecycleInvariantDetails.slice(),
             },
             sortCounters: {
                 sortRequestedCount: collector.sortRequestedCount,
@@ -767,7 +831,25 @@ export class UikaTailIsolation {
             }
         }
 
+        // §11: how much of the tail survives with no sort at all.
+        const residual = a.suspendedExactP95 - TAIL_TARGET.maxExactWallP95Ms;
+        r.residualTailAboveTargetMs = residual;
         const sortShare = a.sortShareOfP95;
+        r.sortPipelineTailConfirmed = sortShare !== null ? sortShare >= 0.3 : null;
+        r.sortIsSoleSourceOfTail = residual > 0 ? false : null;
+        if (residual > 0) {
+            basis.push(`with no sort at all the exact wall p95 is still ${residual.toFixed(2)} ms `
+                + `above the ${TAIL_TARGET.maxExactWallP95Ms} ms target, so the sort is not the `
+                + 'sole source of the tail and fixing it is not by itself a pass');
+        }
+
+        const invariantFailures = r.runs.reduce(
+            (sum, x) => sum + x.sortLifecycle.lifecycleInvariantFailures, 0);
+        if (invariantFailures > 0) {
+            basis.push(`${invariantFailures} lifecycle invariant failures (total below the fence `
+                + 'wait): the lifecycle timing in this run is not trustworthy');
+        }
+
         if (sortShare === null || sortShare < 0.3) {
             r.classification = 'SORT_PIPELINE_NOT_PRIMARY';
             basis.push('removing the sort entirely leaves most of the p95 in place');
@@ -779,7 +861,9 @@ export class UikaTailIsolation {
             ];
             const measured = stages.filter(([, v]) => v !== null) as Array<[UikaTailClassification, number]>;
             if (measured.length === 0) {
-                r.classification = 'SORT_PIPELINE_TAIL_CONFIRMED';
+                r.classification = residual > 0
+                    ? 'SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL'
+                    : 'SORT_PIPELINE_TAIL_CONFIRMED';
                 basis.push('the sort pipeline carries the tail, but Runs C and D were not '
                     + 'executed so the stage inside it is not separated');
             } else {
@@ -789,6 +873,10 @@ export class UikaTailIsolation {
                 if (topValue >= 0.5 && topValue >= second * 2) {
                     r.classification = topName;
                     basis.push(`${topName} accounts for ${(topValue * 100).toFixed(1)}% of Run A's p95`);
+                } else if (residual > 0) {
+                    r.classification = 'SORT_PIPELINE_TAIL_CONFIRMED_BUT_RESIDUAL_TAIL';
+                    basis.push('no single stage of the sort completion accounts for the tail on '
+                        + 'its own, and a residual tail remains with the sort removed');
                 } else {
                     r.classification = 'MIXED_SORT_COMPLETION';
                     basis.push('no single stage of the sort completion accounts for the tail on '

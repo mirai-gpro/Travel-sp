@@ -289,7 +289,8 @@
         html += `<table>
           <tr><th>tail run</th><th>buffer</th><th>fps</th><th>exact p50</th><th>exact p95</th>
               <th>exact p99</th><th>polled p95</th><th>fence p95</th><th>readback p95</th>
-              <th>cpu sort p95</th><th>index p95</th><th>req/sub/done/skip</th><th>valid</th></tr>
+              <th>cpu sort p95</th><th>index p95</th><th>total p95</th><th>inv fail</th>
+              <th>req/sub/done/skip</th><th>valid</th></tr>
           ${report.runs.map((x: any) => `<tr>
             <td>${x.name}</td>
             <td>${x.buffer.drawingBufferWidth}×${x.buffer.drawingBufferHeight}</td>
@@ -302,11 +303,16 @@
             <td>${num(x.sortLifecycle.readbackMs.p95)}</td>
             <td>${num(x.sortLifecycle.cpuSortMs.p95)}</td>
             <td>${num(x.sortLifecycle.indexUpdateMs.p95)}</td>
+            <td>${num(x.sortLifecycle.totalLifecycleMs.p95)}</td>
+            <td class="${x.sortLifecycle.lifecycleInvariantFailures === 0 ? 'ok' : 'bad'}">${x.sortLifecycle.lifecycleInvariantFailures}</td>
             <td>${x.sortCounters.sortRequestedCount}/${x.sortCounters.sortSubmittedCount}/${x.sortCounters.sortCompletedCount}/${x.sortCounters.sortPendingSkipCount}</td>
             <td class="${x.valid ? 'ok' : 'bad'}">${x.valid ? 'yes' : 'no'}</td>
           </tr>`).join('')}
         </table>
-        <p class="note">classification: <b>${report.classification}</b></p>`;
+        <p class="note">classification: <b>${report.classification}</b>
+          &middot; sort pipeline tail confirmed: ${report.sortPipelineTailConfirmed === null ? '—' : (report.sortPipelineTailConfirmed ? 'yes' : 'no')}
+          &middot; residual above target: ${num(report.residualTailAboveTargetMs)} ms
+          &middot; lifecycle invariant failures: ${(report.runs || []).reduce((s: number, x: any) => s + x.sortLifecycle.lifecycleInvariantFailures, 0)}</p>`;
       }
       tablesEl.innerHTML = html;
     };
