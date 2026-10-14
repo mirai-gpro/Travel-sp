@@ -20,6 +20,13 @@ import { collectGpuInfo, type UikaGpuInfo } from './uika-native-benchmark';
 import { UikaPredeformPass } from './predeform/uika-predeform-pass';
 import { UikaCenterProbe, type UikaCenterProbeRoute } from './predeform/uika-center-probe';
 
+/**
+ * The existing correctness bound on an animated-centre component, unchanged by this
+ * investigation (Gate 4B-2A §8). Classification uses this absolute bound, never a ULP
+ * count.
+ */
+export const NUMERIC_BOUND = 1e-6;
+
 export const INVESTIGATION_FRAMES = [20, 63, 132];
 export const DEFAULT_REPEATS = 20;
 
@@ -88,7 +95,15 @@ export interface UikaCenterDiff
     maxAbsXYZIndex: number;
     differentComponents: number;
     bitExactComponents: number;
+    /**
+     * Diagnostic only. A ULP distance is NOT a severity measure: close to zero a large
+     * ULP count can accompany a vanishing absolute difference (two values either side of
+     * zero are far apart in ordered-integer space and almost equal in value). The gate
+     * therefore classifies on absolute difference, never on this.
+     */
     maxUlpDifference: number;
+    /** The absolute difference at the component where the ULP distance was largest. */
+    absAtMaxUlp: number;
     /** ULP distance -> component count. '0', '1', '2', '3', '4', '>4'. */
     ulpHistogram: Record<string, number>;
     nonFinite: number;
@@ -151,6 +166,110 @@ export function investigationOptionsFromUrl(): UikaInvestigationOptions {
     return o;
 }
 
+
+// ---------------------------------------------------------------------------
+// Full-fixture sweep (Gate 4B-2A §5 - §8)
+// ---------------------------------------------------------------------------
+
+export interface UikaSweepFrame {
+    frame: number;
+    nonZeroWeights: number;
+    center: {
+        maxAbsX: number;
+        maxAbsY: number;
+        maxAbsZ: number;
+        maxAbsXYZ: number;
+        meanAbsXYZ: number;
+        maxAbsXYZIndex: number;
+        differentComponents: number;
+        bitExactComponents: number;
+        nonFinite: number;
+        /** Diagnostic only; never used to judge severity. */
+        maxUlpDifference: number;
+        absAtMaxUlp: number;
+        ulpHistogram: Record<string, number>;
+    };
+    /** The existing correctness bound: pre-deformed centres against the CPU reference. */
+    centerVsCpuMaxAbs: number;
+    distance: { maxAbsDifference: number };
+    framebuffer: {
+        differentPixels: number;
+        differentPixelRatio: number;
+        rDifferingCount: number;
+        gDifferingCount: number;
+        bDifferingCount: number;
+        aDifferingCount: number;
+        maxRgbaByteDelta: number;
+        sumAbsoluteDifference: number;
+        alphaPlaneIdentical: boolean;
+        productionHash: string;
+        predeformHash: string;
+        pixelIdentical: boolean;
+    };
+    withinNumericBound: boolean;
+}
+
+export interface UikaSweepReport {
+    spec: 'UIKA Native Runtime v1.1 Gate 4B-2A full fixture sweep';
+    startedAt: string;
+    finishedAt: string | null;
+    gpu: UikaGpuInfo;
+    realGpu: boolean;
+    fixture: unknown;
+    buffer: { width: number; height: number; pixelRatio: number };
+    numericBound: number;
+    centerRoute: UikaCenterProbeRoute;
+    frames: UikaSweepFrame[];
+    summary: {
+        framesCompared: number;
+        framesPixelIdentical: number;
+        framesWithPixelDifference: number;
+        worstDifferentPixels: { value: number; frame: number };
+        worstDifferentPixelRatio: { value: number; frame: number };
+        worstMaxByteDelta: { value: number; frame: number };
+        worstCenterMaxAbs: { value: number; frame: number };
+        worstCenterMeanAbs: { value: number; frame: number };
+        worstDistanceMaxAbs: { value: number; frame: number };
+        worstCenterVsCpuMaxAbs: { value: number; frame: number };
+        /** Diagnostic only. */
+        worstMaxUlp: { value: number; frame: number; absAtThatComponent: number };
+        framesWithAlphaDifference: number[];
+        framesWithNonFinite: number[];
+        framesOutsideNumericBound: number[];
+        allWithinNumericBound: boolean;
+    } | null;
+    /**
+     * The harness never turns a FAIL into a PASS. Acceptance is still pixel-identical and
+     * only a human decision changes it (Gate 4B-2A §9).
+     */
+    acceptance: {
+        rule: 'pixel-identical';
+        ruleChangedByThisRun: false;
+        correctnessUnderCurrentRule: 'PASS' | 'FAIL';
+        note: string;
+    } | null;
+    notes: string[];
+}
+
+export interface UikaSweepOptions {
+    /** Which frames to sweep. The default is the whole fixture. */
+    frames: number[] | null;
+}
+
+/** `?sweepFrames=0,1,2` for a quick driver check; absent means the whole fixture. */
+export function sweepOptionsFromUrl(): UikaSweepOptions {
+    const o: UikaSweepOptions = { frames: null };
+    try {
+        const q = new URLSearchParams(window.location.search);
+        const raw = q.get('sweepFrames');
+        if (raw !== null) {
+            const frames = raw.split(',').map(Number).filter((v) => Number.isInteger(v) && v >= 0);
+            if (frames.length > 0) o.frames = frames;
+        }
+    } catch { /* noop */ }
+    return o;
+}
+
 /** Ordered integer form of a float32, so that a difference of 1 means one ULP. */
 function orderedBits(view: Int32Array, index: number): number {
     const bits = view[index];
@@ -159,6 +278,7 @@ function orderedBits(view: Int32Array, index: number): number {
 
 export class UikaPredeformInvestigation {
     private report: UikaInvestigationReport | null = null;
+    private sweepReport: UikaSweepReport | null = null;
     private pass: UikaPredeformPass | null = null;
     private probe: UikaCenterProbe | null = null;
     private running = false;
@@ -172,6 +292,7 @@ export class UikaPredeformInvestigation {
 
     getLive() { return { ...this.live }; }
     getReport(): UikaInvestigationReport | null { return this.report; }
+    getSweepReport(): UikaSweepReport | null { return this.sweepReport; }
     isRunning(): boolean { return this.running; }
     stop(): void { this.abort = true; }
 
@@ -293,6 +414,14 @@ export class UikaPredeformInvestigation {
             window.clearTimeout(timer);
             viewer.clearPendingDrawingBufferHash?.();
         }
+    }
+
+    /** The same product the viewer's sort builds: projection * view * mesh world. */
+    private mvpFrom(handles: any): any {
+        const m = handles.camera.projectionMatrix.clone();
+        m.multiply(handles.camera.matrixWorld.clone().invert());
+        m.multiply(handles.splatMesh.matrixWorld);
+        return m;
     }
 
     private async investigateFrame(
@@ -502,6 +631,7 @@ export class UikaPredeformInvestigation {
         let different = 0;
         let bitExact = 0;
         let maxUlp = 0;
+        let absAtMaxUlp = 0;
         let nonFinite = 0;
         const ulpHistogram: Record<string, number> = { '0': 0, '1': 0, '2': 0, '3': 0, '4': 0, '>4': 0 };
 
@@ -521,7 +651,7 @@ export class UikaPredeformInvestigation {
             }
             different++;
             const ulp = Math.abs(orderedBits(leftBits, i) - orderedBits(rightBits, i));
-            if (ulp > maxUlp) maxUlp = ulp;
+            if (ulp > maxUlp) { maxUlp = ulp; absAtMaxUlp = d; }
             ulpHistogram[ulp <= 4 ? String(ulp) : '>4']++;
         }
 
@@ -538,9 +668,264 @@ export class UikaPredeformInvestigation {
             differentComponents: different,
             bitExactComponents: bitExact,
             maxUlpDifference: maxUlp,
+            absAtMaxUlp,
             ulpHistogram,
             nonFinite,
         };
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Full-fixture sweep (Gate 4B-2A §5 - §8)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Every frame of the fixture, once each: production against pre-deformed, same camera,
+     * same resolution, sort suspended, one draw order. No repeats, because Diagnostic A
+     * already showed both modes stable 20/20 on the real GPU.
+     *
+     * It measures only. It never changes the acceptance rule and never reports PASS.
+     */
+    async runSweep(options: UikaSweepOptions = { frames: null }): Promise<UikaSweepReport> {
+        if (this.running) throw new Error('UIKA Gate 4B-2A sweep: already running');
+        this.running = true;
+        this.abort = false;
+
+        const viewer = this.viewer();
+        const gpu = collectGpuInfo(viewer?.renderer?.domElement ?? null);
+        const fixture: any = this.replay.getFixture();
+        const frameCount: number = fixture?.frameCount ?? 0;
+        const frames = options.frames ?? Array.from({ length: frameCount }, (_, i) => i);
+
+        const bufferInfo = viewer.getDrawingBufferInfo();
+        const route: UikaCenterProbeRoute = 'production-attribute';
+        const sweep: UikaSweepReport = {
+            spec: 'UIKA Native Runtime v1.1 Gate 4B-2A full fixture sweep',
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            gpu,
+            realGpu: !gpu.isSoftware && gpu.unmaskedAvailable,
+            fixture,
+            buffer: {
+                width: bufferInfo.drawingBufferWidth,
+                height: bufferInfo.drawingBufferHeight,
+                pixelRatio: bufferInfo.rendererPixelRatio,
+            },
+            numericBound: NUMERIC_BOUND,
+            centerRoute: route,
+            frames: [],
+            summary: null,
+            acceptance: null,
+            notes: [
+                'one comparison per frame, no repeats: Diagnostic A measured both modes stable '
+                + '20/20 on the real GPU',
+                'ULP distances are recorded as a diagnostic and are not used to judge severity',
+            ],
+        };
+        this.sweepReport = sweep;
+
+        try {
+            const handles = viewer.getPoCHandles();
+            if (!handles) throw new Error('the viewer has no renderer or splat mesh yet');
+            if (frames.length === 0) throw new Error('the fixture reports no frames');
+
+            this.pass = new UikaPredeformPass();
+            const layout = this.pass.init(handles);
+            this.probe = new UikaCenterProbe(handles.renderer, handles.splatMesh);
+            viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
+            viewer.setExpressionWeightHook(() => { this.pass?.markDirty(); });
+
+            this.replay.stop();
+            this.runtime.setExpressionSource(null);
+            viewer.setDrawingBufferScale(1);
+            viewer.setSortSuspended(true);
+
+            const asset = this.runtime.getAsset()!;
+            const { applyUikaBasisWeightsCpu } = await import('./uika-deformation');
+            const gaussianCount = handles.splatMesh.getSplatCount();
+            const productionDistances = new Float32Array(gaussianCount);
+            const predeformDistances = new Float32Array(gaussianCount);
+            const predeformCenters = new Float32Array(gaussianCount * 3);
+
+            this.live.phase = 'sweep';
+            for (let i = 0; i < frames.length; i++) {
+                if (this.abort) break;
+                const frame = frames[i];
+                this.live.frame = frame;
+                this.live.repeat = i + 1;
+                this.live.step = `frame ${frame} (${i + 1}/${frames.length})`;
+
+                const held = this.replay.holdFrame(frame);
+                const weights = new Float32Array(held.weights);
+
+                // --- production ------------------------------------------------
+                viewer.setPredeformCenterTexture(null, 0, 0);
+                viewer.setDistanceProvider(null);
+                this.runtime.applyWeights(weights);
+                this.pass!.markDirty();
+                const productionFrame = await this.nextFramePixels();
+                const mvp = this.mvp(handles);
+                await handles.splatMesh.computeDistancesOnGPU(mvp, productionDistances);
+                const productionCenters = this.probe!.read(route);
+
+                // --- pre-deformed ----------------------------------------------
+                this.pass!.run();
+                await this.pass!.computeDistances(mvp, predeformDistances);
+                viewer.setPredeformCenterTexture(this.pass!.getTexture(),
+                                                 layout.textureWidth, layout.textureHeight);
+                viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+                const predeformFrame = await this.nextFramePixels();
+
+                const texture = this.pass!.readAnimatedCenters();
+                for (let g = 0; g < gaussianCount; g++) {
+                    const t = (Math.floor(g / layout.textureWidth) * layout.textureWidth
+                               + (g % layout.textureWidth)) * 4;
+                    predeformCenters[g * 3] = texture[t];
+                    predeformCenters[g * 3 + 1] = texture[t + 1];
+                    predeformCenters[g * 3 + 2] = texture[t + 2];
+                }
+
+                // --- compare ---------------------------------------------------
+                const centers = new Map<string, Float32Array>([
+                    [route, productionCenters],
+                    ['predeform', predeformCenters],
+                ]);
+                const centerDiff = this.compareCenters(route, 'predeform', centers);
+                const pixelDiff = this.comparePixels(productionFrame, predeformFrame);
+
+                let distanceMaxAbs = 0;
+                for (let g = 0; g < gaussianCount; g++) {
+                    const d = Math.abs(productionDistances[g] - predeformDistances[g]);
+                    if (d > distanceMaxAbs) distanceMaxAbs = d;
+                }
+
+                const reference = applyUikaBasisWeightsCpu(asset.canonicalPositions, asset.basis, weights);
+                let cpuMaxAbs = 0;
+                for (let c = 0; c < predeformCenters.length; c++) {
+                    const d = Math.abs(predeformCenters[c] - reference.positions[c]);
+                    if (d > cpuMaxAbs) cpuMaxAbs = d;
+                }
+
+                sweep.frames.push({
+                    frame,
+                    nonZeroWeights: Array.from(weights).filter((w) => w !== 0).length,
+                    center: {
+                        maxAbsX: centerDiff.maxAbsX,
+                        maxAbsY: centerDiff.maxAbsY,
+                        maxAbsZ: centerDiff.maxAbsZ,
+                        maxAbsXYZ: centerDiff.maxAbsXYZ,
+                        meanAbsXYZ: centerDiff.meanAbsXYZ,
+                        maxAbsXYZIndex: centerDiff.maxAbsXYZIndex,
+                        differentComponents: centerDiff.differentComponents,
+                        bitExactComponents: centerDiff.bitExactComponents,
+                        nonFinite: centerDiff.nonFinite,
+                        maxUlpDifference: centerDiff.maxUlpDifference,
+                        absAtMaxUlp: centerDiff.absAtMaxUlp,
+                        ulpHistogram: centerDiff.ulpHistogram,
+                    },
+                    centerVsCpuMaxAbs: cpuMaxAbs,
+                    distance: { maxAbsDifference: distanceMaxAbs },
+                    framebuffer: {
+                        differentPixels: pixelDiff.differentPixels,
+                        differentPixelRatio: pixelDiff.differentPixelRatio,
+                        rDifferingCount: pixelDiff.r.differingCount,
+                        gDifferingCount: pixelDiff.g.differingCount,
+                        bDifferingCount: pixelDiff.b.differingCount,
+                        aDifferingCount: pixelDiff.a.differingCount,
+                        maxRgbaByteDelta: pixelDiff.maxRgbaByteDelta,
+                        sumAbsoluteDifference: pixelDiff.sumAbsoluteDifference,
+                        alphaPlaneIdentical: pixelDiff.channelHashes.alphaPlaneIdentical,
+                        productionHash: pixelDiff.hashes.production,
+                        predeformHash: pixelDiff.hashes.predeform,
+                        pixelIdentical: pixelDiff.hashes.identical,
+                    },
+                    withinNumericBound: centerDiff.maxAbsXYZ <= NUMERIC_BOUND
+                        && cpuMaxAbs <= NUMERIC_BOUND
+                        && centerDiff.nonFinite === 0,
+                });
+            }
+
+            sweep.summary = this.summarise(sweep.frames);
+            sweep.acceptance = {
+                rule: 'pixel-identical',
+                ruleChangedByThisRun: false,
+                correctnessUnderCurrentRule:
+                    sweep.summary.framesWithPixelDifference === 0 ? 'PASS' : 'FAIL',
+                note: 'The rule is unchanged by this run. Whether to keep pixel-identical as a '
+                    + 'cross-GPU requirement or replace it with an explicit numeric tolerance is '
+                    + 'a separate decision, to be taken on these numbers.',
+            };
+        } finally {
+            try {
+                viewer?.setPreRenderHook?.(null);
+                viewer?.setExpressionWeightHook?.(null);
+                viewer?.setDistanceProvider?.(null);
+                viewer?.setPredeformCenterTexture?.(null, 0, 0);
+                viewer?.setSortSuspended?.(false);
+            } catch { /* noop */ }
+            this.probe?.dispose();
+            this.probe = null;
+            this.pass?.dispose();
+            this.pass = null;
+            this.replay.stop();
+            this.runtime.setExpressionSource(null);
+            this.runtime.setNeutral();
+            this.live.phase = 'idle';
+            this.live.step = '';
+            this.running = false;
+            sweep.finishedAt = new Date().toISOString();
+        }
+
+        return sweep;
+    }
+
+    private summarise(frames: UikaSweepFrame[]): NonNullable<UikaSweepReport['summary']> {
+        const worst = (pick: (f: UikaSweepFrame) => number) => {
+            let value = -Infinity;
+            let frame = -1;
+            for (const f of frames) {
+                const v = pick(f);
+                if (v > value) { value = v; frame = f.frame; }
+            }
+            return { value: Number.isFinite(value) ? value : 0, frame };
+        };
+        const worstUlp = (() => {
+            let value = -Infinity;
+            let frame = -1;
+            let absAtThatComponent = 0;
+            for (const f of frames) {
+                if (f.center.maxUlpDifference > value) {
+                    value = f.center.maxUlpDifference;
+                    frame = f.frame;
+                    absAtThatComponent = f.center.absAtMaxUlp;
+                }
+            }
+            return { value: Number.isFinite(value) ? value : 0, frame, absAtThatComponent };
+        })();
+
+        const outside = frames.filter((f) => !f.withinNumericBound).map((f) => f.frame);
+        return {
+            framesCompared: frames.length,
+            framesPixelIdentical: frames.filter((f) => f.framebuffer.pixelIdentical).length,
+            framesWithPixelDifference: frames.filter((f) => !f.framebuffer.pixelIdentical).length,
+            worstDifferentPixels: worst((f) => f.framebuffer.differentPixels),
+            worstDifferentPixelRatio: worst((f) => f.framebuffer.differentPixelRatio),
+            worstMaxByteDelta: worst((f) => f.framebuffer.maxRgbaByteDelta),
+            worstCenterMaxAbs: worst((f) => f.center.maxAbsXYZ),
+            worstCenterMeanAbs: worst((f) => f.center.meanAbsXYZ),
+            worstDistanceMaxAbs: worst((f) => f.distance.maxAbsDifference),
+            worstCenterVsCpuMaxAbs: worst((f) => f.centerVsCpuMaxAbs),
+            worstMaxUlp: worstUlp,
+            framesWithAlphaDifference: frames
+                .filter((f) => !f.framebuffer.alphaPlaneIdentical).map((f) => f.frame),
+            framesWithNonFinite: frames.filter((f) => f.center.nonFinite > 0).map((f) => f.frame),
+            framesOutsideNumericBound: outside,
+            allWithinNumericBound: outside.length === 0,
+        };
+    }
+
+    private mvp(handles: any): any {
+        return this.mvpFrom(handles);
     }
 
     /**
@@ -560,10 +945,15 @@ export class UikaPredeformInvestigation {
 
         const anyNondeterministic = r.frames.some((f) => f.repeatability.nondeterministicRender);
         const anyPixelDifference = r.frames.some((f) => !f.pixelDiff.hashes.identical);
-        const anyCenterDifference = r.frames.some((f) => f.centerDiffs.some(
-            (d) => (d.left.startsWith('production') && d.right === 'predeform') && d.differentComponents > 0));
-        const maxUlp = Math.max(...r.frames.flatMap((f) => f.centerDiffs
-            .filter((d) => d.right === 'predeform').map((d) => d.maxUlpDifference)), 0);
+        const productionVsPredeform = (f: UikaFrameInvestigation) => f.centerDiffs.filter(
+            (d) => d.left.startsWith('production') && d.right === 'predeform');
+        const anyCenterDifference = r.frames.some(
+            (f) => productionVsPredeform(f).some((d) => d.differentComponents > 0));
+        const maxUlp = Math.max(...r.frames.flatMap(
+            (f) => productionVsPredeform(f).map((d) => d.maxUlpDifference)), 0);
+        const maxCenterAbs = Math.max(...r.frames.flatMap(
+            (f) => productionVsPredeform(f).map((d) => d.maxAbsXYZ)), 0);
+        const anyNonFinite = r.frames.some((f) => productionVsPredeform(f).some((d) => d.nonFinite > 0));
         const maxByteDelta = Math.max(...r.frames.map((f) => f.pixelDiff.maxRgbaByteDelta), 0);
         const maxRatio = Math.max(...r.frames.map((f) => f.pixelDiff.differentPixelRatio), 0);
 
@@ -575,7 +965,11 @@ export class UikaPredeformInvestigation {
                 + `max byte delta ${f.pixelDiff.maxRgbaByteDelta}, alpha plane `
                 + `${f.pixelDiff.channelHashes.alphaPlaneIdentical ? 'identical' : 'different'}`);
         }
-        basis.push(`largest centre ULP difference against the pre-deformed texture: ${maxUlp}`);
+        basis.push(`largest centre absolute difference against the pre-deformed texture: `
+            + `${maxCenterAbs.toExponential(6)} (numeric bound ${NUMERIC_BOUND.toExponential(0)})`);
+        basis.push(`largest centre ULP distance: ${maxUlp} — diagnostic only, not used to classify`);
+        basis.push(`largest RGBA byte delta: ${maxByteDelta}, worst differing-pixel share `
+            + `${(maxRatio * 100).toFixed(6)}%`);
 
         if (anyNondeterministic) {
             r.classification = 'C-measurement-nondeterminism';
@@ -585,14 +979,16 @@ export class UikaPredeformInvestigation {
             r.classification = 'NO-DIFFERENCE-REPRODUCED';
             basis.push('no pixel difference and no centre difference was reproduced on this '
                 + 'machine, so none of A, B or C applies to it');
-        } else if (maxUlp <= 4 && maxByteDelta <= 2) {
-            r.classification = 'B-deterministic-float-level-difference';
-            basis.push('every mode is self-consistent, the centre difference is within a few ULP '
-                + 'and the pixel difference is within a couple of byte levels');
-        } else {
+        } else if (anyNonFinite || maxCenterAbs > NUMERIC_BOUND) {
             r.classification = 'A-real-correctness-defect';
-            basis.push(`the difference exceeds the float-level band (max ULP ${maxUlp}, max byte `
-                + `delta ${maxByteDelta}, ${(maxRatio * 100).toFixed(4)}% of pixels)`);
+            basis.push(anyNonFinite
+                ? 'a non-finite centre component was produced'
+                : `the centre difference ${maxCenterAbs.toExponential(6)} is outside the numeric `
+                  + `bound ${NUMERIC_BOUND.toExponential(0)}`);
+        } else {
+            r.classification = 'B-deterministic-float-level-difference';
+            basis.push('every mode is self-consistent across repeated renders, so the difference '
+                + 'is deterministic, and every centre difference is inside the numeric bound');
         }
         r.classificationBasis = basis;
         r.notes.push('classification B does not by itself mean the PoC passes: the acceptance '
