@@ -1,0 +1,204 @@
+---
+// UIKA Native Runtime Architecture Correction v1.1 — Gate 4A real-GPU baseline.
+//
+// Run this on a machine with a real GPU. Everything is driven from the buttons below, so
+// DevTools never has to be open while measuring.
+//
+// Isolated PoC route. No Live, no Socket.IO, no AudioContext, no LAMAvatar,
+// no LAMWebSocketManager, no LiveAudioManager, no GaussianSplatRenderer.
+// /uika-native-replay is untouched.
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UIKA Native v1 — Gate 4A GPU benchmark</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: #111; color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    .col { width: min(760px, calc(100vw - 32px)); }
+    #viewer {
+      width: min(760px, calc(100vw - 32px)); aspect-ratio: 1 / 1; position: relative;
+      overflow: hidden; background: #000; border: 1px solid #444;
+    }
+    #viewer :global(canvas) { width: 100% !important; height: 100% !important; display: block; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 10px 14px; border: 1px solid #555; background: #222; color: #eee; cursor: pointer; font: inherit; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.primary { background: #1d4ed8; border-color: #2563eb; }
+    #live {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px;
+      padding: 12px; border: 1px solid #444; background: #181818;
+    }
+    #live div { display: flex; flex-direction: column; gap: 2px; }
+    #live .k { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    #live .v { font-size: 15px; }
+    .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; }
+    pre {
+      margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px;
+      border: 1px solid #444; background: #181818; max-height: 50vh; overflow-y: auto;
+    }
+    .note { color: #999; font-size: 12px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>UIKA Native v1 — Gate 4A real GPU baseline</h1>
+  <div id="viewer"></div>
+
+  <div class="col row">
+    <button id="start" class="primary" disabled>Start Benchmark</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="export" disabled>Export JSON</button>
+    <button id="copy" disabled>Copy Results</button>
+  </div>
+
+  <div class="col" id="live"></div>
+
+  <p class="col note">
+    Keep this tab visible and in the foreground for the whole run; a hidden tab marks the
+    run invalid. Three tests run back to back (neutral, a fixed expressive pose, and the
+    real 192-frame A2E replay), each with a warm-up followed by a 60 s measurement, so the
+    full run takes about 3.5 minutes. Nothing is optimised here — this measures the
+    renderer exactly as it stands.
+  </p>
+
+  <pre class="col" id="status">initializing…</pre>
+
+  <script>
+    import { UikaNativeRuntime } from '../scripts/chat/uika-native/uika-native-runtime';
+    import { UikaNativeReplay } from '../scripts/chat/uika-native/uika-native-replay';
+    import { UikaNativeBenchmark, collectGpuInfo, benchmarkOptionsFromUrl }
+      from '../scripts/chat/uika-native/uika-native-benchmark';
+
+    const container = document.getElementById('viewer');
+    const statusEl = document.getElementById('status');
+    const liveEl = document.getElementById('live');
+    if (!(container instanceof HTMLElement) || !(statusEl instanceof HTMLElement) || !(liveEl instanceof HTMLElement)) {
+      throw new Error('UIKA Native Gate 4A: page elements missing');
+    }
+
+    const btn = {
+      start: document.getElementById('start') as HTMLButtonElement,
+      stop: document.getElementById('stop') as HTMLButtonElement,
+      export: document.getElementById('export') as HTMLButtonElement,
+      copy: document.getElementById('copy') as HTMLButtonElement,
+    };
+
+    const runtime = new UikaNativeRuntime(container);
+    const replay = new UikaNativeReplay((w) => runtime.applyWeights(w));
+    const bench = new UikaNativeBenchmark(runtime, replay);
+    (window as any).__uikaNativeV1 = runtime;
+    (window as any).__uikaNativeReplay = replay;
+    (window as any).__uikaBenchmark = bench;
+
+    let lastError: string | null = null;
+    let report: any = null;
+
+    const cell = (k: string, v: string, cls = '') =>
+      `<div><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
+
+    const renderLive = () => {
+      const l = bench.getLive();
+      const v: any = runtime.getViewer();
+      const canvas = v?.renderer?.domElement ?? null;
+      const gpu = collectGpuInfo(canvas);
+      const r = runtime.report;
+      liveEl.innerHTML = [
+        cell('tab visible', document.visibilityState, document.visibilityState === 'visible' ? 'ok' : 'bad'),
+        cell('hardware GPU', gpu.isSoftware ? 'NO (software)' : (gpu.unmaskedAvailable ? 'YES' : 'UNKNOWN'),
+             gpu.isSoftware ? 'bad' : (gpu.unmaskedAvailable ? 'ok' : 'warn')),
+        cell('GPU', (gpu.renderer || '—').slice(0, 44)),
+        cell('benchmark', bench.isRunning() ? `${l.test} · ${l.phase}` : (report ? 'finished' : 'idle'),
+             bench.isRunning() ? 'warn' : ''),
+        cell('elapsed', `${(l.elapsedMs / 1000).toFixed(1)} s`),
+        cell('rendered frames', String(r.renderedFrames)),
+        cell('effective FPS', l.effectiveFPS ? l.effectiveFPS.toFixed(2) : '—'),
+        cell('p95 interval', l.p95 ? `${l.p95.toFixed(2)} ms` : '—'),
+        cell('GL errors', String(r.glErrorCount), r.glErrorCount === 0 ? 'ok' : 'bad'),
+        cell('splats', String(r.viewerSplatCount ?? 0)),
+        cell('basis', `${r.basisCount} ${r.basisResident ? '(resident)' : ''}`),
+        cell('verdict', report ? report.verdict : '—',
+             report ? (report.verdict === 'PASS' ? 'ok' : report.verdict === 'BORDERLINE' ? 'warn' : 'bad') : ''),
+      ].join('');
+    };
+
+    const renderStatus = () => {
+      statusEl.textContent = JSON.stringify({
+        runtime: runtime.report,
+        fixture: replay.getFixture(),
+        validation: replay.getValidation(),
+        mapping: replay.getMapping(),
+        report,
+        lastError,
+      }, null, 2);
+      btn.start.disabled = !runtime.report.ready || bench.isRunning() || !replay.getFixture();
+      btn.stop.disabled = !bench.isRunning();
+      btn.export.disabled = !report;
+      btn.copy.disabled = !report;
+      renderLive();
+    };
+
+    btn.start.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await bench.run(benchmarkOptionsFromUrl());
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4A]', error);
+      }
+      renderStatus();
+    });
+
+    btn.stop.addEventListener('click', () => { bench.stop(); });
+
+    btn.export.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `uika-gate4a-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    });
+
+    btn.copy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+        btn.copy.textContent = 'Copied';
+        setTimeout(() => { btn.copy.textContent = 'Copy Results'; }, 1500);
+      } catch (error: any) {
+        lastError = `clipboard: ${error?.message || error}`;
+        renderStatus();
+      }
+    });
+
+    renderStatus();
+    const timer = window.setInterval(renderStatus, 500);
+
+    runtime.initializeNeutral()
+      .then(async () => {
+        await replay.loadBundled();
+        replay.bindBasis(runtime.getAsset()!.basis.names);
+        renderStatus();
+      })
+      .catch((error: any) => {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4A PAGE]', error);
+        renderStatus();
+      });
+
+    window.addEventListener('beforeunload', () => {
+      window.clearInterval(timer);
+      runtime.dispose();
+    }, { once: true });
+  </script>
+</body>
+</html>

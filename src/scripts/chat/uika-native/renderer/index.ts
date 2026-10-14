@@ -8,4 +8,5 @@ export type {
     UikaCameraMeta,
     UikaBasisLayout,
     UikaFrameTiming,
+    UikaGpuTimer,
 } from './uika-gaussian-viewer';
