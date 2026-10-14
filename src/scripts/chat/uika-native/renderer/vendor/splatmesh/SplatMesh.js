@@ -90,6 +90,20 @@ export class SplatMesh extends THREE.Mesh {
         // Use a faster integer-based approach for calculating splat distances from the camera
         this.integerBasedDistancesComputation = integerBasedDistancesComputation;
 
+        // UIKA MODIFICATION: expression basis state.
+        //   uikaBasisCount    number of basis channels resident on the GPU (0 = inert)
+        //   uikaGaussianCount Gaussian count the basis was built for
+        //   uikaBasisTexture  RGBA32UI DataTexture holding D_UIKA
+        //   uikaWeightData    CPU staging for the per-frame weights
+        //   uikaWeightTexture RGBA32UI DataTexture holding the per-frame weights
+        this.uikaBasisCount = 0;
+        this.uikaGaussianCount = 0;
+        this.uikaBasisTexture = null;
+        this.uikaBasisTextureSize = null;
+        this.uikaWeightData = null;
+        this.uikaWeightTexture = null;
+        this.uikaWeightTextureSize = null;
+
         // When true, will perform additional steps during rendering to address artifacts caused by the rendering of gaussians at a
         // substantially different resolution than that at which they were rendered during training. This will only work correctly
         // for models that were trained using a process that utilizes this compensation calculation. For more details:
@@ -1231,6 +1245,118 @@ export class SplatMesh extends THREE.Mesh {
      * @param {number} renderSplatCount Total number of splats to be rendered. Necessary because we may not want to render
      *                                  every splat.
      */
+    /**
+     * UIKA MODIFICATION — upload the UIKA expression basis D_UIKA to the GPU. Call once,
+     * after build(). Layout: texel (i + gaussianCount * k) holds (dx, dy, dz) for Gaussian
+     * i and basis channel k, each component bit-cast from float to uint.
+     *
+     * @param {Array<Float32Array>} deltas One VEC3 array per channel, each gaussianCount*3 long.
+     * @param {number} gaussianCount Number of Gaussians the basis was built for.
+     * @return {object} The resulting texture layout, for the record.
+     */
+    setUikaBasis(deltas, gaussianCount) {
+        if (!Array.isArray(deltas) || deltas.length === 0) {
+            throw new Error('UIKA basis: deltas must be a non-empty array');
+        }
+        const basisCount = deltas.length;
+        for (let k = 0; k < basisCount; k++) {
+            if (deltas[k].length !== gaussianCount * 3) {
+                throw new Error(`UIKA basis: channel ${k} length=${deltas[k].length}, ` +
+                                `expected=${gaussianCount * 3}`);
+            }
+        }
+
+        const requiredTexels = gaussianCount * basisCount;
+        const width = 4096;
+        let height = 1;
+        while (width * height < requiredTexels) height *= 2;
+
+        const gl = this.renderer ? this.renderer.getContext() : null;
+        const maxTextureSize = gl ? gl.getParameter(gl.MAX_TEXTURE_SIZE) : 0;
+        if (maxTextureSize && (width > maxTextureSize || height > maxTextureSize)) {
+            throw new Error(`UIKA basis: ${width}x${height} exceeds MAX_TEXTURE_SIZE=${maxTextureSize}`);
+        }
+
+        const data = new Uint32Array(width * height * 4);
+        const view = new DataView(data.buffer);
+        for (let k = 0; k < basisCount; k++) {
+            const delta = deltas[k];
+            const base = gaussianCount * k;
+            for (let i = 0; i < gaussianCount; i++) {
+                const t = (base + i) * 4;
+                view.setFloat32((t + 0) * 4, delta[i * 3 + 0], true);
+                view.setFloat32((t + 1) * 4, delta[i * 3 + 1], true);
+                view.setFloat32((t + 2) * 4, delta[i * 3 + 2], true);
+            }
+        }
+
+        if (this.uikaBasisTexture) this.uikaBasisTexture.dispose();
+        this.uikaBasisTexture = new THREE.DataTexture(data, width, height,
+                                                      THREE.RGBAIntegerFormat, THREE.UnsignedIntType);
+        this.uikaBasisTexture.internalFormat = 'RGBA32UI';
+        this.uikaBasisTexture.needsUpdate = true;
+        this.uikaBasisTextureSize = new THREE.Vector2(width, height);
+
+        // Per-frame weights: four channels per texel.
+        const weightTexels = Math.ceil(basisCount / 4);
+        const weightWidth = 16;
+        let weightHeight = 1;
+        while (weightWidth * weightHeight < weightTexels) weightHeight *= 2;
+        this.uikaWeightData = new Uint32Array(weightWidth * weightHeight * 4);
+        if (this.uikaWeightTexture) this.uikaWeightTexture.dispose();
+        this.uikaWeightTexture = new THREE.DataTexture(this.uikaWeightData, weightWidth, weightHeight,
+                                                       THREE.RGBAIntegerFormat, THREE.UnsignedIntType);
+        this.uikaWeightTexture.internalFormat = 'RGBA32UI';
+        this.uikaWeightTexture.needsUpdate = true;
+        this.uikaWeightTextureSize = new THREE.Vector2(weightWidth, weightHeight);
+
+        this.uikaBasisCount = basisCount;
+        this.uikaGaussianCount = gaussianCount;
+        this.applyUikaUniforms();
+
+        return {
+            basisCount,
+            gaussianCount,
+            requiredTexels,
+            basisTexture: { width, height, texels: width * height, bytes: data.byteLength },
+            weightTexture: { width: weightWidth, height: weightHeight, texels: weightWidth * weightHeight },
+            maxTextureSize,
+        };
+    }
+
+    /**
+     * UIKA MODIFICATION — push the per-frame expression weights. This is the only GPU write
+     * the per-frame path performs: `basisCount` floats into a 16-wide integer texture.
+     * @param {Float32Array} weights Length must equal the resident basis count.
+     */
+    setUikaWeights(weights) {
+        if (this.uikaBasisCount === 0) throw new Error('UIKA basis: setUikaBasis() has not run');
+        if (weights.length !== this.uikaBasisCount) {
+            throw new Error(`UIKA weights: length=${weights.length}, expected=${this.uikaBasisCount}`);
+        }
+        const view = new DataView(this.uikaWeightData.buffer);
+        for (let k = 0; k < weights.length; k++) view.setFloat32(k * 4, weights[k], true);
+        this.uikaWeightTexture.needsUpdate = true;
+        this.material.uniforms.uikaWeightTexture.value = this.uikaWeightTexture;
+        this.material.uniformsNeedUpdate = true;
+    }
+
+    /** UIKA MODIFICATION — (re)bind the basis uniforms, e.g. after a material rebuild. */
+    applyUikaUniforms() {
+        if (!this.material || !this.material.uniforms.uikaBasisCount) return;
+        this.material.uniforms.uikaBasisTexture.value = this.uikaBasisTexture;
+        this.material.uniforms.uikaWeightTexture.value = this.uikaWeightTexture;
+        this.material.uniforms.uikaBasisCount.value = this.uikaBasisCount;
+        this.material.uniforms.uikaGaussianCount.value = this.uikaGaussianCount;
+        if (this.uikaBasisTextureSize) {
+            this.material.uniforms.uikaBasisTextureSize.value.copy(this.uikaBasisTextureSize);
+        }
+        if (this.uikaWeightTextureSize) {
+            this.material.uniforms.uikaWeightTextureSize.value.copy(this.uikaWeightTextureSize);
+        }
+        this.material.uniformsNeedUpdate = true;
+    }
+
     updateRenderIndexes(globalIndexes, renderSplatCount) {
         const geometry = this.geometry;
         geometry.attributes.splatIndex.set(globalIndexes);

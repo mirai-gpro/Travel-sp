@@ -5,7 +5,8 @@
 // talks to Live, A2E, Socket.IO or an AudioContext.
 
 import { loadUikaNativeMigrationAsset } from './uika-native-asset-loader';
-import { UikaGaussianViewer, type UikaCameraMeta } from './renderer';
+import { applyUikaBasisWeightsCpu, singleUikaBasisWeight } from './uika-deformation';
+import { UikaGaussianViewer, type UikaBasisLayout, type UikaCameraMeta } from './renderer';
 import {
     UIKA_NATIVE_V1_BASIS_COUNT,
     UIKA_NATIVE_V1_GAUSSIAN_COUNT,
@@ -32,6 +33,9 @@ export interface UikaNativeRuntimeReport {
     gaussianCount: number;
     basisCount: number;
     viewerSplatCount: number | null;
+    basisResident: boolean;
+    basisLayout: UikaBasisLayout | null;
+    activeWeights: Record<string, number>;
     renderedFrames: number;
     glErrorCount: number;
     frameMs: { sort: number; draw: number; total: number };
@@ -47,6 +51,9 @@ export class UikaNativeRuntime {
         gaussianCount: 0,
         basisCount: 0,
         viewerSplatCount: null,
+        basisResident: false,
+        basisLayout: null,
+        activeWeights: {},
         renderedFrames: 0,
         glErrorCount: 0,
         frameMs: { sort: 0, draw: 0, total: 0 },
@@ -93,6 +100,13 @@ export class UikaNativeRuntime {
             if (stats.splatCount !== UIKA_NATIVE_V1_GAUSSIAN_COUNT) {
                 throw new Error(`viewer splatCount=${stats.splatCount}`);
             }
+
+            // GPU-resident D_UIKA. From here on an expression change costs 51 floats.
+            this.report.basisLayout = this.viewer.setExpressionBasis(
+                this.asset.basis.deltas,
+                this.asset.basis.names,
+            );
+            this.report.basisResident = true;
 
             this.report.oacFreeCheck = this.collectOacFreeCheck();
             this.startRenderLoop();
@@ -155,6 +169,37 @@ export class UikaNativeRuntime {
             this.rafId = requestAnimationFrame(tick);
         };
         this.rafId = requestAnimationFrame(tick);
+    }
+
+    /**
+     * Gate 2 (GPU): drive a single basis channel and leave everything else at zero.
+     * The renderer is never reloaded; only the weight texture changes.
+     */
+    setSingleBasis(name: string, weight = 1.0): { name: string; weight: number } {
+        if (!this.asset || !this.viewer) throw new Error('UIKA Native: not initialized');
+        const weights = singleUikaBasisWeight(this.asset.basis.names, name, weight);
+        this.viewer.setExpressionWeights(weights);
+        this.report.activeWeights = weight === 0 ? {} : { [name]: weight };
+        return { name, weight };
+    }
+
+    /** Back to the canonical pose, again without touching the renderer. */
+    setNeutral(): void {
+        if (!this.asset || !this.viewer) throw new Error('UIKA Native: not initialized');
+        this.viewer.setExpressionWeights(new Float32Array(this.asset.basis.names.length));
+        this.report.activeWeights = {};
+    }
+
+    /**
+     * CPU reference for the same weights, used to check the GPU result. This is the
+     * Gate 2 reference implementation from uika-deformation.ts; it is never part of the
+     * per-frame path.
+     */
+    cpuReference(name: string, weight = 1.0) {
+        if (!this.asset) throw new Error('UIKA Native: not initialized');
+        const weights = singleUikaBasisWeight(this.asset.basis.names, name, weight);
+        const result = applyUikaBasisWeightsCpu(this.asset.canonicalPositions, this.asset.basis, weights);
+        return { name, weight, positions: result.positions, stats: result.stats };
     }
 
     dispose(): void {

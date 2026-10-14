@@ -6,5 +6,6 @@ export { UikaGaussianViewer } from './uika-gaussian-viewer';
 export type {
     UikaGaussianRenderer,
     UikaCameraMeta,
+    UikaBasisLayout,
     UikaFrameTiming,
 } from './uika-gaussian-viewer';

@@ -1,3 +1,12 @@
+// ============================================================================
+// UIKA Native Runtime — forked from @mkkellogg/gaussian-splats-3d@0.4.6
+// Original work: Copyright (c) 2023 Mark Kellogg. Licensed under the MIT License.
+// See ../NOTICE.md for the full licence text and the list of files that carry
+// UIKA modifications.
+//
+// *** THIS FILE CARRIES UIKA MODIFICATIONS. ***
+// Every change is marked with a `UIKA MODIFICATION` comment.
+// ============================================================================
 import * as THREE from 'three';
 import { Constants } from '../Constants.js';
 
@@ -57,6 +66,19 @@ export class SplatMaterial {
         uniform float sphericalHarmonics8BitCompressionRangeMin[${Constants.MaxScenes}];
         uniform float sphericalHarmonics8BitCompressionRangeMax[${Constants.MaxScenes}];
 
+        // UIKA MODIFICATION: expression basis inputs.
+        // uikaBasisTexture holds D_UIKA laid out as texel (i + uikaGaussianCount * k)
+        // -> (dx, dy, dz) for Gaussian i and basis channel k, bit-cast to uint.
+        // uikaWeightTexture holds the per-frame weights, four channels per texel.
+        // When uikaBasisCount is 0 the whole block is inert and the canonical centre
+        // is used unchanged.
+        uniform highp usampler2D uikaBasisTexture;
+        uniform vec2 uikaBasisTextureSize;
+        uniform highp usampler2D uikaWeightTexture;
+        uniform vec2 uikaWeightTextureSize;
+        uniform int uikaBasisCount;
+        uniform int uikaGaussianCount;
+
         varying vec4 vColor;
         varying vec2 vUv;
         varying vec2 vPosition;
@@ -106,6 +128,26 @@ export class SplatMaterial {
             return samplerUV;
         }
 
+        // UIKA MODIFICATION: expression basis lookups. The UV convention is the same as
+        // getDataUV() above (left/top texel edge, NEAREST sampling on an integer texture).
+        vec3 uikaBasisDelta(in int channel, in uint sIndex) {
+            float d = float(sIndex + uint(uikaGaussianCount * channel)) / uikaBasisTextureSize.x;
+            vec2 uv = vec2(fract(d), floor(d) / uikaBasisTextureSize.y);
+            return uintBitsToFloat(texture(uikaBasisTexture, uv).rgb);
+        }
+
+        float uikaWeight(in int channel) {
+            int texel = channel / 4;
+            float d = float(texel) / uikaWeightTextureSize.x;
+            vec2 uv = vec2(fract(d), floor(d) / uikaWeightTextureSize.y);
+            vec4 packed = uintBitsToFloat(texture(uikaWeightTexture, uv));
+            int lane = channel - texel * 4;
+            if (lane == 1) return packed.g;
+            if (lane == 2) return packed.b;
+            if (lane == 3) return packed.a;
+            return packed.r;
+        }
+
         const float SH_C1 = 0.4886025119029199f;
         const float[5] SH_C2 = float[](1.0925484, -1.0925484, 0.3153916, -1.0925484, 0.5462742);
 
@@ -119,6 +161,15 @@ export class SplatMaterial {
 
             uvec4 sampledCenterColor = texture(centersColorsTexture, getDataUV(1, 0, centersColorsTextureSize));
             vec3 splatCenter = uintBitsToFloat(uvec3(sampledCenterColor.gba));
+
+            // UIKA MODIFICATION: animatedCenter(i) = canonicalCenter(i)
+            //                                      + sum(k) uikaWeights[k] * D_UIKA[k, i]
+            // The GPU distance-computation shader in SplatMesh.js evaluates the identical
+            // expression from the identical textures so that render order and draw order
+            // use the same animated centre.
+            for (int k = 0; k < uikaBasisCount; ++k) {
+                splatCenter += uikaWeight(k) * uikaBasisDelta(k, splatIndex);
+            }
 
             uint sceneIndex = uint(0);
             if (sceneCount > 1) {
@@ -397,6 +448,32 @@ export class SplatMaterial {
             'centersColorsTexture': {
                 'type': 't',
                 'value': null
+            },
+            // UIKA MODIFICATION: expression basis uniforms. uikaBasisCount = 0 keeps the
+            // shader loop inert until setUikaBasis() has run.
+            'uikaBasisTexture': {
+                'type': 't',
+                'value': null
+            },
+            'uikaBasisTextureSize': {
+                'type': 'v2',
+                'value': new THREE.Vector2(1, 1)
+            },
+            'uikaWeightTexture': {
+                'type': 't',
+                'value': null
+            },
+            'uikaWeightTextureSize': {
+                'type': 'v2',
+                'value': new THREE.Vector2(1, 1)
+            },
+            'uikaBasisCount': {
+                'type': 'i',
+                'value': 0
+            },
+            'uikaGaussianCount': {
+                'type': 'i',
+                'value': 0
             },
             'sphericalHarmonicsTexture': {
                 'type': 't',

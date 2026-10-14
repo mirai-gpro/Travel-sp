@@ -31,6 +31,15 @@ export interface UikaCameraMeta {
     far: number;
 }
 
+export interface UikaBasisLayout {
+    basisCount: number;
+    gaussianCount: number;
+    requiredTexels: number;
+    basisTexture: { width: number; height: number; texels: number; bytes: number };
+    weightTexture: { width: number; height: number; texels: number };
+    maxTextureSize: number;
+}
+
 export interface UikaFrameTiming {
     sortMs: number;
     drawMs: number;
@@ -39,6 +48,8 @@ export interface UikaFrameTiming {
 
 export interface UikaGaussianRenderer {
     loadCanonicalPly(ply: Blob): Promise<void>;
+    setExpressionBasis(deltas: Float32Array[], basisNames: readonly string[]): UikaBasisLayout;
+    setExpressionWeights(weights: Float32Array): void;
     render(): void;
     dispose(): void;
 }
@@ -147,6 +158,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return {
             splatCount: this.splatCount,
             renderedFrames: this.renderedFrames,
+            basisCount: this.splatMesh ? this.splatMesh.uikaBasisCount : 0,
             glErrorCount: this.glErrorCount,
             timing: { ...this.lastTiming },
             hasFlameModel: this.splatMesh ? this.splatMesh.flameModel !== undefined : null,
@@ -245,6 +257,27 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         // Draw everything until the first sort lands, in splat-buffer order.
         for (let i = 0; i < this.splatCount; i++) this.sortedIndexes[i] = i;
         this.splatMesh.updateRenderIndexes(this.sortedIndexes, this.splatCount);
+        this.sortDirty = true;
+    }
+
+    /**
+     * Upload D_UIKA once. After this the per-frame cost of an expression change is
+     * `basisNames.length` floats, nothing else.
+     */
+    setExpressionBasis(deltas: Float32Array[], basisNames: readonly string[]): UikaBasisLayout {
+        if (!this.splatMesh) fail('loadCanonicalPly() has not run');
+        if (deltas.length !== basisNames.length) {
+            fail(`deltas=${deltas.length} names=${basisNames.length}`);
+        }
+        const layout = this.splatMesh.setUikaBasis(deltas, this.splatCount) as UikaBasisLayout;
+        this.setExpressionWeights(new Float32Array(basisNames.length));
+        return layout;
+    }
+
+    /** Per-frame expression update. No PLY, no Blob, no scene rebuild, no viewer reload. */
+    setExpressionWeights(weights: Float32Array): void {
+        if (!this.splatMesh) fail('loadCanonicalPly() has not run');
+        this.splatMesh.setUikaWeights(weights);
         this.sortDirty = true;
     }
 

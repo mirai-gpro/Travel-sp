@@ -67,6 +67,14 @@
 <body>
   <h1>UIKA Native v1 — Gate 3B project-owned renderer</h1>
   <div id="viewer"></div>
+  <div id="controls">
+    <button data-neutral disabled>neutral</button>
+    <button data-morph="jawOpen" disabled>jawOpen 1.0</button>
+    <button data-morph="mouthSmileLeft" disabled>smile L 1.0</button>
+    <button data-morph="mouthSmileRight" disabled>smile R 1.0</button>
+    <button data-morph="eyeBlinkLeft" disabled>blink L 1.0</button>
+    <button data-morph="eyeBlinkRight" disabled>blink R 1.0</button>
+  </div>
   <pre id="status">initializing...</pre>
 
   <script>
@@ -100,8 +108,25 @@
       }, null, 2);
     };
 
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('#controls button'));
+    const syncControls = () => {
+      for (const button of buttons) button.disabled = !runtime.report.ready;
+    };
+    for (const button of buttons) {
+      const morph = button.dataset.morph;
+      button.addEventListener('click', () => {
+        try {
+          if (morph) runtime.setSingleBasis(morph, 1.0);
+          else runtime.setNeutral();
+        } catch (error) {
+          console.error('[UIKA NATIVE V1 GATE2-GPU]', error);
+        }
+        renderStatus();
+      });
+    }
+
     renderStatus();
-    const timer = window.setInterval(renderStatus, 250);
+    const timer = window.setInterval(() => { renderStatus(); syncControls(); }, 250);
 
     runtime.initializeNeutral()
       .then(renderStatus)
