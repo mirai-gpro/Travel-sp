@@ -2,8 +2,8 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-1.
 Route: `/uika-native-draw-isolation`.
-Status: harness delivered and self-tested. The measurement itself has to be taken on the
-machine with the real GPU, so §6 is PENDING until that run comes back.
+Status: complete. `GATE4B1 CONCLUSION = MIXED`; see §6.3 for the final numbers and
+§6.4 for why the basis-count scaling model must not be used for prediction.
 
 ---
 
@@ -278,44 +278,113 @@ That is why Diagnostic 1 ran at the intended three scales and only Diagnostic 3 
 points. The Diagnostic 3 loop itself is correct: the one point it did run,
 `d3-basis-0`, carries the right shader state.
 
-This defect is **not fixed in this commit**, as instructed: no production code, shader or
-renderer change for the rerun. The rerun passes the counts explicitly, which bypasses the
-default path entirely.
-
-### 6.3 Run 2 — Diagnostic 3 completion (PENDING)
-
-```text
-/uika-native-draw-isolation?d3=1&basisCounts=0,8,16,32,51
-```
-
-Same conditions as Run 1: DevTools closed, tab visible, no tab switching, no window
-minimise, real GPU. Start Diagnostics, then Export JSON when it finishes.
-
-Required from the run — all five points present:
+This defect was deliberately left in place for the rerun, so that the harness measuring
+Run 2 was byte-identical to the one that measured Run 1; the rerun passed the counts
+explicitly and bypassed the default path. It is fixed now that Gate 4B-1 is closed
+(Gate 4B-2A §18): both list parameters are parsed only when the parameter is actually
+present, so an absent `basisCounts` keeps `[0, 8, 16, 32, 51]`. Verified:
 
 ```text
-basis 0    GPU draw p50 / p95, effectiveFPS, valid, GL errors, page errors, invalid GPU timer samples   PENDING
-basis 8    same                                                                                          PENDING
-basis 16   same                                                                                          PENDING
-basis 32   same                                                                                          PENDING
-basis 51   same                                                                                          PENDING
-
-basisScalingFit    interceptMs / msPerBasis / points = 5                                                 PENDING
-literal51MinusUniform51Ms   (literal 51 vs the production uniform-bounded 51)                            PENDING
-repeatabilityDeltaMs        (the noise floor those two should sit inside)                                 PENDING
+absent   -> [0,8,16,32,51]
+explicit -> [0,8,16,32,51]
+'0,51'   -> [0,51]
+'abc'    -> [0,8,16,32,51]
 ```
 
-The least-squares fit over the five points and `literal51MinusUniform51Ms` are already
-implemented and need no change; with five valid points `basisScalingFit.points` reads 5.
-`literal51MinusUniform51Ms` is produced as soon as a `d3-basis-51` point exists, and
-whether it sits inside `repeatabilityDeltaMs` is the check that a literal bound of 51 and
-the production uniform bound of 51 really are the same work.
+The fix is in the diagnostic harness only and has no production path.
 
-Run 1's results are kept: the variant proof, the two shares, `MIXED` and
-`basisLoopDominant = YES` stand as a valid result. Run 2 exists only to complete
-Diagnostic 3.
+### 6.3 Run 2 — Diagnostic 3 completed, 2026-10-14 (final Gate 4B-1 result)
 
-### 6.4 Remaining fields — to be filled from the runs
+The rerun passed the counts explicitly and all five points landed. Reported from the JSON:
+
+```text
+GATE4B1 CONCLUSION = MIXED
+
+production 51-basis draw p50   72.06 ms
+no-basis            draw p50   37.82 ms
+basis removal delta            34.25 ms
+
+resolution 100%     draw p50   71.75 ms
+resolution  25%     draw p50   48.86 ms
+
+no-basis effectiveFPS          25.04
+```
+
+Shares recomputed from those p50s, by the §7 rules:
+
+```text
+basisShare   = (72.06 - 37.82) / 72.06 =  47.5 %
+rasterShare  = (71.75 - 48.86) / 71.75 =  31.9 %
+```
+
+Neither reaches the 0.5 "dominant" rule and `rasterShare` is above the 0.3 "not a factor"
+rule, so the conclusion is `MIXED`. What that settles:
+
+```text
+the basis loop is a major cost        34.25 ms of 72.06 ms
+removing it entirely misses 30 fps    37.82 ms of draw alone, against a 33.3 ms budget,
+                                      and 25.04 fps measured = 39.94 ms per frame
+base Gaussian render / raster is also a major cost
+```
+
+Two facts about the shares, recorded rather than smoothed over. `basisShare` was 56.4 % in
+Run 1 and 47.5 % in Run 2, straddling the 0.5 rule, so the derived
+`basisLoopDominant` flag reads YES on Run 1 and NO on Run 2 while the conclusion is
+`MIXED` in both; the flag is a threshold on a quantity that moved, not a separate finding.
+And Run 2 is internally consistent in a way Run 1 was not: Diagnostic 1 at 100 % and the
+Diagnostic 2 production point, the same configuration twice, differ by 0.32 ms in Run 2
+(71.75 vs 72.06), whereas Run 1's production draw p50 was 91.25 ms against Run 1's own
+100 % point. The Run 2 numbers are therefore the ones carried forward.
+
+§7's caution still applies: `rasterShare` and `basisShare` are not orthogonal components
+of one budget and are not added up to a 100 % breakdown.
+
+### 6.4 Diagnostic 3 — completed, and not usable as a scaling model
+
+All five points, as reported:
+
+```text
+basis  0     37.87 ms
+basis  8     72.50 ms
+basis 16     83.81 ms
+basis 32     69.74 ms
+basis 51     77.77 ms
+```
+
+```text
+basisScalingFit    intercept 57.91 ms, 0.487 ms per channel
+```
+
+The sequence is not monotonic — 16 channels measured slower than 32, and 8 measured
+slower than 32 — so a straight line through it describes nothing the hardware is actually
+doing.
+
+```text
+Diagnostic 3 completed,
+but the linear scaling model is NOT valid for optimisation prediction.
+```
+
+The fit is kept in the JSON because it was asked for and because its own residuals are
+the evidence that it should not be used; it must not be used to predict what removing or
+reducing channels would cost.
+
+The literal-bound and uniform-bound shaders are also not interchangeable:
+
+```text
+production uniform 51   72.06 ms
+literal          51     77.77 ms
+difference              +5.71 ms
+repeatability noise      0.32 ms      (Diagnostic 1 at 100 % vs Diagnostic 2 production)
+```
+
++5.71 ms is about 18 times the measured noise floor, so the two are not performance-
+identical even though they do the same arithmetic over the same data. Shader-compiler
+specialisation on a literal loop bound is one possible explanation; this gate did not test
+it, so nothing is asserted. The practical consequence is recorded instead: a basis-count
+variant built with a literal bound cannot be compared directly against the production
+uniform-bound shader, which is a second reason the §6.4 scaling numbers are not a model.
+
+### 6.5 Remaining fields — to be filled from the runs
 
 ```text
 GPU / browser / DPR                                                      PENDING
