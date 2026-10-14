@@ -97,7 +97,8 @@ Each run now:
 
 ```text
 warm up
-wait until no sort is in flight          (sortPending == false, 5 s cap)
+wait until no sort is in flight          (sortPending == false, idleTimeoutMs cap,
+                                         default 10 s; sorting is suspended while waiting)
 reset the counters, open the window
 measure
 close the window, then drain the in-flight sort before reading the counters

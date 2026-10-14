@@ -32,7 +32,11 @@ import {
     type UikaGpuInfo,
     type UikaIntervalStats,
 } from './uika-native-benchmark';
-import { UikaPredeformPass, type UikaFencePollStrategy } from './predeform/uika-predeform-pass';
+import {
+    UikaPredeformPass,
+    type UikaFencePollStrategy,
+    type UikaCompletionMode,
+} from './predeform/uika-predeform-pass';
 
 /**
  * §3: how far below the fence wait a lifecycle total may fall before it is recorded as an
@@ -60,7 +64,16 @@ export type UikaTailRunName =
     | 'P0-pre-draw'
     | 'P0-pre-draw-repeat'
     | 'P1-post-draw'
-    | 'P1-post-draw-repeat';
+    | 'P1-post-draw-repeat'
+    // Gate 4B-2B-3: completion-path frequency against GPU-to-CPU sync / readback.
+    | 'B0-no-sort-start'
+    | 'C0-current'
+    | 'C0R-current-repeat'
+    | 'F4-4hz-cpu-readback'
+    | 'F4R-4hz-cpu-readback-repeat'
+    | 'G4-4hz-gpu-only'
+    | 'G4R-4hz-gpu-only-repeat'
+    | 'B1-no-sort-end';
 
 export interface UikaStageStats {
     count: number;
@@ -114,6 +127,22 @@ export interface UikaTailRun {
     sortSubmissionPhase: UikaSortSubmissionPhase;
     /** Gate 4B-2B-2 §7: frames where the post-draw sort would have read changed state. */
     phaseStateMismatches: number;
+    /** Gate 4B-2B-3: what happened after the distance submission. */
+    completionMode: UikaCompletionMode;
+    /** Gate 4B-2B-3: the cadence gate's minimum interval, null = production. */
+    sortMinIntervalMs: number | null;
+    cadence: {
+        requested: number;
+        cadenceEligible: number;
+        cadenceSkipped: number;
+        distanceSubmitted: number;
+        gpuOnlyDistanceSubmittedCount: number;
+        cpuCompletionCount: number;
+        cpuReadbackCount: number;
+        fencePollCount: number;
+        actualDistanceSubmissionHz: number;
+    };
+    predeformPassCount: number;
     /** Gate 4B-2B-2 §8: the window started with no sort in flight and ended drained. */
     submittedEqualsCompleted: boolean;
     idleBeforeMeasurement: boolean;
@@ -170,7 +199,6 @@ export interface UikaTailRun {
         framesWithCpuSort: number;
         framesWithIndexUpdate: number;
     };
-    predeformPassCount: number;
     weightUploadCount: number;
     glErrors: number;
     pageErrors: number;
@@ -395,6 +423,81 @@ export interface UikaPhaseReport {
     notes: string[];
 }
 
+
+// ---------------------------------------------------------------------------
+// Gate 4B-2B-3 — completion frequency vs GPU->CPU sync / readback
+// ---------------------------------------------------------------------------
+
+export type UikaLeverVerdict = 'EFFECTIVE' | 'NULL' | 'REGRESSION' | 'UNDETERMINED';
+
+export type UikaLeverSelection =
+    | 'FREQUENCY_PRIMARY'
+    | 'GPU_CPU_SYNC_READBACK_PRIMARY'
+    | 'MIXED_LEVERS'
+    | 'NEITHER_LEVER_ESTABLISHED'
+    | 'UNRESOLVED';
+
+/** §11, §15, §16, §20: decision rules for this gate, not measured quantities. */
+export const LEVER_RULES = {
+    targetHz: 4,
+    minAcceptableHz: 3.8,
+    maxAcceptableHz: 4.2,
+    /** F4 and G4 mean submission rates must agree within this. */
+    maxHzDifference: 0.2,
+    noiseFactor: 2,
+    /** One lever is primary when it is at least this many times the other. */
+    dominanceFactor: 2,
+} as const;
+
+export interface UikaLeverReport {
+    spec: 'UIKA Native Runtime v1.1 Gate 4B-2B-3';
+    startedAt: string;
+    finishedAt: string | null;
+    gpu: UikaGpuInfo;
+    realGpu: boolean;
+    target: typeof TAIL_TARGET;
+    rules: typeof LEVER_RULES;
+    /** §6: the GPU-only premise, checked against the code before it was implemented. */
+    gpuOnlySafetyNote: string;
+    runs: UikaTailRun[];
+    analysis: {
+        bMeanP95: number | null;
+        bSpreadMs: number | null;
+        currentMeanP95: number | null;
+        currentSpreadMs: number | null;
+        f4MeanP95: number | null;
+        f4SpreadMs: number | null;
+        g4MeanP95: number | null;
+        g4SpreadMs: number | null;
+        /** §15: current -> 4 Hz, same completion path. */
+        frequencyImprovementMs: number | null;
+        frequencyNoiseFloorMs: number | null;
+        frequencySignificant: boolean | null;
+        /** §16: same 4 Hz, cpu-readback -> gpu-only. */
+        syncReadbackImprovementMs: number | null;
+        syncReadbackNoiseFloorMs: number | null;
+        syncReadbackSignificant: boolean | null;
+        /** §17: 4 Hz GPU distance only, against no distance work. */
+        gpuDistanceResidualMs: number | null;
+        /** §18: reference shares only; never the basis of a classification. */
+        currentGapMs: number | null;
+        frequencyClosedShare: number | null;
+        syncReadbackClosedShare: number | null;
+        gpuDistanceResidualShare: number | null;
+        /** §11: was the 4 Hz cadence actually achieved, and matched between F4 and G4? */
+        f4MeanHz: number | null;
+        g4MeanHz: number | null;
+        hzDifference: number | null;
+        cadenceValid: boolean | null;
+        cadenceNotes: string[];
+    } | null;
+    frequencyVerdict: UikaLeverVerdict;
+    syncReadbackVerdict: UikaLeverVerdict;
+    selection: UikaLeverSelection;
+    selectionBasis: string[];
+    notes: string[];
+}
+
 /** Collects one run's lifecycle samples. One instance per run. */
 class LifecycleCollector {
     readonly submitCpuMs: number[] = [];
@@ -407,6 +510,8 @@ class LifecycleCollector {
     readonly fencePolls: number[] = [];
 
     sortRequestedCount = 0;
+    cadenceEligibleCount = 0;
+    cadenceSkippedCount = 0;
     sortSubmittedCount = 0;
     sortCompletedCount = 0;
     sortPendingSkipCount = 0;
@@ -447,6 +552,8 @@ class LifecycleCollector {
     requested(): void {
         if (this.collecting) this.sortRequestedCount++;
     }
+    cadenceSkip(): void { if (this.collecting) this.cadenceSkippedCount++; }
+    cadenceEligible(): void { if (this.collecting) this.cadenceEligibleCount++; }
     /** Counts, and measures how long the in-flight sort had been pending. Never a start. */
     pendingSkip(at: number): void {
         if (!this.collecting) return;
@@ -525,6 +632,7 @@ export class UikaTailIsolation {
     private report: UikaTailReport | null = null;
     private fenceReport: UikaFenceReport | null = null;
     private phaseReport: UikaPhaseReport | null = null;
+    private leverReport: UikaLeverReport | null = null;
     private pass: UikaPredeformPass | null = null;
     private running = false;
     private abort = false;
@@ -543,6 +651,7 @@ export class UikaTailIsolation {
     getReport(): UikaTailReport | null { return this.report; }
     getFenceReport(): UikaFenceReport | null { return this.fenceReport; }
     getPhaseReport(): UikaPhaseReport | null { return this.phaseReport; }
+    getLeverReport(): UikaLeverReport | null { return this.leverReport; }
     isRunning(): boolean { return this.running; }
     stop(): void { this.abort = true; }
 
@@ -878,6 +987,312 @@ export class UikaTailIsolation {
         return report;
     }
 
+
+    /**
+     * Gate 4B-2B-3. Two levers, compared in one session against the same no-sort
+     * reference measured at both ends:
+     *
+     *   frequency      the current completion path at ~7.8 Hz against the same path at 4 Hz
+     *   sync/readback  the same 4 Hz and the same GPU distance work, with the fence, the
+     *                  poll and getBufferSubData removed
+     *
+     * Everything else is held: pixelRatio 1.0, 759 x 759, 133,541 Gaussians, 51 basis,
+     * real A2E, pre-deformation on, PRE-DRAW submission, CPU DepthSorter off, render-index
+     * update off, immediate fence polling wherever a fence exists.
+     */
+    async runCompletionLevers(options: UikaTailOptions = DEFAULT_TAIL_OPTIONS): Promise<UikaLeverReport> {
+        if (this.running) throw new Error('UIKA Gate 4B-2B-3: already running');
+        this.running = true;
+        this.abort = false;
+
+        const viewer = this.viewer();
+        const gpu = collectGpuInfo(viewer?.renderer?.domElement ?? null);
+        const report: UikaLeverReport = {
+            spec: 'UIKA Native Runtime v1.1 Gate 4B-2B-3',
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            gpu,
+            realGpu: !gpu.isSoftware && gpu.unmaskedAvailable,
+            target: TAIL_TARGET,
+            rules: LEVER_RULES,
+            gpuOnlySafetyNote: 'Checked against uika-predeform-pass.ts before implementing: the '
+                + 'transform-feedback output buffer is created once with STATIC_READ and is '
+                + 'referenced only by that bufferData, by the bindBufferBase that makes it the '
+                + 'transform-feedback target, and by the getBufferSubData inside the fence '
+                + 'continuation. No vertex attribute, uniform block or buffer copy reads it, and '
+                + 'WebGL2 has no buffer mapping, so successive writes are ordered against each '
+                + 'other on the single context command stream and the fence guards only the CPU '
+                + 'read. gpu-only is therefore restricted to the distance stage, where the stale '
+                + 'CPU distance array has no consumer; the harness refuses any other stage.',
+            runs: [],
+            analysis: null,
+            frequencyVerdict: 'UNDETERMINED',
+            syncReadbackVerdict: 'UNDETERMINED',
+            selection: 'UNRESOLVED',
+            selectionBasis: [],
+            notes: [
+                'POST-DRAW is not used: Gate 4B-2B-2 measured it 12.55 ms slower at p95',
+                'the no-sort reference is measured at both ends of the session, because it has '
+                + 'come back at 34.6, 34.8 and 43.4 ms across earlier sessions',
+                'CPU DepthSorter and the render-index update are off, so the draw order is fixed '
+                + 'and nothing here judges visual correctness; no claim is made that a 4 Hz '
+                + 'cadence is visually acceptable (§22)',
+                'a GPU-only improvement would not by itself mean "implement a GPU sort" (§21): it '
+                + 'separates the GPU distance work from the completion boundary, nothing more',
+                'measurement only: no production cadence change, no GPU sort, no Worker, no WASM',
+            ],
+        };
+        this.leverReport = report;
+
+        try {
+            if (gpu.isSoftware && !options.allowSoftware) {
+                report.selectionBasis.push(`software renderer `
+                    + `(${gpu.softwareMatches.join(', ')}): completion-path timing on a software `
+                    + 'rasteriser is not evidence');
+                return report;
+            }
+
+            const handles = viewer.getPoCHandles();
+            if (!handles) throw new Error('the viewer has no renderer or splat mesh yet');
+
+            this.pass = new UikaPredeformPass();
+            const layout = this.pass.init(handles);
+            viewer.setPredeformCenterTexture(this.pass.getTexture(), layout.textureWidth, layout.textureHeight);
+            viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+            viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
+            viewer.setExpressionWeightHook(() => { this.pass?.markDirty(); });
+            const dpr = window.devicePixelRatio || 1;
+            viewer.setDrawingBufferScale(1 / dpr);
+
+            const interval = 1000 / LEVER_RULES.targetHz;
+            const plan: Array<[UikaTailRunName, UikaSortStage, boolean, UikaCompletionMode, number | null]> = [
+                ['B0-no-sort-start', 'full', true, 'cpu-readback', null],
+                ['C0-current', 'distance', false, 'cpu-readback', null],
+                ['C0R-current-repeat', 'distance', false, 'cpu-readback', null],
+                ['F4-4hz-cpu-readback', 'distance', false, 'cpu-readback', interval],
+                ['F4R-4hz-cpu-readback-repeat', 'distance', false, 'cpu-readback', interval],
+                ['G4-4hz-gpu-only', 'distance', false, 'gpu-only', interval],
+                ['G4R-4hz-gpu-only-repeat', 'distance', false, 'gpu-only', interval],
+                ['B1-no-sort-end', 'full', true, 'cpu-readback', null],
+            ];
+
+            for (const [name, stage, suspended, mode, minInterval] of plan) {
+                if (this.abort) break;
+                report.runs.push(await this.measureRun(
+                    name, stage, suspended, options, 'immediate', 'pre-draw', mode, minInterval));
+            }
+
+            report.analysis = this.analyseLevers(report);
+            this.classifyLevers(report);
+        } finally {
+            try {
+                viewer?.setFrameTickHook?.(null);
+                viewer?.setSortLifecycleRecorder?.(null);
+                viewer?.setDiagnosticSortStage?.('full');
+                viewer?.setDiagnosticSortSubmissionPhase?.('pre-draw');
+                viewer?.setDiagnosticSortMinIntervalMs?.(null);
+                viewer?.setSortSuspended?.(false);
+                viewer?.setPreRenderHook?.(null);
+                viewer?.setExpressionWeightHook?.(null);
+                viewer?.setDistanceProvider?.(null);
+                viewer?.setPredeformCenterTexture?.(null, 0, 0);
+                viewer?.setDrawingBufferScale?.(1);
+                viewer?.setGpuTimer?.(null);
+            } catch { /* noop */ }
+            this.pass?.setDistanceLifecycleRecorder(null);
+            this.pass?.setFencePollStrategy('immediate');
+            this.pass?.setDiagnosticCompletionMode('cpu-readback');
+            this.pass?.dispose();
+            this.pass = null;
+            this.replay.stop();
+            this.runtime.setExpressionSource(null);
+            this.runtime.setNeutral();
+            this.live.phase = 'idle';
+            this.live.step = '';
+            this.running = false;
+            report.finishedAt = new Date().toISOString();
+        }
+
+        return report;
+    }
+
+    private analyseLevers(report: UikaLeverReport): UikaLeverReport['analysis'] {
+        const usable = (name: UikaTailRunName) => {
+            const run = report.runs.find((x) => x.name === name);
+            if (!run || !run.valid || run.exactFrameInterval.count === 0) return null;
+            if (run.completionPathExercised === false) return null;
+            return run.exactFrameInterval.p95;
+        };
+        const hz = (name: UikaTailRunName) => {
+            const run = report.runs.find((x) => x.name === name);
+            return run && run.valid ? run.cadence.actualDistanceSubmissionHz : null;
+        };
+        const pair = (a: number | null, b: number | null) => {
+            const xs = [a, b].filter((v): v is number => v !== null);
+            return {
+                mean: xs.length > 0 ? xs.reduce((x, y) => x + y, 0) / xs.length : null,
+                spread: xs.length === 2 ? Math.abs(xs[0] - xs[1]) : null,
+            };
+        };
+
+        const b = pair(usable('B0-no-sort-start'), usable('B1-no-sort-end'));
+        const current = pair(usable('C0-current'), usable('C0R-current-repeat'));
+        const f4 = pair(usable('F4-4hz-cpu-readback'), usable('F4R-4hz-cpu-readback-repeat'));
+        const g4 = pair(usable('G4-4hz-gpu-only'), usable('G4R-4hz-gpu-only-repeat'));
+
+        const freqImprovement = current.mean !== null && f4.mean !== null
+            ? current.mean - f4.mean : null;
+        const syncImprovement = f4.mean !== null && g4.mean !== null ? f4.mean - g4.mean : null;
+        const residual = g4.mean !== null && b.mean !== null ? g4.mean - b.mean : null;
+        const gap = current.mean !== null && b.mean !== null ? current.mean - b.mean : null;
+
+        const freqNoise = Math.max(current.spread ?? 0, f4.spread ?? 0) * LEVER_RULES.noiseFactor;
+        const syncNoise = Math.max(f4.spread ?? 0, g4.spread ?? 0) * LEVER_RULES.noiseFactor;
+
+        const f4Hz = pair(hz('F4-4hz-cpu-readback'), hz('F4R-4hz-cpu-readback-repeat'));
+        const g4Hz = pair(hz('G4-4hz-gpu-only'), hz('G4R-4hz-gpu-only-repeat'));
+        const cadenceNotes: string[] = [];
+        let cadenceValid: boolean | null = null;
+        if (f4Hz.mean !== null && g4Hz.mean !== null) {
+            const inBand = (v: number) => v >= LEVER_RULES.minAcceptableHz && v <= LEVER_RULES.maxAcceptableHz;
+            const diff = Math.abs(f4Hz.mean - g4Hz.mean);
+            cadenceValid = inBand(f4Hz.mean) && inBand(g4Hz.mean) && diff <= LEVER_RULES.maxHzDifference;
+            if (!inBand(f4Hz.mean)) {
+                cadenceNotes.push(`F4 mean submission rate ${f4Hz.mean.toFixed(2)} Hz is outside `
+                    + `${LEVER_RULES.minAcceptableHz}-${LEVER_RULES.maxAcceptableHz} Hz`);
+            }
+            if (!inBand(g4Hz.mean)) {
+                cadenceNotes.push(`G4 mean submission rate ${g4Hz.mean.toFixed(2)} Hz is outside `
+                    + `${LEVER_RULES.minAcceptableHz}-${LEVER_RULES.maxAcceptableHz} Hz`);
+            }
+            if (diff > LEVER_RULES.maxHzDifference) {
+                cadenceNotes.push(`F4 and G4 submission rates differ by ${diff.toFixed(2)} Hz, more `
+                    + `than the ${LEVER_RULES.maxHzDifference} Hz the readback comparison allows`);
+            }
+        } else {
+            cadenceNotes.push('a 4 Hz run produced no usable submission rate');
+        }
+
+        return {
+            bMeanP95: b.mean, bSpreadMs: b.spread,
+            currentMeanP95: current.mean, currentSpreadMs: current.spread,
+            f4MeanP95: f4.mean, f4SpreadMs: f4.spread,
+            g4MeanP95: g4.mean, g4SpreadMs: g4.spread,
+            frequencyImprovementMs: freqImprovement,
+            frequencyNoiseFloorMs: freqNoise,
+            frequencySignificant: freqImprovement === null ? null : Math.abs(freqImprovement) >= freqNoise,
+            syncReadbackImprovementMs: syncImprovement,
+            syncReadbackNoiseFloorMs: syncNoise,
+            syncReadbackSignificant: syncImprovement === null ? null : Math.abs(syncImprovement) >= syncNoise,
+            gpuDistanceResidualMs: residual,
+            currentGapMs: gap,
+            frequencyClosedShare: freqImprovement !== null && gap !== null && gap > 0
+                ? freqImprovement / gap : null,
+            syncReadbackClosedShare: syncImprovement !== null && gap !== null && gap > 0
+                ? syncImprovement / gap : null,
+            gpuDistanceResidualShare: residual !== null && gap !== null && gap > 0
+                ? residual / gap : null,
+            f4MeanHz: f4Hz.mean, g4MeanHz: g4Hz.mean,
+            hzDifference: f4Hz.mean !== null && g4Hz.mean !== null
+                ? Math.abs(f4Hz.mean - g4Hz.mean) : null,
+            cadenceValid,
+            cadenceNotes,
+        };
+    }
+
+    /** §19, §20. Each lever on its own absolute effect against its own repeat noise. */
+    private classifyLevers(report: UikaLeverReport): void {
+        const a = report.analysis!;
+        const basis: string[] = [];
+
+        for (const run of report.runs) {
+            basis.push(`${run.name}: p95 ${run.exactFrameInterval.p95.toFixed(2)} ms, fps `
+                + `${run.effectiveFPS.toFixed(2)}, mode ${run.completionMode}, cadence `
+                + `${run.sortMinIntervalMs === null ? 'uncapped' : `${run.sortMinIntervalMs} ms`}, `
+                + `requested ${run.cadence.requested}, cadenceSkipped ${run.cadence.cadenceSkipped}, `
+                + `submitted ${run.cadence.distanceSubmitted} `
+                + `(${run.cadence.actualDistanceSubmissionHz.toFixed(2)} Hz), cpuCompletions `
+                + `${run.cadence.cpuCompletionCount}, readbacks ${run.cadence.cpuReadbackCount}, `
+                + `fencePolls ${run.cadence.fencePollCount}`
+                + (run.valid ? '' : ` — INVALID: ${run.invalidReason}`));
+        }
+
+        const invalid = report.runs.filter((x) => !x.valid);
+        const invariantFailures = report.runs
+            .filter((x) => x.completionMode === 'cpu-readback')
+            .reduce((sum, x) => sum + x.sortLifecycle.lifecycleInvariantFailures, 0);
+        const guardFailures = report.runs.filter((x) => x.glErrors !== 0 || x.pageErrors !== 0
+            || x.visibilityLostMs !== 0 || x.phaseStateMismatches !== 0);
+        for (const run of guardFailures) {
+            basis.push(`${run.name}: guard failure — GL ${run.glErrors}, page ${run.pageErrors}, `
+                + `visibilityLost ${run.visibilityLostMs}, state mismatches ${run.phaseStateMismatches}`);
+        }
+        for (const note of a.cadenceNotes) basis.push(note);
+
+        const verdict = (improvement: number | null, noise: number | null): UikaLeverVerdict => {
+            if (improvement === null || noise === null) return 'UNDETERMINED';
+            if (Math.abs(improvement) < noise) return 'NULL';
+            return improvement > 0 ? 'EFFECTIVE' : 'REGRESSION';
+        };
+        report.frequencyVerdict = verdict(a.frequencyImprovementMs, a.frequencyNoiseFloorMs);
+        report.syncReadbackVerdict = verdict(a.syncReadbackImprovementMs, a.syncReadbackNoiseFloorMs);
+
+        if (a.bMeanP95 !== null) {
+            basis.push(`no-sort reference mean p95 ${a.bMeanP95.toFixed(2)} ms, measured at both `
+                + `ends of the session, spread ${a.bSpreadMs?.toFixed(2)} ms`);
+        }
+        basis.push(`current mean p95 ${a.currentMeanP95?.toFixed(2)} ms (spread `
+            + `${a.currentSpreadMs?.toFixed(2)}), 4 Hz cpu-readback ${a.f4MeanP95?.toFixed(2)} ms `
+            + `(spread ${a.f4SpreadMs?.toFixed(2)}), 4 Hz gpu-only ${a.g4MeanP95?.toFixed(2)} ms `
+            + `(spread ${a.g4SpreadMs?.toFixed(2)})`);
+        basis.push(`frequency effect ${a.frequencyImprovementMs?.toFixed(2)} ms against a noise `
+            + `floor of ${a.frequencyNoiseFloorMs?.toFixed(2)} ms -> ${report.frequencyVerdict}`);
+        basis.push(`sync/readback effect ${a.syncReadbackImprovementMs?.toFixed(2)} ms against a `
+            + `noise floor of ${a.syncReadbackNoiseFloorMs?.toFixed(2)} ms -> `
+            + `${report.syncReadbackVerdict}`);
+        if (a.gpuDistanceResidualMs !== null) {
+            basis.push(`4 Hz GPU distance only, against no distance work: `
+                + `${a.gpuDistanceResidualMs.toFixed(2)} ms (no-sort spread `
+                + `${a.bSpreadMs?.toFixed(2)} ms)`);
+        }
+
+        if (invalid.length > 0 || invariantFailures > 0 || guardFailures.length > 0) {
+            report.selection = 'UNRESOLVED';
+            basis.push('a run is invalid or a guard failed, so no lever is selected');
+            report.selectionBasis = basis;
+            return;
+        }
+        if (a.cadenceValid === false) {
+            report.selection = 'UNRESOLVED';
+            basis.push('the 4 Hz cadence condition (§11) was not met, so the readback comparison '
+                + 'is not valid');
+            report.selectionBasis = basis;
+            return;
+        }
+        if (report.frequencyVerdict === 'UNDETERMINED' || report.syncReadbackVerdict === 'UNDETERMINED') {
+            report.selection = 'UNRESOLVED';
+            basis.push('a lever could not be evaluated');
+            report.selectionBasis = basis;
+            return;
+        }
+
+        const freq = report.frequencyVerdict === 'EFFECTIVE' ? a.frequencyImprovementMs! : 0;
+        const sync = report.syncReadbackVerdict === 'EFFECTIVE' ? a.syncReadbackImprovementMs! : 0;
+        if (freq > 0 && sync > 0) {
+            if (freq >= sync * LEVER_RULES.dominanceFactor) report.selection = 'FREQUENCY_PRIMARY';
+            else if (sync >= freq * LEVER_RULES.dominanceFactor) {
+                report.selection = 'GPU_CPU_SYNC_READBACK_PRIMARY';
+            } else report.selection = 'MIXED_LEVERS';
+        } else if (freq > 0) {
+            report.selection = 'FREQUENCY_PRIMARY';
+        } else if (sync > 0) {
+            report.selection = 'GPU_CPU_SYNC_READBACK_PRIMARY';
+        } else {
+            report.selection = 'NEITHER_LEVER_ESTABLISHED';
+        }
+        report.selectionBasis = basis;
+    }
+
     private analysePhase(report: UikaPhaseReport): UikaPhaseReport['analysis'] {
         const usable = (name: UikaTailRunName) => {
             const run = report.runs.find((x) => x.name === name);
@@ -1136,7 +1551,14 @@ export class UikaTailIsolation {
         options: UikaTailOptions,
         pollStrategy: UikaFencePollStrategy = 'immediate',
         phase: UikaSortSubmissionPhase = 'pre-draw',
+        completionMode: UikaCompletionMode = 'cpu-readback',
+        sortMinIntervalMs: number | null = null,
     ): Promise<UikaTailRun> {
+        if (completionMode === 'gpu-only' && stage !== 'distance') {
+            // §5 / §6: with no readback the CPU distance array is stale, so nothing may
+            // consume it. The harness refuses the combination rather than measuring it.
+            throw new Error('UIKA Gate 4B-2B-3: gpu-only is only valid with the distance stage');
+        }
         const viewer = this.viewer();
         const gl = this.gl();
         const ext = gl ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
@@ -1148,6 +1570,8 @@ export class UikaTailIsolation {
         viewer.setSortLifecycleRecorder({
             requested: () => collector.requested(),
             pendingSkip: (at: number) => collector.pendingSkip(at),
+            cadenceSkip: () => collector.cadenceSkip(),
+            cadenceEligible: () => collector.cadenceEligible(),
             submitStart: (at: number) => collector.submitStart(at),
             submitEnd: (at: number) => collector.submitEnd(at),
             cpuSortStart: (at: number) => collector.cpuSortStart(at),
@@ -1167,7 +1591,9 @@ export class UikaTailIsolation {
         viewer.setDiagnosticSortStage(stage);
         viewer.setSortSuspended(suspended);
         this.pass!.setFencePollStrategy(pollStrategy);
+        this.pass!.setDiagnosticCompletionMode(completionMode);
         viewer.setDiagnosticSortSubmissionPhase(phase);
+        viewer.setDiagnosticSortMinIntervalMs(sortMinIntervalMs);
 
         this.replay.stop();
         this.runtime.setExpressionSource(null);
@@ -1194,6 +1620,15 @@ export class UikaTailIsolation {
             'P1-post-draw': 'Run C conditions, the same frame drawn first and the distance '
                 + 'pass submitted after it, inside the same render() call',
             'P1-post-draw-repeat': 'P1 again, to size the run-to-run spread',
+            'B0-no-sort-start': 'no distance submission at all, measured first',
+            'C0-current': 'the current completion path: uncapped cadence, cpu-readback, pre-draw',
+            'C0R-current-repeat': 'C0 again, to size the run-to-run spread',
+            'F4-4hz-cpu-readback': 'the same completion path at a 250 ms minimum interval (4 Hz)',
+            'F4R-4hz-cpu-readback-repeat': 'F4 again',
+            'G4-4hz-gpu-only': 'the same 4 Hz and the same GPU distance work, with no fence, '
+                + 'no poll and no readback',
+            'G4R-4hz-gpu-only-repeat': 'G4 again',
+            'B1-no-sort-end': 'no distance submission, measured last, to show session drift',
         };
 
         this.live.step = name;
@@ -1327,6 +1762,7 @@ export class UikaTailIsolation {
         this.live.fps = effectiveFPS;
         const exact = summariseStage(exactIntervals);
         const replayStats = this.replay.getStats();
+        const passStats = this.pass!.getStats();
 
         const run: UikaTailRun = {
             name,
@@ -1334,6 +1770,20 @@ export class UikaTailIsolation {
             sortStage: stage,
             sortSuspended: suspended,
             fencePollStrategy: pollStrategy,
+            completionMode,
+            sortMinIntervalMs,
+            cadence: {
+                requested: collector.sortRequestedCount,
+                cadenceEligible: collector.cadenceEligibleCount,
+                cadenceSkipped: collector.cadenceSkippedCount,
+                distanceSubmitted: passStats.gpuDistanceSubmittedCount,
+                gpuOnlyDistanceSubmittedCount: passStats.gpuOnlyDistanceSubmittedCount,
+                cpuCompletionCount: passStats.cpuCompletionCount,
+                cpuReadbackCount: passStats.cpuReadbackCount,
+                fencePollCount: passStats.fencePollCount,
+                actualDistanceSubmissionHz: measuredMs > 0
+                    ? passStats.gpuDistanceSubmittedCount / (measuredMs / 1000) : 0,
+            },
             sortSubmissionPhase: phase,
             phaseStateMismatches: viewer.stats.phaseStateMismatches - phaseMismatches0,
             submittedEqualsCompleted:
@@ -1386,7 +1836,7 @@ export class UikaTailIsolation {
                 framesWithCpuSort,
                 framesWithIndexUpdate,
             },
-            predeformPassCount: this.pass!.getStats().passCount,
+            predeformPassCount: passStats.passCount,
             weightUploadCount: replayStats.weightUploadCount,
             glErrors: viewer.stats.glErrorCount - glErrors0,
             pageErrors: this.pageErrors - pageErrors0,
@@ -1395,9 +1845,13 @@ export class UikaTailIsolation {
             invalidReason: visibilityLostMs > 0
                 ? `the tab was hidden for ${Math.round(visibilityLostMs)} ms during measurement`
                 : null,
+            // In gpu-only mode there is no CPU completion by design, so what must be
+            // non-zero is the GPU submission count (§8: the counters are not conflated).
             completionPathExercised: suspended
                 ? null
-                : collector.sortSubmittedCount > 0 && collector.sortCompletedCount > 0,
+                : completionMode === 'gpu-only'
+                    ? passStats.gpuOnlyDistanceSubmittedCount > 0
+                    : collector.sortSubmittedCount > 0 && collector.sortCompletedCount > 0,
             meetsTarget: name === 'A-normal'
                 ? effectiveFPS >= TAIL_TARGET.minFps && exact.p95 <= TAIL_TARGET.maxExactWallP95Ms
                   && viewer.stats.glErrorCount - glErrors0 === 0 && this.pageErrors - pageErrors0 === 0
@@ -1405,7 +1859,19 @@ export class UikaTailIsolation {
             frameRecords,
         };
 
-        if (run.valid && !suspended && !run.submittedEqualsCompleted) {
+        if (run.valid && completionMode === 'gpu-only') {
+            // §13: gpu-only must have submitted GPU work and must NOT have read anything back.
+            if (passStats.gpuOnlyDistanceSubmittedCount === 0) {
+                run.valid = false;
+                run.invalidReason = 'gpu-only submitted no distance pass in the measured window';
+            } else if (passStats.cpuReadbackCount !== 0 || passStats.fencePollCount !== 0) {
+                run.valid = false;
+                run.invalidReason = `gpu-only recorded ${passStats.cpuReadbackCount} readbacks and `
+                    + `${passStats.fencePollCount} fence polls; it must record none`;
+            }
+        }
+        if (run.valid && !suspended && completionMode === 'cpu-readback'
+            && !run.submittedEqualsCompleted) {
             run.valid = false;
             run.invalidReason = `the measured window submitted ${collector.sortSubmittedCount} `
                 + `sorts and completed ${collector.sortCompletedCount}: a sort crossed the window `
@@ -1434,7 +1900,9 @@ export class UikaTailIsolation {
         viewer.setSortSuspended(false);
         viewer.setDiagnosticSortStage('full');
         viewer.setDiagnosticSortSubmissionPhase('pre-draw');
+        viewer.setDiagnosticSortMinIntervalMs(null);
         this.pass!.setFencePollStrategy('immediate');
+        this.pass!.setDiagnosticCompletionMode('cpu-readback');
         return run;
     }
 

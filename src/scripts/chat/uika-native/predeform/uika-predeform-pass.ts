@@ -52,6 +52,12 @@ export interface UikaPredeformStats {
     distanceRuns: number;
     lastDistanceMs: number;
     dirty: boolean;
+    /** Gate 4B-2B-3 §8: counted separately, never conflated. */
+    gpuDistanceSubmittedCount: number;
+    gpuOnlyDistanceSubmittedCount: number;
+    cpuCompletionCount: number;
+    cpuReadbackCount: number;
+    fencePollCount: number;
 }
 
 /** The same shape the Gate 4A/4B-1 GPU timer uses, plus the pre-deformation pass. */
@@ -75,6 +81,29 @@ export interface UikaPredeformGpuTimer {
  *   timer16     setTimeout(checkSync, 16)
  */
 export type UikaFencePollStrategy = 'immediate' | 'frame' | 'timer8' | 'timer16';
+
+/**
+ * Gate 4B-2B-3 §5. What happens after the distance transform-feedback draw is submitted.
+ *
+ *   cpu-readback   fenceSync + clientWaitSync polling + getBufferSubData — the PoC path
+ *   gpu-only       return straight after the GPU submission: no fence, no poll, no
+ *                  readback, no CPU distance array update
+ *
+ * §6 safety, established from this file rather than assumed. The transform-feedback output
+ * buffer is created once with STATIC_READ and is referenced in exactly three places: the
+ * one-time bufferData, the bindBufferBase that makes it the transform-feedback target, and
+ * the getBufferSubData inside the fence continuation. Nothing else reads it — no vertex
+ * attribute, no uniform block, no copyBufferSubData — and WebGL2 has no buffer mapping, so
+ * there is no persistent mapping to invalidate. Successive writes are issued on one
+ * context's command stream and are therefore ordered against each other by GL itself. The
+ * fence exists only to tell the CPU when it may read, so with no CPU read there is nothing
+ * for it to guard.
+ *
+ * In gpu-only mode the CPU distance array is left stale on purpose. It is only valid to
+ * use with the 'distance' sort stage, where neither the CPU depth sort nor the
+ * render-index update consumes it; the harness refuses any other combination.
+ */
+export type UikaCompletionMode = 'cpu-readback' | 'gpu-only';
 
 export interface UikaDistanceLifecycleRecorder {
     fenceWaitStart?(at: number): void;
@@ -215,11 +244,14 @@ export class UikaPredeformPass {
     private gpuTimer: UikaPredeformGpuTimer | null = null;
     private distanceLifecycle: UikaDistanceLifecycleRecorder | null = null;
     private fencePollStrategy: UikaFencePollStrategy = 'immediate';
+    private completionMode: UikaCompletionMode = 'cpu-readback';
     private framePoll: (() => void) | null = null;
     private dirty = true;
     private stats: UikaPredeformStats = {
         passCount: 0, weightChangeCount: 0, lastPassMs: 0,
         distanceRuns: 0, lastDistanceMs: 0, dirty: true,
+        gpuDistanceSubmittedCount: 0, gpuOnlyDistanceSubmittedCount: 0,
+        cpuCompletionCount: 0, cpuReadbackCount: 0, fencePollCount: 0,
     };
 
     static capabilities(gl: WebGL2RenderingContext | null): UikaPredeformCapabilities {
@@ -264,6 +296,15 @@ export class UikaPredeformPass {
         return this.fencePollStrategy;
     }
 
+    /** Gate 4B-2B-3 §5 diagnostic only. 'cpu-readback' is the PoC behaviour. */
+    setDiagnosticCompletionMode(mode: UikaCompletionMode): void {
+        this.completionMode = mode;
+    }
+
+    getCompletionMode(): UikaCompletionMode {
+        return this.completionMode;
+    }
+
     /**
      * Gate 4B-2B-1, 'frame' strategy only: run at most one pending fence poll. The
      * diagnostic calls this once per rendered frame. A no-op under every other strategy
@@ -295,6 +336,11 @@ export class UikaPredeformPass {
         this.stats.passCount = 0;
         this.stats.weightChangeCount = 0;
         this.stats.distanceRuns = 0;
+        this.stats.gpuDistanceSubmittedCount = 0;
+        this.stats.gpuOnlyDistanceSubmittedCount = 0;
+        this.stats.cpuCompletionCount = 0;
+        this.stats.cpuReadbackCount = 0;
+        this.stats.fencePollCount = 0;
     }
 
     /** Called whenever the expression weights change. The pass itself runs in the frame. */
@@ -514,6 +560,22 @@ export class UikaPredeformPass {
             gl.bindTexture(gl.TEXTURE_2D, previousUnit0);
             gl.activeTexture(previousActiveUnit);
 
+            // Everything above is one code path for both completion modes (§7): the same
+            // distance shader, the same bindings, the same draw, the same state restore.
+            // Only what follows differs.
+            this.stats.gpuDistanceSubmittedCount++;
+
+            if (this.completionMode === 'gpu-only') {
+                this.stats.gpuOnlyDistanceSubmittedCount++;
+                this.stats.distanceRuns++;
+                this.stats.lastDistanceMs = performance.now() - started;
+                // No fence, no poll, no readback: the CPU never observes the buffer, so
+                // `outComputedDistances` is deliberately left as it was (§5, §6).
+                if (previousProgram && previousProgramDeleted !== true) gl.useProgram(previousProgram);
+                if (previousVao) gl.bindVertexArray(previousVao);
+                return Promise.resolve();
+            }
+
             const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
             gl.flush();
             this.distanceLifecycle?.fenceWaitStart?.(performance.now());
@@ -522,6 +584,7 @@ export class UikaPredeformPass {
                 let polls = 0;
                 const checkSync = () => {
                     polls++;
+                    this.stats.fencePollCount++;
                     const status = gl.clientWaitSync(sync!, 0, 0);
                     if (status === gl.TIMEOUT_EXPIRED) {
                         this.scheduleFencePoll(checkSync);
@@ -537,8 +600,10 @@ export class UikaPredeformPass {
                     gl.bindBuffer(gl.ARRAY_BUFFER, this.distanceBuffer);
                     gl.getBufferSubData(gl.ARRAY_BUFFER, 0, outComputedDistances);
                     gl.bindBuffer(gl.ARRAY_BUFFER, null);
+                    this.stats.cpuReadbackCount++;
                     this.distanceLifecycle?.readbackEnd?.(performance.now());
                     if (vao) gl.bindVertexArray(vao);
+                    this.stats.cpuCompletionCount++;
                     this.stats.distanceRuns++;
                     this.stats.lastDistanceMs = performance.now() - started;
                     resolve();
