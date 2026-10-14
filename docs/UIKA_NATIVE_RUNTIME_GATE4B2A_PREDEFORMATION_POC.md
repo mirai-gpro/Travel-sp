@@ -2,7 +2,12 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2A.
 Route: `/uika-native-predeform-benchmark`.
-Status: **`GATE4B2A_CORRECTNESS = PASS`** under acceptance v2
+Status: **`GATE4B2A_CORRECTNESS = PASS`** under acceptance v2; **performance FAIL**
+(`FULL_DPR_PERF = FAIL`, `DPR1_PERF = FAIL`) with a large measured improvement — see §6.
+The DPR 1 failure is a tail-latency failure, not a throughput one, and is now
+Gate 4B-2B-0.
+
+Correctness status in full:
 (numeric + visual equivalence), decided on the 192-frame real-GPU sweep. Reported
 separately and kept that way: `BIT_EXACT_EQUIVALENCE = FAIL` (135/192),
 `NUMERIC_EQUIVALENCE = PASS` (192/192), `VISUAL_EQUIVALENCE = PASS` (192/192 within the
@@ -592,63 +597,95 @@ Query parameters: `?warmupMs=`, `?measureMs=`, `?dpr1=1|0`, `?correctnessOnly=1`
 
 ---
 
-## 6. Performance — PENDING (unblocked by §3.7)
+## 6. Performance — FAIL, with a large measured improvement
 
-Correctness passes under v2, so the harness no longer stops before the timings. The
-measurement is the one planned from the start (§9 - §12 of the gate): four measurements at
-DPR 1.5, each a warm-up of at least 6 s and a measurement of at least 30 s, and two more
-at pixelRatio 1.0 if full DPR misses 30 fps.
-
-**Judged on total GPU cost, not on draw alone (§10).** Below 30 fps the replay advances to
-a new A2E frame on every rendered frame, so the deformation pass runs about once per
-rendered frame — measured in the self-test as 5 passes for 5 frames. The pre-deformed path
-is therefore judged on
+Real GPU, AMD Radeon 860M / Chrome 154.
 
 ```text
-pre-deformation + draw + sort
+FULL DPR (1138 x 1138) — real A2E
+  production effectiveFPS     12.56      predeform effectiveFPS     23.38
+  GPU draw p50                74.90 ms   ->                         38.42 ms
+  GPU sort p50                 5.95 ms   ->                          0.66 ms
+
+pixelRatio 1.0 (759 x 759) — real A2E, pre-deformed
+  effectiveFPS                45.19
+  GPU pre-deformation p50      2.03 ms
+  GPU draw p50                17.71 ms
+  GPU sort p50                 0.62 ms
+  wall p95                    68.90 ms
 ```
-
-which the report carries as `realA2eTotalGpuP50` for both modes together with
-`totalGpuSavedMs`. A draw-only improvement is not treated as a pass.
-
-**Criteria at DPR 1.5 (§11).**
 
 ```text
-effectiveFPS >= 30
-wall p95 <= 33.3 ms
-GL errors = 0
-page errors = 0
--> FULL_DPR_PERF_PASS
+FULL_DPR_PERF       = FAIL
+DPR1_PERF           = FAIL
+overall performance = FAIL
 ```
 
-If that is missed, pixelRatio 1.0 is measured as a diagnostic (CSS 759x759, drawing buffer
-about 759x759) for the pre-deformed path, fixed pose and real A2E, plus production real
-A2E for comparison. No automatic resolution switching is implemented.
+Full DPR fails outright: a pre-deformed draw p50 of 38.42 ms already exceeds the 33.3 ms
+a 30 fps frame allows, before the deformation pass and the sort are counted. That verdict
+needs no re-measurement.
+
+DPR 1 fails on the tail, not on throughput. 45.19 fps is 22.13 ms per frame on average,
+and the three stages sum to 2.03 + 17.71 + 0.62 = 20.36 ms, which accounts for that
+average — while wall p95 is 68.90 ms, 3.11x the mean. Average capability is past 30 fps;
+something stalls at the tail. That is Gate 4B-2B-0
+(`UIKA_NATIVE_RUNTIME_GATE4B2B0_DPR1_TAIL_ISOLATION.md`).
+
+### 6.1 The production baseline in that run was contaminated
+
+The hooks that drive the deformation pass were installed once for the whole benchmark run
+rather than per mode, so the **production** measurement ran the pass as well:
 
 ```text
-GPU / browser / DPR / drawingBuffer                                PENDING
-
-DPR 1.5
-  production / fixed-pose   draw p50-p95, sort p50, fps            PENDING
-  predeform  / fixed-pose   predeform p50, draw p50-p95, sort p50, fps   PENDING
-  production / real-a2e     draw p50-p95, sort p50-p95, fps, wall p50-p95-p99   PENDING
-  predeform  / real-a2e     predeform p50-p95, draw p50-p95, sort p50-p95,
-                            fps, wall p50-p95-p99                  PENDING
-  predeformPassCount vs changed expression frames                  PENDING
-  draw saved / sort saved                                          PENDING
-
-pixelRatio 1.0 (only if full DPR misses 30 fps)
-  production / real-a2e     fps                                    PENDING
-  predeform  / real-a2e     fps, wall p95                          PENDING
-
-invalid GPU timer samples / GL errors / page errors                PENDING
-
-FULL_DPR_PERF  = PENDING
-DPR1_PERF      = PENDING
-DECISION       = PENDING
+production, DPR 1.5    predeformPassCount = 197
+production, DPR 1.0    predeformPassCount = 261
 ```
 
-Nothing above is estimated or extrapolated.
+A production baseline that runs a pre-deformation pass is not a baseline. The
+production-side figures above, and therefore the production-to-pre-deformed deltas, are
+affected — the production path was charged for work it does not do. The pre-deformed
+figures are not affected, because that mode is supposed to run the pass.
+
+Fixed: `measure()` now installs `setPreRenderHook` and `setExpressionWeightHook` only in
+pre-deformed mode and clears them in production mode, and a production measurement is
+marked **invalid** unless
+
+```text
+predeformPassCount == 0
+gpuPredeform sample count == 0
+```
+
+so a contaminated baseline can no longer be reported as a measurement. The production
+numbers above are kept as what that run produced, with this caveat attached; a clean
+production baseline needs a re-run and is not claimed here.
+
+### 6.2 `realA2eTotalGpuP50` renamed
+
+The field that summed `p50(pre-deformation) + p50(draw) + p50(sort)` was called
+`realA2eTotalGpuP50`, which claims more than it is: `p50(A) + p50(B) + p50(C)` is not
+`p50(A + B + C)`, and the stages do not all run on every frame.
+
+```text
+FULL DPR, pre-deformed    passCount 330 of 703 frames        (47%)
+DPR 1,    pre-deformed    passCount 687 of 1356 frames       (51%)
+                          sortRuns  282 of 1356 frames       (21%)
+```
+
+It is now `realA2eSumOfStageP50s`, documented as a sum of per-stage p50s and not a
+per-frame total, and the report carries `realA2ePassCount`, `realA2eSortRuns` and
+`realA2eRenderedFrames` next to it so the "not every frame" part is visible. The
+difference field is `sumOfStageP50sSavedMs`. Report terminology only; no measurement
+changed.
+
+Two things that fall out of those counts, as arithmetic rather than interpretation: at
+45.19 fps the replay is above its own 30 fps, so only 51% of rendered frames land on a new
+A2E frame and the deformation pass runs on about half of them — the regime the earlier
+self-test predicted. And 687 weight uploads produced only 282 sort runs, so 405 wanted
+sorts did not start; Gate 4B-2B-0 §5 counts that directly.
+
+```text
+draw p50 full DPR / DPR 1 = 38.42 / 17.71 = 2.17, against a pixel-count ratio of 1.5^2 = 2.25
+```
 
 ### Acceptance as implemented (§16)
 

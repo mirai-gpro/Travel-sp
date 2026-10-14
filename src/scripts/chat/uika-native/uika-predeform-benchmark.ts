@@ -98,6 +98,8 @@ export interface UikaPredeformMeasurement {
     weightChangeCount: number;
     weightUploadCount: number | null;
     predeformPassesWithinChanges: boolean | null;
+    /** §1: production only — no deformation pass ran and no pre-deformation sample exists. */
+    productionBaselineClean: boolean | null;
     glErrors: number;
     pageErrors: number;
     visibilityLostMs: number;
@@ -128,18 +130,34 @@ export interface UikaPredeformReport {
         dpr: number;
         production: { fixedPoseDrawP50: number | null; realA2eFps: number | null;
                       realA2eDrawP50: number | null; realA2eSortP50: number | null;
-                      /** draw + sort; the production path has no deformation pass. */
-                      realA2eTotalGpuP50: number | null } | null;
+                      /**
+                       * §2: the SUM OF PER-STAGE p50s (draw + sort), not a per-frame total
+                       * p50 — p50(A)+p50(B) is not p50(A+B), and the stages do not all run
+                       * on every frame.
+                       */
+                      realA2eSumOfStageP50s: number | null } | null;
         predeform: { fixedPoseDrawP50: number | null; realA2eFps: number | null;
                      realA2eDrawP50: number | null; realA2eSortP50: number | null;
                      realA2ePredeformP50: number | null;
-                     /** pre-deformation + draw + sort: what §10 says to judge on. */
-                     realA2eTotalGpuP50: number | null } | null;
+                     /**
+                      * §2: the SUM OF PER-STAGE p50s (pre-deformation + draw + sort), not a
+                      * per-frame total p50. The deformation pass and the sort each run on a
+                      * fraction of the frames, so this is an upper-bound style indicator and
+                      * not a frame-time distribution.
+                      */
+                     realA2eSumOfStageP50s: number | null;
+                     /** How often each stage actually ran, against the rendered frames. */
+                     realA2ePassCount: number | null;
+                     realA2eSortRuns: number | null;
+                     realA2eRenderedFrames: number | null } | null;
         dpr1: { productionFps: number | null; predeformFps: number | null } | null;
         drawSavedMs: number | null;
         sortSavedMs: number | null;
-        /** Total GPU cost saved. A draw-only improvement is not enough on its own (§10). */
-        totalGpuSavedMs: number | null;
+        /**
+         * The difference of those two sums. A draw-only improvement is not enough on its
+         * own (§10), and this is a stage-sum difference, not a measured frame-time saving.
+         */
+        sumOfStageP50sSavedMs: number | null;
     } | null;
     fullDprPerf: 'PASS' | 'FAIL' | 'NOT_RUN';
     dpr1Perf: 'PASS' | 'FAIL' | 'NOT_RUN';
@@ -270,9 +288,10 @@ export class UikaPredeformBenchmark {
 
             // The deformation pass runs at the top of every frame, but only when the
             // weights actually changed; the viewer's weight setter is what marks it dirty.
-            viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
-            const weightHook = () => { this.pass?.markDirty(); };
-            viewer.setExpressionWeightHook?.(weightHook);
+            // Gate 4B-2B-0 §1: the hooks are installed per mode in measure(), not once for
+            // the whole run. Installing them globally made the production measurement run
+            // the deformation pass as well (197 passes at DPR 1.5, 261 at DPR 1.0), which
+            // contaminated exactly the baseline the comparison rests on.
 
             const glErrors0 = viewer.stats.glErrorCount;
             const pageErrors0 = this.pageErrors;
@@ -392,6 +411,11 @@ export class UikaPredeformBenchmark {
         const names = asset.basis.names;
 
         this.live.phase = 'correctness';
+        // The correctness suite drives the pass explicitly per case; the hooks only keep
+        // the dirty flag honest while it does so, and measure() re-installs or clears them
+        // per mode afterwards.
+        viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
+        viewer.setExpressionWeightHook(() => { this.pass?.markDirty(); });
         this.replay.stop();
         this.runtime.setExpressionSource(null);
         viewer.setDrawingBufferScale(1);
@@ -672,9 +696,14 @@ export class UikaPredeformBenchmark {
         if (mode === 'predeform') {
             viewer.setPredeformCenterTexture(this.pass!.getTexture(), layout.textureWidth, layout.textureHeight);
             viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+            viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
+            viewer.setExpressionWeightHook(() => { this.pass?.markDirty(); });
         } else {
+            // The production baseline must not run a deformation pass at all (§1).
             viewer.setPredeformCenterTexture(null, 0, 0);
             viewer.setDistanceProvider(null);
+            viewer.setPreRenderHook(null);
+            viewer.setExpressionWeightHook(null);
         }
         viewer.setDrawingBufferScale(bufferScale);
 
@@ -781,6 +810,11 @@ export class UikaPredeformBenchmark {
             predeformPassesWithinChanges: mode === 'predeform' && weightUploadCount !== null
                 ? passStats.passCount <= weightUploadCount
                 : null,
+            // §1: a production measurement with any deformation pass or any pre-deformation
+            // GPU sample is not a baseline, so it is marked invalid rather than reported.
+            productionBaselineClean: mode === 'production-51-basis'
+                ? passStats.passCount === 0 && (timers ? timers.predeformMs.length === 0 : true)
+                : null,
             glErrors: viewer.stats.glErrorCount - glErrors0,
             pageErrors: this.pageErrors - pageErrors0,
             visibilityLostMs,
@@ -789,6 +823,13 @@ export class UikaPredeformBenchmark {
                 ? `the tab was hidden for ${Math.round(visibilityLostMs)} ms during measurement`
                 : null,
         };
+
+        if (mode === 'production-51-basis' && result.productionBaselineClean === false) {
+            result.valid = false;
+            result.invalidReason = `the production baseline ran ${passStats.passCount} deformation `
+                + `passes and recorded ${timers?.predeformMs.length ?? 0} pre-deformation GPU `
+                + 'samples; a contaminated baseline is not reported as a measurement';
+        }
 
         timers?.dispose();
         viewer?.setGpuTimer?.(null);
@@ -853,7 +894,7 @@ export class UikaPredeformBenchmark {
                 realA2eFps: prodA2e && prodA2e.valid ? prodA2e.effectiveFPS : null,
                 realA2eDrawP50: prodDraw,
                 realA2eSortP50: prodSort,
-                realA2eTotalGpuP50: prodTotal,
+                realA2eSumOfStageP50s: prodTotal,
             },
             predeform: {
                 fixedPoseDrawP50: p50(preFixed, 'gpuDrawMs'),
@@ -861,7 +902,10 @@ export class UikaPredeformBenchmark {
                 realA2eDrawP50: preDraw,
                 realA2eSortP50: preSort,
                 realA2ePredeformP50: prePredeform,
-                realA2eTotalGpuP50: preTotal,
+                realA2eSumOfStageP50s: preTotal,
+                realA2ePassCount: preA2e ? preA2e.predeformPassCount : null,
+                realA2eSortRuns: preA2e ? preA2e.sortRuns : null,
+                realA2eRenderedFrames: preA2e ? preA2e.renderedFrames : null,
             },
             dpr1: (prodDpr1 || preDpr1) ? {
                 productionFps: prodDpr1 && prodDpr1.valid ? prodDpr1.effectiveFPS : null,
@@ -869,7 +913,7 @@ export class UikaPredeformBenchmark {
             } : null,
             drawSavedMs: prodDraw !== null && preDraw !== null ? prodDraw - preDraw : null,
             sortSavedMs: prodSort !== null && preSort !== null ? prodSort - preSort : null,
-            totalGpuSavedMs: prodTotal !== null && preTotal !== null ? prodTotal - preTotal : null,
+            sumOfStageP50sSavedMs: prodTotal !== null && preTotal !== null ? prodTotal - preTotal : null,
         };
     }
 
@@ -940,14 +984,15 @@ export class UikaPredeformBenchmark {
             r.reasons.push(`the deformation pass itself is ${a.predeform.realA2ePredeformP50.toFixed(2)} ms p50, `
                 + 'once per changed expression frame');
         }
-        const totalSaved = a?.totalGpuSavedMs;
+        const totalSaved = a?.sumOfStageP50sSavedMs;
         if (a && totalSaved !== null && totalSaved !== undefined) {
             // Gate 4B-2A §10: the pre-deformed path is judged on pre-deformation + draw +
             // sort together. Below 30 fps the replay advances every rendered frame, so the
             // deformation pass runs about once per frame and its cost belongs in the total.
-            r.reasons.push(`total GPU cost p50 (pre-deformation + draw + sort): `
-                + `${a.production?.realA2eTotalGpuP50?.toFixed(2)} ms production vs `
-                + `${a.predeform?.realA2eTotalGpuP50?.toFixed(2)} ms pre-deformed `
+            r.reasons.push(`sum of per-stage p50s (pre-deformation + draw + sort), which is `
+                + `NOT a per-frame total p50: `
+                + `${a.production?.realA2eSumOfStageP50s?.toFixed(2)} ms production vs `
+                + `${a.predeform?.realA2eSumOfStageP50s?.toFixed(2)} ms pre-deformed `
                 + `(${totalSaved >= 0 ? '-' : '+'}${Math.abs(totalSaved).toFixed(2)} ms); `
                 + 'a draw-only improvement is not treated as a pass');
         }

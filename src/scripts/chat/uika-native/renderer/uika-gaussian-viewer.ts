@@ -77,6 +77,46 @@ export interface UikaDrawingBufferInfo {
     focalUniform: [number, number] | null;
 }
 
+/**
+ * Gate 4B-2B-0 diagnostic. Every callback is optional and the recorder itself is null on
+ * every production route, so none of this runs unless a diagnostic installs it.
+ *
+ * The phases follow one sort through its life: requested -> submitted -> the GPU distance
+ * pass and its fence and readback (recorded by the pre-deformation pass, which owns them)
+ * -> the CPU counting sort -> the render-index update -> completed.
+ */
+export interface UikaSortLifecycleRecorder {
+    requested?(at: number): void;
+    pendingSkip?(at: number): void;
+    submitStart?(at: number): void;
+    submitEnd?(at: number): void;
+    cpuSortStart?(at: number): void;
+    cpuSortEnd?(at: number): void;
+    indexUpdateStart?(at: number): void;
+    indexUpdateEnd?(at: number): void;
+    completed?(at: number): void;
+    failed?(at: number, error: unknown): void;
+}
+
+/** Gate 4B-2B-0 diagnostic: one entry per actual render() call. */
+export interface UikaFrameTick {
+    startedAt: number;
+    endedAt: number;
+    sortSubmitted: boolean;
+}
+
+/**
+ * Gate 4B-2B-0 diagnostic: how far the sort pipeline is allowed to run.
+ *
+ *   full                 everything, exactly as production does it
+ *   distance             the GPU distance pass, its fence and its readback only
+ *   distance+cpuSort     the above plus the CPU counting sort, no render-index update
+ *
+ * Only `full` is ever used outside a diagnostic; the truncated stages exist to separate
+ * readback from CPU sort from index upload and are not valid for any visual judgement.
+ */
+export type UikaSortStage = 'full' | 'distance' | 'distance+cpuSort';
+
 /** Gate 4B-1 / 4B-2A diagnostic: a fingerprint of one rendered frame. */
 export interface UikaDrawingBufferHash {
     width: number;
@@ -243,6 +283,9 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         resolve: (hash: UikaDrawingBufferHash) => void;
     } | null = null;
     private sortSuspended = false;
+    private sortLifecycle: UikaSortLifecycleRecorder | null = null;
+    private frameTickHook: ((tick: UikaFrameTick) => void) | null = null;
+    private sortStage: UikaSortStage = 'full';
 
     /**
      * The production basis loop, exactly as SplatMaterial.js emits it. Matching this
@@ -523,6 +566,30 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return this.getDiagnosticShaderInfo();
     }
 
+    /**
+     * Gate 4B-2B-0 §3. Called once per actual render() with that frame's own timestamps,
+     * so a diagnostic can measure exact frame intervals instead of polling a counter from
+     * a second requestAnimationFrame and splitting the elapsed time evenly.
+     */
+    setFrameTickHook(hook: ((tick: UikaFrameTick) => void) | null): void {
+        this.frameTickHook = hook;
+    }
+
+    /** Gate 4B-2B-0 §4 / §5. Install or clear the sort lifecycle recorder. */
+    setSortLifecycleRecorder(recorder: UikaSortLifecycleRecorder | null): void {
+        this.sortLifecycle = recorder;
+    }
+
+    /** Gate 4B-2B-0 §8. Diagnostic only; `full` is the production pipeline. */
+    setDiagnosticSortStage(stage: UikaSortStage): void {
+        this.sortStage = stage;
+        this.sortDirty = true;
+    }
+
+    getDiagnosticSortStage(): UikaSortStage {
+        return this.sortStage;
+    }
+
     /** True while the PoC render variant is installed. */
     isPredeformActive(): boolean {
         return this.predeformActive;
@@ -707,7 +774,11 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     /** Recompute view depths on the GPU, then order the splats back to front. */
     private runSort(): void {
         if (!this.splatMesh || !this.renderer || !this.camera) return;
-        if (this.sortPending) return;
+        this.sortLifecycle?.requested?.(performance.now());
+        if (this.sortPending) {
+            this.sortLifecycle?.pendingSkip?.(performance.now());
+            return;
+        }
         if (this.sortSuspended) return;
 
         this.mvpMatrix.copy(this.camera.matrixWorld).invert();
@@ -718,19 +789,32 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         this.sortDirty = false;
         this.sortRuns++;
         const distances = this.distances!;
+        this.sortLifecycle?.submitStart?.(performance.now());
         this.gpuTimer?.beginSort();
         const sortPromise = this.distanceProvider
             ? this.distanceProvider(this.mvpMatrix, distances)
             : this.splatMesh.computeDistancesOnGPU(this.mvpMatrix, distances);
         this.gpuTimer?.endSort();
+        this.sortLifecycle?.submitEnd?.(performance.now());
+        const stage = this.sortStage;
         sortPromise
             .then(() => {
-                this.sorter.sort(distances, this.splatCount, this.sortedIndexes!, this.sortFarthestFirst);
-                this.splatMesh.updateRenderIndexes(this.sortedIndexes!, this.splatCount);
+                if (stage !== 'distance') {
+                    this.sortLifecycle?.cpuSortStart?.(performance.now());
+                    this.sorter.sort(distances, this.splatCount, this.sortedIndexes!, this.sortFarthestFirst);
+                    this.sortLifecycle?.cpuSortEnd?.(performance.now());
+                }
+                if (stage === 'full') {
+                    this.sortLifecycle?.indexUpdateStart?.(performance.now());
+                    this.splatMesh.updateRenderIndexes(this.sortedIndexes!, this.splatCount);
+                    this.sortLifecycle?.indexUpdateEnd?.(performance.now());
+                }
                 this.sortPending = false;
+                this.sortLifecycle?.completed?.(performance.now());
             })
             .catch((error: any) => {
                 this.sortPending = false;
+                this.sortLifecycle?.failed?.(performance.now(), error);
                 throw error;
             });
     }
@@ -750,8 +834,10 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         this.splatMesh.updateUniforms(renderDimensions, focalLengthX, focalLengthY, false, 1.0, 1.0);
 
         const sortStarted = performance.now();
+        const sortRunsBefore = this.sortRuns;
         if (this.sortDirty) this.runSort();
         const sortMs = performance.now() - sortStarted;
+        const sortSubmitted = this.sortRuns !== sortRunsBefore;
 
         const drawStarted = performance.now();
         this.gpuTimer?.beginDraw();
@@ -772,8 +858,11 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         if (err !== gl.NO_ERROR) this.glErrorCount++;
 
         this.renderedFrames++;
-        this.lastTiming = { sortMs, drawMs, totalMs: performance.now() - started };
+        const endedAt = performance.now();
+        this.lastTiming = { sortMs, drawMs, totalMs: endedAt - started };
         this.gpuTimer?.frameDone();
+        // Gate 4B-2B-0 PoC diagnostic only; null on every production route.
+        this.frameTickHook?.({ startedAt: started, endedAt, sortSubmitted });
     }
 
     dispose(): void {

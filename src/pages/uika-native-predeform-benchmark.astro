@@ -61,6 +61,7 @@
     <button id="start" class="primary" disabled>Start PoC</button>
     <button id="investigate" disabled>Run Difference Investigation</button>
     <button id="sweep" disabled>Run 192-Frame Sweep</button>
+    <button id="tail" disabled>Run DPR1 Tail Isolation</button>
     <button id="stop" disabled>Stop</button>
     <button id="export" disabled>Export JSON</button>
     <button id="copy" disabled>Copy Results</button>
@@ -90,6 +91,8 @@
       from '../scripts/chat/uika-native/uika-predeform-benchmark';
     import { UikaPredeformInvestigation, investigationOptionsFromUrl, sweepOptionsFromUrl }
       from '../scripts/chat/uika-native/uika-predeform-investigation';
+    import { UikaTailIsolation, tailOptionsFromUrl }
+      from '../scripts/chat/uika-native/uika-tail-isolation';
 
     const container = document.getElementById('viewer');
     const statusEl = document.getElementById('status');
@@ -104,6 +107,7 @@
       start: document.getElementById('start') as HTMLButtonElement,
       investigate: document.getElementById('investigate') as HTMLButtonElement,
       sweep: document.getElementById('sweep') as HTMLButtonElement,
+      tail: document.getElementById('tail') as HTMLButtonElement,
       stop: document.getElementById('stop') as HTMLButtonElement,
       export: document.getElementById('export') as HTMLButtonElement,
       copy: document.getElementById('copy') as HTMLButtonElement,
@@ -113,10 +117,12 @@
     const replay = new UikaNativeReplay((w) => runtime.applyWeights(w));
     const poc = new UikaPredeformBenchmark(runtime, replay);
     const investigation = new UikaPredeformInvestigation(runtime, replay);
+    const tail = new UikaTailIsolation(runtime, replay);
     (window as any).__uikaNativeV1 = runtime;
     (window as any).__uikaNativeReplay = replay;
     (window as any).__uikaPredeform = poc;
     (window as any).__uikaInvestigation = investigation;
+    (window as any).__uikaTail = tail;
 
     let lastError: string | null = null;
     let report: any = null;
@@ -129,7 +135,9 @@
     const renderLive = () => {
       const l = investigation.isRunning()
         ? { ...poc.getLive(), ...investigation.getLive() } as any
-        : poc.getLive() as any;
+        : tail.isRunning()
+          ? { ...poc.getLive(), ...tail.getLive() } as any
+          : poc.getLive() as any;
       const v: any = runtime.getViewer();
       const gpu = collectGpuInfo(v?.renderer?.domElement ?? null);
       const r = runtime.report;
@@ -141,9 +149,9 @@
         cell('hardware GPU', gpu.isSoftware ? 'NO (software)' : (gpu.unmaskedAvailable ? 'YES' : 'UNKNOWN'),
              gpu.isSoftware ? 'bad' : (gpu.unmaskedAvailable ? 'ok' : 'warn')),
         cell('GPU', (gpu.renderer || '—').slice(0, 44)),
-        cell('step', (poc.isRunning() || investigation.isRunning())
+        cell('step', (poc.isRunning() || investigation.isRunning() || tail.isRunning())
              ? `${l.step} · ${l.phase}` : (report ? 'finished' : 'idle'),
-             (poc.isRunning() || investigation.isRunning()) ? 'warn' : ''),
+             (poc.isRunning() || investigation.isRunning() || tail.isRunning()) ? 'warn' : ''),
         cell('elapsed', `${(l.elapsedMs / 1000).toFixed(1)} s`),
         cell('drawing buffer', buffer ? `${buffer.drawingBufferWidth}×${buffer.drawingBufferHeight}` : '—'),
         cell('pixelRatio', buffer ? num(buffer.rendererPixelRatio) : '—'),
@@ -277,6 +285,29 @@
           </table>`;
         }
       }
+      if ((report.runs || []).length > 0 && report.target) {
+        html += `<table>
+          <tr><th>tail run</th><th>buffer</th><th>fps</th><th>exact p50</th><th>exact p95</th>
+              <th>exact p99</th><th>polled p95</th><th>fence p95</th><th>readback p95</th>
+              <th>cpu sort p95</th><th>index p95</th><th>req/sub/done/skip</th><th>valid</th></tr>
+          ${report.runs.map((x: any) => `<tr>
+            <td>${x.name}</td>
+            <td>${x.buffer.drawingBufferWidth}×${x.buffer.drawingBufferHeight}</td>
+            <td>${num(x.effectiveFPS)}</td>
+            <td>${num(x.exactFrameInterval.p50)}</td>
+            <td class="${x.exactFrameInterval.p95 <= report.target.maxExactWallP95Ms ? 'ok' : 'bad'}">${num(x.exactFrameInterval.p95)}</td>
+            <td>${num(x.exactFrameInterval.p99)}</td>
+            <td>${num(x.polledFrameInterval.p95)}</td>
+            <td>${num(x.sortLifecycle.fenceWaitMs.p95)}</td>
+            <td>${num(x.sortLifecycle.readbackMs.p95)}</td>
+            <td>${num(x.sortLifecycle.cpuSortMs.p95)}</td>
+            <td>${num(x.sortLifecycle.indexUpdateMs.p95)}</td>
+            <td>${x.sortCounters.sortRequestedCount}/${x.sortCounters.sortSubmittedCount}/${x.sortCounters.sortCompletedCount}/${x.sortCounters.sortPendingSkipCount}</td>
+            <td class="${x.valid ? 'ok' : 'bad'}">${x.valid ? 'yes' : 'no'}</td>
+          </tr>`).join('')}
+        </table>
+        <p class="note">classification: <b>${report.classification}</b></p>`;
+      }
       tablesEl.innerHTML = html;
     };
 
@@ -289,10 +320,11 @@
         report,
         lastError,
       }, null, 2);
-      const busy = poc.isRunning() || investigation.isRunning();
+      const busy = poc.isRunning() || investigation.isRunning() || tail.isRunning();
       btn.start.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.investigate.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.sweep.disabled = !runtime.report.ready || busy || !replay.getFixture();
+      btn.tail.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.stop.disabled = !busy;
       btn.export.disabled = !report;
       btn.copy.disabled = !report;
@@ -339,7 +371,20 @@
       renderStatus();
     });
 
-    btn.stop.addEventListener('click', () => { poc.stop(); investigation.stop(); });
+    btn.tail.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await tail.run(tailOptionsFromUrl());
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4B2B0]', error);
+      }
+      renderStatus();
+    });
+
+    btn.stop.addEventListener('click', () => { poc.stop(); investigation.stop(); tail.stop(); });
 
     btn.export.addEventListener('click', () => {
       const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
