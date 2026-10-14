@@ -61,6 +61,17 @@ export interface UikaPredeformGpuTimer {
 }
 
 /**
+ * Gate 4B-2B-0 §4. The fence and the buffer readback live in this pass, so this is where
+ * they are timed. Optional and null on every route that does not install a diagnostic.
+ */
+export interface UikaDistanceLifecycleRecorder {
+    fenceWaitStart?(at: number): void;
+    fenceWaitEnd?(at: number, polls: number): void;
+    readbackStart?(at: number): void;
+    readbackEnd?(at: number): void;
+}
+
+/**
  * The expression helpers are copied verbatim from the production vertex shader
  * (SplatMaterial.js) so that the value written here is produced by the identical
  * expression, with the identical texture sampling convention, in the identical order.
@@ -190,6 +201,7 @@ export class UikaPredeformPass {
 
     private layout: UikaPredeformLayout | null = null;
     private gpuTimer: UikaPredeformGpuTimer | null = null;
+    private distanceLifecycle: UikaDistanceLifecycleRecorder | null = null;
     private dirty = true;
     private stats: UikaPredeformStats = {
         passCount: 0, weightChangeCount: 0, lastPassMs: 0,
@@ -224,6 +236,10 @@ export class UikaPredeformPass {
     getStats(): UikaPredeformStats { return { ...this.stats, dirty: this.dirty }; }
     getTexture(): any { return this.target ? this.target.texture : null; }
     setGpuTimer(timer: UikaPredeformGpuTimer | null): void { this.gpuTimer = timer; }
+    /** Gate 4B-2B-0 diagnostic only. */
+    setDistanceLifecycleRecorder(recorder: UikaDistanceLifecycleRecorder | null): void {
+        this.distanceLifecycle = recorder;
+    }
 
     resetStats(): void {
         this.stats.passCount = 0;
@@ -450,22 +466,28 @@ export class UikaPredeformPass {
 
             const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
             gl.flush();
+            this.distanceLifecycle?.fenceWaitStart?.(performance.now());
 
             const promise = new Promise<void>((resolve) => {
+                let polls = 0;
                 const checkSync = () => {
+                    polls++;
                     const status = gl.clientWaitSync(sync!, 0, 0);
                     if (status === gl.TIMEOUT_EXPIRED) {
                         this.syncTimeout = setTimeout(checkSync);
                         return;
                     }
                     if (status === gl.WAIT_FAILED) fail('clientWaitSync reported WAIT_FAILED');
+                    this.distanceLifecycle?.fenceWaitEnd?.(performance.now(), polls);
                     this.syncTimeout = null;
                     gl.deleteSync(sync!);
                     const vao = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
                     gl.bindVertexArray(this.distanceVao);
+                    this.distanceLifecycle?.readbackStart?.(performance.now());
                     gl.bindBuffer(gl.ARRAY_BUFFER, this.distanceBuffer);
                     gl.getBufferSubData(gl.ARRAY_BUFFER, 0, outComputedDistances);
                     gl.bindBuffer(gl.ARRAY_BUFFER, null);
+                    this.distanceLifecycle?.readbackEnd?.(performance.now());
                     if (vao) gl.bindVertexArray(vao);
                     this.stats.distanceRuns++;
                     this.stats.lastDistanceMs = performance.now() - started;

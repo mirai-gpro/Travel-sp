@@ -12,4 +12,7 @@ export type {
     UikaDiagnosticShaderInfo,
     UikaDrawingBufferInfo,
     UikaDrawingBufferHash,
+    UikaSortLifecycleRecorder,
+    UikaFrameTick,
+    UikaSortStage,
 } from './uika-gaussian-viewer';
