@@ -4,7 +4,7 @@
 **Spec:** `docs/UIKA_NATIVE_RUNTIME_ARCHITECTURE_CORRECTION_v1.1.md`
 **Branch:** `poc/uika-native-runtime-v1`
 **Start HEAD:** `95b1af777163022c22dbc44e3ef349d12b69b2e5`
-**Implementation commit:** `3fe4c0b`
+**Implementation commits:** `3fe4c0b` (replay wiring), `09ba2e4` (fixture intake + contract)
 **Page:** `/uika-native-replay`
 
 ```text
@@ -13,8 +13,10 @@ GATE3_CLOCK_LOGIC           = PASS
 GATE3_MAPPING_CONTRACT      = PASS
 GATE3_RENDERER_LIFECYCLE    = PASS
 GATE3_NO_SILENT_FALLBACK    = PASS
+GATE3_FIXTURE_CONTRACT      = IMPLEMENTED (v1.1 Gate 3 §1), rejection paths verified
+GATE3_FIXTURE_INTAKE        = READY (drop the JSON in, no code change needed)
 
-GATE3_FIXED_A2E_REPLAY      = BLOCKED — no real captured A2E fixture is available
+GATE3_FIXED_REAL_A2E        = BLOCKED — no real captured A2E fixture has been received
 ```
 
 **Gate 3 is not claimed as PASS.** Everything that does not depend on real A2E content is
@@ -55,17 +57,39 @@ credential here. Fabricating 52-channel values would violate §4, so none was fa
 
 ### What unblocks it
 
-One real capture, taken once by a human, then handed to the page:
+One real capture, taken once by a human:
 
 1. open the normal Travel-sp chat with `?a2eCapture=1`,
 2. speak once so a full A2E turn streams (the HUD shows `A2E CAPTURE frames=…`),
 3. in the console run `copy(__a2eCaptureJson())`,
-4. paste it into the textarea on `/uika-native-replay` and press
-   **load fixture: pasted JSON** — or save it as a file and open
-   `/uika-native-replay?fixture=/path/to/capture.json`.
+4. save it as `src/scripts/chat/uika-native/fixtures/a2e-real-capture-gate3.json`.
 
-If the capture is taken in the same browser profile, **load fixture: localStorage** reads
-it directly with no copy-paste.
+Anything committed in that directory is bundled automatically, so no code change is
+needed when it lands. The page also accepts the same JSON pasted into its textarea,
+fetched from `?fixture=<url>`, or read from `localStorage` when the capture was taken in
+the same browser profile.
+
+### Intake is implemented and verified
+
+The acceptance side is in place and was exercised against deliberately broken inputs:
+
+* `validateGate3Fixture()` / `validateGate3Mapping()` in
+  `src/scripts/chat/uika-native/uika-native-replay.ts` implement the v1.1 Gate 3 §1
+  contract check by check, and a fixture that fails any check is not adopted — Gate 3
+  does not run on it.
+* `mappedCount` is measured by mapping one real frame, not assumed.
+* `tools/validate_a2e_fixture.mjs` runs the same contract offline and prints the
+  provenance block, including the SHA-256 that §3 designates as the Source of Truth.
+* Six malformed inputs (`fps = 0`, 51 names, zero frames, a wrong-width frame, a
+  non-array frame, non-numeric values) were each rejected with the failing check named,
+  and the tool exits non-zero with `FIXTURE CONTRACT: FAIL — Gate 3 must not run`.
+* In the browser with nothing bundled: `bundledFixtures = []`, the bundled button is
+  disabled, every loader fails with an explicit message, `start replay` stays disabled,
+  `weightUploadCount` stays 0, and the renderer stays healthy
+  (`splatCount 133541`, `basisResident true`, `glErrorCount 0`, OAC-free all false,
+  page errors 0).
+
+Nothing is substituted for the missing data.
 
 ---
 
@@ -94,6 +118,8 @@ Files:
 | `src/scripts/chat/uika-native/uika-native-replay.ts` | new — the replay controller and its diagnostics |
 | `src/pages/uika-native-replay.astro` | new — isolated PoC route |
 | `src/scripts/chat/uika-native/uika-native-runtime.ts` | per-frame expression-source hook, `applyWeights`, render-interval statistics |
+| `src/scripts/chat/uika-native/fixtures/README.md` | new — where the capture goes, and what must not be done to it |
+| `tools/validate_a2e_fixture.mjs` | new — offline Gate 3 §1 contract check and SHA-256 provenance |
 
 `src/scripts/chat/a2e-replay.ts` is **unchanged**; the controller imports
 `loadCapturedA2E` from it. No separate Gate 3 mapping exists — the production mapper is
@@ -207,7 +233,7 @@ canonical pose. Nothing is invented to fill the gap.
 These need the fixture and are therefore absent, not estimated:
 
 ```text
-fixture provenance / frame count / duration / expression rate
+fixture SHA-256 / provenance / frame count / duration / expression rate
 replayed expression progression on real data
 duplicate and skipped expression frames on real data
 weight upload count and timing on real data
