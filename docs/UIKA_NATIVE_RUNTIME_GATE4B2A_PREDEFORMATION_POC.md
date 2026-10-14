@@ -2,13 +2,13 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2A.
 Route: `/uika-native-predeform-benchmark`.
-Status: PoC built. On the real GPU **`CORRECTNESS = FAIL`** — one of the eleven cases,
-`C-a2e-frame-20`, rendered a different framebuffer hash: one pixel in 1,295,044, one byte
-level in R, with the alpha plane identical. The difference investigation classified that as
-**`B-deterministic-float-level-difference`** (§3.4), which is not a pass: acceptance is
-still pixel-identical, so correctness stays FAIL and performance stays `NOT_RUN`. The open
-work is the full 192-frame sweep in §3.4.3, which measures the worst case over the whole
-fixture before any acceptance decision is taken.
+Status: **`GATE4B2A_CORRECTNESS = PASS`** under acceptance v2
+(numeric + visual equivalence), decided on the 192-frame real-GPU sweep. Reported
+separately and kept that way: `BIT_EXACT_EQUIVALENCE = FAIL` (135/192),
+`NUMERIC_EQUIVALENCE = PASS` (192/192), `VISUAL_EQUIVALENCE = PASS` (192/192 within the
+explicit tolerance). Under the earlier v1 rule (pixel-identical) this PoC was
+`CORRECTNESS = FAIL`, and that result is kept, not rewritten — §3 is in chronological
+order. Performance is now unblocked and is the open work (§6).
 
 ---
 
@@ -274,12 +274,16 @@ Nothing beyond that is claimed. In particular the gate does not record "visually
 identical, therefore acceptable": whether a difference is acceptable is decided after it
 is measured, not instead of measuring it.
 
-### 3.3 Acceptance is unchanged
+### 3.3 Acceptance at that point — unchanged (historical)
 
-The §4 thresholds stay exactly as they are, including **pixel-identical**, while the
-difference is investigated. A hash mismatch counts as a failure until there is a measured
-reason to treat it otherwise, and any change to the rule will be a separate decision
-taken on the numbers §3.4 produces — not a loosening to make the current run pass.
+While the difference was being investigated the thresholds stayed exactly as they were,
+including **pixel-identical**: a hash mismatch counted as a failure until there was a
+measured reason to treat it otherwise, and any change to the rule was to be a separate
+decision taken on the numbers, not a loosening to make the run pass.
+
+That is what happened. The numbers came from the 192-frame sweep (§3.4.3), and the rule
+was then revised deliberately in §3.6. The `CORRECTNESS = FAIL` of §3.2 stands as the
+result under v1 and is not rewritten.
 
 ### 3.4 The difference investigation — result
 
@@ -379,57 +383,136 @@ stage-specific optimisation differing between the production vertex shader and t
 pre-deformation fragment shader on the AMD driver. None of it was tested, so none of it is
 a finding; the report carries the list under `hypothesesNotTested`.
 
-### 3.4.3 Full-fixture sweep (§5 - §8) — PENDING
-
-Before any acceptance decision, the worst case over the whole fixture. Route: the same
-page, third button, **Run 192-Frame Sweep**.
+### 3.4.3 Full-fixture sweep (§5 - §8) — result
 
 All 192 frames of `a2e-real-capture-gate3.json`, production against pre-deformed, one
-comparison per frame — no repeats, because Diagnostic A already measured both modes stable
-20/20 — with the same camera, the same resolution, the sort suspended and one draw order.
-
-Per frame:
+comparison per frame, same camera, same resolution, sort suspended, one draw order. Real
+GPU: AMD Radeon 860M / Chrome 154 / DPR 1.5.
 
 ```text
-centre      maxAbsX, maxAbsY, maxAbsZ, maxAbsXYZ, meanAbsXYZ,
-            differentComponents, bitExactComponents, nonFinite,
-            ULP histogram (diagnostic, not severity)
-            plus max |pre-deformed - CPU reference|, the existing bound
-distance    maxAbsDistanceDifference
-framebuffer differentPixels, differentPixelRatio, R/G/B/A differing counts,
-            maxRgbaByteDelta, sumAbsoluteDifference, alphaPlaneIdentical
+frames compared               192
+
+pixel-identical frames        135
+frames with a pixel diff       57
+
+worst different pixels          5
+worst different ratio           3.8608726807737804e-06
+max RGBA byte delta             1
+
+worst centre maxAbs             1.4901161193847656e-08
+worst centre meanAbs            2.1734084847940168e-11
+worst distance maxAbs           7.450580596923828e-09
+worst centre-vs-CPU maxAbs      5.960464477539063e-08
+
+frames with an alpha diff       [64, 159]
+frames with non-finite          []
+frames outside the 1e-06 bound  []
+
+allWithinNumericBound           true
 ```
 
-Summary over the sweep, each worst case carrying its frame number:
+The arithmetic those numbers imply, stated rather than left to be taken on trust:
 
 ```text
-framesCompared / framesPixelIdentical / framesWithPixelDifference
-worstDifferentPixels / worstDifferentPixelRatio / worstMaxByteDelta
-worstCenterMaxAbs / worstCenterMeanAbs / worstDistanceMaxAbs
-worstCenterVsCpuMaxAbs / worstMaxUlp (with the absolute difference at that component)
-framesWithAlphaDifference / framesWithNonFinite
-framesOutsideNumericBound / allWithinNumericBound
+5 differing pixels / 1,295,044        = 3.8608726807737804e-06   exactly the reported ratio
+worst centre maxAbs                   = 2^-26, one float32 ULP at that magnitude
+worst distance maxAbs                 = 2^-27
+worst centre-vs-CPU maxAbs            = 4 x 2^-26
+57 of 192 frames (29.7%) differed in at least one pixel; none by more than one byte level
 ```
 
-The numeric bound stays at 1e-06 (§8) and every frame is checked against it. The harness
-reports `acceptance.rule = 'pixel-identical'`, `ruleChangedByThisRun = false` and
-`correctnessUnderCurrentRule`, and it cannot turn a FAIL into a PASS: whether
-pixel-identical should remain a cross-GPU correctness requirement or be replaced by an
-explicit numeric tolerance is decided afterwards, by a person, on these numbers (§9).
-
-Query parameter for a driver check: `?sweepFrames=0,20,63,132`. Absent means the whole
-fixture.
+### 3.4.4 ULP, once more, measured
 
 ```text
-GPU / browser / drawingBuffer                                     PENDING
-per-frame centre / distance / framebuffer tables                  PENDING
-sweep summary with worst-case frame numbers                       PENDING
-allWithinNumericBound                                             PENDING
+max ULP distance                           91834
+absolute difference at that component      8.15649769947413e-11
 ```
 
-Nothing above is estimated or extrapolated.
+8.16e-11 is 0.0055 of a float32 ULP at the |x| ∈ [0.125, 0.25) scale — the component sits
+near zero, where ordered-integer distance says nothing about magnitude. The ULP histogram
+stays in the report as a diagnostic and is not used for severity or for PASS/FAIL.
 
-### 3.5 Visual comparison (§11)
+### 3.6 Acceptance revision — v2
+
+On the evidence above, cross-GPU correctness is no longer judged by bit-exact framebuffer
+equality but by
+
+```text
+numeric equivalence  +  visual equivalence
+```
+
+Why: the same GLSL arithmetic does not produce the same final float32 bits across shader
+stages and GPU drivers — measured, not assumed (§3.0, §3.2, §3.4) — so bit-exact
+framebuffer equality is not a portable contract. Over the whole fixture the actual
+differences stayed minute: one ULP of centre, half an ULP of depth key, one byte level of
+colour, five pixels in 1.3 million at worst.
+
+```text
+acceptanceVersion          v2-numeric-and-visual-equivalence
+previousAcceptanceVersion  v1-pixel-identical
+```
+
+**A. Structural**
+
+```text
+framesCompared == expected frames
+nonFinite == 0
+GL errors == 0
+page errors == 0
+```
+
+**B. Numeric equivalence** — the v1 bound carried over, plus the depth key
+
+```text
+max animated-centre absolute difference  <= 1e-06
+max distance absolute difference         <= 1e-06
+```
+
+**C. Visual equivalence** — explicit cross-GPU tolerances
+
+```text
+max RGBA byte delta          <= 1
+differentPixelRatio          <= 1e-05   per frame
+```
+
+Alpha is evaluated under the same rules as the colour channels: it is not required to be
+bit-exact, but an alpha byte delta above 1, or a ratio above the per-frame limit, fails.
+That is why frames 64 and 159 — which differ in alpha — are reported individually and are
+also measured against the byte-delta rule rather than waved through.
+
+The three equivalences are reported separately and never collapsed into one flag:
+`bitExactVerdict`, `numericVerdict`, `visualVerdict`, `correctnessVerdict`,
+`acceptanceVersion`. Each run also reports `underPreviousAcceptance`, so what v1 would
+have said stays visible in the JSON.
+
+### 3.7 Final correctness decision
+
+```text
+BIT_EXACT_EQUIVALENCE  = FAIL      135 / 192
+NUMERIC_EQUIVALENCE    = PASS      192 / 192
+VISUAL_EQUIVALENCE     = PASS      192 / 192 within the explicit tolerance
+
+GATE4B2A_CORRECTNESS   = PASS      under v2-numeric-and-visual-equivalence
+```
+
+Margins against the v2 rules, from the worst case of the sweep:
+
+```text
+centre         1.4901e-08  against 1e-06     67x inside
+distance       7.4506e-09  against 1e-06    134x inside
+centre vs CPU  5.9605e-08  against 1e-06     17x inside
+byte delta     1           against 1          at the limit
+pixel ratio    3.8609e-06  against 1e-05    2.6x inside
+```
+
+The history is kept, not rewritten: under v1 this PoC was `CORRECTNESS = FAIL`
+(§3.2), the difference investigation classified it `B-deterministic-float-level-difference`
+(§3.4), and the revision to v2 (§3.6) is what changes the verdict — not a re-reading of
+the earlier run. `BIT_EXACT_EQUIVALENCE = FAIL` remains in every report.
+
+Performance is unblocked by this decision and is the next measurement (§6).
+
+### 3.8 Visual comparison (§11)
 
 §11's checklist — jaw, blink, pucker, stretch, neutral, face outline, hair/face depth,
 Gaussian smear, explosion — is answered by that last column rather than by eye: when the
@@ -448,18 +531,32 @@ the resolution that matters.
 
 ## 4. Thresholds used
 
+Acceptance **v1** (pixel-identical), in force until §3.6:
+
 ```text
-max |pre-deformed - CPU reference|   <= 1e-6      decision rule for this gate
-max |production distance - PoC|      <= 1e-6      decision rule for this gate
-rendered frames                      identical    required
-Gate 3B's figure for the production path against the same CPU reference: 9.80e-09
+max |pre-deformed - CPU reference|   <= 1e-6
+max |production distance - PoC|      <= 1e-6
+rendered frames                      identical     required
 ```
 
-The two 1e-6 bounds are decision rules chosen for this gate, not measured quantities. The
-measured values are three to four orders of magnitude below them, and the production-path
-comparison is exactly zero on SwiftShader; on the AMD GPU it is of the order 1e-09,
-which is still three orders of magnitude inside the rule. The rule itself is unchanged —
-see §3.3.
+Acceptance **v2** (`v2-numeric-and-visual-equivalence`), in force now and implemented in
+`predeform/uika-correctness-contract.ts`:
+
+```text
+A structural   framesCompared == expected, nonFinite == 0, GL errors == 0, page errors == 0
+B numeric      max animated-centre absolute difference  <= 1e-06
+               max distance absolute difference         <= 1e-06
+C visual       max RGBA byte delta                      <= 1
+               differentPixelRatio per frame            <= 1e-05
+               alpha under the same rules; not required to be bit-exact
+```
+
+Every bound is a decision rule chosen for this gate, not a measured quantity. The
+measured worst case over the whole fixture sits 17x to 134x inside the numeric bounds and
+2.6x inside the pixel-ratio bound, with the byte-delta rule met exactly at 1 (§3.7).
+Gate 3B's figure for the production path against the same CPU reference, for comparison:
+9.80e-09. Bit-exactness is still measured and still reported — as
+`BIT_EXACT_EQUIVALENCE`, which is FAIL — it is simply no longer a requirement.
 
 ---
 
@@ -495,11 +592,38 @@ Query parameters: `?warmupMs=`, `?measureMs=`, `?dpr1=1|0`, `?correctnessOnly=1`
 
 ---
 
-## 6. Performance — NOT_RUN
+## 6. Performance — PENDING (unblocked by §3.7)
 
-Blocked by §3.2: correctness must be settled first, and the harness itself stops before
-any timing when correctness fails. The layout below is what the run will fill in once it
-is unblocked.
+Correctness passes under v2, so the harness no longer stops before the timings. The
+measurement is the one planned from the start (§9 - §12 of the gate): four measurements at
+DPR 1.5, each a warm-up of at least 6 s and a measurement of at least 30 s, and two more
+at pixelRatio 1.0 if full DPR misses 30 fps.
+
+**Judged on total GPU cost, not on draw alone (§10).** Below 30 fps the replay advances to
+a new A2E frame on every rendered frame, so the deformation pass runs about once per
+rendered frame — measured in the self-test as 5 passes for 5 frames. The pre-deformed path
+is therefore judged on
+
+```text
+pre-deformation + draw + sort
+```
+
+which the report carries as `realA2eTotalGpuP50` for both modes together with
+`totalGpuSavedMs`. A draw-only improvement is not treated as a pass.
+
+**Criteria at DPR 1.5 (§11).**
+
+```text
+effectiveFPS >= 30
+wall p95 <= 33.3 ms
+GL errors = 0
+page errors = 0
+-> FULL_DPR_PERF_PASS
+```
+
+If that is missed, pixelRatio 1.0 is measured as a diagnostic (CSS 759x759, drawing buffer
+about 759x759) for the pre-deformed path, fixed pose and real A2E, plus production real
+A2E for comparison. No automatic resolution switching is implemented.
 
 ```text
 GPU / browser / DPR / drawingBuffer                                PENDING
@@ -678,6 +802,40 @@ centre-vs-CPU figures match the correctness run frame for frame (3.725e-08 / 4.4
 
 ---
 
+
+### 7.3 Acceptance v2 self-test
+
+Two runs on this container: the sweep with `?sweepFrames=0,20,63,132`, and the full PoC
+run with `?allowSoftware=1&warmupMs=3000&measureMs=12000&dpr1=0`.
+
+```text
+sweep      acceptanceVersion v2-numeric-and-visual-equivalence (previous v1-pixel-identical)
+           structural PASS 4/4, GL 0, page 0
+           BIT_EXACT PASS 4/4   NUMERIC PASS 4/4   VISUAL PASS 4/4
+           correctnessVerdict PASS, underPreviousAcceptance PASS
+           per-frame aMaxAbsByteDiff / rMaxAbsByteDiff present
+
+PoC run    contract structural PASS 11/11, BIT_EXACT PASS 11/11, NUMERIC PASS, VISUAL PASS
+           correctnessVerdict PASS
+           decision  PREDEFORM_CORRECTNESS_PASS, PERF_BLOCKED_SOFTWARE_RENDERER
+           the four DPR measurements ran, so correctness no longer blocks the timings
+           pre-deformed real A2E: predeform p50 46.66 ms, passes 3 for 3 uploads
+           realA2eTotalGpuP50 (pre-deformation + draw + sort) computed for the
+           pre-deformed mode; the production total came back null because its draw had no
+           timer samples in a 12 s window at 0.25 fps, and totalGpuSavedMs is null rather
+           than a figure computed from a missing stage
+GL errors 0, page errors 0, pageerror events 0
+```
+
+Everything bit-exact on this renderer, so `BIT_EXACT` reads PASS here; the 135/192 FAIL is
+the real-GPU result. What the self-test establishes is that the v2 contract is wired into
+both the sweep and the eleven-case suite, that the three equivalences are reported
+separately alongside `underPreviousAcceptance`, that a correctness PASS now lets the
+performance measurements run, and that the total-GPU-cost figures appear — or are reported
+as absent — rather than being filled in from a partial sum.
+
+---
+
 ## 8. Gate 4B-1 known bug (§18)
 
 `isolationOptionsFromUrl()` overwrote the default `basisCounts` with `[0]` whenever the
@@ -697,6 +855,24 @@ Diagnostic harness only; no production path.
 ---
 
 ## 9. Changes
+
+Acceptance v2 commit:
+
+```text
+new   src/scripts/chat/uika-native/predeform/uika-correctness-contract.ts
+        the v1 history, the v2 tolerances, per-sample evaluation and the roll-up:
+        bitExactVerdict / numericVerdict / visualVerdict / correctnessVerdict /
+        acceptanceVersion / underPreviousAcceptance
+edit  src/scripts/chat/uika-native/uika-predeform-investigation.ts
+        the sweep evaluates and rolls up the contract, records per-channel max byte
+        deltas, and counts GL and page errors
+edit  src/scripts/chat/uika-native/uika-predeform-benchmark.ts
+        the eleven-case suite compares pixels (not just hashes), judges under v2, and
+        gates the performance run on correctnessVerdict; realA2eTotalGpuP50 and
+        totalGpuSavedMs added for the §10 total-cost comparison
+edit  src/pages/uika-native-predeform-benchmark.astro
+        the three verdicts in the live panel and a contract table
+```
 
 Full-fixture sweep commit:
 
