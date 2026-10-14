@@ -27,7 +27,7 @@ import {
     type UikaGpuInfo,
     type UikaIntervalStats,
 } from './uika-native-benchmark';
-import { UikaPredeformPass } from './predeform/uika-predeform-pass';
+import { UikaPredeformPass, type UikaFencePollStrategy } from './predeform/uika-predeform-pass';
 
 /**
  * §3: how far below the fence wait a lifecycle total may fall before it is recorded as an
@@ -42,7 +42,14 @@ export type UikaTailRunName =
     | 'A-normal'
     | 'B-sort-suspended'
     | 'C-distance-readback-only'
-    | 'D-distance-plus-cpu-sort';
+    | 'D-distance-plus-cpu-sort'
+    // Gate 4B-2B-1: the same Run C conditions with different fence-poll scheduling.
+    | 'B-no-sort-reference'
+    | 'C0-immediate-poll'
+    | 'C0-immediate-poll-repeat'
+    | 'C1-frame-poll'
+    | 'C2-timer-8ms'
+    | 'C3-timer-16ms';
 
 export interface UikaStageStats {
     count: number;
@@ -90,6 +97,8 @@ export interface UikaTailRun {
     description: string;
     sortStage: UikaSortStage;
     sortSuspended: boolean;
+    /** Gate 4B-2B-1: which fence-poll scheduling this run used. */
+    fencePollStrategy: UikaFencePollStrategy;
     buffer: UikaDrawingBufferInfo;
     warmupMs: number;
     measuredMs: number;
@@ -147,6 +156,13 @@ export interface UikaTailRun {
     visibilityLostMs: number;
     valid: boolean;
     invalidReason: string | null;
+    /**
+     * Gate 4B-2B-1: did this run actually exercise the completion path? A window in which
+     * no sort was submitted or none completed measures nothing about the fence, and must
+     * not contribute a p95 to the comparison. null for a no-sort run, where there is
+     * nothing to exercise.
+     */
+    completionPathExercised: boolean | null;
     /** Against §11, using the exact interval. Diagnostic truncations are not acceptance. */
     meetsTarget: boolean | null;
     /** Kept for inspection; capped so the JSON stays readable. */
@@ -213,6 +229,8 @@ export interface UikaTailOptions {
     forceCD: boolean | null;
     allowSoftware: boolean;
     maxFrameRecords: number;
+    /** Gate 4B-2B-1: measure C0 twice, to size the run-to-run spread. */
+    repeatC0: boolean;
 }
 
 export const DEFAULT_TAIL_OPTIONS: UikaTailOptions = {
@@ -221,6 +239,7 @@ export const DEFAULT_TAIL_OPTIONS: UikaTailOptions = {
     forceCD: null,
     allowSoftware: false,
     maxFrameRecords: 4000,
+    repeatC0: true,
 };
 
 /** `?warmupMs=`, `?measureMs=`, `?cd=1|0`, `?allowSoftware=1`, `?maxFrameRecords=`. */
@@ -243,8 +262,54 @@ export function tailOptionsFromUrl(): UikaTailOptions {
         if (q.get('cd') === '1') o.forceCD = true;
         if (q.get('cd') === '0') o.forceCD = false;
         if (q.get('allowSoftware') === '1') o.allowSoftware = true;
+        if (q.get('repeatC0') === '0') o.repeatC0 = false;
     } catch { /* noop */ }
     return o;
+}
+
+
+// ---------------------------------------------------------------------------
+// Gate 4B-2B-1 — fence / GPU->CPU completion path isolation
+// ---------------------------------------------------------------------------
+
+export type UikaFenceClassification =
+    | 'POLLING_OVERHEAD_CONFIRMED'
+    | 'GPU_COMPLETION_PATH_DOMINANT'
+    | 'MIXED_COMPLETION_PATH'
+    | 'UNRESOLVED';
+
+export interface UikaFenceReport {
+    spec: 'UIKA Native Runtime v1.1 Gate 4B-2B-1';
+    startedAt: string;
+    finishedAt: string | null;
+    gpu: UikaGpuInfo;
+    realGpu: boolean;
+    target: typeof TAIL_TARGET;
+    runs: UikaTailRun[];
+    analysis: {
+        noSortP95: number | null;
+        c0P95: number | null;
+        c0RepeatP95: number | null;
+        /** |C0 - C0 repeat|: the run-to-run spread of the number being compared. */
+        c0RepeatabilityMs: number | null;
+        c1P95: number | null;
+        c2P95: number | null;
+        c3P95: number | null;
+        bestPollP95: number | null;
+        bestPollRun: UikaTailRunName | null;
+        /** C0 - no-sort: the gap the completion path costs today. */
+        originalGapMs: number | null;
+        /** C0 - best: how much of it the poll scheduling accounts for. */
+        closedByPollingMs: number | null;
+        /** best - no-sort: what survives the poll change. */
+        residualGapMs: number | null;
+        closedShare: number | null;
+    } | null;
+    classification: UikaFenceClassification;
+    classificationBasis: string[];
+    /** Hypotheses, explicitly not findings (§4). */
+    hypothesesNotTested: string[];
+    notes: string[];
 }
 
 /** Collects one run's lifecycle samples. One instance per run. */
@@ -375,6 +440,7 @@ class LifecycleCollector {
 
 export class UikaTailIsolation {
     private report: UikaTailReport | null = null;
+    private fenceReport: UikaFenceReport | null = null;
     private pass: UikaPredeformPass | null = null;
     private running = false;
     private abort = false;
@@ -391,6 +457,7 @@ export class UikaTailIsolation {
 
     getLive() { return { ...this.live }; }
     getReport(): UikaTailReport | null { return this.report; }
+    getFenceReport(): UikaFenceReport | null { return this.fenceReport; }
     isRunning(): boolean { return this.running; }
     stop(): void { this.abort = true; }
 
@@ -499,11 +566,264 @@ export class UikaTailIsolation {
         return r;
     }
 
+
+    /**
+     * Gate 4B-2B-1. The Run C conditions throughout — pre-deformed, pixelRatio 1.0, real
+     * A2E, 133,541 Gaussians, 51 basis, CPU sort OFF, render-index update OFF — with only
+     * the fence-poll scheduling changed between runs, plus a no-sort reference and a
+     * repeat of C0 to size the run-to-run spread.
+     *
+     * Longer poll intervals are expected to raise the fence elapsed time, the pending-skip
+     * count and the sort completion latency (§9). None of that is the question: the
+     * question is what happens to the main rendering wall tail.
+     */
+    async runFenceIsolation(options: UikaTailOptions = DEFAULT_TAIL_OPTIONS): Promise<UikaFenceReport> {
+        if (this.running) throw new Error('UIKA Gate 4B-2B-1: already running');
+        this.running = true;
+        this.abort = false;
+
+        const viewer = this.viewer();
+        const gpu = collectGpuInfo(viewer?.renderer?.domElement ?? null);
+        const report: UikaFenceReport = {
+            spec: 'UIKA Native Runtime v1.1 Gate 4B-2B-1',
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            gpu,
+            realGpu: !gpu.isSoftware && gpu.unmaskedAvailable,
+            target: TAIL_TARGET,
+            runs: [],
+            analysis: null,
+            classification: 'UNRESOLVED',
+            classificationBasis: [],
+            hypothesesNotTested: [
+                'H1 setTimeout / clientWaitSync polling callback overhead',
+                'H2 transform feedback + fence GPU or driver scheduling interaction',
+                'H3 getBufferSubData completion timing disturbing frame scheduling',
+                'H4 a combination of the above',
+                'none of these is a finding: this gate measures the effect of the poll '
+                + 'scheduling on the wall tail and nothing else',
+            ],
+            notes: [
+                'every run uses the Run C conditions: CPU sort off, render-index update off, '
+                + 'pre-deformed, pixelRatio 1.0, real A2E, 133,541 Gaussians, 51 basis',
+                'the distance shader, the fence and getBufferSubData are identical in every '
+                + 'run; only the scheduling of clientWaitSync differs',
+                'fence elapsed, pendingSkip and completion latency may rise with a longer poll '
+                + 'interval; that is expected and is not the metric under test',
+                'measurement only: no production sort, DepthSorter, sort frequency, render '
+                + 'index format, SplatMesh, SplatMaterial, mapper, LAM, A2E or backend change',
+            ],
+        };
+        this.fenceReport = report;
+
+        try {
+            if (gpu.isSoftware && !options.allowSoftware) {
+                report.classificationBasis.push(`software renderer `
+                    + `(${gpu.softwareMatches.join(', ')}): completion-path timing on a software `
+                    + 'rasteriser is not evidence');
+                return report;
+            }
+
+            const handles = viewer.getPoCHandles();
+            if (!handles) throw new Error('the viewer has no renderer or splat mesh yet');
+
+            this.pass = new UikaPredeformPass();
+            const layout = this.pass.init(handles);
+            viewer.setPredeformCenterTexture(this.pass.getTexture(), layout.textureWidth, layout.textureHeight);
+            viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+            viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
+            viewer.setExpressionWeightHook(() => { this.pass?.markDirty(); });
+            const dpr = window.devicePixelRatio || 1;
+            viewer.setDrawingBufferScale(1 / dpr);
+
+            const plan: Array<[UikaTailRunName, UikaSortStage, boolean, UikaFencePollStrategy]> = [
+                ['B-no-sort-reference', 'full', true, 'immediate'],
+                ['C0-immediate-poll', 'distance', false, 'immediate'],
+                ['C1-frame-poll', 'distance', false, 'frame'],
+                ['C2-timer-8ms', 'distance', false, 'timer8'],
+                ['C3-timer-16ms', 'distance', false, 'timer16'],
+            ];
+            if (options.repeatC0) plan.push(['C0-immediate-poll-repeat', 'distance', false, 'immediate']);
+
+            for (const [name, stage, suspended, strategy] of plan) {
+                if (this.abort) break;
+                report.runs.push(await this.measureRun(name, stage, suspended, options, strategy));
+            }
+
+            report.analysis = this.analyseFence(report);
+            this.classifyFence(report);
+        } finally {
+            try {
+                viewer?.setFrameTickHook?.(null);
+                viewer?.setSortLifecycleRecorder?.(null);
+                viewer?.setDiagnosticSortStage?.('full');
+                viewer?.setSortSuspended?.(false);
+                viewer?.setPreRenderHook?.(null);
+                viewer?.setExpressionWeightHook?.(null);
+                viewer?.setDistanceProvider?.(null);
+                viewer?.setPredeformCenterTexture?.(null, 0, 0);
+                viewer?.setDrawingBufferScale?.(1);
+                viewer?.setGpuTimer?.(null);
+            } catch { /* noop */ }
+            this.pass?.setDistanceLifecycleRecorder(null);
+            this.pass?.setFencePollStrategy('immediate');
+            this.pass?.dispose();
+            this.pass = null;
+            this.replay.stop();
+            this.runtime.setExpressionSource(null);
+            this.runtime.setNeutral();
+            this.live.phase = 'idle';
+            this.live.step = '';
+            this.running = false;
+            report.finishedAt = new Date().toISOString();
+        }
+
+        return report;
+    }
+
+    private analyseFence(report: UikaFenceReport): UikaFenceReport['analysis'] {
+        // A run only contributes a p95 when it is valid, has samples, and — for the
+        // poll-strategy variants — actually submitted and completed a sort. A window where
+        // a warm-up sort was still pending throughout submits nothing, so its p95 is a
+        // no-sort measurement wearing a variant's name.
+        const p95 = (name: UikaTailRunName) => {
+            const run = report.runs.find((x) => x.name === name);
+            if (!run || !run.valid || run.exactFrameInterval.count === 0) return null;
+            if (run.completionPathExercised === false) return null;
+            return run.exactFrameInterval.p95;
+        };
+        const noSort = p95('B-no-sort-reference');
+        const c0 = p95('C0-immediate-poll');
+        const c0Repeat = p95('C0-immediate-poll-repeat');
+        const c1 = p95('C1-frame-poll');
+        const c2 = p95('C2-timer-8ms');
+        const c3 = p95('C3-timer-16ms');
+
+        const candidates: Array<[UikaTailRunName, number]> = [];
+        if (c1 !== null) candidates.push(['C1-frame-poll', c1]);
+        if (c2 !== null) candidates.push(['C2-timer-8ms', c2]);
+        if (c3 !== null) candidates.push(['C3-timer-16ms', c3]);
+        candidates.sort((a, b) => a[1] - b[1]);
+        const best = candidates.length > 0 ? candidates[0] : null;
+
+        const originalGap = c0 !== null && noSort !== null ? c0 - noSort : null;
+        const closed = c0 !== null && best !== null ? c0 - best[1] : null;
+        const residual = best !== null && noSort !== null ? best[1] - noSort : null;
+
+        return {
+            noSortP95: noSort,
+            c0P95: c0,
+            c0RepeatP95: c0Repeat,
+            c0RepeatabilityMs: c0 !== null && c0Repeat !== null ? Math.abs(c0 - c0Repeat) : null,
+            c1P95: c1,
+            c2P95: c2,
+            c3P95: c3,
+            bestPollP95: best ? best[1] : null,
+            bestPollRun: best ? best[0] : null,
+            originalGapMs: originalGap,
+            closedByPollingMs: closed,
+            residualGapMs: residual,
+            closedShare: closed !== null && originalGap !== null && originalGap > 0
+                ? closed / originalGap : null,
+        };
+    }
+
+    /**
+     * §8. From the measurements only. The 0.7 / 0.2 shares and the "the effect must be at
+     * least twice the measured run-to-run spread" rule are decision rules for this gate,
+     * not measured quantities.
+     */
+    private classifyFence(report: UikaFenceReport): void {
+        const a = report.analysis!;
+        const basis: string[] = [];
+
+        const invalid = report.runs.filter((x) => !x.valid);
+        for (const run of invalid) basis.push(`${run.name}: ${run.invalidReason}`);
+        const notExercised = report.runs.filter((x) => x.completionPathExercised === false);
+        for (const run of notExercised) {
+            basis.push(`${run.name}: no sort was submitted and completed in the measured window `
+                + `(requested ${run.sortCounters.sortRequestedCount}, submitted `
+                + `${run.sortCounters.sortSubmittedCount}, completed `
+                + `${run.sortCounters.sortCompletedCount}, pendingSkip `
+                + `${run.sortCounters.sortPendingSkipCount}) — it measures nothing about the `
+                + 'completion path and is excluded from the comparison');
+        }
+        const invariantFailures = report.runs.reduce(
+            (sum, x) => sum + x.sortLifecycle.lifecycleInvariantFailures, 0);
+        if (invariantFailures > 0) {
+            basis.push(`${invariantFailures} lifecycle invariant failures: the lifecycle timing in `
+                + 'this run is not trustworthy');
+        }
+
+        for (const run of report.runs) {
+            basis.push(`${run.name}: exact p95 ${run.exactFrameInterval.p95.toFixed(2)} ms, `
+                + `fps ${run.effectiveFPS.toFixed(2)}, fence p95 `
+                + `${run.sortLifecycle.fenceWaitMs.p95.toFixed(2)} ms, polls per sort p50 `
+                + `${run.sortLifecycle.fencePolls.p50}, submitted `
+                + `${run.sortCounters.sortSubmittedCount}, completed `
+                + `${run.sortCounters.sortCompletedCount}, pendingSkip `
+                + `${run.sortCounters.sortPendingSkipCount}`);
+        }
+
+        if (a.c0P95 === null || a.noSortP95 === null || a.bestPollP95 === null) {
+            report.classification = 'UNRESOLVED';
+            basis.push('a run needed for the comparison produced no usable exact-interval p95 '
+                + '(no valid samples, or the completion path was never exercised)');
+            report.classificationBasis = basis;
+            return;
+        }
+        if (invariantFailures > 0 || invalid.length > 0 || notExercised.length > 0) {
+            report.classification = 'UNRESOLVED';
+            report.classificationBasis = basis;
+            return;
+        }
+
+        basis.push(`no-sort ${a.noSortP95.toFixed(2)} ms, C0 ${a.c0P95.toFixed(2)} ms, best poll `
+            + `${a.bestPollRun} ${a.bestPollP95.toFixed(2)} ms; gap ${a.originalGapMs?.toFixed(2)} ms, `
+            + `closed ${a.closedByPollingMs?.toFixed(2)} ms, residual ${a.residualGapMs?.toFixed(2)} ms`);
+
+        const spread = a.c0RepeatabilityMs;
+        const effect = a.closedByPollingMs ?? 0;
+        if (spread !== null) {
+            basis.push(`C0 measured twice differs by ${spread.toFixed(2)} ms, against an effect of `
+                + `${effect.toFixed(2)} ms`);
+            if (effect < spread * 2) {
+                report.classification = 'UNRESOLVED';
+                basis.push('the poll-strategy effect is not at least twice the measured run-to-run '
+                    + 'spread, so it is not separable from it in this run');
+                report.classificationBasis = basis;
+                return;
+            }
+        } else {
+            basis.push('C0 was measured once, so the run-to-run spread is not known for this run');
+        }
+
+        const share = a.closedShare;
+        if (share === null) {
+            report.classification = 'UNRESOLVED';
+            basis.push('the no-sort reference is not below C0, so there is no gap to attribute');
+        } else if (share >= 0.7) {
+            report.classification = 'POLLING_OVERHEAD_CONFIRMED';
+            basis.push(`changing only the poll scheduling closes ${(share * 100).toFixed(1)}% of the `
+                + 'gap to the no-sort reference, with the distance pass and the readback identical');
+        } else if (share <= 0.2) {
+            report.classification = 'GPU_COMPLETION_PATH_DOMINANT';
+            basis.push(`changing the poll scheduling closes only ${(share * 100).toFixed(1)}% of the `
+                + 'gap, which stays wide open against the no-sort reference');
+        } else {
+            report.classification = 'MIXED_COMPLETION_PATH';
+            basis.push(`the poll scheduling closes ${(share * 100).toFixed(1)}% of the gap and the `
+                + 'rest survives it');
+        }
+        report.classificationBasis = basis;
+    }
+
     private async measureRun(
         name: UikaTailRunName,
         stage: UikaSortStage,
         suspended: boolean,
         options: UikaTailOptions,
+        pollStrategy: UikaFencePollStrategy = 'immediate',
     ): Promise<UikaTailRun> {
         const viewer = this.viewer();
         const gl = this.gl();
@@ -534,6 +854,7 @@ export class UikaTailIsolation {
 
         viewer.setDiagnosticSortStage(stage);
         viewer.setSortSuspended(suspended);
+        this.pass!.setFencePollStrategy(pollStrategy);
 
         this.replay.stop();
         this.runtime.setExpressionSource(null);
@@ -546,6 +867,14 @@ export class UikaTailIsolation {
             'C-distance-readback-only': 'GPU distance + fence + getBufferSubData; no CPU sort, '
                 + 'no render-index update',
             'D-distance-plus-cpu-sort': 'the above plus the CPU counting sort; no render-index update',
+            'B-no-sort-reference': 'no sort at all, kept as the reference for the poll-strategy runs',
+            'C0-immediate-poll': 'Run C conditions with the current fence polling: '
+                + 'setTimeout(checkSync) with no delay',
+            'C0-immediate-poll-repeat': 'C0 measured a second time, to put a number on the '
+                + 'run-to-run spread of the p95 the classification rests on',
+            'C1-frame-poll': 'Run C conditions, at most one clientWaitSync per rendered frame',
+            'C2-timer-8ms': 'Run C conditions, setTimeout(checkSync, 8)',
+            'C3-timer-16ms': 'Run C conditions, setTimeout(checkSync, 16)',
         };
 
         this.live.step = name;
@@ -571,6 +900,8 @@ export class UikaTailIsolation {
         let lastPassCount = this.pass!.getStats().passCount;
 
         viewer.setFrameTickHook((tick: UikaFrameTick) => {
+            // Gate 4B-2B-1 'frame' strategy: this is the one poll per rendered frame.
+            if (pollStrategy === 'frame') this.pass?.pollFenceOnFrame();
             if (!collecting) { previousStart = tick.startedAt; collector.clearFrameFlags(); return; }
             const interval = previousStart === null ? null : tick.startedAt - previousStart;
             previousStart = tick.startedAt;
@@ -668,6 +999,7 @@ export class UikaTailIsolation {
             description: descriptions[name],
             sortStage: stage,
             sortSuspended: suspended,
+            fencePollStrategy: pollStrategy,
             buffer: viewer.getDrawingBufferInfo(),
             warmupMs,
             measuredMs,
@@ -721,6 +1053,9 @@ export class UikaTailIsolation {
             invalidReason: visibilityLostMs > 0
                 ? `the tab was hidden for ${Math.round(visibilityLostMs)} ms during measurement`
                 : null,
+            completionPathExercised: suspended
+                ? null
+                : collector.sortSubmittedCount > 0 && collector.sortCompletedCount > 0,
             meetsTarget: name === 'A-normal'
                 ? effectiveFPS >= TAIL_TARGET.minFps && exact.p95 <= TAIL_TARGET.maxExactWallP95Ms
                   && viewer.stats.glErrorCount - glErrors0 === 0 && this.pageErrors - pageErrors0 === 0
@@ -733,6 +1068,7 @@ export class UikaTailIsolation {
         this.pass!.setGpuTimer(null);
         viewer.setSortSuspended(false);
         viewer.setDiagnosticSortStage('full');
+        this.pass!.setFencePollStrategy('immediate');
         return run;
     }
 
