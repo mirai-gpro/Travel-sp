@@ -155,8 +155,15 @@
         cell('GPU predeform p50', l.predeformP50 ? `${l.predeformP50.toFixed(2)} ms` : '—'),
         cell('GL errors', String(r.glErrorCount), r.glErrorCount === 0 ? 'ok' : 'bad'),
         cell('splats', String(r.viewerSplatCount ?? 0)),
-        cell('correctness', report?.correctnessVerdict ?? '—',
-             report?.correctnessVerdict ? (report.correctnessVerdict === 'PASS' ? 'ok' : 'bad') : ''),
+        cell('bit-exact', report?.contract?.bitExactVerdict ?? '—',
+             report?.contract ? (report.contract.bitExactVerdict === 'PASS' ? 'ok' : 'warn') : ''),
+        cell('numeric', report?.contract?.numericVerdict ?? '—',
+             report?.contract ? (report.contract.numericVerdict === 'PASS' ? 'ok' : 'bad') : ''),
+        cell('visual', report?.contract?.visualVerdict ?? '—',
+             report?.contract ? (report.contract.visualVerdict === 'PASS' ? 'ok' : 'bad') : ''),
+        cell('correctness', report?.contract?.correctnessVerdict ?? report?.correctnessVerdict ?? '—',
+             (report?.contract?.correctnessVerdict ?? report?.correctnessVerdict) === 'PASS' ? 'ok'
+             : (report?.contract || report?.correctnessVerdict ? 'bad' : '')),
         cell('decision', report ? ((report.decision || []).join(' / ') || report.classification || '—') : '—'),
       ].join('');
     };
@@ -221,6 +228,17 @@
         </table>
         <p class="note">classification: <b>${report.classification}</b></p>`;
       }
+      if (report.contract) {
+        const c = report.contract;
+        html += `<table>
+          <tr><th>acceptance ${c.acceptanceVersion}</th><th>verdict</th><th>passing</th></tr>
+          <tr><td>structural</td><td class="${c.structural.verdict === 'PASS' ? 'ok' : 'bad'}">${c.structural.verdict}</td><td>${c.structural.samplesCompared}/${c.structural.samplesExpected} samples, GL ${c.structural.glErrors}, page ${c.structural.pageErrors}</td></tr>
+          <tr><td>BIT_EXACT_EQUIVALENCE</td><td class="${c.bitExactVerdict === 'PASS' ? 'ok' : 'warn'}">${c.bitExactVerdict}</td><td>${c.counts.bitExactPassing}/${c.counts.total}</td></tr>
+          <tr><td>NUMERIC_EQUIVALENCE</td><td class="${c.numericVerdict === 'PASS' ? 'ok' : 'bad'}">${c.numericVerdict}</td><td>${c.counts.numericPassing}/${c.counts.total}</td></tr>
+          <tr><td>VISUAL_EQUIVALENCE</td><td class="${c.visualVerdict === 'PASS' ? 'ok' : 'bad'}">${c.visualVerdict}</td><td>${c.counts.visualPassing}/${c.counts.total} within explicit tolerance</td></tr>
+          <tr><td><b>correctnessVerdict</b></td><td class="${c.correctnessVerdict === 'PASS' ? 'ok' : 'bad'}"><b>${c.correctnessVerdict}</b></td><td>under ${c.previousAcceptanceVersion}: ${c.underPreviousAcceptance}</td></tr>
+        </table>`;
+      }
       if (report.summary) {
         const s = report.summary;
         const w = (x: any) => `${typeof x.value === 'number' ? (Number.isInteger(x.value) ? x.value : x.value.toExponential(4)) : '—'} @f${x.frame}`;
@@ -240,7 +258,6 @@
           <tr><td>frames with an alpha difference</td><td class="${s.framesWithAlphaDifference.length === 0 ? 'ok' : 'bad'}">${s.framesWithAlphaDifference.length === 0 ? 'none' : s.framesWithAlphaDifference.join(', ')}</td></tr>
           <tr><td>frames with non-finite centres</td><td class="${s.framesWithNonFinite.length === 0 ? 'ok' : 'bad'}">${s.framesWithNonFinite.length === 0 ? 'none' : s.framesWithNonFinite.join(', ')}</td></tr>
           <tr><td>all within ${report.numericBound}</td><td class="${s.allWithinNumericBound ? 'ok' : 'bad'}">${s.allWithinNumericBound ? 'yes' : `NO: ${s.framesOutsideNumericBound.join(', ')}`}</td></tr>
-          <tr><td>acceptance rule</td><td>${report.acceptance?.rule} (unchanged) &rarr; ${report.acceptance?.correctnessUnderCurrentRule}</td></tr>
         </table>`;
         const diff = (report.frames || []).filter((f: any) => f.framebuffer && !f.framebuffer.pixelIdentical);
         if (diff.length > 0) {

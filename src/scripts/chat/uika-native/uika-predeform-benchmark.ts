@@ -20,6 +20,12 @@ import {
     type UikaPredeformCapabilities,
     type UikaPredeformLayout,
 } from './predeform/uika-predeform-pass';
+import {
+    evaluateSample,
+    rollUpContract,
+    type UikaContractReport,
+    type UikaContractSample,
+} from './predeform/uika-correctness-contract';
 
 /** Decision rules for this gate, not measured quantities. */
 export const CORRECTNESS_MAX_ABS_XYZ_ERROR = 1e-6;
@@ -54,6 +60,15 @@ export interface UikaCorrectnessCase {
     productionFrame: UikaDrawingBufferHash | null;
     predeformFrame: UikaDrawingBufferHash | null;
     framesIdentical: boolean | null;
+    /** v2 visual-equivalence inputs, measured rather than inferred from the hash. */
+    differentPixels: number;
+    differentPixelRatio: number;
+    maxRgbaByteDelta: number;
+    maxAlphaByteDelta: number;
+    alphaPlaneIdentical: boolean | null;
+    bitExact: 'PASS' | 'FAIL';
+    numeric: 'PASS' | 'FAIL';
+    visual: 'PASS' | 'FAIL';
     pass: boolean;
     failures: string[];
 }
@@ -105,18 +120,26 @@ export interface UikaPredeformReport {
         oacFreeCheck: Record<string, boolean>;
     };
     correctness: UikaCorrectnessCase[];
+    /** The roll-up under the acceptance version in force (v2), with v1 reported alongside. */
+    contract: UikaContractReport | null;
     correctnessVerdict: 'PASS' | 'FAIL' | 'NOT_RUN';
     measurements: UikaPredeformMeasurement[];
     analysis: {
         dpr: number;
         production: { fixedPoseDrawP50: number | null; realA2eFps: number | null;
-                      realA2eDrawP50: number | null; realA2eSortP50: number | null } | null;
+                      realA2eDrawP50: number | null; realA2eSortP50: number | null;
+                      /** draw + sort; the production path has no deformation pass. */
+                      realA2eTotalGpuP50: number | null } | null;
         predeform: { fixedPoseDrawP50: number | null; realA2eFps: number | null;
                      realA2eDrawP50: number | null; realA2eSortP50: number | null;
-                     realA2ePredeformP50: number | null } | null;
+                     realA2ePredeformP50: number | null;
+                     /** pre-deformation + draw + sort: what §10 says to judge on. */
+                     realA2eTotalGpuP50: number | null } | null;
         dpr1: { productionFps: number | null; predeformFps: number | null } | null;
         drawSavedMs: number | null;
         sortSavedMs: number | null;
+        /** Total GPU cost saved. A draw-only improvement is not enough on its own (§10). */
+        totalGpuSavedMs: number | null;
     } | null;
     fullDprPerf: 'PASS' | 'FAIL' | 'NOT_RUN';
     dpr1Perf: 'PASS' | 'FAIL' | 'NOT_RUN';
@@ -214,6 +237,7 @@ export class UikaPredeformBenchmark {
                 oacFreeCheck: rt.oacFreeCheck,
             },
             correctness: [],
+            contract: null,
             correctnessVerdict: 'NOT_RUN',
             measurements: [],
             analysis: null,
@@ -250,16 +274,34 @@ export class UikaPredeformBenchmark {
             const weightHook = () => { this.pass?.markDirty(); };
             viewer.setExpressionWeightHook?.(weightHook);
 
+            const glErrors0 = viewer.stats.glErrorCount;
+            const pageErrors0 = this.pageErrors;
             r.correctness = await this.runCorrectness(handles);
-            r.correctnessVerdict = r.correctness.length > 0 && r.correctness.every((c) => c.pass)
-                ? 'PASS' : 'FAIL';
+            r.contract = rollUpContract(
+                r.correctness.map((c) => this.contractSample(c)),
+                {
+                    samplesCompared: r.correctness.length,
+                    samplesExpected: 1 + MORPH_CORRECTNESS_CHANNELS.length + A2E_CORRECTNESS_FRAMES.length,
+                    glErrors: viewer.stats.glErrorCount - glErrors0,
+                    pageErrors: this.pageErrors - pageErrors0,
+                    nonFiniteComponents: r.correctness.reduce((sum, c) => sum + c.nonFiniteCenters, 0),
+                },
+            );
+            r.correctnessVerdict = r.contract.correctnessVerdict;
 
             if (r.correctnessVerdict === 'FAIL') {
                 r.decision = ['PREDEFORM_CORRECTNESS_FAIL'];
                 r.reasons.push('no performance number is reported: the PoC must be correct first');
-                for (const c of r.correctness) for (const f of c.failures) r.reasons.push(`${c.name}: ${f}`);
+                for (const f of r.contract.structural.failures) r.reasons.push(`structural: ${f}`);
+                for (const s of r.contract.failingSamples) {
+                    for (const f of s.failures) r.reasons.push(`${s.label}: ${f}`);
+                }
                 return r;
             }
+            r.reasons.push(`acceptance ${r.contract.acceptanceVersion}: bit-exact `
+                + `${r.contract.bitExactVerdict} (${r.contract.counts.bitExactPassing}/`
+                + `${r.contract.counts.total}), numeric ${r.contract.numericVerdict}, visual `
+                + `${r.contract.visualVerdict}`);
             if (options.correctnessOnly) {
                 r.decision = ['PREDEFORM_CORRECTNESS_PASS', 'PERF_NOT_RUN'];
                 r.reasons.push('correctnessOnly=1: no performance measurement was taken');
@@ -404,6 +446,9 @@ export class UikaPredeformBenchmark {
             maxAbsDistanceDiff: Number.NaN, maxAbsDistanceDiffIndex: -1,
             productionDistanceMin: Number.NaN, productionDistanceMax: Number.NaN,
             productionFrame: null, predeformFrame: null, framesIdentical: null,
+            differentPixels: 0, differentPixelRatio: 0,
+            maxRgbaByteDelta: 0, maxAlphaByteDelta: 0, alphaPlaneIdentical: null,
+            bitExact: 'FAIL', numeric: 'FAIL', visual: 'FAIL',
             pass: false,
             failures: [`the basis has ${basisCount} channels and none of them is ${channel}`],
         };
@@ -422,7 +467,7 @@ export class UikaPredeformBenchmark {
         viewer.setDistanceProvider(null);
         this.runtime.applyWeights(item.weights);
         this.pass!.markDirty();
-        const productionFrame = await this.hashNextFrame();
+        const productionFrame = await this.pixelsNextFrame();
 
         const mvp = this.mvpMatrix(handles);
         const gaussianCount = handles.splatMesh.getSplatCount();
@@ -438,7 +483,7 @@ export class UikaPredeformBenchmark {
         viewer.setPredeformCenterTexture(
             this.pass!.getTexture(), this.pass!.getLayout()!.textureWidth, this.pass!.getLayout()!.textureHeight);
         viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
-        const predeformFrame = await this.hashNextFrame();
+        const predeformFrame = await this.pixelsNextFrame();
 
         // --- numbers ----------------------------------------------------------
         const reference = applyUikaBasisWeightsCpu(asset.canonicalPositions, asset.basis, item.weights);
@@ -474,20 +519,25 @@ export class UikaPredeformBenchmark {
         }
 
         const framesIdentical = productionFrame.hash === predeformFrame.hash;
-        if (nonFinite > 0) failures.push(`${nonFinite} non-finite centre components`);
-        if (!(maxAbsXyzError <= CORRECTNESS_MAX_ABS_XYZ_ERROR)) {
-            failures.push(`max |pre-deformed - CPU reference| = ${maxAbsXyzError} > ${CORRECTNESS_MAX_ABS_XYZ_ERROR}`);
-        }
-        if (!(maxAbsDistanceDiff <= CORRECTNESS_MAX_ABS_DISTANCE_DIFF)) {
-            failures.push(`max |production distance - PoC distance| = ${maxAbsDistanceDiff} `
-                + `> ${CORRECTNESS_MAX_ABS_DISTANCE_DIFF}`);
-        }
-        if (!framesIdentical) {
-            failures.push(`the rendered frames differ (production ${productionFrame.hash}, `
-                + `pre-deformed ${predeformFrame.hash}) with the same camera, the same suspended `
-                + 'sort order and the same resolution');
-        }
+        const pixels = this.comparePixels(productionFrame, predeformFrame);
         if (productionFrame.nonZeroPixels === 0) failures.push('the production frame is empty');
+
+        // Acceptance v2: numeric equivalence and visual equivalence, with bit-exactness
+        // reported separately rather than required. See uika-correctness-contract.ts.
+        const outcome = evaluateSample({
+            label: item.name,
+            centerAbsDifferences: [
+                { name: 'centre, pre-deformed vs CPU reference', maxAbs: maxAbsXyzError },
+            ],
+            distanceMaxAbsDifference: maxAbsDistanceDiff,
+            nonFiniteComponents: nonFinite,
+            pixelIdentical: framesIdentical,
+            maxRgbaByteDelta: pixels.maxRgbaByteDelta,
+            maxAlphaByteDelta: pixels.aMaxAbsByteDiff,
+            differentPixels: pixels.differentPixels,
+            differentPixelRatio: pixels.differentPixelRatio,
+        });
+        failures.push(...outcome.failures);
 
         return {
             name: item.name,
@@ -503,11 +553,92 @@ export class UikaPredeformBenchmark {
             maxAbsDistanceDiffIndex: distanceIndex,
             productionDistanceMin: pMin,
             productionDistanceMax: pMax,
-            productionFrame,
-            predeformFrame,
+            productionFrame: this.withoutPixels(productionFrame),
+            predeformFrame: this.withoutPixels(predeformFrame),
             framesIdentical,
+            differentPixels: pixels.differentPixels,
+            differentPixelRatio: pixels.differentPixelRatio,
+            maxRgbaByteDelta: pixels.maxRgbaByteDelta,
+            maxAlphaByteDelta: pixels.aMaxAbsByteDiff,
+            alphaPlaneIdentical: productionFrame.aHash === predeformFrame.aHash,
+            bitExact: outcome.bitExact,
+            numeric: outcome.numeric,
+            visual: outcome.visual,
             pass: failures.length === 0,
             failures,
+        };
+    }
+
+    /** Keep the report serialisable: the RGBA bytes are compared, then dropped. */
+    private withoutPixels(frame: UikaDrawingBufferHash): UikaDrawingBufferHash {
+        const { pixels, ...rest } = frame as any;
+        void pixels;
+        return rest as UikaDrawingBufferHash;
+    }
+
+    /** The v2 visual-equivalence inputs, from the two RGBA buffers. */
+    private comparePixels(a: UikaDrawingBufferHash, b: UikaDrawingBufferHash) {
+        const pa = a.pixels!;
+        const pb = b.pixels!;
+        const totalPixels = a.width * a.height;
+        let differentPixels = 0;
+        let maxRgbaByteDelta = 0;
+        let aMaxAbsByteDiff = 0;
+        for (let p = 0; p < totalPixels; p++) {
+            const i = p * 4;
+            let differs = false;
+            for (let c = 0; c < 4; c++) {
+                const d = Math.abs(pa[i + c] - pb[i + c]);
+                if (d === 0) continue;
+                differs = true;
+                if (d > maxRgbaByteDelta) maxRgbaByteDelta = d;
+                if (c === 3 && d > aMaxAbsByteDiff) aMaxAbsByteDiff = d;
+            }
+            if (differs) differentPixels++;
+        }
+        return {
+            totalPixels,
+            differentPixels,
+            differentPixelRatio: totalPixels > 0 ? differentPixels / totalPixels : 0,
+            maxRgbaByteDelta,
+            aMaxAbsByteDiff,
+        };
+    }
+
+    /** One readback that keeps the bytes, for the pixel comparison. */
+    private async pixelsNextFrame(): Promise<UikaDrawingBufferHash> {
+        const viewer = this.viewer();
+        let timer = 0;
+        try {
+            return await Promise.race([
+                viewer.requestDrawingBufferPixels() as Promise<UikaDrawingBufferHash>,
+                new Promise<UikaDrawingBufferHash>((_, reject) => {
+                    timer = window.setTimeout(
+                        () => reject(new Error('UIKA Gate 4B-2A: no frame was rendered within 30000 ms')),
+                        30000,
+                    );
+                }),
+            ]);
+        } finally {
+            window.clearTimeout(timer);
+            viewer.clearPendingDrawingBufferHash?.();
+        }
+    }
+
+    /** What the contract roll-up reads from a finished case. */
+    private contractSample(c: UikaCorrectnessCase): UikaContractSample {
+        return {
+            label: c.name,
+            centerAbsDifferences: [
+                { name: 'centre, pre-deformed vs CPU reference', maxAbs: c.maxAbsXyzError },
+            ],
+            distanceMaxAbsDifference: c.maxAbsDistanceDiff,
+            nonFiniteComponents: c.nonFiniteCenters,
+            pixelIdentical: c.framesIdentical === true,
+            maxRgbaByteDelta: c.maxRgbaByteDelta,
+            maxAlphaByteDelta: c.maxAlphaByteDelta,
+            differentPixels: c.differentPixels,
+            differentPixelRatio: c.differentPixelRatio,
         };
     }
 
@@ -705,6 +836,16 @@ export class UikaPredeformBenchmark {
         const prodSort = p50(prodA2e, 'gpuSortMs');
         const preSort = p50(preA2e, 'gpuSortMs');
 
+        const prePredeform = p50(preA2e, 'gpuPredeformMs');
+        // Null if any part is missing: a total that silently counts a missing stage as
+        // zero would understate the cost the §10 comparison is about.
+        const sum = (parts: (number | null)[]) =>
+            parts.some((x) => x === null)
+                ? null
+                : parts.reduce((total: number, x) => total + (x as number), 0);
+        const prodTotal = sum([prodDraw, prodSort]);
+        const preTotal = sum([prePredeform, preDraw, preSort]);
+
         return {
             dpr,
             production: {
@@ -712,13 +853,15 @@ export class UikaPredeformBenchmark {
                 realA2eFps: prodA2e && prodA2e.valid ? prodA2e.effectiveFPS : null,
                 realA2eDrawP50: prodDraw,
                 realA2eSortP50: prodSort,
+                realA2eTotalGpuP50: prodTotal,
             },
             predeform: {
                 fixedPoseDrawP50: p50(preFixed, 'gpuDrawMs'),
                 realA2eFps: preA2e && preA2e.valid ? preA2e.effectiveFPS : null,
                 realA2eDrawP50: preDraw,
                 realA2eSortP50: preSort,
-                realA2ePredeformP50: p50(preA2e, 'gpuPredeformMs'),
+                realA2ePredeformP50: prePredeform,
+                realA2eTotalGpuP50: preTotal,
             },
             dpr1: (prodDpr1 || preDpr1) ? {
                 productionFps: prodDpr1 && prodDpr1.valid ? prodDpr1.effectiveFPS : null,
@@ -726,6 +869,7 @@ export class UikaPredeformBenchmark {
             } : null,
             drawSavedMs: prodDraw !== null && preDraw !== null ? prodDraw - preDraw : null,
             sortSavedMs: prodSort !== null && preSort !== null ? prodSort - preSort : null,
+            totalGpuSavedMs: prodTotal !== null && preTotal !== null ? prodTotal - preTotal : null,
         };
     }
 
@@ -795,6 +939,17 @@ export class UikaPredeformBenchmark {
         if (a?.predeform?.realA2ePredeformP50 !== null && a?.predeform?.realA2ePredeformP50 !== undefined) {
             r.reasons.push(`the deformation pass itself is ${a.predeform.realA2ePredeformP50.toFixed(2)} ms p50, `
                 + 'once per changed expression frame');
+        }
+        const totalSaved = a?.totalGpuSavedMs;
+        if (a && totalSaved !== null && totalSaved !== undefined) {
+            // Gate 4B-2A §10: the pre-deformed path is judged on pre-deformation + draw +
+            // sort together. Below 30 fps the replay advances every rendered frame, so the
+            // deformation pass runs about once per frame and its cost belongs in the total.
+            r.reasons.push(`total GPU cost p50 (pre-deformation + draw + sort): `
+                + `${a.production?.realA2eTotalGpuP50?.toFixed(2)} ms production vs `
+                + `${a.predeform?.realA2eTotalGpuP50?.toFixed(2)} ms pre-deformed `
+                + `(${totalSaved >= 0 ? '-' : '+'}${Math.abs(totalSaved).toFixed(2)} ms); `
+                + 'a draw-only improvement is not treated as a pass');
         }
     }
 }

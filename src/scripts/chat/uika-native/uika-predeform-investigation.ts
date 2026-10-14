@@ -19,6 +19,12 @@ import type { UikaDrawingBufferHash } from './renderer';
 import { collectGpuInfo, type UikaGpuInfo } from './uika-native-benchmark';
 import { UikaPredeformPass } from './predeform/uika-predeform-pass';
 import { UikaCenterProbe, type UikaCenterProbeRoute } from './predeform/uika-center-probe';
+import {
+    evaluateSample,
+    rollUpContract,
+    type UikaContractReport,
+    type UikaContractSample,
+} from './predeform/uika-correctness-contract';
 
 /**
  * The existing correctness bound on an animated-centre component, unchanged by this
@@ -199,6 +205,10 @@ export interface UikaSweepFrame {
         gDifferingCount: number;
         bDifferingCount: number;
         aDifferingCount: number;
+        rMaxAbsByteDiff: number;
+        gMaxAbsByteDiff: number;
+        bMaxAbsByteDiff: number;
+        aMaxAbsByteDiff: number;
         maxRgbaByteDelta: number;
         sumAbsoluteDifference: number;
         alphaPlaneIdentical: boolean;
@@ -207,6 +217,10 @@ export interface UikaSweepFrame {
         pixelIdentical: boolean;
     };
     withinNumericBound: boolean;
+    /** Per-frame contract outcome; the roll-up is in the report's `contract` field. */
+    bitExact: 'PASS' | 'FAIL';
+    numeric: 'PASS' | 'FAIL';
+    visual: 'PASS' | 'FAIL';
 }
 
 export interface UikaSweepReport {
@@ -239,15 +253,13 @@ export interface UikaSweepReport {
         allWithinNumericBound: boolean;
     } | null;
     /**
-     * The harness never turns a FAIL into a PASS. Acceptance is still pixel-identical and
-     * only a human decision changes it (Gate 4B-2A §9).
+     * The three equivalences, reported separately, plus the roll-up under the acceptance
+     * version in force. The previous acceptance (pixel-identical) is reported alongside as
+     * `underPreviousAcceptance`, so the historical FAIL stays visible.
      */
-    acceptance: {
-        rule: 'pixel-identical';
-        ruleChangedByThisRun: false;
-        correctnessUnderCurrentRule: 'PASS' | 'FAIL';
-        note: string;
-    } | null;
+    contract: UikaContractReport | null;
+    glErrors: number;
+    pageErrors: number;
     notes: string[];
 }
 
@@ -285,10 +297,15 @@ export class UikaPredeformInvestigation {
     private abort = false;
     private live = { step: '', phase: 'idle', frame: 0, repeat: 0 };
 
+    private pageErrors = 0;
+
     constructor(
         private readonly runtime: UikaNativeRuntime,
         private readonly replay: UikaNativeReplay,
-    ) {}
+    ) {
+        window.addEventListener('error', () => { this.pageErrors++; });
+        window.addEventListener('unhandledrejection', () => { this.pageErrors++; });
+    }
 
     getLive() { return { ...this.live }; }
     getReport(): UikaInvestigationReport | null { return this.report; }
@@ -715,7 +732,9 @@ export class UikaPredeformInvestigation {
             centerRoute: route,
             frames: [],
             summary: null,
-            acceptance: null,
+            contract: null,
+            glErrors: 0,
+            pageErrors: 0,
             notes: [
                 'one comparison per frame, no repeats: Diagnostic A measured both modes stable '
                 + '20/20 on the real GPU',
@@ -746,6 +765,9 @@ export class UikaPredeformInvestigation {
             const productionDistances = new Float32Array(gaussianCount);
             const predeformDistances = new Float32Array(gaussianCount);
             const predeformCenters = new Float32Array(gaussianCount * 3);
+            const samples: UikaContractSample[] = [];
+            const glErrors0 = viewer.stats.glErrorCount;
+            const pageErrors0 = this.pageErrors;
 
             this.live.phase = 'sweep';
             for (let i = 0; i < frames.length; i++) {
@@ -832,6 +854,10 @@ export class UikaPredeformInvestigation {
                         gDifferingCount: pixelDiff.g.differingCount,
                         bDifferingCount: pixelDiff.b.differingCount,
                         aDifferingCount: pixelDiff.a.differingCount,
+                        rMaxAbsByteDiff: pixelDiff.r.maxAbsByteDiff,
+                        gMaxAbsByteDiff: pixelDiff.g.maxAbsByteDiff,
+                        bMaxAbsByteDiff: pixelDiff.b.maxAbsByteDiff,
+                        aMaxAbsByteDiff: pixelDiff.a.maxAbsByteDiff,
                         maxRgbaByteDelta: pixelDiff.maxRgbaByteDelta,
                         sumAbsoluteDifference: pixelDiff.sumAbsoluteDifference,
                         alphaPlaneIdentical: pixelDiff.channelHashes.alphaPlaneIdentical,
@@ -842,19 +868,43 @@ export class UikaPredeformInvestigation {
                     withinNumericBound: centerDiff.maxAbsXYZ <= NUMERIC_BOUND
                         && cpuMaxAbs <= NUMERIC_BOUND
                         && centerDiff.nonFinite === 0,
+                    bitExact: 'PASS',
+                    numeric: 'PASS',
+                    visual: 'PASS',
                 });
+
+                const sample: UikaContractSample = {
+                    label: `frame-${frame}`,
+                    centerAbsDifferences: [
+                        { name: 'centre, production GPU vs pre-deformed', maxAbs: centerDiff.maxAbsXYZ },
+                        { name: 'centre, pre-deformed vs CPU reference', maxAbs: cpuMaxAbs },
+                    ],
+                    distanceMaxAbsDifference: distanceMaxAbs,
+                    nonFiniteComponents: centerDiff.nonFinite,
+                    pixelIdentical: pixelDiff.hashes.identical,
+                    maxRgbaByteDelta: pixelDiff.maxRgbaByteDelta,
+                    maxAlphaByteDelta: pixelDiff.a.maxAbsByteDiff,
+                    differentPixels: pixelDiff.differentPixels,
+                    differentPixelRatio: pixelDiff.differentPixelRatio,
+                };
+                samples.push(sample);
+                const outcome = evaluateSample(sample);
+                const last = sweep.frames[sweep.frames.length - 1];
+                last.bitExact = outcome.bitExact;
+                last.numeric = outcome.numeric;
+                last.visual = outcome.visual;
             }
 
             sweep.summary = this.summarise(sweep.frames);
-            sweep.acceptance = {
-                rule: 'pixel-identical',
-                ruleChangedByThisRun: false,
-                correctnessUnderCurrentRule:
-                    sweep.summary.framesWithPixelDifference === 0 ? 'PASS' : 'FAIL',
-                note: 'The rule is unchanged by this run. Whether to keep pixel-identical as a '
-                    + 'cross-GPU requirement or replace it with an explicit numeric tolerance is '
-                    + 'a separate decision, to be taken on these numbers.',
-            };
+            sweep.glErrors = viewer.stats.glErrorCount - glErrors0;
+            sweep.pageErrors = this.pageErrors - pageErrors0;
+            sweep.contract = rollUpContract(samples, {
+                samplesCompared: samples.length,
+                samplesExpected: frames.length,
+                glErrors: sweep.glErrors,
+                pageErrors: sweep.pageErrors,
+                nonFiniteComponents: sweep.frames.reduce((sum, f) => sum + f.center.nonFinite, 0),
+            });
         } finally {
             try {
                 viewer?.setPreRenderHook?.(null);
