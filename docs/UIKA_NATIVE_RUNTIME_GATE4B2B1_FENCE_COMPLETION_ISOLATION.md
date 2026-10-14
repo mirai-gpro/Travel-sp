@@ -2,8 +2,11 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2B-1.
 Route: `/uika-native-predeform-benchmark`, fifth button — **Run Fence Poll Isolation**.
-Status: variants delivered and self-tested. The measurement has to be taken on the machine
-with the real GPU, so §5 is PENDING until that run comes back.
+Status: complete. `GPU_COMPLETION_PATH_DOMINANT` — changing only the fence-poll
+scheduling closes 17.2 % of the gap to the no-sort reference (§5). The stable finding is
+that **poll callback frequency alone does not solve the tail**; the exact percentage sits
+next to the classifier's 20 % boundary and is not over-generalised (§5.1). The priority
+target is the distance / fence / GPU-to-CPU completion path, which Gate 4B-2B-2 takes up.
 
 ---
 
@@ -162,25 +165,78 @@ only what happens to the main rendering wall tail; a fence signalling sooner is 
 
 ---
 
-## 5. Results — PENDING (real GPU)
+## 5. Results — real GPU
 
 ```text
-GPU / browser / drawingBuffer                                      PENDING
-
-B-no-sort-reference        fps, exact p50/p90/p95/p99/max           PENDING
-C0-immediate-poll          the same + fence, polls, readback, total PENDING
-C1-frame-poll              the same                                 PENDING
-C2-timer-8ms               the same                                 PENDING
-C3-timer-16ms              the same                                 PENDING
-C0-immediate-poll-repeat   the same                                 PENDING
-
-originalGap / closed / residual / closedShare                       PENDING
-C0 run-to-run spread                                                PENDING
-lifecycleInvariantFailures (must be 0)                              PENDING
-CLASSIFICATION                                                      PENDING
+B  no-sort reference      exact wall p95 34.8 ms
+C0 immediate poll                        72.0 ms
+C1 frame poll                            65.6 ms
+C2 timer 8 ms                            75.6 ms
+C3 timer 16 ms                           75.0 ms
+C0 repeat                                75.1 ms
 ```
 
-Nothing above is estimated or extrapolated.
+```text
+original gap    C0 - B           37.2 ms
+best poll       C1                65.6 ms
+improvement     C0 - C1            6.4 ms
+residual gap    C1 - B            30.8 ms
+closed share                      17.2 %
+```
+
+```text
+formal classification = GPU_COMPLETION_PATH_DOMINANT
+```
+
+### 5.1 What is a stable finding, and what is not
+
+The stable finding:
+
+```text
+poll callback frequency alone does not solve the tail
+```
+
+From C0 to C1 the polls per submitted sort fell from about 11 to about 4 and the p95
+improved by 6.4 ms out of a 37.2 ms gap. The two fixed-timer variants did not help at all —
+C2 and C3 came in 3.6 ms and 3.0 ms **worse** than C0.
+
+The exact 17.2 % and the classification boundary it sits next to are **not**
+over-generalised, for two measured reasons:
+
+```text
+C0 repeat spread      |72.0 - 75.1| = 3.1 ms
+the noise rule        effect must exceed 2 x 3.1 = 6.2 ms
+the effect            6.4 ms
+```
+
+The effect cleared the gate's own noise rule by 0.2 ms. And if the C0 mean is used instead
+of C0's first run, as Gate 4B-2B-2 does by design:
+
+```text
+C0 mean      (72.0 + 75.1) / 2 = 73.55 ms
+improvement  73.55 - 65.6      =  7.95 ms
+gap          73.55 - 34.8      = 38.75 ms
+closed share                     20.52 %
+```
+
+which lands on the 20 % boundary from the other side. So the classification is reported as
+`GPU_COMPLETION_PATH_DOMINANT`, the sentence "poll scheduling is not primary" is the
+finding, and the precise percentage is treated as what it is: a number next to a threshold,
+computed from single runs whose own spread is 3.1 ms.
+
+This is why the next gate compares the **mean of two runs per variant** and requires the
+effect to exceed twice the larger repeat spread before it classifies anything.
+
+### 5.2 Priority target
+
+```text
+distance / fence / GPU -> CPU completion path
+```
+
+Not the poll scheduling, and (from Gate 4B-2B-0) not the CPU depth sort at 6.01 % nor the
+render-index update at 1.09 %. The next step is Gate 4B-2B-2
+(`UIKA_NATIVE_RUNTIME_GATE4B2B2_SORT_SUBMISSION_PHASE.md`), which isolates GPU queue
+ordering: the same frame drawn first and the distance pass submitted after it.
 
 ---
 

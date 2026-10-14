@@ -19,7 +19,12 @@
 
 import type { UikaNativeRuntime } from './uika-native-runtime';
 import type { UikaNativeReplay } from './uika-native-replay';
-import type { UikaFrameTick, UikaSortStage, UikaDrawingBufferInfo } from './renderer';
+import type {
+    UikaFrameTick,
+    UikaSortStage,
+    UikaSortSubmissionPhase,
+    UikaDrawingBufferInfo,
+} from './renderer';
 import {
     GpuTimerPool,
     collectGpuInfo,
@@ -49,7 +54,13 @@ export type UikaTailRunName =
     | 'C0-immediate-poll-repeat'
     | 'C1-frame-poll'
     | 'C2-timer-8ms'
-    | 'C3-timer-16ms';
+    | 'C3-timer-16ms'
+    // Gate 4B-2B-2: the same Run C conditions with the sort submitted before or after
+    // the current frame's draw.
+    | 'P0-pre-draw'
+    | 'P0-pre-draw-repeat'
+    | 'P1-post-draw'
+    | 'P1-post-draw-repeat';
 
 export interface UikaStageStats {
     count: number;
@@ -99,6 +110,16 @@ export interface UikaTailRun {
     sortSuspended: boolean;
     /** Gate 4B-2B-1: which fence-poll scheduling this run used. */
     fencePollStrategy: UikaFencePollStrategy;
+    /** Gate 4B-2B-2: when the distance pass was submitted within the frame. */
+    sortSubmissionPhase: UikaSortSubmissionPhase;
+    /** Gate 4B-2B-2 §7: frames where the post-draw sort would have read changed state. */
+    phaseStateMismatches: number;
+    /** Gate 4B-2B-2 §8: the window started with no sort in flight and ended drained. */
+    submittedEqualsCompleted: boolean;
+    idleBeforeMeasurement: boolean;
+    idleWaitMs: number;
+    drainedAfterMeasurement: boolean;
+    drainWaitMs: number;
     buffer: UikaDrawingBufferInfo;
     warmupMs: number;
     measuredMs: number;
@@ -231,6 +252,13 @@ export interface UikaTailOptions {
     maxFrameRecords: number;
     /** Gate 4B-2B-1: measure C0 twice, to size the run-to-run spread. */
     repeatC0: boolean;
+    /**
+     * Gate 4B-2B-2 §8: how long to wait for the sort pipeline to go idle before opening
+     * and after closing the measured window. The real GPU showed a fence max around
+     * 6033 ms in Gate 4B-2B-1, so the default leaves headroom above that; a timeout makes
+     * the run invalid rather than measuring a window a warm-up sort spills into.
+     */
+    idleTimeoutMs: number;
 }
 
 export const DEFAULT_TAIL_OPTIONS: UikaTailOptions = {
@@ -240,6 +268,7 @@ export const DEFAULT_TAIL_OPTIONS: UikaTailOptions = {
     allowSoftware: false,
     maxFrameRecords: 4000,
     repeatC0: true,
+    idleTimeoutMs: 10000,
 };
 
 /** `?warmupMs=`, `?measureMs=`, `?cd=1|0`, `?allowSoftware=1`, `?maxFrameRecords=`. */
@@ -263,6 +292,8 @@ export function tailOptionsFromUrl(): UikaTailOptions {
         if (q.get('cd') === '0') o.forceCD = false;
         if (q.get('allowSoftware') === '1') o.allowSoftware = true;
         if (q.get('repeatC0') === '0') o.repeatC0 = false;
+        const idle = Number(q.get('idleTimeoutMs'));
+        if (Number.isFinite(idle) && idle > 0) o.idleTimeoutMs = idle;
     } catch { /* noop */ }
     return o;
 }
@@ -309,6 +340,53 @@ export interface UikaFenceReport {
     classificationBasis: string[];
     /** Hypotheses, explicitly not findings (§4). */
     hypothesesNotTested: string[];
+    notes: string[];
+}
+
+
+// ---------------------------------------------------------------------------
+// Gate 4B-2B-2 — sort submission phase PoC
+// ---------------------------------------------------------------------------
+
+export type UikaPhaseClassification =
+    | 'POST_DRAW_PHASE_EFFECTIVE'
+    | 'POST_DRAW_PHASE_PARTIAL'
+    | 'POST_DRAW_PHASE_NOT_PRIMARY'
+    | 'UNRESOLVED';
+
+/** §13: decision rules for this gate, not measured quantities. */
+export const PHASE_RULES = {
+    effectiveClosedShare: 0.5,
+    notPrimaryClosedShare: 0.2,
+    /** The effect must be at least this many times the larger repeat spread. */
+    noiseFactor: 2,
+} as const;
+
+export interface UikaPhaseReport {
+    spec: 'UIKA Native Runtime v1.1 Gate 4B-2B-2';
+    startedAt: string;
+    finishedAt: string | null;
+    gpu: UikaGpuInfo;
+    realGpu: boolean;
+    target: typeof TAIL_TARGET;
+    rules: typeof PHASE_RULES;
+    runs: UikaTailRun[];
+    analysis: {
+        noSortP95: number | null;
+        preDrawP95: number[];
+        postDrawP95: number[];
+        preDrawMeanP95: number | null;
+        postDrawMeanP95: number | null;
+        preDrawSpreadMs: number | null;
+        postDrawSpreadMs: number | null;
+        phaseImprovementMs: number | null;
+        originalGapMs: number | null;
+        closedShare: number | null;
+        /** §7: a post-draw frame must read the same state the draw used. */
+        phaseStateMismatches: number;
+    } | null;
+    classification: UikaPhaseClassification;
+    classificationBasis: string[];
     notes: string[];
 }
 
@@ -441,6 +519,7 @@ class LifecycleCollector {
 export class UikaTailIsolation {
     private report: UikaTailReport | null = null;
     private fenceReport: UikaFenceReport | null = null;
+    private phaseReport: UikaPhaseReport | null = null;
     private pass: UikaPredeformPass | null = null;
     private running = false;
     private abort = false;
@@ -458,6 +537,7 @@ export class UikaTailIsolation {
     getLive() { return { ...this.live }; }
     getReport(): UikaTailReport | null { return this.report; }
     getFenceReport(): UikaFenceReport | null { return this.fenceReport; }
+    getPhaseReport(): UikaPhaseReport | null { return this.phaseReport; }
     isRunning(): boolean { return this.running; }
     stop(): void { this.abort = true; }
 
@@ -681,6 +761,220 @@ export class UikaTailIsolation {
         return report;
     }
 
+
+    /**
+     * Gate 4B-2B-2. Run C conditions throughout — pre-deformed, pixelRatio 1.0, real A2E,
+     * 133,541 Gaussians, 51 basis, CPU sort OFF, render-index update OFF, immediate fence
+     * polling in every run — with only the moment the distance pass is submitted changed:
+     * before this frame's draw (production) or after it, inside the same render() call.
+     *
+     * Each phase is measured twice and compared on the mean of the two p95s, so a single
+     * run is never the baseline.
+     */
+    async runSubmissionPhase(options: UikaTailOptions = DEFAULT_TAIL_OPTIONS): Promise<UikaPhaseReport> {
+        if (this.running) throw new Error('UIKA Gate 4B-2B-2: already running');
+        this.running = true;
+        this.abort = false;
+
+        const viewer = this.viewer();
+        const gpu = collectGpuInfo(viewer?.renderer?.domElement ?? null);
+        const report: UikaPhaseReport = {
+            spec: 'UIKA Native Runtime v1.1 Gate 4B-2B-2',
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            gpu,
+            realGpu: !gpu.isSoftware && gpu.unmaskedAvailable,
+            target: TAIL_TARGET,
+            rules: PHASE_RULES,
+            runs: [],
+            analysis: null,
+            classification: 'UNRESOLVED',
+            classificationBasis: [],
+            notes: [
+                'every run uses the Run C conditions and immediate fence polling; only the '
+                + 'submission phase differs',
+                'the distance shader, the pre-deformation maths, the fence, getBufferSubData, '
+                + 'DepthSorter, the sort frequency, sortDirty semantics, the Gaussian and basis '
+                + 'counts, the render-index format, the mapper, A2E, LAM and the backend are all '
+                + 'unchanged',
+                'both phases submit inside the same synchronous render() call, so the weights, '
+                + 'the camera, the MVP and the pre-deformed centres are identical for the draw '
+                + 'and for the distance pass; the viewer counts any frame where that does not '
+                + 'hold and such a run is marked invalid',
+                'CPU sort and the render-index update are off, so every run draws in the same '
+                + 'fixed order: these runs say nothing about visual correctness (§14)',
+                'measurement only: no GPU sort, no sort cadence change, no Worker, no WASM',
+            ],
+        };
+        this.phaseReport = report;
+
+        try {
+            if (gpu.isSoftware && !options.allowSoftware) {
+                report.classificationBasis.push(`software renderer `
+                    + `(${gpu.softwareMatches.join(', ')}): submission-phase timing on a software `
+                    + 'rasteriser is not evidence');
+                return report;
+            }
+
+            const handles = viewer.getPoCHandles();
+            if (!handles) throw new Error('the viewer has no renderer or splat mesh yet');
+
+            this.pass = new UikaPredeformPass();
+            const layout = this.pass.init(handles);
+            viewer.setPredeformCenterTexture(this.pass.getTexture(), layout.textureWidth, layout.textureHeight);
+            viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+            viewer.setPreRenderHook(() => { this.pass?.runIfDirty(); });
+            viewer.setExpressionWeightHook(() => { this.pass?.markDirty(); });
+            const dpr = window.devicePixelRatio || 1;
+            viewer.setDrawingBufferScale(1 / dpr);
+
+            const plan: Array<[UikaTailRunName, UikaSortStage, boolean, UikaSortSubmissionPhase]> = [
+                ['B-no-sort-reference', 'full', true, 'pre-draw'],
+                ['P0-pre-draw', 'distance', false, 'pre-draw'],
+                ['P0-pre-draw-repeat', 'distance', false, 'pre-draw'],
+                ['P1-post-draw', 'distance', false, 'post-draw'],
+                ['P1-post-draw-repeat', 'distance', false, 'post-draw'],
+            ];
+
+            for (const [name, stage, suspended, phase] of plan) {
+                if (this.abort) break;
+                report.runs.push(await this.measureRun(name, stage, suspended, options, 'immediate', phase));
+            }
+
+            report.analysis = this.analysePhase(report);
+            this.classifyPhase(report);
+        } finally {
+            try {
+                viewer?.setFrameTickHook?.(null);
+                viewer?.setSortLifecycleRecorder?.(null);
+                viewer?.setDiagnosticSortStage?.('full');
+                viewer?.setDiagnosticSortSubmissionPhase?.('pre-draw');
+                viewer?.setSortSuspended?.(false);
+                viewer?.setPreRenderHook?.(null);
+                viewer?.setExpressionWeightHook?.(null);
+                viewer?.setDistanceProvider?.(null);
+                viewer?.setPredeformCenterTexture?.(null, 0, 0);
+                viewer?.setDrawingBufferScale?.(1);
+                viewer?.setGpuTimer?.(null);
+            } catch { /* noop */ }
+            this.pass?.setDistanceLifecycleRecorder(null);
+            this.pass?.setFencePollStrategy('immediate');
+            this.pass?.dispose();
+            this.pass = null;
+            this.replay.stop();
+            this.runtime.setExpressionSource(null);
+            this.runtime.setNeutral();
+            this.live.phase = 'idle';
+            this.live.step = '';
+            this.running = false;
+            report.finishedAt = new Date().toISOString();
+        }
+
+        return report;
+    }
+
+    private analysePhase(report: UikaPhaseReport): UikaPhaseReport['analysis'] {
+        const usable = (name: UikaTailRunName) => {
+            const run = report.runs.find((x) => x.name === name);
+            if (!run || !run.valid || run.exactFrameInterval.count === 0) return null;
+            if (run.completionPathExercised === false) return null;
+            return run.exactFrameInterval.p95;
+        };
+        const noSort = usable('B-no-sort-reference');
+        const pre = [usable('P0-pre-draw'), usable('P0-pre-draw-repeat')]
+            .filter((v): v is number => v !== null);
+        const post = [usable('P1-post-draw'), usable('P1-post-draw-repeat')]
+            .filter((v): v is number => v !== null);
+        const mean = (xs: number[]) => (xs.length > 0 ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+        const spread = (xs: number[]) => (xs.length === 2 ? Math.abs(xs[0] - xs[1]) : null);
+
+        const preMean = mean(pre);
+        const postMean = mean(post);
+        const improvement = preMean !== null && postMean !== null ? preMean - postMean : null;
+        const gap = preMean !== null && noSort !== null ? preMean - noSort : null;
+
+        return {
+            noSortP95: noSort,
+            preDrawP95: pre,
+            postDrawP95: post,
+            preDrawMeanP95: preMean,
+            postDrawMeanP95: postMean,
+            preDrawSpreadMs: spread(pre),
+            postDrawSpreadMs: spread(post),
+            phaseImprovementMs: improvement,
+            originalGapMs: gap,
+            closedShare: improvement !== null && gap !== null && gap > 0 ? improvement / gap : null,
+            phaseStateMismatches: report.runs.reduce((sum, x) => sum + x.phaseStateMismatches, 0),
+        };
+    }
+
+    /** §13. From the measurements only; the thresholds are PHASE_RULES. */
+    private classifyPhase(report: UikaPhaseReport): void {
+        const a = report.analysis!;
+        const basis: string[] = [];
+
+        for (const run of report.runs) {
+            basis.push(`${run.name}: phase ${run.sortSubmissionPhase}, exact p95 `
+                + `${run.exactFrameInterval.p95.toFixed(2)} ms, fps ${run.effectiveFPS.toFixed(2)}, `
+                + `submitted ${run.sortCounters.sortSubmittedCount}, completed `
+                + `${run.sortCounters.sortCompletedCount}, pendingSkip `
+                + `${run.sortCounters.sortPendingSkipCount}, idle at open `
+                + `${run.idleBeforeMeasurement}, state mismatches ${run.phaseStateMismatches}`
+                + (run.valid ? '' : ` — INVALID: ${run.invalidReason}`));
+        }
+
+        const invalid = report.runs.filter((x) => !x.valid);
+        const invariantFailures = report.runs.reduce(
+            (sum, x) => sum + x.sortLifecycle.lifecycleInvariantFailures, 0);
+        if (invariantFailures > 0) {
+            basis.push(`${invariantFailures} lifecycle invariant failures: the lifecycle timing is `
+                + 'not trustworthy in this run');
+        }
+
+        if (a.preDrawMeanP95 === null || a.postDrawMeanP95 === null || a.noSortP95 === null
+            || a.phaseImprovementMs === null || invalid.length > 0 || invariantFailures > 0) {
+            report.classification = 'UNRESOLVED';
+            basis.push('a run needed for the comparison is missing or invalid');
+            report.classificationBasis = basis;
+            return;
+        }
+
+        basis.push(`pre-draw mean p95 ${a.preDrawMeanP95.toFixed(2)} ms (spread `
+            + `${a.preDrawSpreadMs?.toFixed(2)} ms), post-draw mean p95 `
+            + `${a.postDrawMeanP95.toFixed(2)} ms (spread ${a.postDrawSpreadMs?.toFixed(2)} ms), `
+            + `no-sort ${a.noSortP95.toFixed(2)} ms`);
+        basis.push(`phase improvement ${a.phaseImprovementMs.toFixed(2)} ms against a gap of `
+            + `${a.originalGapMs?.toFixed(2)} ms`);
+
+        const noise = Math.max(a.preDrawSpreadMs ?? 0, a.postDrawSpreadMs ?? 0);
+        if (a.phaseImprovementMs < noise * PHASE_RULES.noiseFactor) {
+            report.classification = 'UNRESOLVED';
+            basis.push(`the effect is below ${PHASE_RULES.noiseFactor}x the larger repeat spread `
+                + `(${noise.toFixed(2)} ms), so it is not separable from the run-to-run variation`);
+            report.classificationBasis = basis;
+            return;
+        }
+
+        const share = a.closedShare;
+        if (share === null) {
+            report.classification = 'UNRESOLVED';
+            basis.push('the no-sort reference is not below the pre-draw mean, so there is no gap '
+                + 'to attribute');
+        } else if (share >= PHASE_RULES.effectiveClosedShare) {
+            report.classification = 'POST_DRAW_PHASE_EFFECTIVE';
+            basis.push(`submitting the distance pass after the draw closes `
+                + `${(share * 100).toFixed(1)}% of the gap to the no-sort reference`);
+        } else if (share <= PHASE_RULES.notPrimaryClosedShare) {
+            report.classification = 'POST_DRAW_PHASE_NOT_PRIMARY';
+            basis.push(`the submission phase closes only ${(share * 100).toFixed(1)}% of the gap`);
+        } else {
+            report.classification = 'POST_DRAW_PHASE_PARTIAL';
+            basis.push(`the submission phase closes ${(share * 100).toFixed(1)}% of the gap and the `
+                + 'rest survives it');
+        }
+        report.classificationBasis = basis;
+    }
+
     private analyseFence(report: UikaFenceReport): UikaFenceReport['analysis'] {
         // A run only contributes a p95 when it is valid, has samples, and — for the
         // poll-strategy variants — actually submitted and completed a sort. A window where
@@ -824,6 +1118,7 @@ export class UikaTailIsolation {
         suspended: boolean,
         options: UikaTailOptions,
         pollStrategy: UikaFencePollStrategy = 'immediate',
+        phase: UikaSortSubmissionPhase = 'pre-draw',
     ): Promise<UikaTailRun> {
         const viewer = this.viewer();
         const gl = this.gl();
@@ -855,6 +1150,7 @@ export class UikaTailIsolation {
         viewer.setDiagnosticSortStage(stage);
         viewer.setSortSuspended(suspended);
         this.pass!.setFencePollStrategy(pollStrategy);
+        viewer.setDiagnosticSortSubmissionPhase(phase);
 
         this.replay.stop();
         this.runtime.setExpressionSource(null);
@@ -875,6 +1171,12 @@ export class UikaTailIsolation {
             'C1-frame-poll': 'Run C conditions, at most one clientWaitSync per rendered frame',
             'C2-timer-8ms': 'Run C conditions, setTimeout(checkSync, 8)',
             'C3-timer-16ms': 'Run C conditions, setTimeout(checkSync, 16)',
+            'P0-pre-draw': 'Run C conditions, the distance pass submitted before this '
+                + "frame's draw — the production order",
+            'P0-pre-draw-repeat': 'P0 again, to size the run-to-run spread',
+            'P1-post-draw': 'Run C conditions, the same frame drawn first and the distance '
+                + 'pass submitted after it, inside the same render() call',
+            'P1-post-draw-repeat': 'P1 again, to size the run-to-run spread',
         };
 
         this.live.step = name;
@@ -882,6 +1184,14 @@ export class UikaTailIsolation {
         const warmupStart = performance.now();
         await this.waitFor(() => performance.now() - warmupStart >= options.warmupMs);
         const warmupMs = performance.now() - warmupStart;
+
+        // Gate 4B-2B-2 §8: a sort submitted during warm-up must not complete inside the
+        // measured window, or the window reports a completion it never paid for — which
+        // is how Gate 4B-2B-1's C1 came back with 317 submitted and 318 completed.
+        this.live.phase = 'draining warm-up';
+        const idleWaitStart = performance.now();
+        const idleBeforeMeasurement = await this.waitForSortIdle(viewer, options.idleTimeoutMs);
+        const idleWaitMs = performance.now() - idleWaitStart;
 
         // --- measure -----------------------------------------------------
         const exactIntervals: number[] = [];
@@ -949,6 +1259,7 @@ export class UikaTailIsolation {
         let lastAt = performance.now();
         const frames0 = viewer.stats.renderedFrames;
         const glErrors0 = viewer.stats.glErrorCount;
+        const phaseMismatches0 = viewer.stats.phaseStateMismatches;
         const pageErrors0 = this.pageErrors;
         let visibilityLostMs = 0;
         let hiddenSince: number | null = document.visibilityState === 'hidden' ? performance.now() : null;
@@ -980,6 +1291,12 @@ export class UikaTailIsolation {
         );
         collecting = false;
         const measuredMs = performance.now() - measureStart;
+        // §8: let the last in-flight sort finish before the counters are read, so
+        // submitted == completed can be a real assertion.
+        this.live.phase = 'draining';
+        const drainStart = performance.now();
+        const drained = await this.waitForSortIdle(viewer, options.idleTimeoutMs);
+        const drainMs = performance.now() - drainStart;
         document.removeEventListener('visibilitychange', onVis);
         if (hiddenSince !== null) visibilityLostMs += performance.now() - hiddenSince;
         timers?.setCollecting(false);
@@ -1000,6 +1317,14 @@ export class UikaTailIsolation {
             sortStage: stage,
             sortSuspended: suspended,
             fencePollStrategy: pollStrategy,
+            sortSubmissionPhase: phase,
+            phaseStateMismatches: viewer.stats.phaseStateMismatches - phaseMismatches0,
+            submittedEqualsCompleted:
+                collector.sortSubmittedCount === collector.sortCompletedCount,
+            idleBeforeMeasurement,
+            idleWaitMs,
+            drainedAfterMeasurement: drained,
+            drainWaitMs: drainMs,
             buffer: viewer.getDrawingBufferInfo(),
             warmupMs,
             measuredMs,
@@ -1063,13 +1388,63 @@ export class UikaTailIsolation {
             frameRecords,
         };
 
+        if (run.valid && !suspended && !run.submittedEqualsCompleted) {
+            run.valid = false;
+            run.invalidReason = `the measured window submitted ${collector.sortSubmittedCount} `
+                + `sorts and completed ${collector.sortCompletedCount}: a sort crossed the window `
+                + 'boundary, so the completions and the submissions do not describe the same work';
+        }
+        if (run.valid && !idleBeforeMeasurement) {
+            run.valid = false;
+            run.invalidReason = `a sort was still in flight when the measured window opened `
+                + `(waited ${Math.round(idleWaitMs)} ms of a ${options.idleTimeoutMs} ms cap)`;
+        }
+        if (run.valid && !drained) {
+            run.valid = false;
+            run.invalidReason = `the in-flight sort did not finish within `
+                + `${options.idleTimeoutMs} ms after the window closed, so the counters do not `
+                + 'describe a completed set of work';
+        }
+        if (run.valid && run.phaseStateMismatches > 0) {
+            run.valid = false;
+            run.invalidReason = `${run.phaseStateMismatches} frames changed the state the distance `
+                + 'pass reads between the draw and the post-draw submission';
+        }
+
         timers?.dispose();
         viewer.setGpuTimer?.(null);
         this.pass!.setGpuTimer(null);
         viewer.setSortSuspended(false);
         viewer.setDiagnosticSortStage('full');
+        viewer.setDiagnosticSortSubmissionPhase('pre-draw');
         this.pass!.setFencePollStrategy('immediate');
         return run;
+    }
+
+    /**
+     * §8. Wait until no sort is in flight. Returns false on timeout, which makes the run
+     * invalid rather than silently measuring a window a warm-up sort spills into.
+     *
+     * Sorting is suspended for the duration, then put back as it was. Without that the
+     * wait cannot succeed: the weights change on nearly every frame, so render() submits a
+     * new sort in the same frame the previous one completed, and a once-per-frame poll of
+     * `sortPending` samples at exactly the wrong moment and reads `true` for ever. The
+     * self-test hit precisely that — 43 s of waiting against a 40 s cap on a renderer
+     * where sorts were in fact completing six times per window.
+     */
+    private async waitForSortIdle(viewer: any, timeoutMs: number): Promise<boolean> {
+        const wasSuspended: boolean = viewer.isSortSuspended?.() ?? false;
+        viewer.setSortSuspended?.(true);
+        try {
+            const deadline = performance.now() + timeoutMs;
+            while (viewer.isSortPending?.()) {
+                if (this.abort || performance.now() > deadline) return false;
+                await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+            }
+            return true;
+        } finally {
+            viewer.setSortSuspended?.(wasSuspended);
+        }
     }
 
     private waitFor(done: () => boolean, each?: () => void): Promise<void> {

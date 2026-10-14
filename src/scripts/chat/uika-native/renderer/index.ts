@@ -15,4 +15,5 @@ export type {
     UikaSortLifecycleRecorder,
     UikaFrameTick,
     UikaSortStage,
+    UikaSortSubmissionPhase,
 } from './uika-gaussian-viewer';
