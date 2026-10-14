@@ -17,11 +17,97 @@ import { mapA2eToUikaBasis } from './uika-expression-mapper';
  * needs no code change. Raw text is imported (not parsed JSON) so the SHA-256 is taken
  * over the exact bytes on disk.
  */
-const BUNDLED_FIXTURES = import.meta.glob('./fixtures/*.json', {
+const BUNDLED_JSON = import.meta.glob('./fixtures/*.json', {
     query: '?raw',
     import: 'default',
     eager: true,
 }) as Record<string, string>;
+
+/** `*.expected.json` holds the sender's measurements, not a capture. */
+const EXPECTED_SUFFIX = '.expected.json';
+
+const BUNDLED_FIXTURES: Record<string, string> = Object.fromEntries(
+    Object.entries(BUNDLED_JSON).filter(([k]) => !k.endsWith(EXPECTED_SUFFIX)),
+);
+
+const BUNDLED_EXPECTATIONS: Record<string, string> = Object.fromEntries(
+    Object.entries(BUNDLED_JSON).filter(([k]) => k.endsWith(EXPECTED_SUFFIX)),
+);
+
+/**
+ * Check a capture against the values its sender measured. A prettified, rounded or
+ * otherwise reformatted copy still satisfies the structural contract but fails here,
+ * which is exactly the transit damage v1.1 Gate 3 §1 forbids.
+ */
+export function validateGate3Expectations(
+    data: any,
+    sha256: string,
+    byteLength: number,
+    expected: any,
+): UikaGate3Validation {
+    const checks: UikaGate3Check[] = [];
+    const add = (name: string, pass: boolean, detail: string) => checks.push({ name, pass, detail });
+    const near = (a: number, b: number, tol: number) => Number.isFinite(a) && Math.abs(a - b) <= tol;
+
+    const names: string[] = Array.isArray(data.expression_names) ? data.expression_names : [];
+    const frames: number[][] = Array.isArray(data.frames) ? data.frames : [];
+    const chunks: any[] = Array.isArray(data.chunks) ? data.chunks : [];
+
+    add('sha256 matches the received original', sha256 === expected.sha256, `got ${sha256}`);
+    add('byte count matches', byteLength === expected.bytes,
+        `got ${byteLength}, expected ${expected.bytes}`);
+    add(`fps == ${expected.fps}`, data.fps === expected.fps, `fps=${data.fps}`);
+    add(`frames == ${expected.frameCount}`, frames.length === expected.frameCount,
+        `frames=${frames.length}`);
+    add(`channels == ${expected.expressionNameCount}`, names.length === expected.expressionNameCount,
+        `channels=${names.length}`);
+    add(`chunks == ${expected.chunkCount}`, chunks.length === expected.chunkCount,
+        `chunks=${chunks.length}`);
+
+    const chunkCounts = chunks.map((c) => c.frames);
+    add(`chunk frame counts == ${JSON.stringify(expected.chunkFrameCounts)}`,
+        JSON.stringify(chunkCounts) === JSON.stringify(expected.chunkFrameCounts),
+        `got ${JSON.stringify(chunkCounts)}`);
+
+    let monotonic = chunks.length > 0;
+    for (let i = 1; i < chunks.length; i++) {
+        if (!(chunks[i].perfMs >= chunks[i - 1].perfMs)) monotonic = false;
+    }
+    add('chunks[].perfMs is monotonic', monotonic === expected.chunkPerfMsMonotonic,
+        `monotonic=${monotonic}`);
+
+    let gMin = Infinity;
+    let gMax = -Infinity;
+    for (const f of frames) for (const v of f) { if (v < gMin) gMin = v; if (v > gMax) gMax = v; }
+    add(`global min == ${expected.globalMin}`, near(gMin, expected.globalMin, 1e-12), `min=${gMin}`);
+    add(`global max == ${expected.globalMax}`, near(gMax, expected.globalMax, 1e-12), `max=${gMax}`);
+
+    const t = expected.tongueOut;
+    if (t) {
+        const ti = names.indexOf('tongueOut');
+        add(`tongueOut index == ${t.index}`, ti === t.index, `index=${ti}`);
+        if (ti >= 0) {
+            let nz = 0;
+            let mx = 0;
+            for (const f of frames) { const v = Math.abs(f[ti]); if (v !== 0) nz++; if (v > mx) mx = v; }
+            add(`tongueOut non-zero frames == ${t.nonZeroFrames}/${t.totalFrames}`,
+                nz === t.nonZeroFrames && frames.length === t.totalFrames,
+                `nonzero=${nz}/${frames.length}`);
+            add(`tongueOut max abs ~= ${t.maxAbs}`, near(mx, t.maxAbs, t.maxAbsTolerance ?? 1e-9),
+                `maxAbs=${mx}`);
+        }
+    }
+
+    for (const [channel, want] of Object.entries(expected.channelMax || {})) {
+        const i = names.indexOf(channel);
+        if (i < 0) { add(`${channel} present`, false, 'not in expression_names'); continue; }
+        let mx = -Infinity;
+        for (const f of frames) if (f[i] > mx) mx = f[i];
+        add(`${channel} max == ${want}`, near(mx, want as number, 1e-12), `max=${mx}`);
+    }
+
+    return { pass: checks.every((c) => c.pass), checks };
+}
 
 /** Quiet tail appended to each loop so the pass restarts from a closed mouth. */
 const LOOP_GAP_MS = 1000;
@@ -212,6 +298,7 @@ export class UikaNativeReplay {
 
     private lastValidation: UikaGate3Validation | null = null;
     private lastMappingValidation: UikaGate3Validation | null = null;
+    private lastExpectationValidation: UikaGate3Validation | null = null;
 
     private start = 0;
     private running = false;
@@ -250,8 +337,16 @@ export class UikaNativeReplay {
         return this.mapping;
     }
 
-    getValidation(): { fixture: UikaGate3Validation | null; mapping: UikaGate3Validation | null } {
-        return { fixture: this.lastValidation, mapping: this.lastMappingValidation };
+    getValidation(): {
+        fixture: UikaGate3Validation | null;
+        expectations: UikaGate3Validation | null;
+        mapping: UikaGate3Validation | null;
+    } {
+        return {
+            fixture: this.lastValidation,
+            expectations: this.lastExpectationValidation,
+            mapping: this.lastMappingValidation,
+        };
     }
 
     /** Names of the JSON files bundled from ./fixtures, if any. */
@@ -338,6 +433,22 @@ export class UikaNativeReplay {
         }
         const data = raw as CapturedA2E;
         const sha256 = await sha256Hex(text);
+
+        // When the sender's measurements are bundled alongside, the file must match them.
+        const expectedKey = Object.keys(BUNDLED_EXPECTATIONS)[0];
+        if (expectedKey) {
+            const expected = JSON.parse(BUNDLED_EXPECTATIONS[expectedKey]);
+            const byteLength = new TextEncoder().encode(text).length;
+            const expectations = validateGate3Expectations(data, sha256, byteLength, expected);
+            this.lastExpectationValidation = expectations;
+            if (!expectations.pass) {
+                this.data = null;
+                this.fixture = null;
+                fail(`${detail} does not match ${expectedKey}: ${describeFailure(expectations)}`);
+            }
+        } else {
+            this.lastExpectationValidation = null;
+        }
         this.data = data;
         this.durationMs = (data.frames.length / data.fps) * 1000;
         this.periodMs = this.durationMs + LOOP_GAP_MS;

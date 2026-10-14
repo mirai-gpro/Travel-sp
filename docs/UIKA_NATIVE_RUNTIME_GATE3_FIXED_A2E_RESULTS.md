@@ -14,9 +14,10 @@ GATE3_MAPPING_CONTRACT      = PASS
 GATE3_RENDERER_LIFECYCLE    = PASS
 GATE3_NO_SILENT_FALLBACK    = PASS
 GATE3_FIXTURE_CONTRACT      = IMPLEMENTED (v1.1 Gate 3 §1), rejection paths verified
+GATE3_FIXTURE_EXPECTATIONS  = RECORDED (sender's SHA-256 and statistics, §2-§5)
 GATE3_FIXTURE_INTAKE        = READY (drop the JSON in, no code change needed)
 
-GATE3_FIXED_REAL_A2E        = BLOCKED — no real captured A2E fixture has been received
+GATE3_FIXED_REAL_A2E        = BLOCKED — the fixture file itself has still not arrived
 ```
 
 **Gate 3 is not claimed as PASS.** Everything that does not depend on real A2E content is
@@ -68,6 +69,58 @@ Anything committed in that directory is bundled automatically, so no code change
 needed when it lands. The page also accepts the same JSON pasted into its textarea,
 fetched from `?fixture=<url>`, or read from `localStorage` when the capture was taken in
 the same browser profile.
+
+### Attempt 2 — 2026-10-14, execution instruction received, file still absent
+
+An execution instruction was issued stating the fixture had been received, and giving its
+name, SHA-256 (`54f581ac…e24b`), byte count (214,357) and measured statistics. **The file
+itself was not attached and is not reachable from this session.** Searched before doing
+anything else:
+
+```text
+find / -name 'a2e-real-capture-gate3*'                            0 hits
+working tree src/scripts/chat/uika-native/fixtures/               README.md only
+every remote branch of mirai-gpro/travel-sp                       0 hits
+any 200-300 KB *.json modified in the last 12 h                   0 hits
+```
+
+v1.1 Gate 3 §2 says the saved copy's SHA-256 must be recomputed and must match, otherwise
+Gate 3 does not run. There is nothing to save and nothing to hash, and reconstructing the
+frames from the quoted statistics would be exactly the synthetic data §4 forbids. Gate 3
+therefore remains BLOCKED.
+
+What was done instead: the quoted measurements were recorded as the acceptance criteria
+(see below), so that when the file does arrive it is checked against **its own
+fingerprint**, not merely against the generic contract.
+
+### Expected values are now recorded (§2-§5)
+
+`src/scripts/chat/uika-native/fixtures/a2e-real-capture-gate3.expected.json` holds the
+sender's measurements — the file's fingerprint and summary statistics only, no expression
+data:
+
+```text
+sha256 54f581aca7c5994cf4a818f71e7673a1bd689767097ab5b692e5dad65be2e24b
+bytes  214357
+fps 30 / frames 192 / channels 52 / chunks 6 / duration 6.4 s
+chunk frame counts [6, 26, 64, 34, 36, 26], sum 192, perfMs monotonic
+global min 0.0 / global max 0.9002304077148438 / NaN 0 / Inf 0
+tongueOut index 51, non-zero in 192/192 frames, max abs 0.0014989759 (kept, not zeroed)
+jawOpen max 0.3598918318748474            mouthPucker max 0.30823880434036255
+mouthStretchLeft  max 0.3514883816242218  eyeBlinkLeft  max 0.886151909828186
+mouthStretchRight max 0.3514883816242218  eyeBlinkRight max 0.886151909828186
+mouthFunnel max 0.08393868803977966
+```
+
+Both the offline validator (`--expect`) and the browser path check these. The point is
+transit damage: a prettified or rounded copy still satisfies the structural contract but
+fails its own SHA-256 and byte count. Verified by running `--expect` against a
+structurally valid but wrong-content stand-in — the nine structural checks passed while
+sha256, bytes, frame count, duration, chunk layout, global max, tongueOut statistics and
+all seven channel maxima failed, and the tool exited non-zero.
+
+The `*.expected.json` file is excluded from the fixture glob, confirmed in the browser
+(`bundledFixtures: []` with the expectations file present).
 
 ### Intake is implemented and verified
 
