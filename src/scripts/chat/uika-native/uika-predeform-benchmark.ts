@@ -309,6 +309,9 @@ export class UikaPredeformBenchmark {
             this.live.phase = 'idle';
             this.live.step = '';
             this.running = false;
+            // Gate 4B-2A §10: a run that stopped early — a correctness failure, a missing
+            // capability, Stop — still carries a finish time when it is exported.
+            r.finishedAt = new Date().toISOString();
         }
 
         this.finishDecision();

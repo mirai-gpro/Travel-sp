@@ -77,13 +77,20 @@ export interface UikaDrawingBufferInfo {
     focalUniform: [number, number] | null;
 }
 
-/** Gate 4B-1 diagnostic: a fingerprint of one rendered frame. */
+/** Gate 4B-1 / 4B-2A diagnostic: a fingerprint of one rendered frame. */
 export interface UikaDrawingBufferHash {
     width: number;
     height: number;
     hash: string;
     nonZeroPixels: number;
     alphaSum: number;
+    /** Per-channel hashes. An RGB-only difference leaves aHash equal. */
+    rHash: string;
+    gHash: string;
+    bHash: string;
+    aHash: string;
+    /** Only present when the caller asked for the pixels (Gate 4B-2A Diagnostic B). */
+    pixels?: Uint8Array;
 }
 
 /**
@@ -231,7 +238,10 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     private productionVertexShader: string | null = null;
     private diagnosticBasisBound: number | null = null;
     private drawingBufferScale = 1;
-    private pendingHash: ((hash: UikaDrawingBufferHash) => void) | null = null;
+    private pendingReadback: {
+        wantPixels: boolean;
+        resolve: (hash: UikaDrawingBufferHash) => void;
+    } | null = null;
     private sortSuspended = false;
 
     /**
@@ -384,9 +394,21 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
      */
     requestDrawingBufferHash(): Promise<UikaDrawingBufferHash> {
         if (!this.renderer) fail('the renderer has not been created');
-        if (this.pendingHash) fail('a drawing-buffer hash is already pending');
+        if (this.pendingReadback) fail('a drawing-buffer readback is already pending');
         return new Promise<UikaDrawingBufferHash>((resolve) => {
-            this.pendingHash = resolve;
+            this.pendingReadback = { wantPixels: false, resolve };
+        });
+    }
+
+    /**
+     * The same readback, keeping the RGBA bytes. Gate 4B-2A Diagnostic B compares two
+     * frames pixel by pixel, which a hash cannot do.
+     */
+    requestDrawingBufferPixels(): Promise<UikaDrawingBufferHash> {
+        if (!this.renderer) fail('the renderer has not been created');
+        if (this.pendingReadback) fail('a drawing-buffer readback is already pending');
+        return new Promise<UikaDrawingBufferHash>((resolve) => {
+            this.pendingReadback = { wantPixels: true, resolve };
         });
     }
 
@@ -506,34 +528,49 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return this.predeformActive;
     }
 
-    /** Drop a hash request that was abandoned, so the next one can be made. */
+    /** Drop a readback request that was abandoned, so the next one can be made. */
     clearPendingDrawingBufferHash(): void {
-        this.pendingHash = null;
+        this.pendingReadback = null;
     }
 
-    private hashDrawingBuffer(): UikaDrawingBufferHash {
+    private hashDrawingBuffer(keepPixels = false): UikaDrawingBufferHash {
         const gl = this.renderer.getContext();
         const width = gl.drawingBufferWidth;
         const height = gl.drawingBufferHeight;
         const pixels = new Uint8Array(width * height * 4);
         gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        const FNV_PRIME = 0x01000193;
         let hash = 0x811c9dc5;
+        let rHash = 0x811c9dc5;
+        let gHash = 0x811c9dc5;
+        let bHash = 0x811c9dc5;
+        let aHash = 0x811c9dc5;
         let nonZero = 0;
         let alphaSum = 0;
         for (let i = 0; i < pixels.length; i += 4) {
             const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
             if (r !== 0 || g !== 0 || b !== 0 || a !== 0) nonZero++;
             alphaSum += a;
-            hash ^= r; hash = Math.imul(hash, 0x01000193);
-            hash ^= g; hash = Math.imul(hash, 0x01000193);
-            hash ^= b; hash = Math.imul(hash, 0x01000193);
-            hash ^= a; hash = Math.imul(hash, 0x01000193);
+            hash ^= r; hash = Math.imul(hash, FNV_PRIME);
+            hash ^= g; hash = Math.imul(hash, FNV_PRIME);
+            hash ^= b; hash = Math.imul(hash, FNV_PRIME);
+            hash ^= a; hash = Math.imul(hash, FNV_PRIME);
+            rHash ^= r; rHash = Math.imul(rHash, FNV_PRIME);
+            gHash ^= g; gHash = Math.imul(gHash, FNV_PRIME);
+            bHash ^= b; bHash = Math.imul(bHash, FNV_PRIME);
+            aHash ^= a; aHash = Math.imul(aHash, FNV_PRIME);
         }
+        const hex = (v: number) => (v >>> 0).toString(16).padStart(8, '0');
         return {
             width, height,
-            hash: (hash >>> 0).toString(16).padStart(8, '0'),
+            hash: hex(hash),
             nonZeroPixels: nonZero,
             alphaSum,
+            rHash: hex(rHash),
+            gHash: hex(gHash),
+            bHash: hex(bHash),
+            aHash: hex(aHash),
+            ...(keepPixels ? { pixels } : {}),
         };
     }
 
@@ -724,10 +761,10 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
 
         // Gate 4B-1 verification only, and never inside a measurement window: the
         // readback stalls the pipeline. Inert when nothing requested a hash.
-        if (this.pendingHash) {
-            const resolve = this.pendingHash;
-            this.pendingHash = null;
-            resolve(this.hashDrawingBuffer());
+        if (this.pendingReadback) {
+            const request = this.pendingReadback;
+            this.pendingReadback = null;
+            request.resolve(this.hashDrawingBuffer(request.wantPixels));
         }
 
         const gl = this.renderer.getContext();

@@ -2,8 +2,11 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2A.
 Route: `/uika-native-predeform-benchmark`.
-Status: PoC built, **correctness measured and PASS**. Performance has to be measured on
-the machine with the real GPU, so §6 is PENDING until that run comes back.
+Status: PoC built. On the real GPU **`CORRECTNESS = FAIL`** — one of the eleven cases,
+`C-a2e-frame-20`, rendered a different framebuffer hash. Performance is `NOT_RUN` and
+stays that way until that difference is understood; see §3.2 for the real-GPU result and
+§3.3 for the investigation that is now the open work. The SwiftShader figures in §3.1 are
+kept, with their scope corrected.
 
 ---
 
@@ -150,11 +153,30 @@ there is no second deformation result anywhere.
 
 ---
 
-## 3. Correctness — measured, PASS
+## 3. Correctness
 
-Run on this container (ANGLE + SwiftShader). Correctness does not depend on GPU speed,
-and the same shader source and the same textures are used there as on real hardware, so
-this part of the gate is settled here; only the timings in §6 need the real GPU.
+### 3.0 Correction to the scope of §3.1
+
+§3.1 was written as though correctness were settled by the SwiftShader run, on the
+grounds that the shader source and the data are the same on any GPU. The real-GPU run
+disproved that: the arithmetic a driver emits for the same GLSL is not the same on every
+device. Two statements from the earlier record are therefore withdrawn as
+hardware-independent claims and now read:
+
+```text
+production GPU distance vs PoC distance
+  SwiftShader    bit-exact (0.000000e+00 in all eleven cases)
+  AMD real GPU   tiny non-zero floating-point differences observed on real A2E frames,
+                 of the order 3.725e-09 and 7.451e-09
+```
+
+"The PoC is bit-exact against the production GPU path" is not used as a
+hardware-independent fact anywhere in this document. What §3.1 measures is what that
+machine does.
+
+### 3.1 Correctness on SwiftShader — PASS (this container)
+
+Run on this container (ANGLE + SwiftShader).
 
 Each case sets the weights, then compares three things over **all 133,541 Gaussians**:
 the pre-deformed centres against the CPU reference
@@ -190,7 +212,8 @@ mean |xyz - CPU| across the A2E cases: 1.18e-09 to 1.57e-09
 Reading those three columns:
 
 - **Against the production GPU path**, which is the reference §10 names, the difference is
-  **exactly zero** in all eleven cases, over every Gaussian. The depth key is a dot
+  **exactly zero** in all eleven cases on this renderer, over every Gaussian — see §3.0:
+  this is a SwiftShader result, not a hardware-independent one. The depth key is a dot
   product of the animated centre, so a single differing bit in any centre would show up
   here, and none does.
 - **Against the CPU reference**, neutral and every single-channel morph are exactly zero.
@@ -204,12 +227,151 @@ Reading those three columns:
   count, the same alpha sum — in all eleven cases, with the same camera, the same
   resolution and the sort suspended so that compositing order cannot differ.
 
-### 3.1 Visual comparison (§11)
+### 3.2 Correctness on the real GPU — FAIL (1 of 11)
+
+```text
+CORRECTNESS = FAIL
+PERFORMANCE = NOT_RUN
+DECISION    = PREDEFORM_CORRECTNESS_FAIL
+```
+
+The failing case, as reported from the JSON:
+
+```text
+C-a2e-frame-20
+  gaussiansCompared            133541
+  max |xyz - CPU|              4.470348358154297e-08
+  max distance diff            3.725290298461914e-09
+  nonFiniteCenters             0
+
+  production framebuffer hash  b55a0889
+  predeform  framebuffer hash  b487892c
+
+  nonZeroPixels                702787  /  702787
+  alphaSum                     174749179  /  174749179
+```
+
+Only the framebuffer hash differs. The other real A2E frames — 63, 123, 132 and 191 —
+carry numerical differences of the same order and their framebuffer hashes match
+completely.
+
+What that does and does not establish:
+
+- The numbers are within the §4 rules by a wide margin: 4.47e-08 against a 1e-06 bound
+  (and 4.47e-08 is exactly 3 float32 ulp at this coordinate magnitude), 3.73e-09 against
+  the same bound.
+- The frame nevertheless renders differently, so **something** reaches the pixels. An
+  identical non-zero pixel count and an identical alpha sum are consistent with a tiny
+  colour difference but do not prove the alpha plane is bit-exact: a sum can match while
+  individual values move in opposite directions.
+- Four other 51-channel frames with comparable numerical differences produce identical
+  pixels, so the relationship between the centre difference and the pixel difference is
+  not a simple function of magnitude.
+
+Nothing beyond that is claimed. In particular the gate does not record "visually
+identical, therefore acceptable": whether a difference is acceptable is decided after it
+is measured, not instead of measuring it.
+
+### 3.3 Acceptance is unchanged
+
+The §4 thresholds stay exactly as they are, including **pixel-identical**, while the
+difference is investigated. A hash mismatch counts as a failure until there is a measured
+reason to treat it otherwise, and any change to the rule will be a separate decision
+taken on the numbers §3.4 produces — not a loosening to make the current run pass.
+
+### 3.4 The difference investigation — PENDING
+
+Route: the same `/uika-native-predeform-benchmark` page, second button,
+**Run Difference Investigation**. It measures only; it runs no performance test and
+changes no threshold.
+
+**Diagnostic A — repeatability.** Frame 20 held, same camera, same weights, sort
+suspended, same resolution. At least 20 consecutive renders in each mode, every
+framebuffer hash kept, with the unique hashes and the frequency of each one reported.
+Variation *inside* one mode points at render or readPixels nondeterminism; both modes
+internally fixed but different from each other points at a deterministic numerical
+difference.
+
+**Diagnostic B — pixel-level diff.** Both RGBA buffers are kept and compared value by
+value, which a hash cannot do:
+
+```text
+totalPixels / differentPixels / differentPixelRatio / differentChannels
+per channel R, G, B, A:  differing count, max abs byte diff, mean abs diff
+max RGBA byte delta / sum of absolute differences / difference bounding box
+histogram of |delta| = 1, 2, 3, ...
+```
+
+**Alpha, independently (§6).** Per-channel FNV hashes of the R, G, B and A planes for both
+modes, so "is the alpha plane exact?" and "is this an RGB-only difference?" are answered
+directly rather than inferred from a matching sum.
+
+**Diagnostic C — GPU centre comparison.** A CPU reference cannot localise this, and the
+distance comparison cannot either: a depth key is one dot product, so a difference along
+one axis can cancel in it. So the animated centre XYZ is read straight out of the GPU by
+transform feedback, by three routes that use the **verbatim** production expression:
+
+```text
+production-attribute   the production distance shader's route — canonical centre as a
+                       vertex attribute from SplatMesh's centres buffer, 51 channels
+                       summed in the vertex stage
+production-texture     the same vertex stage, canonical centre fetched from
+                       centersColorsTexture the way the render shader fetches it
+predeform              the RGBA32F texture written by the fragment-stage pass
+```
+
+For all 133,541 Gaussians, each pair is compared on
+`maxAbsX`, `maxAbsY`, `maxAbsZ`, `maxAbsXYZ`, `meanAbsXYZ`, differing component count,
+bit-exact component count, and a ULP-distance histogram (0, 1, 2, 3, 4, >4). Comparing
+the first two routes isolates the centre's data path; comparing either against the third
+isolates the shader stage.
+
+**Diagnostic D — the other frames.** The same three diagnostics for frame 20 (hash FAIL),
+frame 63 (hash PASS) and frame 132 (hash PASS), to see why a comparable centre difference
+reaches the pixels in one frame and not the others.
+
+Query parameters: `?repeats=20`, `?frames=20,63,132`.
+
+**Outcome.** The harness then picks between the three outcomes the gate defined, from the
+measurements alone:
+
+```text
+A-real-correctness-defect                 the difference is outside the float-level band
+B-deterministic-float-level-difference    each mode self-consistent, centre within a few
+                                          ULP, pixels within a couple of byte levels
+C-measurement-nondeterminism              a mode disagreed with itself
+UNDETERMINED                              nothing was measured
+```
+
+`B` is not a pass. It is a finding that then has to be judged against an acceptance rule,
+and the rule is still pixel-identical.
+
+**Hypotheses, recorded as hypotheses.** The production vertex shader and the
+pre-deformation fragment shader could be compiled differently by the AMD driver — FMA
+contraction, rounding, instruction ordering, stage-specific optimisation. None of that was
+tested here, so none of it is a finding; the report carries the list under
+`hypothesesNotTested` so it cannot be read as a conclusion.
+
+```text
+GPU / browser / drawingBuffer                                    PENDING
+Diagnostic A  unique hashes and frequency, per mode, per frame    PENDING
+Diagnostic B  pixel and channel diff, byte-delta histogram        PENDING
+Alpha plane exact? RGB-only difference?                           PENDING
+Diagnostic C  centre diff per route pair, ULP histogram           PENDING
+Diagnostic D  frame 20 vs 63 vs 132                               PENDING
+CLASSIFICATION                                                    PENDING
+```
+
+Nothing above is estimated or extrapolated.
+
+### 3.5 Visual comparison (§11)
 
 §11's checklist — jaw, blink, pucker, stretch, neutral, face outline, hair/face depth,
 Gaussian smear, explosion — is answered by that last column rather than by eye: when the
-drawing buffers hash identically there is no visual difference to inspect, at any of the
-five A2E frames or the five morphs. The route also renders either mode live, so the same
+drawing buffers hash identically there is no visual difference to inspect. On SwiftShader
+that held for all ten morph and A2E cases; on the real GPU it holds for every case except
+frame 20, whose actual pixel difference §3.4's Diagnostic B measures instead of
+eyeballing. The route also renders either mode live, so the same
 frames can be looked at directly on the real GPU.
 
 Note what the pixel-identity does and does not cover: it was measured at this container's
@@ -230,7 +392,9 @@ Gate 3B's figure for the production path against the same CPU reference: 9.80e-0
 
 The two 1e-6 bounds are decision rules chosen for this gate, not measured quantities. The
 measured values are three to four orders of magnitude below them, and the production-path
-comparison is exactly zero.
+comparison is exactly zero on SwiftShader; on the AMD GPU it is of the order 1e-09,
+which is still three orders of magnitude inside the rule. The rule itself is unchanged —
+see §3.3.
 
 ---
 
@@ -266,7 +430,11 @@ Query parameters: `?warmupMs=`, `?measureMs=`, `?dpr1=1|0`, `?correctnessOnly=1`
 
 ---
 
-## 6. Performance — PENDING (real GPU)
+## 6. Performance — NOT_RUN
+
+Blocked by §3.2: correctness must be settled first, and the harness itself stops before
+any timing when correctness fails. The layout below is what the run will fill in once it
+is unblocked.
 
 ```text
 GPU / browser / DPR / drawingBuffer                                PENDING
@@ -368,6 +536,46 @@ depend on the shader source and the data, not on how fast the GPU is.
 
 ---
 
+
+### 7.1 Difference-investigation self-test
+
+`?repeats=3&frames=20,63` on this container, which is enough to exercise every
+diagnostic at 3.4 s per rendered frame.
+
+```text
+classification        NO-DIFFERENCE-REPRODUCED
+finishedAt            set (Gate 4B-2A §10 fix verified)
+GL errors             0        pageerror events 0
+buffer                386 x 386, pixelRatio 1
+```
+
+```text
+Diagnostic A   frame 20   production 1 unique hash (ab7e6127 x3)   predeform 1 unique hash (ab7e6127 x3)
+               frame 63   production 1 unique hash (dcf70b96 x3)   predeform 1 unique hash (dcf70b96 x3)
+               both modes self-consistent, and equal to each other
+
+Diagnostic B   0 of 148,996 pixels differ, 0 differing channels, max byte delta 0,
+               sum of absolute differences 0, bounding box null, histogram empty,
+               alpha plane identical
+
+Diagnostic C   400,623 components per pair, all three pairs bit-exact, max ULP 0
+                 production-attribute vs predeform            0 differing components
+                 production-texture   vs predeform            0 differing components
+                 production-attribute vs production-texture   0 differing components
+               max |centre - CPU reference| = 4.470348e-08 for all three routes,
+               the same value the correctness run reported, so the probe reads the same
+               centres the PoC and the production path use
+```
+
+So on this renderer there is nothing to investigate — which is the point of the
+`NO-DIFFERENCE-REPRODUCED` outcome existing separately from `B`. What the self-test
+establishes is that the three diagnostics, the per-channel hashes, the ULP histogram, the
+three centre routes and the `finishedAt` fix all work, and that the centre probe agrees
+with the PoC and the production path to the bit where the hardware has no disagreement to
+report.
+
+---
+
 ## 8. Gate 4B-1 known bug (§18)
 
 `isolationOptionsFromUrl()` overwrote the default `basisCounts` with `[0]` whenever the
@@ -386,7 +594,24 @@ Diagnostic harness only; no production path.
 
 ---
 
-## 9. Changes in this commit
+## 9. Changes
+
+Difference-investigation commit:
+
+```text
+new   src/scripts/chat/uika-native/uika-predeform-investigation.ts
+        Diagnostics A-D, per-channel hashes, ULP histograms, classification
+new   src/scripts/chat/uika-native/predeform/uika-center-probe.ts
+        animated centre XYZ out of the GPU by three routes, verbatim production expression
+edit  src/scripts/chat/uika-native/renderer/uika-gaussian-viewer.ts
+        requestDrawingBufferPixels() and per-channel hashes on the readback
+edit  src/scripts/chat/uika-native/uika-predeform-benchmark.ts
+        §10: finishedAt is set even when the run stops early
+edit  src/pages/uika-native-predeform-benchmark.astro
+        the second button and the investigation table
+```
+
+PoC commit:
 
 ```text
 new   src/pages/uika-native-predeform-benchmark.astro              Gate 4B-2A route

@@ -59,6 +59,7 @@
 
   <div class="col row">
     <button id="start" class="primary" disabled>Start PoC</button>
+    <button id="investigate" disabled>Run Difference Investigation</button>
     <button id="stop" disabled>Stop</button>
     <button id="export" disabled>Export JSON</button>
     <button id="copy" disabled>Copy Results</button>
@@ -86,6 +87,8 @@
     import { collectGpuInfo } from '../scripts/chat/uika-native/uika-native-benchmark';
     import { UikaPredeformBenchmark, predeformOptionsFromUrl }
       from '../scripts/chat/uika-native/uika-predeform-benchmark';
+    import { UikaPredeformInvestigation, investigationOptionsFromUrl }
+      from '../scripts/chat/uika-native/uika-predeform-investigation';
 
     const container = document.getElementById('viewer');
     const statusEl = document.getElementById('status');
@@ -98,6 +101,7 @@
 
     const btn = {
       start: document.getElementById('start') as HTMLButtonElement,
+      investigate: document.getElementById('investigate') as HTMLButtonElement,
       stop: document.getElementById('stop') as HTMLButtonElement,
       export: document.getElementById('export') as HTMLButtonElement,
       copy: document.getElementById('copy') as HTMLButtonElement,
@@ -106,9 +110,11 @@
     const runtime = new UikaNativeRuntime(container);
     const replay = new UikaNativeReplay((w) => runtime.applyWeights(w));
     const poc = new UikaPredeformBenchmark(runtime, replay);
+    const investigation = new UikaPredeformInvestigation(runtime, replay);
     (window as any).__uikaNativeV1 = runtime;
     (window as any).__uikaNativeReplay = replay;
     (window as any).__uikaPredeform = poc;
+    (window as any).__uikaInvestigation = investigation;
 
     let lastError: string | null = null;
     let report: any = null;
@@ -119,7 +125,9 @@
     const sci = (v: any) => (typeof v === 'number' && Number.isFinite(v) ? v.toExponential(3) : '—');
 
     const renderLive = () => {
-      const l = poc.getLive();
+      const l = investigation.isRunning()
+        ? { ...poc.getLive(), ...investigation.getLive() } as any
+        : poc.getLive() as any;
       const v: any = runtime.getViewer();
       const gpu = collectGpuInfo(v?.renderer?.domElement ?? null);
       const r = runtime.report;
@@ -131,8 +139,9 @@
         cell('hardware GPU', gpu.isSoftware ? 'NO (software)' : (gpu.unmaskedAvailable ? 'YES' : 'UNKNOWN'),
              gpu.isSoftware ? 'bad' : (gpu.unmaskedAvailable ? 'ok' : 'warn')),
         cell('GPU', (gpu.renderer || '—').slice(0, 44)),
-        cell('step', poc.isRunning() ? `${l.step} · ${l.phase}` : (report ? 'finished' : 'idle'),
-             poc.isRunning() ? 'warn' : ''),
+        cell('step', (poc.isRunning() || investigation.isRunning())
+             ? `${l.step} · ${l.phase}` : (report ? 'finished' : 'idle'),
+             (poc.isRunning() || investigation.isRunning()) ? 'warn' : ''),
         cell('elapsed', `${(l.elapsedMs / 1000).toFixed(1)} s`),
         cell('drawing buffer', buffer ? `${buffer.drawingBufferWidth}×${buffer.drawingBufferHeight}` : '—'),
         cell('pixelRatio', buffer ? num(buffer.rendererPixelRatio) : '—'),
@@ -144,9 +153,9 @@
         cell('GPU predeform p50', l.predeformP50 ? `${l.predeformP50.toFixed(2)} ms` : '—'),
         cell('GL errors', String(r.glErrorCount), r.glErrorCount === 0 ? 'ok' : 'bad'),
         cell('splats', String(r.viewerSplatCount ?? 0)),
-        cell('correctness', report ? report.correctnessVerdict : '—',
-             report ? (report.correctnessVerdict === 'PASS' ? 'ok' : 'bad') : ''),
-        cell('decision', report ? (report.decision || []).join(' / ') : '—'),
+        cell('correctness', report?.correctnessVerdict ?? '—',
+             report?.correctnessVerdict ? (report.correctnessVerdict === 'PASS' ? 'ok' : 'bad') : ''),
+        cell('decision', report ? ((report.decision || []).join(' / ') || report.classification || '—') : '—'),
       ].join('');
     };
 
@@ -185,6 +194,30 @@
           </tr>`).join('')}
         </table>`;
       }
+      if ((report.frames || []).length > 0) {
+        html += `<table>
+          <tr><th>frame</th><th>prod unique</th><th>poc unique</th><th>hash equal</th>
+              <th>diff px</th><th>diff %</th><th>max byte Δ</th><th>alpha same</th>
+              <th>RGB only</th><th>centre ΔULP max</th><th>centre diff comps</th></tr>
+          ${report.frames.map((f: any) => {
+            const c = (f.centerDiffs || []).find((d: any) => d.left === 'production-attribute' && d.right === 'predeform');
+            return `<tr>
+              <td>${f.frame}</td>
+              <td>${f.repeatability.production.uniqueHashes.length}</td>
+              <td>${f.repeatability.predeform.uniqueHashes.length}</td>
+              <td class="${f.pixelDiff.hashes.identical ? 'ok' : 'bad'}">${f.pixelDiff.hashes.identical ? 'yes' : 'NO'}</td>
+              <td>${f.pixelDiff.differentPixels}</td>
+              <td>${(f.pixelDiff.differentPixelRatio * 100).toFixed(5)}</td>
+              <td>${f.pixelDiff.maxRgbaByteDelta}</td>
+              <td class="${f.pixelDiff.channelHashes.alphaPlaneIdentical ? 'ok' : 'bad'}">${f.pixelDiff.channelHashes.alphaPlaneIdentical ? 'yes' : 'NO'}</td>
+              <td>${f.pixelDiff.channelHashes.rgbOnlyDifference ? 'yes' : 'no'}</td>
+              <td>${c ? c.maxUlpDifference : '—'}</td>
+              <td>${c ? c.differentComponents : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </table>
+        <p class="note">classification: <b>${report.classification}</b></p>`;
+      }
       tablesEl.innerHTML = html;
     };
 
@@ -197,8 +230,10 @@
         report,
         lastError,
       }, null, 2);
-      btn.start.disabled = !runtime.report.ready || poc.isRunning() || !replay.getFixture();
-      btn.stop.disabled = !poc.isRunning();
+      const busy = poc.isRunning() || investigation.isRunning();
+      btn.start.disabled = !runtime.report.ready || busy || !replay.getFixture();
+      btn.investigate.disabled = !runtime.report.ready || busy || !replay.getFixture();
+      btn.stop.disabled = !busy;
       btn.export.disabled = !report;
       btn.copy.disabled = !report;
       renderLive();
@@ -218,7 +253,20 @@
       renderStatus();
     });
 
-    btn.stop.addEventListener('click', () => { poc.stop(); });
+    btn.investigate.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await investigation.run(investigationOptionsFromUrl());
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4B2A INVESTIGATION]', error);
+      }
+      renderStatus();
+    });
+
+    btn.stop.addEventListener('click', () => { poc.stop(); investigation.stop(); });
 
     btn.export.addEventListener('click', () => {
       const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
