@@ -386,6 +386,11 @@ export interface UikaPhaseReport {
         phaseStateMismatches: number;
     } | null;
     classification: UikaPhaseClassification;
+    /**
+     * Set when post-draw measured SLOWER than pre-draw by more than the noise floor: how
+     * much slower, at p95. A regression is a result, so it is reported as one.
+     */
+    phaseRegressionMs?: number;
     classificationBasis: string[];
     notes: string[];
 }
@@ -946,13 +951,25 @@ export class UikaTailIsolation {
         basis.push(`phase improvement ${a.phaseImprovementMs.toFixed(2)} ms against a gap of `
             + `${a.originalGapMs?.toFixed(2)} ms`);
 
+        // The noise test is on the MAGNITUDE of the effect. Testing the signed value made
+        // a clearly negative effect — post-draw measurably slower — come out as "below the
+        // noise floor", which conflates "too small to tell" with "worse in the other
+        // direction". A regression is a measured result, not an absence of one.
         const noise = Math.max(a.preDrawSpreadMs ?? 0, a.postDrawSpreadMs ?? 0);
-        if (a.phaseImprovementMs < noise * PHASE_RULES.noiseFactor) {
+        if (Math.abs(a.phaseImprovementMs) < noise * PHASE_RULES.noiseFactor) {
             report.classification = 'UNRESOLVED';
-            basis.push(`the effect is below ${PHASE_RULES.noiseFactor}x the larger repeat spread `
+            basis.push(`the effect magnitude ${Math.abs(a.phaseImprovementMs).toFixed(2)} ms is `
+                + `below ${PHASE_RULES.noiseFactor}x the larger repeat spread `
                 + `(${noise.toFixed(2)} ms), so it is not separable from the run-to-run variation`);
             report.classificationBasis = basis;
             return;
+        }
+        if (a.phaseImprovementMs < 0) {
+            report.phaseRegressionMs = -a.phaseImprovementMs;
+            basis.push(`post-draw is SLOWER than pre-draw by `
+                + `${(-a.phaseImprovementMs).toFixed(2)} ms at p95, which is `
+                + `${(Math.abs(a.phaseImprovementMs) / Math.max(noise, 1e-9)).toFixed(1)}x the `
+                + 'larger repeat spread — a measured regression, not an absent effect');
         }
 
         const share = a.closedShare;
