@@ -339,3 +339,222 @@ LiveAudioManager 変更が必要                    NO
 
 No STOP condition in §19 was hit. The blocker is an absent input, not a design problem,
 and no workaround was built for it.
+
+---
+
+# Attempt 3 — 2026-10-14, fixture received, Gate 3 executed
+
+The sections above are kept as the history of the two BLOCKED attempts. This section
+records the run that actually happened.
+
+```text
+GATE3_FIXTURE_RECEIVED   = YES (commit bea8038, "Add files via upload")
+GATE3_SHA_VERIFIED       = PASS
+GATE3_FIXTURE_CONTRACT   = PASS (35/35 checks)
+GATE3_REPLAY_EXECUTED    = YES
+GATE3_FIXED_REAL_A2E     = PASS
+```
+
+## 1. Fixture and its verification
+
+```text
+path    src/scripts/chat/uika-native/fixtures/a2e-real-capture-gate3.json
+bytes   214357                      (expected 214357)      MATCH
+sha256  54f581aca7c5994cf4a818f71e7673a1bd689767097ab5b692e5dad65be2e24b
+                                    (expected identical)   MATCH
+git blob cd7708b21543d71205c716bb10ad8907847752f1 — identical in the commit and in the
+working tree, so the file was never rewritten, prettified or re-serialised here.
+```
+
+`node tools/validate_a2e_fixture.mjs <fixture> <51 basis names> --expect <expected.json>`
+— **35/35 PASS, exit 0**:
+
+```text
+structural   fps>0 · names==52 · frames>0 · every frame Array · every frame length==52
+             · NaN==0 · Inf==0 · every value finite
+mapping      basisCount==51 · dropped==["tongueOut"] · basis missing==[]
+expectations sha256 · bytes · fps==30 · frames==192 · channels==52 · duration==6.4s
+             · chunks==6 · chunk frame counts==[6,26,64,34,36,26] · sum==192
+             · perfMs monotonic · global min==0 · global max==0.9002304077148438
+             · tongueOut index==51 · tongueOut non-zero 192/192
+             · tongueOut max abs 0.0014989759074524045
+             · jawOpen/mouthStretchL/mouthStretchR/mouthFunnel/mouthPucker/
+               eyeBlinkL/eyeBlinkR maxima · jawOpen min==0
+```
+
+Provenance recorded by the tool:
+
+```text
+source                 live_expression capture
+capture implementation a2eCapture.v1 (src/scripts/chat/a2e-replay.ts)
+fps 30 / frames 192 / channels 52 / duration 6.400 s / chunks 6
+capturedAt 2026-10-14T03:27:10.286Z
+```
+
+The same three validators ran again in the browser on the bundled fixture and all passed
+(`validateGate3Fixture` 9/9, `validateGate3Expectations` 22/22, `validateGate3Mapping` 4/4).
+
+## 2. Mapping
+
+```text
+input channels   52
+mapped channels  51
+dropped          ["tongueOut"]
+basis missing    []
+```
+
+`tongueOut` is non-zero in all 192 frames of the capture and was left untouched in the
+file; it is dropped by the mapper only, exactly as v1.1 Gate 3 §4 requires.
+
+## 3. Chain correctness — exact
+
+For every sampled frame the 51 weights resident on the GPU were compared against the
+production mapper recomputed offline from the fixture:
+
+```text
+compared samples                                   27
+channels compared per sample                        7
+max |CPU mapper − GPU staging|                      0
+```
+
+Zero. The chain fixture → `UikaExpressionMapper` → production JP mouth correction →
+`tongueOut` drop → GPU weights is bit-exact.
+
+## 4. Replay execution
+
+Route used: bundled fixture → `/uika-native-replay` → `load bundled`. No Gemini Live, no
+Socket.IO, no `LiveAudioManager`, no AudioContext, no legacy UIKA path, no LAM skeleton,
+no `flameModel`, no `animation.glb`.
+
+Run: 435 s of replay clock, **58 loops** of the 6.4 s sequence (+1 s neutral gap).
+
+```text
+selectedFrame == requestedFrame whenever in range   clamp violations 0
+selectedFrame always within 0..191                  range violations 0
+distinct A2E frames rendered                        26 (of 192) in the sampled window
+expression frames mapped                            128
+weight uploads                                      128   (1 per mapped frame, никогда more)
+duplicateFrameRenders                               2
+maxHoldMs                                           14.4 ms
+skippedExpressionFrames                             4880
+maxFrameJump                                        109
+weight upload ms                                    p50 0.2 · p95 0.4 · max 2.9
+renderedFrames                                      151
+render interval ms                                  p50 3377.7 · p95 3620.5 · p99 6860.4
+                                                    · max 7099.3 · >33ms 147 · >50ms 147
+                                                    · >100ms 147
+GL errors                                           0
+page errors                                         0
+runtime errors                                      []
+```
+
+**`skippedExpressionFrames` and `maxFrameJump` are artefacts of this machine, not of the
+replay.** The renderer here is ANGLE + SwiftShader with no GPU, and a frame costs ~3.4 s
+because the vertex shader walks 51 basis channels for each of 133,541 Gaussians twice per
+frame (render pass and distance pass) in software. Shrinking the canvas from 300 px to
+120 px changed the interval only from 3.31 s to 2.75 s, confirming the cost is per-splat,
+not per-pixel. With 3.4 s between renders the clock legitimately advances ~100 A2E frames
+between them. The replay is picking the correct frame for the current time every single
+render — that is what `clamp violations 0` and `selectedFrame == requestedFrame` show, and
+what the mocked-clock test proved independently (a 1000 ms stall jumps to frame 45 and maps
+exactly one frame, instead of advancing a counter to 16).
+
+Per v1.1 Gate 3 §15 these timing figures are not used for Gate 4.
+
+## 5. Renderer lifecycle
+
+```text
+renderer recreation   0      (one UikaGaussianViewer for the whole session;
+                              renderedFrames rose monotonically 0 → 151)
+PLY rewrite           0
+Blob recreation       0
+addSplatScene calls   0 after load
+basis texture rebuild 0
+splatCount            133541, constant throughout
+basisResident         true
+```
+
+Source check of the replay path: `uika-native-replay.ts` contains zero occurrences of
+`new Viewer`, `dispose()`, `addSplatScene`, `loadCanonicalPly`, `rewritePlyPositions`,
+`new Blob` or `setUikaBasis`. Its per-frame work is `mapA2eToUikaBasis(...)` followed by
+`applyWeights(...)`.
+
+## 6. Visual verification
+
+At ~3.4 s per frame a screenshot taken mid-replay shows a render from an earlier frame
+than the weights just read, so individual real frames were also held still long enough for
+a render to complete (`holdFrame()`, marked in the source as visual verification only and
+not part of the replay path). The frames and weights come from the fixture through the
+production mapper; nothing is synthesised.
+
+Post-mapper weights and what was observed:
+
+| frame | jawOpen | blink L/R | stretch L/R | pucker | observed |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 0.050 | 0.000 | 0.024 | 0.038 | near neutral, mouth closed |
+| 18 | 0.147 | 0.000 | 0.312 | 0.016 | mouth open and stretched wide |
+| 20 | **0.236** | 0.000 | **0.457** | 0.009 | widest mouth of the take, teeth visible, face intact |
+| 23 | 0.148 | 0.000 | 0.267 | 0.008 | mouth open, stretch easing off |
+| 56 | 0.009 | 0.001 | 0.028 | 0.177 | mouth closed, lips slightly rounded |
+| 63 | 0.012 | **0.878** | 0.062 | 0.090 | both eyes closed, mouth closed |
+| 95 | 0.010 | 0.001 | 0.112 | 0.102 | neutral-ish |
+| 123 | 0.050 | 0.000 | 0.024 | **0.339** | lips pursed/rounded |
+| 132 | 0.083 | **0.886** | 0.076 | 0.088 | both eyes closed, mouth slightly open |
+| 141 | 0.154 | 0.000 | 0.181 | 0.021 | mouth open |
+| 180 | 0.159 | 0.000 | 0.086 | 0.051 | mouth open, teeth visible |
+| 191 | 0.000 | 0.001 | 0.018 | 0.019 | closed mouth, back to neutral |
+
+```text
+口が実際に開閉する              PASS  frame 20 (jaw 0.236 / stretch 0.457) vs frame 191 (0.000)
+口形が連続する                  PASS  largest frame-to-frame jawOpen step in the source is
+                                      0.0717 over 1/30 s; no discontinuity in the rendered poses
+長い口形固定がない              PASS  maxHoldMs 14.4 ms (two duplicate renders inside one 33 ms step)
+mouthStretch が破綻しない       PASS  frames 18/20/23, face geometry intact at stretch 0.457
+blink 正常                      PASS  frames 63 and 132, both eyes close symmetrically,
+                                      mouth and brows unaffected
+neutral 付近へ戻る              PASS  frame 191 and the post-stop neutral screenshot
+顔形状破綻なし                  PASS  all 12 held frames plus 9 in-replay captures
+Gaussian smear なし             PASS
+Gaussian explosion なし         PASS
+明確な depth-order 破綻なし     PASS  hair/face/shoulder layering correct in every capture
+```
+
+**左右反転** could not be tested with this fixture: it is exactly left/right symmetric —
+`max |L − R| = 0` over all 192 frames for `eyeBlink`, `mouthStretch`, `mouthSmile` and
+`noseSneer`. Sidedness was established separately in Gate 3B, where `eyeBlinkLeft = 1.0`
+alone closed only the avatar's left eye and `eyeBlinkRight = 1.0` only the right.
+
+**Not judged here:** lip-sync. There is no audio in this gate, per v1.1 Gate 3 §12. What is
+judged is that the facial animation driven by real A2E is correct and stable, and it is.
+
+## 7. LAM / OAC dependency
+
+```json
+{ "flameModel": false, "skeleton": false, "bonesMatrix": false, "bonesWeight": false,
+  "morphTargetDictionary": false, "boneTextureUniform": false,
+  "boneWeightTextureUniform": false, "headBoneIndexUniform": false,
+  "flameModelTextureUniform": false, "avatarMeshOnViewer": false, "splatTree": false }
+```
+
+## 8. Normal LAM regression
+
+Blob SHA against baseline `e86f066`: `LAMAvatar.astro`, `lam-websocket-manager.ts`,
+`live-audio-manager.ts`, `uika-133k-mode.ts`, `a2e-replay.ts`, `package.json`,
+`package-lock.json` all identical; `support-base/**` no diff. The legacy Gate 1/2 files
+(`uika-render-adapter.ts`, `uika-native-driver.ts`, `uika-deformation.ts`) are unchanged
+and were neither renamed nor deleted. `tsc --noEmit` reports the same 9 pre-existing
+errors.
+
+## 9. Verdict
+
+```text
+GATE3_FIXED_REAL_A2E = PASS
+```
+
+Every v1.1 Gate 3 §9 criterion is met: SHA match, 192 real frames, 52 input, 51 mapped,
+`tongueOut` only dropped, basis missing 0, 133,541 splats, `basisResident` true,
+time-based replay, renderer recreation 0, PLY rewrite 0, Blob recreation 0, no visible long
+hold, no replay-caused frame jump, no facial breakdown, GL errors 0, page errors 0, OAC
+dependency 0.
+
+Stopping here. Gate 4 (30 fps on real GPU hardware) and Gate 5 (Live) are not started.

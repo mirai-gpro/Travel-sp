@@ -500,6 +500,29 @@ export class UikaNativeReplay {
         return this.mapping;
     }
 
+    /**
+     * Visual verification only: map one real fixture frame and push its weights, without
+     * the clock. Needed because the software rasteriser takes seconds per frame, so a
+     * screenshot taken during the replay shows an earlier frame than the weights just
+     * written. The frame and its weights come from the fixture through the production
+     * mapper; nothing is synthesised. This is not part of the replay path.
+     */
+    holdFrame(index: number): { frame: number; weights: number[] } {
+        if (!this.data) fail('load a fixture first');
+        if (this.basisNames.length === 0) fail('bindBasis() has not run');
+        if (!Number.isInteger(index) || index < 0 || index >= this.data.frames.length) {
+            fail(`frame ${index} is outside 0..${this.data.frames.length - 1}`);
+        }
+        this.running = false;
+        const mapped = mapA2eToUikaBasis(
+            { names: this.data.expression_names, values: this.data.frames[index] },
+            this.basisNames,
+        );
+        this.applyWeights(mapped.weights);
+        this.lastSelected = index;
+        return { frame: index, weights: Array.from(mapped.weights) };
+    }
+
     start_(): void {
         if (!this.data) fail('load a fixture first');
         if (this.basisNames.length === 0) fail('bindBasis() has not run');
