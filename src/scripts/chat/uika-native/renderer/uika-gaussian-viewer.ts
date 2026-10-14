@@ -50,6 +50,9 @@ export interface UikaFrameTiming {
 export interface UikaDiagnosticShaderInfo {
     /** null = the production source (loop bounded by the uikaBasisCount uniform). */
     bound: number | null;
+    /** Gate 4B-2A: the PoC variant that fetches one pre-deformed centre is installed. */
+    predeformActive: boolean;
+    predeformFetches: number;
     basisLoopPresent: boolean;
     /** The loop bound as it appears in the source: 'uikaBasisCount', '8', ... */
     basisLoopBound: string | null;
@@ -312,6 +315,8 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         }
         return {
             bound: this.diagnosticBasisBound,
+            predeformActive: this.predeformActive,
+            predeformFetches: source.split('uikaPredeformedCenter(splatIndex)').length - 1,
             basisLoopPresent: loop !== null,
             basisLoopBound: loop ? loop[1] : null,
             basisDeltaCalls: calls,
@@ -383,6 +388,122 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return new Promise<UikaDrawingBufferHash>((resolve) => {
             this.pendingHash = resolve;
         });
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Gate 4B-2A pre-deformation PoC hooks.
+    //
+    // Opt-in and inert until the PoC calls them. /uika-native-replay,
+    // /uika-native-benchmark and /uika-native-draw-isolation call none of these, so
+    // with no call the shader source, the uniforms, the sort path and the draw path
+    // are exactly what Gate 3, Gate 4A and Gate 4B-1 measured.
+    // ------------------------------------------------------------------------
+
+    private preRenderHook: (() => void) | null = null;
+    private expressionWeightHook: (() => void) | null = null;
+    private distanceProvider: ((mvp: any, out: Float32Array) => Promise<void>) | null = null;
+    private predeformActive = false;
+
+    /** Production basis loop replacement: one fetch from the pre-deformed centre texture. */
+    private static readonly PREDEFORM_CENTER_FETCH = `
+        // UIKA Gate 4B-2A PoC variant: the 51-channel basis loop is replaced by one
+        // fetch of the pre-deformed animated centre. The pass that writes that texture
+        // evaluates the identical expression once per expression frame.
+        uniform highp sampler2D uikaAnimatedCenterTexture;
+        uniform vec2 uikaAnimatedCenterTextureSize;
+
+        vec3 uikaPredeformedCenter(in uint sIndex) {
+            int i = int(sIndex);
+            int w = int(uikaAnimatedCenterTextureSize.x);
+            return texelFetch(uikaAnimatedCenterTexture, ivec2(i % w, i / w), 0).xyz;
+        }
+`;
+
+    /** Borrowed by the PoC pass, which needs the same renderer and the same textures. */
+    getPoCHandles(): { renderer: any; splatMesh: any; camera: any } | null {
+        if (!this.renderer || !this.splatMesh) return null;
+        return { renderer: this.renderer, splatMesh: this.splatMesh, camera: this.camera };
+    }
+
+    /** Run before anything else in render(). The PoC uses it for its deformation pass. */
+    setPreRenderHook(hook: (() => void) | null): void {
+        this.preRenderHook = hook;
+    }
+
+    /**
+     * Called after every weight upload. The PoC uses it to mark its deformation pass
+     * dirty, which is what keeps that pass to one run per changed expression frame
+     * instead of one per animation frame.
+     */
+    setExpressionWeightHook(hook: (() => void) | null): void {
+        this.expressionWeightHook = hook;
+    }
+
+    /**
+     * Replace the depth-key source. null is the production path
+     * (`SplatMesh.computeDistancesOnGPU`, which re-evaluates all 51 channels); the PoC
+     * installs a pass that reads the same pre-deformed centres the render shader reads,
+     * so render order and draw order still come from one animated centre.
+     */
+    setDistanceProvider(provider: ((mvp: any, out: Float32Array) => Promise<void>) | null): void {
+        this.distanceProvider = provider;
+        this.sortDirty = true;
+    }
+
+    /**
+     * Gate 4B-2A §7. Swap the render vertex shader between the production 51-channel
+     * loop (`texture = null`) and the PoC variant that fetches one pre-deformed centre.
+     * Opacity, scale, rotation, SH/RGB, covariance and the projection are untouched in
+     * both: only the statement that produces `splatCenter` differs.
+     */
+    setPredeformCenterTexture(texture: any | null, width: number, height: number): UikaDiagnosticShaderInfo {
+        if (!this.splatMesh) fail('loadCanonicalPly() has not run');
+        const material = this.splatMesh.material;
+        if (this.productionVertexShader === null) {
+            this.productionVertexShader = material.vertexShader;
+        }
+        const production = this.productionVertexShader!;
+        if (!UikaGaussianViewer.BASIS_LOOP_RE.test(production)) {
+            fail('the production basis loop was not found in the vertex shader source');
+        }
+
+        if (texture === null) {
+            material.vertexShader = production;
+            material.needsUpdate = true;
+            this.predeformActive = false;
+            this.diagnosticBasisBound = null;
+            this.sortDirty = true;
+            return this.getDiagnosticShaderInfo();
+        }
+
+        const anchor = '        const float SH_C1 = 0.4886025119029199f;';
+        if (production.split(anchor).length - 1 !== 1) {
+            fail('the shader anchor for the PoC uniform block is not unique');
+        }
+        let next = production.replace(
+            anchor,
+            UikaGaussianViewer.PREDEFORM_CENTER_FETCH + anchor,
+        );
+        next = next.replace(
+            UikaGaussianViewer.BASIS_LOOP_RE,
+            '            splatCenter = uikaPredeformedCenter(splatIndex);',
+        );
+
+        material.uniforms.uikaAnimatedCenterTexture = { value: texture };
+        material.uniforms.uikaAnimatedCenterTextureSize = { value: new THREE.Vector2(width, height) };
+        material.vertexShader = next;
+        material.needsUpdate = true;
+        material.uniformsNeedUpdate = true;
+        this.predeformActive = true;
+        this.diagnosticBasisBound = null;
+        this.sortDirty = true;
+        return this.getDiagnosticShaderInfo();
+    }
+
+    /** True while the PoC render variant is installed. */
+    isPredeformActive(): boolean {
+        return this.predeformActive;
     }
 
     /** Drop a hash request that was abandoned, so the next one can be made. */
@@ -542,6 +663,8 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         if (!this.splatMesh) fail('loadCanonicalPly() has not run');
         this.splatMesh.setUikaWeights(weights);
         this.sortDirty = true;
+        // Gate 4B-2A PoC only; null on every production route.
+        this.expressionWeightHook?.();
     }
 
     /** Recompute view depths on the GPU, then order the splats back to front. */
@@ -559,7 +682,9 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         this.sortRuns++;
         const distances = this.distances!;
         this.gpuTimer?.beginSort();
-        const sortPromise = this.splatMesh.computeDistancesOnGPU(this.mvpMatrix, distances);
+        const sortPromise = this.distanceProvider
+            ? this.distanceProvider(this.mvpMatrix, distances)
+            : this.splatMesh.computeDistancesOnGPU(this.mvpMatrix, distances);
         this.gpuTimer?.endSort();
         sortPromise
             .then(() => {
@@ -576,6 +701,9 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     render(): void {
         if (!this.renderer || !this.camera || !this.scene || !this.splatMesh) return;
         const started = performance.now();
+
+        // Gate 4B-2A PoC only; null on every production route.
+        this.preRenderHook?.();
 
         const renderDimensions = new THREE.Vector2();
         this.renderer.getSize(renderDimensions);

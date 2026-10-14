@@ -202,9 +202,11 @@ export function collectGpuInfo(canvas: HTMLCanvasElement | null): UikaGpuInfo {
  * any sample flagged disjoint is discarded.
  */
 export class GpuTimerPool {
-    private readonly pending: Array<{ q: WebGLQuery; kind: 'sort' | 'draw'; frame: number; counted: boolean }> = [];
+    private readonly pending: Array<{ q: WebGLQuery; kind: 'sort' | 'draw' | 'predeform'; frame: number; counted: boolean }> = [];
     readonly sortMs: number[] = [];
     readonly drawMs: number[] = [];
+    /** Gate 4B-2A only. Stays empty on every route that does not run a deformation pass. */
+    readonly predeformMs: number[] = [];
     disjointDiscarded = 0;
     /**
      * v1.1 Gate 4B-1 §8. A single GL command cannot take longer than the whole
@@ -226,7 +228,7 @@ export class GpuTimerPool {
 
     setCollecting(on: boolean): void { this.collecting = on; }
 
-    private begin(kind: 'sort' | 'draw'): void {
+    private begin(kind: 'sort' | 'draw' | 'predeform'): void {
         if (this.active || this.pending.length > 24) return;
         const q = this.gl.createQuery();
         if (!q) return;
@@ -248,6 +250,8 @@ export class GpuTimerPool {
     endSort(): void { this.end(); }
     beginDraw(): void { this.begin('draw'); }
     endDraw(): void { this.end(); }
+    beginPredeform(): void { this.begin('predeform'); }
+    endPredeform(): void { this.end(); }
 
     frameDone(): void {
         this.frame++;
@@ -265,13 +269,16 @@ export class GpuTimerPool {
             if (disjoint) { this.disjointDiscarded++; continue; }
             const ms = ns / 1e6;
             if (this.maxValidMs > 0 && ms > this.maxValidMs) { this.invalidMs.push(ms); continue; }
-            (e.kind === 'sort' ? this.sortMs : this.drawMs).push(ms);
+            const bucket = e.kind === 'sort' ? this.sortMs
+                : e.kind === 'draw' ? this.drawMs : this.predeformMs;
+            bucket.push(ms);
         }
     }
 
     reset(): void {
         this.sortMs.length = 0;
         this.drawMs.length = 0;
+        this.predeformMs.length = 0;
         this.invalidMs.length = 0;
         this.disjointDiscarded = 0;
         // Drop anything still in flight from the previous phase.
