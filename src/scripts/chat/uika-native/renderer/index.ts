@@ -9,4 +9,7 @@ export type {
     UikaBasisLayout,
     UikaFrameTiming,
     UikaGpuTimer,
+    UikaDiagnosticShaderInfo,
+    UikaDrawingBufferInfo,
+    UikaDrawingBufferHash,
 } from './uika-gaussian-viewer';

@@ -70,6 +70,10 @@ export interface UikaTestResult {
         drawPassMs: UikaIntervalStats | null;
         totalMs: UikaIntervalStats | null;
         disjointDiscarded: number;
+        /** Gate 4B-1 §8: samples longer than the measurement window, excluded and listed. */
+        invalidSamples: number;
+        invalidValuesMs: number[];
+        invalidRuleMs: number;
     };
     expression: Record<string, number | boolean> | null;
     sortRuns: number;
@@ -197,11 +201,23 @@ export function collectGpuInfo(canvas: HTMLCanvasElement | null): UikaGpuInfo {
  * Results are polled several frames later so the benchmark never stalls on the GPU, and
  * any sample flagged disjoint is discarded.
  */
-class GpuTimerPool {
+export class GpuTimerPool {
     private readonly pending: Array<{ q: WebGLQuery; kind: 'sort' | 'draw'; frame: number; counted: boolean }> = [];
     readonly sortMs: number[] = [];
     readonly drawMs: number[] = [];
     disjointDiscarded = 0;
+    /**
+     * v1.1 Gate 4B-1 §8. A single GL command cannot take longer than the whole
+     * measurement window it was issued in, so a sample above `maxValidMs` is
+     * physically impossible and is excluded from the percentiles instead of being
+     * averaged in. The excluded values are kept and reported, never hidden.
+     *
+     * The Gate 4A rerun carried one such sample (184467.440737 ms) in Test A and one
+     * in Test B. Samples that were already plausible are untouched by this rule, so
+     * the Test B / Test C percentiles already reported do not move.
+     */
+    readonly invalidMs: number[] = [];
+    maxValidMs = 0;
     private frame = 0;
     private active: WebGLQuery | null = null;
     private collecting = false;
@@ -247,13 +263,16 @@ class GpuTimerPool {
             this.pending.splice(i, 1);
             if (!e.counted) continue;
             if (disjoint) { this.disjointDiscarded++; continue; }
-            (e.kind === 'sort' ? this.sortMs : this.drawMs).push(ns / 1e6);
+            const ms = ns / 1e6;
+            if (this.maxValidMs > 0 && ms > this.maxValidMs) { this.invalidMs.push(ms); continue; }
+            (e.kind === 'sort' ? this.sortMs : this.drawMs).push(ms);
         }
     }
 
     reset(): void {
         this.sortMs.length = 0;
         this.drawMs.length = 0;
+        this.invalidMs.length = 0;
         this.disjointDiscarded = 0;
         // Drop anything still in flight from the previous phase.
         for (const e of this.pending) this.gl.deleteQuery(e.q);
@@ -445,6 +464,7 @@ export class UikaNativeBenchmark {
 
         // --- measure -------------------------------------------------------------
         timers?.reset();
+        if (timers) timers.maxValidMs = options.measureMs;
         timers?.setCollecting(true);
         this.replay.resetInstrumentation();
         sampler.reset();
@@ -501,15 +521,20 @@ export class UikaNativeBenchmark {
             },
             gpu: timers ? {
                 available: true,
-                note: 'EXT_disjoint_timer_query_webgl2, polled 4+ frames later, disjoint samples discarded',
+                note: 'EXT_disjoint_timer_query_webgl2, polled 4+ frames later; disjoint samples discarded, '
+                      + 'and samples longer than the measurement window excluded as invalid (Gate 4B-1 §8)',
                 sortPassMs: summariseIntervals(timers.sortMs),
                 drawPassMs: summariseIntervals(timers.drawMs),
                 totalMs: summariseIntervals(timers.sortMs.concat(timers.drawMs)),
                 disjointDiscarded: timers.disjointDiscarded,
+                invalidSamples: timers.invalidMs.length,
+                invalidValuesMs: timers.invalidMs.slice(0, 16),
+                invalidRuleMs: timers.maxValidMs,
             } : {
                 available: false,
                 note: 'GPU_TIMER_QUERY = UNAVAILABLE (EXT_disjoint_timer_query_webgl2 not exposed)',
                 sortPassMs: null, drawPassMs: null, totalMs: null, disjointDiscarded: 0,
+                invalidSamples: 0, invalidValuesMs: [], invalidRuleMs: 0,
             },
             expression,
             sortRuns: (viewer.getSortRuns?.() ?? 0) - sortRuns0,

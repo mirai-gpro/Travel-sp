@@ -46,6 +46,43 @@ export interface UikaFrameTiming {
     totalMs: number;
 }
 
+/** Gate 4B-1 diagnostic: what the render vertex shader actually contains right now. */
+export interface UikaDiagnosticShaderInfo {
+    /** null = the production source (loop bounded by the uikaBasisCount uniform). */
+    bound: number | null;
+    basisLoopPresent: boolean;
+    /** The loop bound as it appears in the source: 'uikaBasisCount', '8', ... */
+    basisLoopBound: string | null;
+    basisDeltaCalls: number;
+    vertexShaderChars: number;
+    vertexShaderHash: string;
+    uikaBasisCountUniform: number;
+}
+
+/** Gate 4B-1 diagnostic: CSS size vs drawing-buffer size, measured from GL. */
+export interface UikaDrawingBufferInfo {
+    requestedScale: number;
+    devicePixelRatio: number;
+    rendererPixelRatio: number;
+    cssWidth: number;
+    cssHeight: number;
+    rendererWidth: number;
+    rendererHeight: number;
+    drawingBufferWidth: number;
+    drawingBufferHeight: number;
+    viewportUniform: [number, number] | null;
+    focalUniform: [number, number] | null;
+}
+
+/** Gate 4B-1 diagnostic: a fingerprint of one rendered frame. */
+export interface UikaDrawingBufferHash {
+    width: number;
+    height: number;
+    hash: string;
+    nonZeroPixels: number;
+    alphaSum: number;
+}
+
 /**
  * Instrumentation only (Gate 4A). The benchmark owns the GL query objects; the viewer
  * just marks where the distance/sort submission and the draw submission begin and end.
@@ -177,6 +214,206 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     setSortFarthestFirst(value: boolean): void {
         this.sortFarthestFirst = value;
         this.sortDirty = true;
+    }
+
+    // ------------------------------------------------------------------------
+    // Gate 4B-1 draw-isolation diagnostics.
+    //
+    // Everything in this block is opt-in and inert until a benchmark calls it.
+    // The production path (/uika-native-replay) calls none of it, so with no call
+    // the generated shader source, every uniform and the drawing-buffer size stay
+    // exactly what Gate 3 and the Gate 4A rerun measured.
+    // ------------------------------------------------------------------------
+
+    private productionVertexShader: string | null = null;
+    private diagnosticBasisBound: number | null = null;
+    private drawingBufferScale = 1;
+    private pendingHash: ((hash: UikaDrawingBufferHash) => void) | null = null;
+    private sortSuspended = false;
+
+    /**
+     * The production basis loop, exactly as SplatMaterial.js emits it. Matching this
+     * and nothing else is what makes the diagnostic variants honest: the rest of the
+     * vertex shader — centres, covariance, opacity, scale, rotation, SH/RGB, the
+     * projection — is carried over byte for byte.
+     */
+    private static readonly BASIS_LOOP_RE =
+        /[ \t]*for \(int k = 0; k < uikaBasisCount; \+\+k\) \{\s*splatCenter \+= uikaWeight\(k\) \* uikaBasisDelta\(k, splatIndex\);\s*\}/;
+
+    /**
+     * Gate 4B-1 §4 / §7. Rebuild the render shader with a different basis loop:
+     *
+     *   null  the production source, loop bounded by the `uikaBasisCount` uniform
+     *   0     no loop at all — the statement is gone from the shader source, so the
+     *         GPU issues zero basis texture fetches. This is NOT the same as setting
+     *         the weights to zero, which still runs 51 iterations and 51 fetches.
+     *   N>0   the loop with a literal bound of N, for basis-count scaling
+     *
+     * Diagnostic only. The production renderer is never switched to a variant.
+     */
+    setDiagnosticBasisBound(bound: number | null): UikaDiagnosticShaderInfo {
+        if (!this.splatMesh) fail('loadCanonicalPly() has not run');
+        const material = this.splatMesh.material;
+        if (this.productionVertexShader === null) {
+            this.productionVertexShader = material.vertexShader;
+        }
+        const production = this.productionVertexShader!;
+        if (!UikaGaussianViewer.BASIS_LOOP_RE.test(production)) {
+            fail('the production basis loop was not found in the vertex shader source');
+        }
+
+        let next: string;
+        if (bound === null) {
+            next = production;
+        } else if (!Number.isInteger(bound) || bound < 0) {
+            fail(`diagnostic basis bound must be null or a non-negative integer, got ${bound}`);
+        } else if (bound === 0) {
+            next = production.replace(
+                UikaGaussianViewer.BASIS_LOOP_RE,
+                '            // UIKA Gate 4B-1 diagnostic variant: the basis loop is absent from\n'
+                + '            // this shader source. No uikaBasisDelta / uikaWeight fetch is issued.',
+            );
+        } else {
+            next = production.replace(
+                UikaGaussianViewer.BASIS_LOOP_RE,
+                `            for (int k = 0; k < ${bound}; ++k) {\n`
+                + '                splatCenter += uikaWeight(k) * uikaBasisDelta(k, splatIndex);\n'
+                + '            }',
+            );
+        }
+
+        material.vertexShader = next;
+        material.needsUpdate = true;
+        this.diagnosticBasisBound = bound;
+        this.sortDirty = true;
+        return this.getDiagnosticShaderInfo();
+    }
+
+    /**
+     * Gate 4B-1 §4 verification only. Hold the draw order still so that comparing two
+     * rendered frames compares the shader and nothing else: a weight change moves the
+     * animated centres, which would otherwise re-sort the splats, and alpha compositing
+     * is order dependent. Measurements run with sorting in its normal state.
+     */
+    setSortSuspended(suspended: boolean): void {
+        this.sortSuspended = suspended;
+    }
+
+    /** What the render shader currently contains. Measured from the source, not assumed. */
+    getDiagnosticShaderInfo(): UikaDiagnosticShaderInfo {
+        if (!this.splatMesh) fail('loadCanonicalPly() has not run');
+        const source: string = this.splatMesh.material.vertexShader;
+        const loop = source.match(/for \(int k = 0; k < ([A-Za-z0-9_]+); \+\+k\) \{/);
+        const calls = source.split('uikaBasisDelta(k, splatIndex)').length - 1;
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < source.length; i++) {
+            hash ^= source.charCodeAt(i) & 0xff;
+            hash = Math.imul(hash, 0x01000193);
+        }
+        return {
+            bound: this.diagnosticBasisBound,
+            basisLoopPresent: loop !== null,
+            basisLoopBound: loop ? loop[1] : null,
+            basisDeltaCalls: calls,
+            vertexShaderChars: source.length,
+            vertexShaderHash: (hash >>> 0).toString(16).padStart(8, '0'),
+            uikaBasisCountUniform: this.splatMesh.material.uniforms.uikaBasisCount.value,
+        };
+    }
+
+    /**
+     * Gate 4B-1 §3. Scale the drawing buffer while the CSS size stays put.
+     *
+     * Only `WebGLRenderer.setPixelRatio` moves. `renderer.getSize()` keeps reporting
+     * the CSS size, so the focal length this viewer computes per frame does not move,
+     * and `SplatMesh.updateUniforms` derives `viewport` / `basisViewport` from the
+     * mesh's own devicePixelRatio, which is also left alone. The vertex shader
+     * therefore produces identical clip-space geometry at every scale and only the
+     * number of rasterised samples changes.
+     */
+    setDrawingBufferScale(scale: number): UikaDrawingBufferInfo {
+        if (!this.renderer) fail('the renderer has not been created');
+        if (!(scale > 0)) fail(`drawing-buffer scale must be positive, got ${scale}`);
+        const width = this.container.clientWidth || 512;
+        const height = this.container.clientHeight || 512;
+        this.drawingBufferScale = scale;
+        this.renderer.setPixelRatio((window.devicePixelRatio || 1) * scale);
+        this.renderer.setSize(width, height, false);
+        return this.getDrawingBufferInfo();
+    }
+
+    getDrawingBufferInfo(): UikaDrawingBufferInfo {
+        if (!this.renderer) fail('the renderer has not been created');
+        const gl = this.renderer.getContext();
+        const canvas: HTMLCanvasElement = this.renderer.domElement;
+        const size = new THREE.Vector2();
+        this.renderer.getSize(size);
+        return {
+            requestedScale: this.drawingBufferScale,
+            devicePixelRatio: window.devicePixelRatio || 1,
+            rendererPixelRatio: this.renderer.getPixelRatio(),
+            cssWidth: canvas.clientWidth,
+            cssHeight: canvas.clientHeight,
+            rendererWidth: size.x,
+            rendererHeight: size.y,
+            drawingBufferWidth: gl.drawingBufferWidth,
+            drawingBufferHeight: gl.drawingBufferHeight,
+            viewportUniform: this.splatMesh
+                ? [this.splatMesh.material.uniforms.viewport.value.x,
+                   this.splatMesh.material.uniforms.viewport.value.y]
+                : null,
+            focalUniform: this.splatMesh
+                ? [this.splatMesh.material.uniforms.focal.value.x,
+                   this.splatMesh.material.uniforms.focal.value.y]
+                : null,
+        };
+    }
+
+    /**
+     * Hash the next rendered frame's drawing buffer. This is how a shader variant is
+     * proved to be real rather than merely requested: a no-basis variant must render
+     * the canonical pose even while non-zero weights are resident.
+     *
+     * readPixels stalls the pipeline, so this is only ever called in the verification
+     * step, never inside a measurement window.
+     */
+    requestDrawingBufferHash(): Promise<UikaDrawingBufferHash> {
+        if (!this.renderer) fail('the renderer has not been created');
+        if (this.pendingHash) fail('a drawing-buffer hash is already pending');
+        return new Promise<UikaDrawingBufferHash>((resolve) => {
+            this.pendingHash = resolve;
+        });
+    }
+
+    /** Drop a hash request that was abandoned, so the next one can be made. */
+    clearPendingDrawingBufferHash(): void {
+        this.pendingHash = null;
+    }
+
+    private hashDrawingBuffer(): UikaDrawingBufferHash {
+        const gl = this.renderer.getContext();
+        const width = gl.drawingBufferWidth;
+        const height = gl.drawingBufferHeight;
+        const pixels = new Uint8Array(width * height * 4);
+        gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        let hash = 0x811c9dc5;
+        let nonZero = 0;
+        let alphaSum = 0;
+        for (let i = 0; i < pixels.length; i += 4) {
+            const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
+            if (r !== 0 || g !== 0 || b !== 0 || a !== 0) nonZero++;
+            alphaSum += a;
+            hash ^= r; hash = Math.imul(hash, 0x01000193);
+            hash ^= g; hash = Math.imul(hash, 0x01000193);
+            hash ^= b; hash = Math.imul(hash, 0x01000193);
+            hash ^= a; hash = Math.imul(hash, 0x01000193);
+        }
+        return {
+            width, height,
+            hash: (hash >>> 0).toString(16).padStart(8, '0'),
+            nonZeroPixels: nonZero,
+            alphaSum,
+        };
     }
 
     get stats() {
@@ -311,6 +548,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     private runSort(): void {
         if (!this.splatMesh || !this.renderer || !this.camera) return;
         if (this.sortPending) return;
+        if (this.sortSuspended) return;
 
         this.mvpMatrix.copy(this.camera.matrixWorld).invert();
         this.mvpMatrix.premultiply(this.camera.projectionMatrix);
@@ -355,6 +593,14 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         this.renderer.render(this.scene, this.camera);
         this.gpuTimer?.endDraw();
         const drawMs = performance.now() - drawStarted;
+
+        // Gate 4B-1 verification only, and never inside a measurement window: the
+        // readback stalls the pipeline. Inert when nothing requested a hash.
+        if (this.pendingHash) {
+            const resolve = this.pendingHash;
+            this.pendingHash = null;
+            resolve(this.hashDrawingBuffer());
+        }
 
         const gl = this.renderer.getContext();
         const err = gl.getError();
