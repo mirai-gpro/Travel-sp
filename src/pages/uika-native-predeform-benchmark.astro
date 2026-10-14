@@ -60,6 +60,7 @@
   <div class="col row">
     <button id="start" class="primary" disabled>Start PoC</button>
     <button id="investigate" disabled>Run Difference Investigation</button>
+    <button id="sweep" disabled>Run 192-Frame Sweep</button>
     <button id="stop" disabled>Stop</button>
     <button id="export" disabled>Export JSON</button>
     <button id="copy" disabled>Copy Results</button>
@@ -87,7 +88,7 @@
     import { collectGpuInfo } from '../scripts/chat/uika-native/uika-native-benchmark';
     import { UikaPredeformBenchmark, predeformOptionsFromUrl }
       from '../scripts/chat/uika-native/uika-predeform-benchmark';
-    import { UikaPredeformInvestigation, investigationOptionsFromUrl }
+    import { UikaPredeformInvestigation, investigationOptionsFromUrl, sweepOptionsFromUrl }
       from '../scripts/chat/uika-native/uika-predeform-investigation';
 
     const container = document.getElementById('viewer');
@@ -102,6 +103,7 @@
     const btn = {
       start: document.getElementById('start') as HTMLButtonElement,
       investigate: document.getElementById('investigate') as HTMLButtonElement,
+      sweep: document.getElementById('sweep') as HTMLButtonElement,
       stop: document.getElementById('stop') as HTMLButtonElement,
       export: document.getElementById('export') as HTMLButtonElement,
       copy: document.getElementById('copy') as HTMLButtonElement,
@@ -194,7 +196,8 @@
           </tr>`).join('')}
         </table>`;
       }
-      if ((report.frames || []).length > 0) {
+      // The investigation and the sweep both report `frames`, with different shapes.
+      if ((report.frames || []).length > 0 && report.frames[0].repeatability) {
         html += `<table>
           <tr><th>frame</th><th>prod unique</th><th>poc unique</th><th>hash equal</th>
               <th>diff px</th><th>diff %</th><th>max byte Δ</th><th>alpha same</th>
@@ -218,6 +221,45 @@
         </table>
         <p class="note">classification: <b>${report.classification}</b></p>`;
       }
+      if (report.summary) {
+        const s = report.summary;
+        const w = (x: any) => `${typeof x.value === 'number' ? (Number.isInteger(x.value) ? x.value : x.value.toExponential(4)) : '—'} @f${x.frame}`;
+        html += `<table>
+          <tr><th>sweep summary</th><th>value</th></tr>
+          <tr><td>frames compared</td><td>${s.framesCompared}</td></tr>
+          <tr><td>pixel-identical frames</td><td class="${s.framesWithPixelDifference === 0 ? 'ok' : ''}">${s.framesPixelIdentical}</td></tr>
+          <tr><td>frames with a pixel difference</td><td class="${s.framesWithPixelDifference === 0 ? 'ok' : 'bad'}">${s.framesWithPixelDifference}</td></tr>
+          <tr><td>worst differing pixels</td><td>${w(s.worstDifferentPixels)}</td></tr>
+          <tr><td>worst differing-pixel ratio</td><td>${w(s.worstDifferentPixelRatio)}</td></tr>
+          <tr><td>worst max byte delta</td><td>${w(s.worstMaxByteDelta)}</td></tr>
+          <tr><td>worst centre max abs</td><td>${w(s.worstCenterMaxAbs)}</td></tr>
+          <tr><td>worst centre mean abs</td><td>${w(s.worstCenterMeanAbs)}</td></tr>
+          <tr><td>worst distance max abs</td><td>${w(s.worstDistanceMaxAbs)}</td></tr>
+          <tr><td>worst centre vs CPU max abs</td><td>${w(s.worstCenterVsCpuMaxAbs)}</td></tr>
+          <tr><td>worst ULP (diagnostic only)</td><td>${s.worstMaxUlp.value} @f${s.worstMaxUlp.frame}, abs ${s.worstMaxUlp.absAtThatComponent.toExponential(4)}</td></tr>
+          <tr><td>frames with an alpha difference</td><td class="${s.framesWithAlphaDifference.length === 0 ? 'ok' : 'bad'}">${s.framesWithAlphaDifference.length === 0 ? 'none' : s.framesWithAlphaDifference.join(', ')}</td></tr>
+          <tr><td>frames with non-finite centres</td><td class="${s.framesWithNonFinite.length === 0 ? 'ok' : 'bad'}">${s.framesWithNonFinite.length === 0 ? 'none' : s.framesWithNonFinite.join(', ')}</td></tr>
+          <tr><td>all within ${report.numericBound}</td><td class="${s.allWithinNumericBound ? 'ok' : 'bad'}">${s.allWithinNumericBound ? 'yes' : `NO: ${s.framesOutsideNumericBound.join(', ')}`}</td></tr>
+          <tr><td>acceptance rule</td><td>${report.acceptance?.rule} (unchanged) &rarr; ${report.acceptance?.correctnessUnderCurrentRule}</td></tr>
+        </table>`;
+        const diff = (report.frames || []).filter((f: any) => f.framebuffer && !f.framebuffer.pixelIdentical);
+        if (diff.length > 0) {
+          html += `<table>
+            <tr><th>frame with a pixel difference</th><th>diff px</th><th>ratio</th><th>max byte Δ</th>
+                <th>R/G/B/A differing</th><th>alpha same</th><th>centre max abs</th><th>dist max abs</th></tr>
+            ${diff.map((f: any) => `<tr>
+              <td>${f.frame}</td>
+              <td>${f.framebuffer.differentPixels}</td>
+              <td>${f.framebuffer.differentPixelRatio.toExponential(3)}</td>
+              <td>${f.framebuffer.maxRgbaByteDelta}</td>
+              <td>${f.framebuffer.rDifferingCount}/${f.framebuffer.gDifferingCount}/${f.framebuffer.bDifferingCount}/${f.framebuffer.aDifferingCount}</td>
+              <td class="${f.framebuffer.alphaPlaneIdentical ? 'ok' : 'bad'}">${f.framebuffer.alphaPlaneIdentical ? 'yes' : 'NO'}</td>
+              <td>${f.center.maxAbsXYZ.toExponential(4)}</td>
+              <td>${f.distance.maxAbsDifference.toExponential(4)}</td>
+            </tr>`).join('')}
+          </table>`;
+        }
+      }
       tablesEl.innerHTML = html;
     };
 
@@ -233,6 +275,7 @@
       const busy = poc.isRunning() || investigation.isRunning();
       btn.start.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.investigate.disabled = !runtime.report.ready || busy || !replay.getFixture();
+      btn.sweep.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.stop.disabled = !busy;
       btn.export.disabled = !report;
       btn.copy.disabled = !report;
@@ -262,6 +305,19 @@
       } catch (error: any) {
         lastError = error?.message || String(error);
         console.error('[UIKA GATE4B2A INVESTIGATION]', error);
+      }
+      renderStatus();
+    });
+
+    btn.sweep.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await investigation.runSweep(sweepOptionsFromUrl());
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4B2A SWEEP]', error);
       }
       renderStatus();
     });

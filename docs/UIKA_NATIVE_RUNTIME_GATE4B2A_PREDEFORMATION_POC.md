@@ -3,10 +3,12 @@
 Spec: UIKA Native Runtime v1.1 Gate 4B-2A.
 Route: `/uika-native-predeform-benchmark`.
 Status: PoC built. On the real GPU **`CORRECTNESS = FAIL`** — one of the eleven cases,
-`C-a2e-frame-20`, rendered a different framebuffer hash. Performance is `NOT_RUN` and
-stays that way until that difference is understood; see §3.2 for the real-GPU result and
-§3.3 for the investigation that is now the open work. The SwiftShader figures in §3.1 are
-kept, with their scope corrected.
+`C-a2e-frame-20`, rendered a different framebuffer hash: one pixel in 1,295,044, one byte
+level in R, with the alpha plane identical. The difference investigation classified that as
+**`B-deterministic-float-level-difference`** (§3.4), which is not a pass: acceptance is
+still pixel-identical, so correctness stays FAIL and performance stays `NOT_RUN`. The open
+work is the full 192-frame sweep in §3.4.3, which measures the worst case over the whole
+fixture before any acceptance decision is taken.
 
 ---
 
@@ -279,87 +281,150 @@ difference is investigated. A hash mismatch counts as a failure until there is a
 reason to treat it otherwise, and any change to the rule will be a separate decision
 taken on the numbers §3.4 produces — not a loosening to make the current run pass.
 
-### 3.4 The difference investigation — PENDING
-
-Route: the same `/uika-native-predeform-benchmark` page, second button,
-**Run Difference Investigation**. It measures only; it runs no performance test and
-changes no threshold.
-
-**Diagnostic A — repeatability.** Frame 20 held, same camera, same weights, sort
-suspended, same resolution. At least 20 consecutive renders in each mode, every
-framebuffer hash kept, with the unique hashes and the frequency of each one reported.
-Variation *inside* one mode points at render or readPixels nondeterminism; both modes
-internally fixed but different from each other points at a deterministic numerical
-difference.
-
-**Diagnostic B — pixel-level diff.** Both RGBA buffers are kept and compared value by
-value, which a hash cannot do:
+### 3.4 The difference investigation — result
 
 ```text
-totalPixels / differentPixels / differentPixelRatio / differentChannels
-per channel R, G, B, A:  differing count, max abs byte diff, mean abs diff
-max RGBA byte delta / sum of absolute differences / difference bounding box
-histogram of |delta| = 1, 2, 3, ...
+INVESTIGATION CLASSIFICATION = B-deterministic-float-level-difference
 ```
+
+Set by the user after reviewing the real-GPU run, replacing the `A-real-correctness-defect`
+the harness had reported. `A` is not adopted. Frame 20, real GPU:
+
+```text
+production hash stable       20 / 20
+predeform  hash stable       20 / 20
+
+different pixels             1 / 1,295,044        (= 7.72e-07 of the frame)
+different channels           1 / 5,180,176
+R max byte delta             1
+G / B / A delta              0
+alpha plane identical        YES
+
+max  centre abs diff         1.490116119e-08
+mean centre abs diff         2.17e-11
+nonFinite                    0
+```
+
+Both modes are self-consistent across 20 renders of the same pose, so this is not
+measurement nondeterminism: the difference is deterministic. And 1.490116119e-08 is
+exactly 2^-26, one float32 ULP at this coordinate magnitude, against a numeric bound of
+1e-06 — so one pixel in 1.3 million moved by one byte level in R alone.
+
+```text
+B does NOT mean PASS.
+```
+
+The acceptance rule is still pixel-identical (§3.3), so under the rule in force:
+
+```text
+CORRECTNESS = FAIL
+PERFORMANCE = NOT_RUN
+```
+
+### 3.4.1 ULP distance is no longer a severity classifier
+
+The harness classified on `maxUlp <= 4`. The real-GPU run contradicts that rule directly:
+
+```text
+frame 132   maxUlpDifference 2706   differentPixels 0   framebuffer pixel-identical
+frame  20   maxUlpDifference 1364   differentPixels 1   framebuffer differs
+```
+
+The frame with more than twice the ULP distance is the one that renders identically. Near
+zero a large ULP count can accompany a vanishing absolute difference — two values either
+side of zero are far apart in ordered-integer space and almost equal in value — so a ULP
+count is not a magnitude.
+
+The classifier now uses the absolute difference, the determinism result and the presence
+of non-finite values, and nothing else:
+
+```text
+a mode disagrees with itself                          -> C-measurement-nondeterminism
+no pixel and no centre difference at all               -> NO-DIFFERENCE-REPRODUCED
+a non-finite component, or centre abs > 1e-06          -> A-real-correctness-defect
+otherwise (deterministic, inside the numeric bound)    -> B-deterministic-float-level-difference
+```
+
+The ULP histogram stays in the report as a diagnostic, and each comparison now also
+carries `absAtMaxUlp` — the absolute difference at the component where the ULP distance
+was largest — so the two can never be confused again.
+
+### 3.4.2 What the three diagnostics measure
+
+Unchanged from the plan, and all four ran on the real GPU:
+
+**Diagnostic A — repeatability.** Frame held, same camera, same weights, sort suspended,
+same resolution; 20 consecutive renders per mode, every framebuffer hash kept with its
+frequency.
+
+**Diagnostic B — pixel-level diff.** Both RGBA buffers kept and compared value by value:
+`totalPixels`, `differentPixels`, `differentPixelRatio`, `differentChannels`, per-channel
+differing count / max abs byte diff / mean abs diff, `maxRgbaByteDelta`,
+`sumAbsoluteDifference`, the difference bounding box, and a histogram of `|delta|`.
 
 **Alpha, independently (§6).** Per-channel FNV hashes of the R, G, B and A planes for both
 modes, so "is the alpha plane exact?" and "is this an RGB-only difference?" are answered
 directly rather than inferred from a matching sum.
 
-**Diagnostic C — GPU centre comparison.** A CPU reference cannot localise this, and the
-distance comparison cannot either: a depth key is one dot product, so a difference along
-one axis can cancel in it. So the animated centre XYZ is read straight out of the GPU by
-transform feedback, by three routes that use the **verbatim** production expression:
+**Diagnostic C — GPU centre comparison.** The animated centre XYZ read out of the GPU by
+transform feedback, by three routes using the verbatim production expression
+(`production-attribute`, the production distance shader's attribute route;
+`production-texture`, the same vertex stage with the render shader's centre fetch;
+`predeform`, the fragment-stage RGBA32F texture), compared over all 133,541 Gaussians.
+
+**Diagnostic D.** The same three for frame 20 (hash FAIL) and frames 63 and 132 (hash PASS).
+
+**Hypotheses, recorded as hypotheses.** FMA contraction, rounding, instruction ordering or
+stage-specific optimisation differing between the production vertex shader and the
+pre-deformation fragment shader on the AMD driver. None of it was tested, so none of it is
+a finding; the report carries the list under `hypothesesNotTested`.
+
+### 3.4.3 Full-fixture sweep (§5 - §8) — PENDING
+
+Before any acceptance decision, the worst case over the whole fixture. Route: the same
+page, third button, **Run 192-Frame Sweep**.
+
+All 192 frames of `a2e-real-capture-gate3.json`, production against pre-deformed, one
+comparison per frame — no repeats, because Diagnostic A already measured both modes stable
+20/20 — with the same camera, the same resolution, the sort suspended and one draw order.
+
+Per frame:
 
 ```text
-production-attribute   the production distance shader's route — canonical centre as a
-                       vertex attribute from SplatMesh's centres buffer, 51 channels
-                       summed in the vertex stage
-production-texture     the same vertex stage, canonical centre fetched from
-                       centersColorsTexture the way the render shader fetches it
-predeform              the RGBA32F texture written by the fragment-stage pass
+centre      maxAbsX, maxAbsY, maxAbsZ, maxAbsXYZ, meanAbsXYZ,
+            differentComponents, bitExactComponents, nonFinite,
+            ULP histogram (diagnostic, not severity)
+            plus max |pre-deformed - CPU reference|, the existing bound
+distance    maxAbsDistanceDifference
+framebuffer differentPixels, differentPixelRatio, R/G/B/A differing counts,
+            maxRgbaByteDelta, sumAbsoluteDifference, alphaPlaneIdentical
 ```
 
-For all 133,541 Gaussians, each pair is compared on
-`maxAbsX`, `maxAbsY`, `maxAbsZ`, `maxAbsXYZ`, `meanAbsXYZ`, differing component count,
-bit-exact component count, and a ULP-distance histogram (0, 1, 2, 3, 4, >4). Comparing
-the first two routes isolates the centre's data path; comparing either against the third
-isolates the shader stage.
-
-**Diagnostic D — the other frames.** The same three diagnostics for frame 20 (hash FAIL),
-frame 63 (hash PASS) and frame 132 (hash PASS), to see why a comparable centre difference
-reaches the pixels in one frame and not the others.
-
-Query parameters: `?repeats=20`, `?frames=20,63,132`.
-
-**Outcome.** The harness then picks between the three outcomes the gate defined, from the
-measurements alone:
+Summary over the sweep, each worst case carrying its frame number:
 
 ```text
-A-real-correctness-defect                 the difference is outside the float-level band
-B-deterministic-float-level-difference    each mode self-consistent, centre within a few
-                                          ULP, pixels within a couple of byte levels
-C-measurement-nondeterminism              a mode disagreed with itself
-UNDETERMINED                              nothing was measured
+framesCompared / framesPixelIdentical / framesWithPixelDifference
+worstDifferentPixels / worstDifferentPixelRatio / worstMaxByteDelta
+worstCenterMaxAbs / worstCenterMeanAbs / worstDistanceMaxAbs
+worstCenterVsCpuMaxAbs / worstMaxUlp (with the absolute difference at that component)
+framesWithAlphaDifference / framesWithNonFinite
+framesOutsideNumericBound / allWithinNumericBound
 ```
 
-`B` is not a pass. It is a finding that then has to be judged against an acceptance rule,
-and the rule is still pixel-identical.
+The numeric bound stays at 1e-06 (§8) and every frame is checked against it. The harness
+reports `acceptance.rule = 'pixel-identical'`, `ruleChangedByThisRun = false` and
+`correctnessUnderCurrentRule`, and it cannot turn a FAIL into a PASS: whether
+pixel-identical should remain a cross-GPU correctness requirement or be replaced by an
+explicit numeric tolerance is decided afterwards, by a person, on these numbers (§9).
 
-**Hypotheses, recorded as hypotheses.** The production vertex shader and the
-pre-deformation fragment shader could be compiled differently by the AMD driver — FMA
-contraction, rounding, instruction ordering, stage-specific optimisation. None of that was
-tested here, so none of it is a finding; the report carries the list under
-`hypothesesNotTested` so it cannot be read as a conclusion.
+Query parameter for a driver check: `?sweepFrames=0,20,63,132`. Absent means the whole
+fixture.
 
 ```text
-GPU / browser / drawingBuffer                                    PENDING
-Diagnostic A  unique hashes and frequency, per mode, per frame    PENDING
-Diagnostic B  pixel and channel diff, byte-delta histogram        PENDING
-Alpha plane exact? RGB-only difference?                           PENDING
-Diagnostic C  centre diff per route pair, ULP histogram           PENDING
-Diagnostic D  frame 20 vs 63 vs 132                               PENDING
-CLASSIFICATION                                                    PENDING
+GPU / browser / drawingBuffer                                     PENDING
+per-frame centre / distance / framebuffer tables                  PENDING
+sweep summary with worst-case frame numbers                       PENDING
+allWithinNumericBound                                             PENDING
 ```
 
 Nothing above is estimated or extrapolated.
@@ -576,6 +641,43 @@ report.
 
 ---
 
+
+### 7.2 Full-fixture sweep self-test
+
+`?sweepFrames=0,20,63,132` and then `?sweepFrames=20` on this container.
+
+```text
+finishedAt            set
+GL errors             0        pageerror events 0
+buffer                386 x 386, pixelRatio 1
+centre route          production-attribute
+numeric bound         1e-06
+```
+
+```text
+frame   centre maxAbsXYZ   diffComps   ULP   centre vs CPU   distance   pixels   alpha
+    0     0.000e+00            0         0     3.725e-08      0.0e+00    0 diff   same
+   20     0.000e+00            0         0     4.470e-08      0.0e+00    0 diff   same
+   63     0.000e+00            0         0     4.470e-08      0.0e+00    0 diff   same
+  132     0.000e+00            0         0     5.215e-08      0.0e+00    0 diff   same
+
+summary   framesCompared 4, framesPixelIdentical 4, framesWithPixelDifference 0
+          worstCenterVsCpuMaxAbs 5.215406e-08 @frame 132
+          framesWithAlphaDifference none, framesWithNonFinite none
+          framesOutsideNumericBound none, allWithinNumericBound true
+acceptance rule 'pixel-identical', ruleChangedByThisRun false
+```
+
+Every per-frame field and every summary field is populated, each worst case carries its
+frame number, and `acceptance.ruleChangedByThisRun` is `false` — the harness records what
+the current rule says and does not touch it. On this renderer the centre difference is
+again zero everywhere, so the numbers that matter will come from the real GPU; what the
+self-test establishes is that the sweep measures and summarises correctly, and that the
+centre-vs-CPU figures match the correctness run frame for frame (3.725e-08 / 4.470e-08 /
+5.215e-08), which is how the sweep is known to be comparing the same thing.
+
+---
+
 ## 8. Gate 4B-1 known bug (§18)
 
 `isolationOptionsFromUrl()` overwrote the default `basisCounts` with `[0]` whenever the
@@ -595,6 +697,21 @@ Diagnostic harness only; no production path.
 ---
 
 ## 9. Changes
+
+Full-fixture sweep commit:
+
+```text
+edit  src/scripts/chat/uika-native/uika-predeform-investigation.ts
+        runSweep(): all 192 frames, one comparison each, per-frame centre / distance /
+        framebuffer metrics and a worst-case summary carrying frame numbers;
+        classification no longer uses maxUlp — absolute difference, determinism and
+        non-finite values only; absAtMaxUlp added to every centre comparison
+edit  src/pages/uika-native-predeform-benchmark.astro
+        the third button, the sweep summary table and a per-frame table for any frame
+        that is not pixel-identical
+edit  docs/UIKA_NATIVE_RUNTIME_GATE4B2A_PREDEFORMATION_POC.md
+        classification B recorded, the ULP-classifier correction, the sweep plan
+```
 
 Difference-investigation commit:
 
