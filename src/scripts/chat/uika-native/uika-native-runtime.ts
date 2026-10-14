@@ -39,6 +39,10 @@ export interface UikaNativeRuntimeReport {
     renderedFrames: number;
     glErrorCount: number;
     frameMs: { sort: number; draw: number; total: number };
+    renderInterval: {
+        count: number; p50: number; p95: number; p99: number; max: number;
+        over33: number; over50: number; over100: number;
+    };
     /** Proof that no LAM OAC object exists on the native path. */
     oacFreeCheck: Record<string, boolean>;
     errors: string[];
@@ -57,6 +61,7 @@ export class UikaNativeRuntime {
         renderedFrames: 0,
         glErrorCount: 0,
         frameMs: { sort: 0, draw: 0, total: 0 },
+        renderInterval: { count: 0, p50: 0, p95: 0, p99: 0, max: 0, over33: 0, over50: 0, over100: 0 },
         oacFreeCheck: {},
         errors: [],
     };
@@ -64,6 +69,11 @@ export class UikaNativeRuntime {
     private asset: UikaNativeAsset | null = null;
     private viewer: UikaGaussianViewer | null = null;
     private rafId: number | null = null;
+    /**
+     * Optional per-frame hook, called just before the draw. Gate 3 uses it to advance a
+     * fixed A2E replay. It owns no renderer state; all it may do is push weights.
+     */
+    private expressionSource: (() => void) | null = null;
 
     constructor(private readonly container: HTMLElement) {}
 
@@ -153,11 +163,45 @@ export class UikaNativeRuntime {
         };
     }
 
+    /** Render-to-render wall clock, for v1.1 Gate 3 §11. */
+    private readonly renderIntervals: number[] = [];
+    private lastRenderAt = 0;
+
+    private recordRenderInterval(): void {
+        const now = performance.now();
+        if (this.lastRenderAt > 0) {
+            const dt = now - this.lastRenderAt;
+            this.renderIntervals.push(dt);
+            if (this.renderIntervals.length > 4000) this.renderIntervals.shift();
+            const r = this.report.renderInterval;
+            r.count++;
+            if (dt > 33) r.over33++;
+            if (dt > 50) r.over50++;
+            if (dt > 100) r.over100++;
+            if (dt > r.max) r.max = dt;
+            const sorted = [...this.renderIntervals].sort((a, b) => a - b);
+            const at = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+            r.p50 = at(0.5);
+            r.p95 = at(0.95);
+            r.p99 = at(0.99);
+        }
+        this.lastRenderAt = now;
+    }
+
     private startRenderLoop(): void {
         if (this.rafId !== null) return;
         const tick = () => {
             if (!this.viewer) return;
+            if (this.expressionSource) {
+                try {
+                    this.expressionSource();
+                } catch (error: any) {
+                    this.report.errors.push(`expressionSource: ${error?.message || error}`);
+                    this.expressionSource = null;
+                }
+            }
             this.viewer.render();
+            this.recordRenderInterval();
             const stats = this.viewer.stats;
             this.report.renderedFrames = stats.renderedFrames;
             this.report.glErrorCount = stats.glErrorCount;
@@ -169,6 +213,17 @@ export class UikaNativeRuntime {
             this.rafId = requestAnimationFrame(tick);
         };
         this.rafId = requestAnimationFrame(tick);
+    }
+
+    /** Install (or clear) the per-frame expression source. */
+    setExpressionSource(source: (() => void) | null): void {
+        this.expressionSource = source;
+    }
+
+    /** Push weights straight to the GPU. The renderer is never recreated. */
+    applyWeights(weights: Float32Array): void {
+        if (!this.viewer) throw new Error('UIKA Native: not initialized');
+        this.viewer.setExpressionWeights(weights);
     }
 
     /**

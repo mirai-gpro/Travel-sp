@@ -1,0 +1,168 @@
+---
+// UIKA Native Runtime Architecture Correction v1.1 — Gate 3 fixed real-A2E replay.
+//
+// Isolated PoC route. No Live, no Socket.IO, no AudioContext, no LAMAvatar,
+// no LAMWebSocketManager, no LiveAudioManager, no GaussianSplatRenderer.
+// Not wired into any Travel-sp screen.
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UIKA Native v1 — Gate 3 fixed A2E replay</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: #111; color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    #viewer {
+      width: min(720px, calc(100vw - 32px)); aspect-ratio: 1 / 1; position: relative;
+      overflow: hidden; background: #000; border: 1px solid #444;
+    }
+    #viewer :global(canvas) { width: 100% !important; height: 100% !important; display: block; }
+    .row { width: min(720px, calc(100vw - 32px)); display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 8px 10px; border: 1px solid #555; background: #222; color: #eee; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    textarea {
+      width: min(720px, calc(100vw - 32px)); height: 70px; background: #181818; color: #ddd;
+      border: 1px solid #444; padding: 8px; font: inherit;
+    }
+    #status {
+      width: min(720px, calc(100vw - 32px)); min-height: 220px; margin: 0; white-space: pre-wrap;
+      overflow-wrap: anywhere; padding: 12px; border: 1px solid #444; background: #181818;
+    }
+    .note { width: min(720px, calc(100vw - 32px)); color: #999; font-size: 12px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>UIKA Native v1 — Gate 3 fixed real-A2E replay</h1>
+  <div id="viewer"></div>
+  <div class="row">
+    <button data-load="localStorage" disabled>load fixture: localStorage</button>
+    <button data-load="json" disabled>load fixture: pasted JSON</button>
+    <button data-start disabled>start replay</button>
+    <button data-stop disabled>stop</button>
+  </div>
+  <textarea id="fixtureJson" placeholder='Paste the output of __a2eCaptureJson() here, or append ?fixture=/path/to/capture.json to the URL.'></textarea>
+  <p class="note">
+    The A2E sequence must be a real capture recorded with <code>?a2eCapture=1</code>.
+    No synthetic expression data is generated here: without a real fixture this page
+    reports the error and plays nothing.
+  </p>
+  <pre id="status">initializing...</pre>
+
+  <script>
+    import { UikaNativeRuntime } from '../scripts/chat/uika-native/uika-native-runtime';
+    import { UikaNativeReplay } from '../scripts/chat/uika-native/uika-native-replay';
+
+    const container = document.getElementById('viewer');
+    const statusEl = document.getElementById('status');
+    const jsonEl = document.getElementById('fixtureJson') as HTMLTextAreaElement | null;
+    if (!(container instanceof HTMLElement) || !(statusEl instanceof HTMLElement) || !jsonEl) {
+      throw new Error('UIKA Native Gate 3: page elements missing');
+    }
+
+    const runtime = new UikaNativeRuntime(container);
+    const replay = new UikaNativeReplay((weights) => runtime.applyWeights(weights));
+    (window as any).__uikaNativeV1 = runtime;
+    (window as any).__uikaNativeReplay = replay;
+
+    let lastError: string | null = null;
+
+    const buttons = {
+      localStorage: document.querySelector<HTMLButtonElement>('[data-load="localStorage"]')!,
+      json: document.querySelector<HTMLButtonElement>('[data-load="json"]')!,
+      start: document.querySelector<HTMLButtonElement>('[data-start]')!,
+      stop: document.querySelector<HTMLButtonElement>('[data-stop]')!,
+    };
+
+    const renderStatus = () => {
+      const stats = replay.getStats();
+      statusEl.textContent = JSON.stringify({
+        runtime: runtime.report,
+        fixture: replay.getFixture(),
+        mapping: replay.getMapping(),
+        replay: stats,
+        lastError,
+      }, null, 2);
+      const ready = runtime.report.ready;
+      buttons.localStorage.disabled = !ready;
+      buttons.json.disabled = !ready;
+      buttons.start.disabled = !ready || !replay.getFixture() || stats.running;
+      buttons.stop.disabled = !stats.running;
+    };
+
+    const guard = (fn: () => unknown) => {
+      try {
+        lastError = null;
+        fn();
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA NATIVE GATE3]', error);
+      }
+      renderStatus();
+    };
+
+    const bind = () => {
+      const asset = runtime.getAsset();
+      if (!asset) throw new Error('asset is not loaded');
+      const mapping = replay.bindBasis(asset.basis.names);
+      console.log('[UIKA NATIVE GATE3] fixture bound', replay.getFixture(), mapping);
+    };
+
+    buttons.localStorage.addEventListener('click', () => guard(() => {
+      replay.loadFromLocalStorage();
+      bind();
+    }));
+    buttons.json.addEventListener('click', () => guard(() => {
+      replay.loadFromJson(jsonEl.value, 'pasted JSON');
+      bind();
+    }));
+    buttons.start.addEventListener('click', () => guard(() => {
+      replay.start_();
+      runtime.setExpressionSource(() => replay.tick());
+    }));
+    buttons.stop.addEventListener('click', () => guard(() => {
+      replay.stop();
+      runtime.setExpressionSource(null);
+      runtime.setNeutral();
+    }));
+
+    renderStatus();
+    const timer = window.setInterval(renderStatus, 250);
+
+    runtime.initializeNeutral()
+      .then(async () => {
+        renderStatus();
+        let fixtureUrl: string | null = null;
+        try { fixtureUrl = new URLSearchParams(location.search).get('fixture'); } catch { /* noop */ }
+        if (fixtureUrl) {
+          try {
+            lastError = null;
+            await replay.loadFromUrl(fixtureUrl);
+            bind();
+          } catch (error: any) {
+            lastError = error?.message || String(error);
+            console.error('[UIKA NATIVE GATE3]', error);
+          }
+        }
+        renderStatus();
+      })
+      .catch((error) => {
+        lastError = error?.message || String(error);
+        renderStatus();
+        console.error('[UIKA NATIVE GATE3 PAGE]', error);
+      });
+
+    window.addEventListener('beforeunload', () => {
+      window.clearInterval(timer);
+      runtime.dispose();
+    }, { once: true });
+  </script>
+</body>
+</html>
