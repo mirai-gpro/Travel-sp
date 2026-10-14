@@ -184,11 +184,22 @@ export function isolationOptionsFromUrl(): UikaDrawIsolationOptions {
         const meas = Number(q.get('measureMs'));
         if (Number.isFinite(warm) && warm > 0) o.warmupMs = warm;
         if (Number.isFinite(meas) && meas > 0) o.measureMs = meas;
-        const scales = (q.get('scales') || '').split(',').map(Number).filter((v) => v > 0);
-        if (scales.length > 0) o.scales = scales;
-        const counts = (q.get('basisCounts') || '').split(',').map(Number)
-            .filter((v) => Number.isInteger(v) && v >= 0);
-        if (counts.length > 0) o.basisCounts = counts;
+        // Parse a list ONLY when the parameter is actually present. Gate 4B-1 Run 1 lost
+        // four of its five Diagnostic 3 points to the absent case: (null || '') is '',
+        // ''.split(',') is [''], Number('') is 0, and 0 passes an "integer >= 0" filter, so
+        // the default [0, 8, 16, 32, 51] was overwritten with [0]. `scales` survived only
+        // because its filter is v > 0, which happens to reject that same 0.
+        const rawScales = q.get('scales');
+        if (rawScales !== null) {
+            const scales = rawScales.split(',').map(Number).filter((v) => v > 0);
+            if (scales.length > 0) o.scales = scales;
+        }
+        const rawCounts = q.get('basisCounts');
+        if (rawCounts !== null) {
+            const counts = rawCounts.split(',').map(Number)
+                .filter((v) => Number.isInteger(v) && v >= 0);
+            if (counts.length > 0) o.basisCounts = counts;
+        }
         if (q.get('d3') === '1') o.forceDiagnostic3 = true;
         if (q.get('d3') === '0') o.forceDiagnostic3 = false;
         if (q.get('allowSoftware') === '1') o.allowSoftware = true;
