@@ -165,32 +165,96 @@ and the new CPU split reports selection ~0.0 ms, mapper ~0.1 ms, upload p50 0.2 
 
 ---
 
-## 6. Results — to be filled from the real-GPU run
+## 6. Results
+
+### 6.1 Run 1 — real GPU, 2026-10-14 (INCOMPLETE)
+
+The user ran `/uika-native-benchmark` on the real Windows PC in Chrome and reported the
+result JSON. Official verdict for that run, as set by the user:
 
 ```text
-OS / browser                 PENDING
-GPU vendor / renderer        PENDING
-software renderer ruled out  PENDING
-canvas CSS / drawingBuffer / DPR   PENDING
-WebGL limits                 PENDING
-
-Test A   fps / p50 / p95 / p99     PENDING
-Test B   fps / p50 / p95 / p99     PENDING
-Test C   fps / p50 / p95 / p99     PENDING
-Test C   expression diagnostics    PENDING
-CPU timing breakdown               PENDING
-GPU timer results                  PENDING
-GL / page errors                   PENDING
-OAC-free                           PENDING
-
-GATE4A = PENDING
+GATE4A (Run 1) = INCOMPLETE
+reason          Test A  visibilityLostMs = 17624.9 , valid = false
 ```
 
-Nothing above is estimated or extrapolated from the software-rendered numbers.
+Test A is therefore not usable as a measurement. Tests B and C were `valid`, and the
+figures below are the ones the user quoted from the exported JSON. Nothing here is
+estimated, interpolated or extrapolated; fields the user did not quote are recorded as
+not reported rather than filled in.
+
+```text
+Test B (expression hold, no sort)
+  effectiveFPS        13.60
+  sortRuns            0
+  GPU draw p50        72.90 ms
+  GPU draw p95        73.74 ms
+
+Test C (replay + sort)
+  effectiveFPS        13.01
+  GPU draw p50        73.93 ms
+  GPU draw p95        78.43 ms
+  GPU sort p50         6.81 ms
+  GPU sort p95         7.51 ms
+
+CPU stages (Tests B/C)   0.1 – 0.2 ms per stage
+
+OS / browser                       not reported in this record
+GPU vendor / renderer              not reported in this record
+software renderer ruled out        not reported in this record
+canvas CSS / drawingBuffer / DPR   not reported in this record
+WebGL limits                       not reported in this record
+wall-clock p99                     not reported in this record
+Test C expression diagnostics      not reported in this record
+GL / page errors                   not reported in this record
+OAC-free                           not reported in this record
+```
+
+Recorded as instructed, as a candidate only and not as a Gate 4A verdict:
+
+```text
+primary bottleneck candidate = GPU draw / 133541 x 51 basis evaluation
+```
+
+Basis for calling it a candidate, from the two valid tests only: Test B has
+`sortRuns = 0` and still shows GPU draw p50 72.90 ms, and the CPU stages are 0.1–0.2 ms,
+so neither sorting nor CPU work accounts for the frame time in that run. GPU sort adds
+~6.8 ms p50 in Test C. No cause beyond that is asserted here.
+
+### 6.2 Run 2 — clean real-GPU rerun (PENDING)
+
+Run 1 cannot carry a formal Gate 4A PASS/FAIL because Test A is invalid. A clean rerun of
+the same page, with no code change and no optimization, is required first.
+
+Conditions for Run 2, as instructed:
+
+```text
+same route            /uika-native-benchmark , harness unchanged
+DevTools              closed
+tab                   never hidden, never switched away from, window never minimised
+required outcome      Test A, B and C all valid: true , visibilityLostMs = 0
+then                  Export JSON
+```
+
+Also to be recorded from Run 2, without changing the harness for it: whether the
+anomalous GPU timer sample `184467.440737 ms` — one occurrence in Test A and one in
+Test B of Run 1 — appears again.
+
+Judgement for Run 2 uses `effectiveFPS`, wall-clock frame interval p95/p99 and GPU timer
+p50/p95/p99 — not mean and not max — then the rules already implemented in §4.
+
+```text
+Test C   effectiveFPS >= 30 and p95 <= 33.3 ms and p99 <= 50 ms   PASS
+Test C   effectiveFPS < 30                                        FAIL
+Test C   fps >= 30 but p95/p99 over                               BORDERLINE
+
+GATE4A (Run 2) = PENDING
+```
+
+No Gate 4B optimization and no Live work until Run 2 is judged.
 
 ---
 
-## 7. Changes in this commit
+## 7. Changes in the harness commit (`10e5636`)
 
 ```text
 new   src/pages/uika-native-benchmark.astro              Gate 4A route and controls
@@ -211,3 +275,7 @@ against baseline `e86f066`: `LAMAvatar.astro`, `lam-websocket-manager.ts`,
 mapper change), the Gate 3 fixture, and the old Gate 1/2 files
 (`uika-render-adapter.ts`, `uika-native-driver.ts`, `uika-deformation.ts`), which are kept
 until Live passes. `tsc --noEmit` reports the same 9 pre-existing errors.
+
+The Run 1 record in §6 was added in a later, documentation-only commit: no file under
+`src/`, `support-base/` or `tools/` was touched for it, and the harness is byte-identical
+to the one Run 1 was measured with.
