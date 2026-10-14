@@ -118,6 +118,19 @@ export interface UikaFrameTick {
  */
 export type UikaSortStage = 'full' | 'distance' | 'distance+cpuSort';
 
+/**
+ * Gate 4B-2B-2 diagnostic: when the distance/sort pass is submitted to the GPU within a
+ * frame.
+ *
+ *   pre-draw    `if (sortDirty) runSort(); renderer.render();` — the production order
+ *   post-draw   `renderer.render(); if (sortDirty) runSort();`
+ *
+ * Both happen inside the same synchronous render() call, so the expression weights, the
+ * camera, the MVP and the pre-deformed centres are the same for the draw and for the
+ * distance pass. The viewer checks that and counts any mismatch.
+ */
+export type UikaSortSubmissionPhase = 'pre-draw' | 'post-draw';
+
 /** Gate 4B-1 / 4B-2A diagnostic: a fingerprint of one rendered frame. */
 export interface UikaDrawingBufferHash {
     width: number;
@@ -287,6 +300,11 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     private sortLifecycle: UikaSortLifecycleRecorder | null = null;
     private frameTickHook: ((tick: UikaFrameTick) => void) | null = null;
     private sortStage: UikaSortStage = 'full';
+    private sortSubmissionPhase: UikaSortSubmissionPhase = 'pre-draw';
+    /** Bumped on every weight upload, so a frame can tell whether the weights moved. */
+    private weightUploadSeq = 0;
+    /** Gate 4B-2B-2: frames where the post-draw sort would have read changed state. */
+    private phaseStateMismatches = 0;
 
     /**
      * The production basis loop, exactly as SplatMaterial.js emits it. Matching this
@@ -591,6 +609,42 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return this.sortStage;
     }
 
+    /**
+     * Gate 4B-2B-2 §5. Diagnostic only; `pre-draw` is the production order and the
+     * default, so with no call the frame is byte-for-byte the production sequence.
+     */
+    setDiagnosticSortSubmissionPhase(phase: UikaSortSubmissionPhase): void {
+        this.sortSubmissionPhase = phase;
+        this.sortDirty = true;
+    }
+
+    getDiagnosticSortSubmissionPhase(): UikaSortSubmissionPhase {
+        return this.sortSubmissionPhase;
+    }
+
+    /** Gate 4B-2B-2 §8: is a sort in flight right now? */
+    isSortPending(): boolean {
+        return this.sortPending;
+    }
+
+    /** Gate 4B-2B-2 §8: so a drain can suspend sorting and put it back as it was. */
+    isSortSuspended(): boolean {
+        return this.sortSuspended;
+    }
+
+    /**
+     * The state the distance pass reads: the weight-upload sequence and the three
+     * matrices the MVP is built from. Compared across the draw in post-draw mode.
+     */
+    private sortStateKey(): string {
+        let sum = 0;
+        const add = (elements: number[]) => { for (let i = 0; i < elements.length; i++) sum += elements[i]; };
+        add(this.camera.matrixWorld.elements);
+        add(this.camera.projectionMatrix.elements);
+        add(this.splatMesh.matrixWorld.elements);
+        return `${this.weightUploadSeq}|${sum}`;
+    }
+
     /** True while the PoC render variant is installed. */
     isPredeformActive(): boolean {
         return this.predeformActive;
@@ -649,6 +703,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
             sortRuns: this.sortRuns,
             basisCount: this.splatMesh ? this.splatMesh.uikaBasisCount : 0,
             glErrorCount: this.glErrorCount,
+            phaseStateMismatches: this.phaseStateMismatches,
             timing: { ...this.lastTiming },
             hasFlameModel: this.splatMesh ? this.splatMesh.flameModel !== undefined : null,
             hasSkeleton: this.splatMesh ? this.splatMesh.skeleton !== undefined : null,
@@ -768,6 +823,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         if (!this.splatMesh) fail('loadCanonicalPly() has not run');
         this.splatMesh.setUikaWeights(weights);
         this.sortDirty = true;
+        this.weightUploadSeq++;
         // Gate 4B-2A PoC only; null on every production route.
         this.expressionWeightHook?.();
     }
@@ -834,17 +890,32 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         const focalLengthX = focalLengthY * this.camera.aspect;
         this.splatMesh.updateUniforms(renderDimensions, focalLengthX, focalLengthY, false, 1.0, 1.0);
 
-        const sortStarted = performance.now();
+        const postDraw = this.sortSubmissionPhase === 'post-draw';
         const sortRunsBefore = this.sortRuns;
-        if (this.sortDirty) this.runSort();
-        const sortMs = performance.now() - sortStarted;
-        const sortSubmitted = this.sortRuns !== sortRunsBefore;
+        const stateBeforeDraw = postDraw ? this.sortStateKey() : null;
+
+        // Production order: the distance pass is submitted before this frame's draw.
+        let sortMs = 0;
+        if (!postDraw) {
+            const sortStarted = performance.now();
+            if (this.sortDirty) this.runSort();
+            sortMs = performance.now() - sortStarted;
+        }
 
         const drawStarted = performance.now();
         this.gpuTimer?.beginDraw();
         this.renderer.render(this.scene, this.camera);
         this.gpuTimer?.endDraw();
         const drawMs = performance.now() - drawStarted;
+
+        // Gate 4B-2B-2 PoC order: the same frame's draw is submitted first.
+        if (postDraw) {
+            if (this.sortStateKey() !== stateBeforeDraw) this.phaseStateMismatches++;
+            const sortStarted = performance.now();
+            if (this.sortDirty) this.runSort();
+            sortMs = performance.now() - sortStarted;
+        }
+        const sortSubmitted = this.sortRuns !== sortRunsBefore;
 
         // Gate 4B-1 verification only, and never inside a measurement window: the
         // readback stalls the pipeline. Inert when nothing requested a hash.
