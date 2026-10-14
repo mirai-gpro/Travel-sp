@@ -12,8 +12,24 @@
 import { loadCapturedA2E, type CapturedA2E } from '../a2e-replay';
 import { mapA2eToUikaBasis } from './uika-expression-mapper';
 
+/**
+ * Any JSON dropped into ./fixtures is bundled automatically, so landing the captured file
+ * needs no code change. Raw text is imported (not parsed JSON) so the SHA-256 is taken
+ * over the exact bytes on disk.
+ */
+const BUNDLED_FIXTURES = import.meta.glob('./fixtures/*.json', {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+}) as Record<string, string>;
+
 /** Quiet tail appended to each loop so the pass restarts from a closed mouth. */
 const LOOP_GAP_MS = 1000;
+
+/** The A2E output contract Gate 3 accepts, per v1.1 Gate 3 §1. */
+export const GATE3_EXPECTED_INPUT_CHANNELS = 52;
+export const GATE3_EXPECTED_BASIS_CHANNELS = 51;
+export const GATE3_EXPECTED_DROPPED_NAMES = ['tongueOut'] as const;
 
 /** Mouth channels reported for inspection, per v1.1 Gate 3 §10. */
 const WATCHED_CHANNELS = [
@@ -24,11 +40,24 @@ const WATCHED_CHANNELS = [
     'mouthPucker',
 ] as const;
 
-export type UikaReplayFixtureOrigin = 'localStorage' | 'url' | 'inline';
+export type UikaReplayFixtureOrigin = 'bundled' | 'localStorage' | 'url' | 'inline';
+
+export interface UikaGate3Check {
+    name: string;
+    pass: boolean;
+    detail: string;
+}
+
+export interface UikaGate3Validation {
+    pass: boolean;
+    checks: UikaGate3Check[];
+}
 
 export interface UikaReplayFixtureInfo {
     origin: UikaReplayFixtureOrigin;
     detail: string;
+    /** SHA-256 of the exact bytes loaded. This is the fixture's Source of Truth. */
+    sha256: string;
     fps: number;
     frameCount: number;
     durationMs: number;
@@ -74,25 +103,97 @@ function fail(message: string): never {
     throw new Error(`UIKA Native Replay: ${message}`);
 }
 
-function validateCapture(data: any, detail: string): CapturedA2E {
-    if (!data || typeof data !== 'object') fail(`${detail}: not an object`);
-    if (typeof data.fps !== 'number' || !(data.fps > 0)) fail(`${detail}: fps=${data.fps}`);
-    if (!Array.isArray(data.expression_names) || data.expression_names.length === 0) {
-        fail(`${detail}: expression_names is empty`);
-    }
-    if (!Array.isArray(data.frames) || data.frames.length === 0) fail(`${detail}: frames is empty`);
-    if (!Array.isArray(data.frames[0])) fail(`${detail}: frames[0] is not an array`);
-    const width = data.expression_names.length;
+async function sha256Hex(text: string): Promise<string> {
+    const bytes = new TextEncoder().encode(text);
+    if (!globalThis.crypto?.subtle) return 'unavailable (no Web Crypto)';
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The structural half of the v1.1 Gate 3 §1 contract. Every check is reported, pass or
+ * fail, so a rejected fixture says exactly which rule it broke.
+ */
+export function validateGate3Fixture(data: any): UikaGate3Validation {
+    const checks: UikaGate3Check[] = [];
+    const add = (name: string, pass: boolean, detail: string) => checks.push({ name, pass, detail });
+
+    const isObject = !!data && typeof data === 'object';
+    add('is an object', isObject, isObject ? 'ok' : `typeof ${typeof data}`);
+    if (!isObject) return { pass: false, checks };
+
+    const fpsOk = typeof data.fps === 'number' && data.fps > 0;
+    add('fps > 0', fpsOk, `fps=${data.fps}`);
+
+    const namesIsArray = Array.isArray(data.expression_names);
+    const nameCount = namesIsArray ? data.expression_names.length : -1;
+    add(`expression_names.length == ${GATE3_EXPECTED_INPUT_CHANNELS}`,
+        nameCount === GATE3_EXPECTED_INPUT_CHANNELS, `length=${nameCount}`);
+
+    const framesIsArray = Array.isArray(data.frames);
+    const frameCount = framesIsArray ? data.frames.length : -1;
+    add('frames.length > 0', framesIsArray && frameCount > 0, `length=${frameCount}`);
+
+    if (!framesIsArray || frameCount === 0) return { pass: false, checks };
+
+    let nonArray = 0;
+    let wrongWidth = 0;
+    let nanCount = 0;
+    let infCount = 0;
+    let otherNonFinite = 0;
     for (let i = 0; i < data.frames.length; i++) {
         const f = data.frames[i];
-        if (!Array.isArray(f) || f.length !== width) {
-            fail(`${detail}: frame ${i} has ${Array.isArray(f) ? f.length : 'non-array'} values, expected ${width}`);
-        }
+        if (!Array.isArray(f)) { nonArray++; continue; }
+        if (f.length !== GATE3_EXPECTED_INPUT_CHANNELS) wrongWidth++;
         for (let k = 0; k < f.length; k++) {
-            if (!Number.isFinite(f[k])) fail(`${detail}: frame ${i} channel ${k} is not finite`);
+            const v = f[k];
+            if (typeof v !== 'number') { otherNonFinite++; continue; }
+            if (Number.isNaN(v)) nanCount++;
+            else if (!Number.isFinite(v)) infCount++;
         }
     }
-    return data as CapturedA2E;
+    add('every frame is an Array', nonArray === 0, `non-array frames=${nonArray}`);
+    add(`every frame length == ${GATE3_EXPECTED_INPUT_CHANNELS}`, wrongWidth === 0,
+        `wrong-width frames=${wrongWidth}`);
+    add('NaN == 0', nanCount === 0, `NaN values=${nanCount}`);
+    add('Inf == 0', infCount === 0, `Inf values=${infCount}`);
+    add('every value finite', nanCount === 0 && infCount === 0 && otherNonFinite === 0,
+        `NaN=${nanCount} Inf=${infCount} non-numeric=${otherNonFinite}`);
+
+    return { pass: checks.every((c) => c.pass), checks };
+}
+
+/**
+ * The mapping half of the v1.1 Gate 3 §1 contract, checked against the asset's own basis
+ * names rather than against a hard-coded list.
+ */
+export function validateGate3Mapping(
+    inputNames: readonly string[],
+    basisNames: readonly string[],
+    mappedLength: number,
+): UikaGate3Validation {
+    const checks: UikaGate3Check[] = [];
+    const add = (name: string, pass: boolean, detail: string) => checks.push({ name, pass, detail });
+
+    const basisSet = new Set(basisNames);
+    const inputSet = new Set(inputNames);
+    const dropped = inputNames.filter((n) => !basisSet.has(n));
+    const missing = basisNames.filter((n) => !inputSet.has(n));
+    const expectedDropped = [...GATE3_EXPECTED_DROPPED_NAMES];
+
+    add(`basisCount == ${GATE3_EXPECTED_BASIS_CHANNELS}`,
+        basisNames.length === GATE3_EXPECTED_BASIS_CHANNELS, `basisCount=${basisNames.length}`);
+    add(`mappedCount == ${GATE3_EXPECTED_BASIS_CHANNELS}`,
+        mappedLength === GATE3_EXPECTED_BASIS_CHANNELS, `mappedCount=${mappedLength}`);
+    add(`dropped == ${JSON.stringify(expectedDropped)}`,
+        JSON.stringify(dropped) === JSON.stringify(expectedDropped), `dropped=${JSON.stringify(dropped)}`);
+    add('basis missing == []', missing.length === 0, `missing=${JSON.stringify(missing)}`);
+
+    return { pass: checks.every((c) => c.pass), checks };
+}
+
+function describeFailure(validation: UikaGate3Validation): string {
+    return validation.checks.filter((c) => !c.pass).map((c) => `${c.name} (${c.detail})`).join('; ');
 }
 
 /**
@@ -108,6 +209,9 @@ export class UikaNativeReplay {
     private fixture: UikaReplayFixtureInfo | null = null;
     private mapping: UikaReplayMappingInfo | null = null;
     private basisNames: readonly string[] = [];
+
+    private lastValidation: UikaGate3Validation | null = null;
+    private lastMappingValidation: UikaGate3Validation | null = null;
 
     private start = 0;
     private running = false;
@@ -146,6 +250,15 @@ export class UikaNativeReplay {
         return this.mapping;
     }
 
+    getValidation(): { fixture: UikaGate3Validation | null; mapping: UikaGate3Validation | null } {
+        return { fixture: this.lastValidation, mapping: this.lastMappingValidation };
+    }
+
+    /** Names of the JSON files bundled from ./fixtures, if any. */
+    static listBundledFixtures(): string[] {
+        return Object.keys(BUNDLED_FIXTURES).sort();
+    }
+
     /** Returns a snapshot, so a caller can diff two reads. */
     getStats(): UikaReplayStats {
         const sorted = [...this.uploadMs].sort((a, b) => a - b);
@@ -164,43 +277,74 @@ export class UikaNativeReplay {
         };
     }
 
+    /** Load the fixture committed under ./fixtures. Throws if none is bundled. */
+    async loadBundled(name?: string): Promise<UikaReplayFixtureInfo> {
+        const keys = UikaNativeReplay.listBundledFixtures();
+        if (keys.length === 0) {
+            fail('no fixture is bundled under src/scripts/chat/uika-native/fixtures/. '
+                 + 'See that directory\'s README.md for how to capture one. '
+                 + 'No synthetic expression data is generated as a substitute.');
+        }
+        const key = name ? keys.find((k) => k.endsWith(name)) : keys[0];
+        if (!key) fail(`bundled fixture "${name}" not found; have ${JSON.stringify(keys)}`);
+        return this.adopt(BUNDLED_FIXTURES[key], 'bundled', key);
+    }
+
     /** Load the capture saved by `?a2eCapture=1`. Throws if there is none. */
-    loadFromLocalStorage(): UikaReplayFixtureInfo {
+    async loadFromLocalStorage(): Promise<UikaReplayFixtureInfo> {
         const data = loadCapturedA2E();
         if (!data) {
             fail('no captured A2E found in localStorage (key "a2eCapture.v1"). '
                  + 'Record one first with ?a2eCapture=1 on a page that runs a real Live turn. '
                  + 'No synthetic expression data is generated as a substitute.');
         }
-        return this.adopt(data, 'localStorage', 'localStorage["a2eCapture.v1"]');
+        return this.adopt(JSON.stringify(data), 'localStorage', 'localStorage["a2eCapture.v1"]');
     }
 
     /** Load a capture JSON exported from `__a2eCaptureJson()`. */
     async loadFromUrl(url: string): Promise<UikaReplayFixtureInfo> {
         const response = await fetch(url, { cache: 'no-store' });
         if (!response.ok) fail(`fetch ${url} failed: ${response.status} ${response.statusText}`);
-        return this.adopt(await response.json(), 'url', url);
+        return this.adopt(await response.text(), 'url', url);
     }
 
     /** Load a capture JSON pasted into the page. */
-    loadFromJson(json: string, detail = 'inline JSON'): UikaReplayFixtureInfo {
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(json);
-        } catch (error: any) {
-            fail(`${detail}: ${error?.message || error}`);
-        }
-        return this.adopt(parsed, 'inline', detail);
+    async loadFromJson(json: string, detail = 'inline JSON'): Promise<UikaReplayFixtureInfo> {
+        return this.adopt(json, 'inline', detail);
     }
 
-    private adopt(raw: unknown, origin: UikaReplayFixtureOrigin, detail: string): UikaReplayFixtureInfo {
-        const data = validateCapture(raw, detail);
+    /**
+     * Parse, run the v1.1 Gate 3 §1 structural contract, and keep the data only if every
+     * check passes. A failing fixture is reported check by check and Gate 3 does not run.
+     */
+    private async adopt(
+        text: string,
+        origin: UikaReplayFixtureOrigin,
+        detail: string,
+    ): Promise<UikaReplayFixtureInfo> {
+        let raw: unknown;
+        try {
+            raw = JSON.parse(text);
+        } catch (error: any) {
+            fail(`${detail}: not valid JSON (${error?.message || error})`);
+        }
+
+        const validation = validateGate3Fixture(raw);
+        this.lastValidation = validation;
+        if (!validation.pass) {
+            this.data = null;
+            this.fixture = null;
+            fail(`${detail} failed the Gate 3 fixture contract: ${describeFailure(validation)}`);
+        }
+        const data = raw as CapturedA2E;
+        const sha256 = await sha256Hex(text);
         this.data = data;
         this.durationMs = (data.frames.length / data.fps) * 1000;
         this.periodMs = this.durationMs + LOOP_GAP_MS;
         this.fixture = {
             origin,
             detail,
+            sha256,
             fps: data.fps,
             frameCount: data.frames.length,
             durationMs: this.durationMs,
@@ -218,10 +362,24 @@ export class UikaNativeReplay {
      */
     bindBasis(basisNames: readonly string[]): UikaReplayMappingInfo {
         if (!this.data) fail('load a fixture first');
-        this.basisNames = basisNames;
         const inputNames = this.data.expression_names;
         const basisSet = new Set(basisNames);
         const inputSet = new Set(inputNames);
+
+        // Map one real frame so mappedCount is measured, not assumed.
+        const probe = mapA2eToUikaBasis(
+            { names: inputNames, values: this.data.frames[0] },
+            basisNames,
+        );
+        const mappingValidation = validateGate3Mapping(inputNames, basisNames, probe.weights.length);
+        this.lastMappingValidation = mappingValidation;
+        if (!mappingValidation.pass) {
+            this.basisNames = [];
+            this.mapping = null;
+            fail(`mapping contract failed: ${describeFailure(mappingValidation)}`);
+        }
+
+        this.basisNames = basisNames;
         this.mapping = {
             inputChannels: inputNames.length,
             outputChannels: basisNames.length,
