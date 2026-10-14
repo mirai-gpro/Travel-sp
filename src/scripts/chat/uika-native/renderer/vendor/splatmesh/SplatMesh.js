@@ -103,6 +103,7 @@ export class SplatMesh extends THREE.Mesh {
         this.uikaWeightData = null;
         this.uikaWeightTexture = null;
         this.uikaWeightTextureSize = null;
+        this.uikaSavedTextureState = null;
 
         // When true, will perform additional steps during rendering to address artifacts caused by the rendering of gaussians at a
         // substantially different resolution than that at which they were rendered during training. This will only work correctly
@@ -1339,6 +1340,12 @@ export class SplatMesh extends THREE.Mesh {
         this.uikaWeightTexture.needsUpdate = true;
         this.material.uniforms.uikaWeightTexture.value = this.uikaWeightTexture;
         this.material.uniformsNeedUpdate = true;
+        // Push it to the GPU now. three.js would otherwise only upload during the next
+        // renderer.render(), and the transform-feedback distance pass runs before that —
+        // which would sort this frame against the previous frame's weights.
+        if (this.renderer && typeof this.renderer.initTexture === 'function') {
+            this.renderer.initTexture(this.uikaWeightTexture);
+        }
     }
 
     /** UIKA MODIFICATION — (re)bind the basis uniforms, e.g. after a material rebuild. */
@@ -1617,10 +1624,46 @@ export class SplatMesh extends THREE.Mesh {
                         }
                     `;
                 } else {
+                    // UIKA MODIFICATION: evaluate the SAME animated centre the render shader
+                    // uses, from the SAME two textures, so sort order and draw order can never
+                    // disagree. gl_VertexID equals the global splat index because the centres
+                    // buffer is filled in splat-index order by getFloatCenters().
                     vsSource += `
                         uniform vec3 modelViewProj;
+                        uniform highp usampler2D uikaBasisTexture;
+                        uniform vec2 uikaBasisTextureSize;
+                        uniform highp usampler2D uikaWeightTexture;
+                        uniform vec2 uikaWeightTextureSize;
+                        uniform int uikaBasisCount;
+                        uniform int uikaGaussianCount;
+
+                        vec3 uikaBasisDelta(in int channel, in uint sIndex) {
+                            float d = float(sIndex + uint(uikaGaussianCount * channel)) / uikaBasisTextureSize.x;
+                            vec2 uv = vec2(fract(d), floor(d) / uikaBasisTextureSize.y);
+                            return uintBitsToFloat(texture(uikaBasisTexture, uv).rgb);
+                        }
+
+                        float uikaWeight(in int channel) {
+                            int texel = channel / 4;
+                            float d = float(texel) / uikaWeightTextureSize.x;
+                            vec2 uv = vec2(fract(d), floor(d) / uikaWeightTextureSize.y);
+                            vec4 packed = uintBitsToFloat(texture(uikaWeightTexture, uv));
+                            int lane = channel - texel * 4;
+                            if (lane == 1) return packed.g;
+                            if (lane == 2) return packed.b;
+                            if (lane == 3) return packed.a;
+                            return packed.r;
+                        }
+
                         void main(void) {
-                            distance = center.x * modelViewProj.x + center.y * modelViewProj.y + center.z * modelViewProj.z;
+                            vec3 animatedCenter = center.xyz;
+                            uint sIndex = uint(gl_VertexID);
+                            for (int k = 0; k < uikaBasisCount; ++k) {
+                                animatedCenter += uikaWeight(k) * uikaBasisDelta(k, sIndex);
+                            }
+                            distance = animatedCenter.x * modelViewProj.x +
+                                       animatedCenter.y * modelViewProj.y +
+                                       animatedCenter.z * modelViewProj.z;
                         }
                     `;
                 }
@@ -1684,6 +1727,15 @@ export class SplatMesh extends THREE.Mesh {
             } else {
                 this.distancesTransformFeedback.modelViewProjLoc =
                     gl.getUniformLocation(this.distancesTransformFeedback.program, 'modelViewProj');
+                // UIKA MODIFICATION: basis uniforms on the distance-computation program.
+                const uikaDtf = this.distancesTransformFeedback;
+                const uikaPgm = uikaDtf.program;
+                uikaDtf.uikaBasisTextureLoc = gl.getUniformLocation(uikaPgm, 'uikaBasisTexture');
+                uikaDtf.uikaBasisTextureSizeLoc = gl.getUniformLocation(uikaPgm, 'uikaBasisTextureSize');
+                uikaDtf.uikaWeightTextureLoc = gl.getUniformLocation(uikaPgm, 'uikaWeightTexture');
+                uikaDtf.uikaWeightTextureSizeLoc = gl.getUniformLocation(uikaPgm, 'uikaWeightTextureSize');
+                uikaDtf.uikaBasisCountLoc = gl.getUniformLocation(uikaPgm, 'uikaBasisCount');
+                uikaDtf.uikaGaussianCountLoc = gl.getUniformLocation(uikaPgm, 'uikaGaussianCount');
             }
 
             if (rebuildGPUObjects || rebuildBuffers) {
@@ -1830,6 +1882,63 @@ export class SplatMesh extends THREE.Mesh {
 
     }();
 
+    /**
+     * UIKA MODIFICATION — bind the expression basis onto the distance-computation program.
+     * Texture units 0 and 1 are used; three.js re-binds its own units on the next draw, so
+     * this does not leak into normal rendering.
+     * @param {WebGL2RenderingContext} gl The context.
+     */
+    bindUikaDistanceUniforms(gl) {
+        const dtf = this.distancesTransformFeedback;
+        if (!dtf || dtf.uikaBasisCountLoc === undefined || dtf.uikaBasisCountLoc === null) return;
+        if (this.uikaBasisCount === 0 || !this.uikaBasisTexture || !this.uikaWeightTexture) {
+            gl.uniform1i(dtf.uikaBasisCountLoc, 0);
+            return;
+        }
+        // three.js caches which texture is bound to which unit. Binding raw below would
+        // leave that cache stale and three.js would then skip re-binding its own textures,
+        // so remember the current state and put it back in restoreUikaDistanceTextures().
+        this.uikaSavedTextureState = {
+            activeTexture: gl.getParameter(gl.ACTIVE_TEXTURE),
+            unit0: (gl.activeTexture(gl.TEXTURE0), gl.getParameter(gl.TEXTURE_BINDING_2D)),
+            unit1: (gl.activeTexture(gl.TEXTURE1), gl.getParameter(gl.TEXTURE_BINDING_2D)),
+        };
+        const basisProps = this.renderer.properties.get(this.uikaBasisTexture);
+        const weightProps = this.renderer.properties.get(this.uikaWeightTexture);
+        if (!basisProps || !basisProps.__webglTexture || !weightProps || !weightProps.__webglTexture) {
+            // three.js has not uploaded the textures yet. Stay inert for this pass rather
+            // than sorting against a half-initialised basis.
+            gl.uniform1i(dtf.uikaBasisCountLoc, 0);
+            return;
+        }
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, basisProps.__webglTexture);
+        gl.uniform1i(dtf.uikaBasisTextureLoc, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, weightProps.__webglTexture);
+        gl.uniform1i(dtf.uikaWeightTextureLoc, 1);
+        gl.uniform2f(dtf.uikaBasisTextureSizeLoc, this.uikaBasisTextureSize.x, this.uikaBasisTextureSize.y);
+        gl.uniform2f(dtf.uikaWeightTextureSizeLoc, this.uikaWeightTextureSize.x, this.uikaWeightTextureSize.y);
+        gl.uniform1i(dtf.uikaBasisCountLoc, this.uikaBasisCount);
+        gl.uniform1i(dtf.uikaGaussianCountLoc, this.uikaGaussianCount);
+    }
+
+    /**
+     * UIKA MODIFICATION — undo the raw texture-unit binds from bindUikaDistanceUniforms so
+     * that three.js's cached state still describes the real GL state.
+     * @param {WebGL2RenderingContext} gl The context.
+     */
+    restoreUikaDistanceTextures(gl) {
+        const saved = this.uikaSavedTextureState;
+        if (!saved) return;
+        this.uikaSavedTextureState = null;
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, saved.unit0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, saved.unit1);
+        gl.activeTexture(saved.activeTexture);
+    }
+
     computeDistancesOnGPU = function() {
 
         const tempMatrix = new THREE.Matrix4();
@@ -1874,6 +1983,11 @@ export class SplatMesh extends THREE.Mesh {
                 }
             }
 
+            // UIKA MODIFICATION: bind the expression basis for the distance pass. These are
+            // the very texture objects the render material uses, so there is one Source of
+            // Truth for the animated centre.
+            this.bindUikaDistanceUniforms(gl);
+
             gl.bindBuffer(gl.ARRAY_BUFFER, this.distancesTransformFeedback.centersBuffer);
             gl.enableVertexAttribArray(this.distancesTransformFeedback.centersLoc);
             if (this.integerBasedDistancesComputation) {
@@ -1899,6 +2013,9 @@ export class SplatMesh extends THREE.Mesh {
             gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
 
             gl.disable(gl.RASTERIZER_DISCARD);
+
+            // UIKA MODIFICATION: put the texture units back the way three.js left them.
+            this.restoreUikaDistanceTextures(gl);
 
             const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
             gl.flush();
