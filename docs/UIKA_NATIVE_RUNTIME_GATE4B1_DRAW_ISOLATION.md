@@ -181,31 +181,148 @@ Query parameters for a quicker driver check: `?warmupMs=`, `?measureMs=`, `?scal
 software renderer and forces the conclusion to `BLOCKED` so it can never be mistaken for
 a result.
 
----
-
-## 6. Results — to be filled from the real-GPU run
+For the Diagnostic 3 completion run, the counts have to be passed explicitly:
 
 ```text
-GPU / browser / DPR                  PENDING
-variant proof                        PENDING
+/uika-native-draw-isolation?d3=1&basisCounts=0,8,16,32,51
+```
 
-Diagnostic 1  100%  buffer / fps / wall p50-p95-p99 / draw p50-p95-p99   PENDING
-Diagnostic 1   50%  buffer / fps / wall p50-p95-p99 / draw p50-p95-p99   PENDING
-Diagnostic 1   25%  buffer / fps / wall p50-p95-p99 / draw p50-p95-p99   PENDING
+§6.2 has the measured reason why the default does not survive on its own.
 
-Diagnostic 2  production 51-basis   fps / draw p50-p95-p99               PENDING
-Diagnostic 2  canonical no-basis    fps / draw p50-p95-p99               PENDING
+---
 
-Diagnostic 3  basis 0 / 8 / 16 / 32 / 51   draw p50-p95 / fps            PENDING
+## 6. Results
 
-raster share / basis share / base render share                           PENDING
-repeatability delta / literal-51 vs uniform-51 delta                     PENDING
+### 6.1 Run 1 — real GPU, 2026-10-14 (Diagnostics 1 and 2 valid, Diagnostic 3 incomplete)
+
+The user ran the page on the real GPU and reported the result. Diagnostics 1 and 2 stand;
+Diagnostic 3 came back with one point instead of five, for the reason in §6.2.
+
+```text
+variant proof      PASS
+
+rasterShare        47.7 %
+basisShare         56.4 %
+
+production draw p50   91.25 ms
+no-basis   draw p50   39.82 ms
+no-basis   FPS        23.82
+
+conclusion         = MIXED
+basisLoopDominant  = YES
+```
+
+What that fixes, and nothing beyond it:
+
+```text
+the 51-channel basis loop is a major bottleneck
+removing it entirely still does not reach 30 fps
+raster / base Gaussian render cannot be ignored either
+```
+
+Arithmetic on the reported numbers, not an interpretation: the loop accounts for
+91.25 - 39.82 = 51.43 ms of the production draw time, and what is left, 39.82 ms, is
+already above the 33.3 ms a 30 fps frame allows for everything including the sort and the
+CPU stages. 23.82 fps is 41.98 ms per frame.
+
+§7's caution applies to these two shares: `rasterShare` and `basisShare` are not
+orthogonal components of one budget and must not be added up to a 100 % breakdown. The
+resolution sweep lowers the raster work of the same 51-channel shader, so part of what it
+measures is also inside what the no-basis comparison measures.
+
+One fact to carry into the rerun, recorded without a cause attached: production draw p50
+here is 91.25 ms, while the Gate 4A clean rerun reported 74.67 ms for Test B — the same
+pose, the same resolution, the same shader. Both are real measurements from different
+runs. The shares above are computed only from comparisons inside one run, so they do not
+depend on the two runs being comparable; `repeatabilityDeltaMs` in the rerun will put a
+number on that spread, since Diagnostic 1 at 100 % and the Diagnostic 2 production point
+measure the identical configuration twice.
+
+Fields the user did not quote (per-measurement buffer dimensions, wall-clock percentiles,
+draw p95/p99, GPU sort, GL and page errors, invalid GPU timer samples, and whether the
+`184467.440737 ms` sample recurred) are not reproduced here and were not inferred.
+
+### 6.2 Why Diagnostic 3 came back with one point
+
+Reported from the JSON:
+
+```text
+diagnostic3.length           1
+basisCount                   0 only
+basisScalingFit              null
+literal51MinusUniform51Ms    null
+```
+
+The cause is in `isolationOptionsFromUrl()` in `uika-draw-isolation.ts`, and it is
+confirmed by reading the code and running the expression, not inferred from the symptom:
+
+```js
+const counts = (q.get('basisCounts') || '').split(',').map(Number)
+    .filter((v) => Number.isInteger(v) && v >= 0);
+if (counts.length > 0) o.basisCounts = counts;
+```
+
+With no `basisCounts` in the URL, `q.get('basisCounts')` is `null`, `(null || '')` is `''`,
+`''.split(',')` is `['']`, `Number('')` is `0`, and `0` passes
+`Number.isInteger(v) && v >= 0`. So `counts` is `[0]`, `counts.length > 0` holds, and the
+default `[0, 8, 16, 32, 51]` is overwritten with `[0]`.
+
+```text
+absent  basisCounts  ->  [0]            measured, not assumed
+explicit             ->  [0,8,16,32,51]
+absent  scales       ->  []             the same shape of code, but its filter is v > 0,
+                                        so 0 is rejected and the default survives
+```
+
+That is why Diagnostic 1 ran at the intended three scales and only Diagnostic 3 lost its
+points. The Diagnostic 3 loop itself is correct: the one point it did run,
+`d3-basis-0`, carries the right shader state.
+
+This defect is **not fixed in this commit**, as instructed: no production code, shader or
+renderer change for the rerun. The rerun passes the counts explicitly, which bypasses the
+default path entirely.
+
+### 6.3 Run 2 — Diagnostic 3 completion (PENDING)
+
+```text
+/uika-native-draw-isolation?d3=1&basisCounts=0,8,16,32,51
+```
+
+Same conditions as Run 1: DevTools closed, tab visible, no tab switching, no window
+minimise, real GPU. Start Diagnostics, then Export JSON when it finishes.
+
+Required from the run — all five points present:
+
+```text
+basis 0    GPU draw p50 / p95, effectiveFPS, valid, GL errors, page errors, invalid GPU timer samples   PENDING
+basis 8    same                                                                                          PENDING
+basis 16   same                                                                                          PENDING
+basis 32   same                                                                                          PENDING
+basis 51   same                                                                                          PENDING
+
+basisScalingFit    interceptMs / msPerBasis / points = 5                                                 PENDING
+literal51MinusUniform51Ms   (literal 51 vs the production uniform-bounded 51)                            PENDING
+repeatabilityDeltaMs        (the noise floor those two should sit inside)                                 PENDING
+```
+
+The least-squares fit over the five points and `literal51MinusUniform51Ms` are already
+implemented and need no change; with five valid points `basisScalingFit.points` reads 5.
+`literal51MinusUniform51Ms` is produced as soon as a `d3-basis-51` point exists, and
+whether it sits inside `repeatabilityDeltaMs` is the check that a literal bound of 51 and
+the production uniform bound of 51 really are the same work.
+
+Run 1's results are kept: the variant proof, the two shares, `MIXED` and
+`basisLoopDominant = YES` stand as a valid result. Run 2 exists only to complete
+Diagnostic 3.
+
+### 6.4 Remaining fields — to be filled from the runs
+
+```text
+GPU / browser / DPR                                                      PENDING
+Diagnostic 1  100% / 50% / 25%  buffer, fps, wall p50-p95-p99, draw p50-p95-p99   PENDING
+Diagnostic 2  production / no-basis  fps, draw p50-p95-p99                PENDING
 invalid GPU timer samples                                                PENDING
 GL errors / page errors                                                  PENDING
-
-CONCLUSION = PENDING   (RASTER_DOMINANT | BASE_RENDER_DOMINANT |
-                        BASIS_LOOP_DOMINANT | MIXED)
-BASIS_LOOP_DOMINANT = PENDING
 ```
 
 Nothing above is estimated or extrapolated.
@@ -230,6 +347,13 @@ otherwise                                 MIXED
 
 BASIS_LOOP_DOMINANT = YES  when basisShare >= 0.5
 ```
+
+`rasterShare` and `basisShare` must not be added together as a 100 % breakdown. They are
+not orthogonal components of one budget: the resolution sweep lowers the raster work of
+the same 51-channel shader, so part of what it measures also sits inside what the no-basis
+comparison measures, and the two overlap by an amount this gate does not separate. Each
+share answers one question — "how much does the raster own" and "how much does the loop
+own" — and nothing is claimed about their sum.
 
 The 0.5 and 0.3 shares are decision rules chosen for this gate, not measured quantities:
 a component counts as dominant when removing it takes at least half the draw time away,
@@ -299,7 +423,7 @@ Software-renderer numbers from these runs are deliberately not quoted as a resul
 
 ---
 
-## 9. Changes in this commit
+## 9. Changes in the harness commit (`44fc259`)
 
 ```text
 new   src/pages/uika-native-draw-isolation.astro          Gate 4B-1 route, table and controls
@@ -327,3 +451,8 @@ and the drawing-buffer size are exactly what Gate 3 and the Gate 4A rerun measur
 The gate ends when the cause is classified. Gate 4B-2 production optimisation is not
 implemented, and Gate 5 Live is not started. The optimisation approach is decided after
 this report.
+
+The Run 1 record in §6 was added in a later, documentation-only commit: no file under
+`src/`, `support-base/` or `tools/` was touched for it, so the harness the rerun uses is
+byte-identical to the one Run 1 was measured with. The `isolationOptionsFromUrl()` defect
+in §6.2 is deliberately left in place for that reason.
