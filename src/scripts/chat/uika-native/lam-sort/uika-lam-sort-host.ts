@@ -76,7 +76,15 @@ export interface UikaLamSortStats {
     submitMsSamples: number[];
     /** submit -> sortDone handled, per completed sort. */
     roundTripMsSamples: number[];
+    /**
+     * Variant D only: request -> the depth keys are in the CPU array, i.e. the whole GPU
+     * distance pass + fence + getBufferSubData, measured as wall time. Empty for variant C,
+     * which runs no GPU distance pass at all.
+     */
+    distanceStageMsSamples: number[];
     workerErrors: number;
+    /** Variant D only: a GPU distance pass that failed before the worker was reached. */
+    distanceErrors: number;
 }
 
 export interface UikaLamSortCentreInfo {
@@ -116,7 +124,9 @@ function emptyStats(): UikaLamSortStats {
         indexUpdateMsSamples: [],
         submitMsSamples: [],
         roundTripMsSamples: [],
+        distanceStageMsSamples: [],
         workerErrors: 0,
+        distanceErrors: 0,
     };
 }
 
@@ -144,6 +154,16 @@ export class UikaLamSortHost {
     private centresForProbe: Float32Array | null = null;
     private options: UikaLamSortOptions = { ...LAM_SORT_DEFAULTS };
 
+    /**
+     * Variant D. When set, every request first runs this — the EXISTING animated-centre
+     * GPU distance pass, with its fence and its getBufferSubData — and the resulting depth
+     * keys are handed to the same vendored worker as `precomputedDistances`. No new
+     * distance shader is written for this: the provider is
+     * `UikaPredeformPass.computeDistances`, the very function variant B's sort uses.
+     */
+    private distanceSource: ((mvp: any, out: Float32Array) => Promise<void>) | null = null;
+    private precomputedDistances: Float32Array | null = null;
+
     getStats(): UikaLamSortStats {
         return {
             ...this.stats,
@@ -151,12 +171,28 @@ export class UikaLamSortHost {
             indexUpdateMsSamples: this.stats.indexUpdateMsSamples.slice(),
             submitMsSamples: this.stats.submitMsSamples.slice(),
             roundTripMsSamples: this.stats.roundTripMsSamples.slice(),
+            distanceStageMsSamples: this.stats.distanceStageMsSamples.slice(),
         };
     }
 
     resetStats(): void {
         this.stats = emptyStats();
     }
+
+    /**
+     * Variant D: install the animated-centre distance provider, or clear it for variant C.
+     * The matrix passed to it is the same one the sort message carries, so the keys and the
+     * order come from one state.
+     */
+    setDistanceSource(source: ((mvp: any, out: Float32Array) => Promise<void>) | null): void {
+        if (this.running) throw new Error('UIKA LAM sort host: a sort is in flight');
+        this.distanceSource = source;
+        if (source && !this.precomputedDistances) {
+            this.precomputedDistances = new Float32Array(this.splatCount);
+        }
+    }
+
+    usesPrecomputedDistances(): boolean { return this.distanceSource !== null; }
 
     getCentreInfo(): UikaLamSortCentreInfo | null { return this.centreInfo; }
     getOrderProbe(): UikaLamSortOrderProbe | null { return this.orderProbe; }
@@ -298,10 +334,12 @@ export class UikaLamSortHost {
      * §5, the LAM reference policy verbatim: every render requests a sort; if one is
      * already running the request is dropped; otherwise the latest matrix is submitted.
      *
+     * @param modelViewProj the THREE.Matrix4 built by the viewer. Its `elements` go to the
+     *        worker; the matrix itself goes to the distance source in variant D.
      * @returns a promise that settles when the render indexes for THIS submission have
      *          been applied, or null when the request was dropped.
      */
-    request(modelViewProj: ArrayLike<number>): Promise<void> | null {
+    request(modelViewProj: { elements: ArrayLike<number> }): Promise<void> | null {
         this.stats.sortRequested++;
         if (!this.ready || !this.worker) {
             this.stats.sortSkippedBeforeReady++;
@@ -312,6 +350,8 @@ export class UikaLamSortHost {
             return null;
         }
 
+        // `running` is set before the GPU distance pass, not after it: in variant D the
+        // distance pass is part of this submission, so the back-pressure has to cover it.
         this.running = true;
         this.stats.sortSubmitted++;
         const pending = new Promise<void>((resolve, reject) => {
@@ -320,23 +360,46 @@ export class UikaLamSortHost {
         });
 
         // The probe needs the matrix that produced the order it inspects.
-        if (!this.orderProbe) this.probeMvp = Float32Array.from(modelViewProj as any);
+        if (!this.orderProbe) this.probeMvp = Float32Array.from(modelViewProj.elements as any);
 
+        if (this.distanceSource) {
+            // The worker message carries a snapshot: the viewer reuses its Matrix4, and the
+            // GPU distance pass has to complete before the message is posted.
+            const mvpCopy = Float32Array.from(modelViewProj.elements as any);
+            const distanceStart = performance.now();
+            this.distanceSource(modelViewProj, this.precomputedDistances!)
+                .then(() => {
+                    this.stats.distanceStageMsSamples.push(performance.now() - distanceStart);
+                    if (this.disposed || !this.worker) return;
+                    this.postSort(mvpCopy, true);
+                })
+                .catch((error: any) => {
+                    this.stats.distanceErrors++;
+                    this.failRunning(error);
+                });
+            return pending;
+        }
+
+        this.postSort(modelViewProj.elements, false);
+        return pending;
+    }
+
+    /** The exact message shape Viewer.js posts, with only `usePrecomputedDistances` moving. */
+    private postSort(modelViewProj: ArrayLike<number>, usePrecomputedDistances: boolean): void {
+        const message: any = {
+            modelViewProj,
+            splatRenderCount: this.splatCount,
+            splatSortCount: this.splatCount,
+            usePrecomputedDistances,
+            indexesToSort: this.indexesToSort,
+            transforms: this.transforms,
+        };
+        if (usePrecomputedDistances) message.precomputedDistances = this.precomputedDistances;
         const submitStart = performance.now();
-        this.worker.postMessage({
-            sort: {
-                modelViewProj,
-                splatRenderCount: this.splatCount,
-                splatSortCount: this.splatCount,
-                usePrecomputedDistances: LAM_SORT_DEFAULTS.usePrecomputedDistances,
-                indexesToSort: this.indexesToSort,
-                transforms: this.transforms,
-            },
-        });
+        this.worker!.postMessage({ sort: message });
         const submitEnd = performance.now();
         this.submittedAt = submitEnd;
         this.stats.submitMsSamples.push(submitEnd - submitStart);
-        return pending;
     }
 
     private onSortDone(data: any): void {
@@ -427,5 +490,7 @@ export class UikaLamSortHost {
         this.sortedIndexes = null;
         this.centresForProbe = null;
         this.probeMvp = null;
+        this.distanceSource = null;
+        this.precomputedDistances = null;
     }
 }

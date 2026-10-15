@@ -147,8 +147,14 @@ export type UikaSortSubmissionPhase = 'pre-draw' | 'post-draw';
  * returns null when the driver dropped the request because one sort was already running.
  */
 export interface UikaExternalSortDriver {
-    /** @returns a promise that settles when this submission's indexes are applied, or null if dropped. */
-    request(modelViewProjElements: ArrayLike<number>): Promise<void> | null;
+    /**
+     * @param modelViewProj the THREE.Matrix4 the viewer built for this sort — projection *
+     *        view * mesh world. The Matrix4 itself, not its elements, because a driver may
+     *        need to hand it to the existing GPU distance pass, which takes a Matrix4.
+     * @returns a promise that settles when this submission's indexes are applied, or null
+     *          if the driver dropped the request because one sort was already running.
+     */
+    request(modelViewProj: any): Promise<void> | null;
     isRunning(): boolean;
 }
 
@@ -685,6 +691,15 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return this.externalSortDriver;
     }
 
+    /**
+     * Gate 4B-2C diagnostic only: a copy of the index order the viewer's own counting sort
+     * most recently applied. Used to compare the main-thread sort against the LAM worker
+     * sort element by element rather than only through the framebuffer.
+     */
+    getDiagnosticSortedIndexes(): Uint32Array | null {
+        return this.sortedIndexes ? this.sortedIndexes.slice(0, this.splatCount) : null;
+    }
+
     /** Gate 4B-2B-2 §8: is a sort in flight right now? */
     isSortPending(): boolean {
         if (this.externalSortDriver) return this.externalSortDriver.isRunning();
@@ -923,7 +938,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         // no readback, no counting sort on this thread — and no stage truncation, because
         // the driver's own completion applies the render indexes.
         if (this.externalSortDriver) {
-            const pending = this.externalSortDriver.request(this.mvpMatrix.elements);
+            const pending = this.externalSortDriver.request(this.mvpMatrix);
             if (pending === null) {
                 this.externalSortDropped++;
                 return;

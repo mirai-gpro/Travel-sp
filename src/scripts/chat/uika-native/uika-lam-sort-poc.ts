@@ -55,7 +55,20 @@ export const LAM_SORT_TARGET = { minFps: 30, maxExactWallP95Ms: 33.3 } as const;
 export type UikaLamRunName =
     | 'A-no-sort'
     | 'B-exact-animated-centre-sort'
+    | 'D-lam-exact-distance-worker-sort'
     | 'C-lam-canonical-centre-worker-sort';
+
+/**
+ * Round-robin, in this order, so session drift lands on all four runs equally. D sits
+ * between B and C because it is the bridge between them: it shares B's depth keys and C's
+ * sort implementation.
+ */
+export const RUN_ORDER: UikaLamRunName[] = [
+    'A-no-sort',
+    'B-exact-animated-centre-sort',
+    'D-lam-exact-distance-worker-sort',
+    'C-lam-canonical-centre-worker-sort',
+];
 
 export interface UikaLamRunSample {
     name: UikaLamRunName;
@@ -82,7 +95,11 @@ export interface UikaLamRunSample {
         indexUpdateMs: UikaStageStats;
         submitMs: UikaStageStats;
         roundTripMs: UikaStageStats;
+        /** Variant D only: the whole GPU distance pass + fence + readback, per submission. */
+        distanceStageMs: UikaStageStats;
+        usePrecomputedDistances: boolean;
         workerErrors: number;
+        distanceErrors: number;
         effectiveSortHz: number;
     } | null;
     /** The exact path's own counters, for the B run. */
@@ -91,10 +108,33 @@ export interface UikaLamRunSample {
         effectiveSortHz: number;
         predeformPasses: number;
     } | null;
+    /**
+     * §"D validity": the GPU distance pass counters, read straight off the pre-deformation
+     * pass. Non-zero in B and D, zero in C — which is what makes C the no-readback run.
+     */
+    gpuDistance: {
+        submitted: number;
+        cpuCompletions: number;
+        readbacks: number;
+        fencePolls: number;
+        gpuOnlySubmitted: number;
+    };
     glErrors: number;
     pageErrors: number;
     weightUploads: number;
     visibilityLostMs: number;
+    /**
+     * The warm-up drain and the post-window drain, each with the wall time it took. A run
+     * whose warm-up drain timed out can count a completion it never submitted — which is
+     * what the container self-test produced: variant D reported 1 submitted and 2
+     * completed after a 9.3 s GPU distance pass outran a 10 s drain.
+     */
+    idleBeforeMeasurement: boolean;
+    idleWaitMs: number;
+    drainedAfterMeasurement: boolean;
+    drainWaitMs: number;
+    /** Worker runs only; true for runs with no worker. */
+    submittedEqualsCompleted: boolean;
 }
 
 /**
@@ -116,6 +156,7 @@ export interface UikaLamRunRollUp {
     meanGpuDrawP50Ms: number;
     meanWorkerSortP50Ms: number | null;
     meanIndexUpdateP50Ms: number | null;
+    meanDistanceStageP50Ms: number | null;
     meanEffectiveSortHz: number | null;
 }
 
@@ -149,6 +190,63 @@ export interface UikaLamFrameComparison {
      */
     tileDifferentPixels: number[];
     worstTile: { index: number; x: number; y: number; differentPixels: number } | null;
+}
+
+/**
+ * The B vs D check. Both runs feed the SAME depth keys — the animated-centre GPU distance
+ * pass, fence and readback — to two different sorts: the project-owned main-thread
+ * counting sort, and the vendored LAM worker with `usePrecomputedDistances = true`. If the
+ * two sorts agree, the index arrays match element for element and the framebuffers are
+ * identical. Both are measured; neither is assumed.
+ */
+export interface UikaLamBvsDComparison {
+    frame: number;
+    /** Element-for-element equality of the two emitted index arrays. */
+    identicalIndexOrder: boolean;
+    indexPositionsCompared: number;
+    differingIndexPositions: number;
+    firstDifferingIndexPosition: number | null;
+    /** What each sort put at the first position they disagree on. */
+    firstDifferingPair: { exact: number; lam: number } | null;
+    /** Whether the two orders are at least permutations of the same set. */
+    sameIndexMultiset: boolean;
+    /**
+     * The decisive measurement when the index arrays differ. If the SEQUENCE OF DEPTH KEYS
+     * under each order is identical, the two sorts put the same key at every position and
+     * differ only in which tied splat they chose — the orders are the same sort, resolved
+     * differently. If the key sequences differ, the two sorts ordered by different criteria.
+     */
+    identicalKeySequence: boolean;
+    firstDifferingKeyPosition: number | null;
+    maxKeySequenceAbsDifference: number;
+    /** Both sequences checked for monotonicity in the key, back to front. */
+    exactOrderMonotonic: boolean;
+    lamOrderMonotonic: boolean;
+    /** Largest key increase between consecutive emitted positions; 0 when monotonic. */
+    exactMaxInversion: number;
+    lamMaxInversion: number;
+    /** How much tie-breaking room there is: distinct float keys among the splats. */
+    distinctKeys: number;
+    /** The span of the depth keys, so an inversion magnitude can be read as a fraction. */
+    keyMin: number;
+    keyMax: number;
+    /**
+     * Each order's worst local inversion as a fraction of the key range. Both sorts are
+     * bucketed counting sorts, so neither is exactly monotonic in the raw float key; this
+     * is what each one's bucket granularity actually costs at this key range.
+     */
+    exactMaxInversionRelative: number;
+    lamMaxInversionRelative: number;
+    /** The depth keys the two sorts were given, compared as arrays. */
+    identicalDepthKeys: boolean;
+    maxDepthKeyAbsDifference: number;
+    pixelIdentical: boolean;
+    differentPixels: number;
+    differentPixelRatio: number;
+    maxRgbaByteDelta: number;
+    maxAlphaByteDelta: number;
+    exactHash: string;
+    lamHash: string;
 }
 
 /** §9: side-by-side captures for the frames with the largest difference. */
@@ -203,6 +301,31 @@ export interface UikaLamSortReport {
         structural: UikaLamStructuralResult | null;
         visualVerdict: UikaLamVisualVerdict;
         visualNotes: string[];
+        /**
+         * B vs D. Unlike the C comparison this one has an expected answer — the same keys
+         * sorted two ways — so it carries an automatic verdict. It is still measured, and a
+         * mismatch is reported as a mismatch, not explained away.
+         */
+        bVsD: {
+            frames: UikaLamBvsDComparison[];
+            framesCompared: number;
+            framesWithIdenticalIndexOrder: number;
+            framesPixelIdentical: number;
+            worstDifferingIndexPositions: { value: number; frame: number } | null;
+            worstDifferentPixels: { value: number; frame: number } | null;
+            worstMaxRgbaByteDelta: { value: number; frame: number } | null;
+            allDepthKeysIdentical: boolean;
+            /** Every frame's emitted key sequence matched, i.e. only tie order differs. */
+            allKeySequencesIdentical: boolean;
+            framesWithBothOrdersMonotonic: number;
+            /**
+             * IDENTICAL          the index arrays and the framebuffers all match
+             * TIE_ORDER_DIFFERS  the key sequences match everywhere; only tied splats
+             *                    were placed differently
+             * ORDER_DIFFERS      the key sequences themselves differ
+             */
+            verdict: 'IDENTICAL' | 'TIE_ORDER_DIFFERS' | 'ORDER_DIFFERS' | 'NOT_RUN';
+        };
     };
     performance: {
         target: typeof LAM_SORT_TARGET;
@@ -216,17 +339,39 @@ export interface UikaLamSortReport {
              */
             valid: boolean;
             invalidReasons: string[];
-            /** C vs B on the metric this gate exists for. */
+            /**
+             * B vs D: the same depth keys, the same readback, only the sort implementation
+             * differs. This is the LAM Worker/WASM migration effect on its own.
+             */
+            workerMigrationP95DeltaMs: number | null;
+            workerMigrationFpsDelta: number | null;
+            /**
+             * D vs C: the same worker, the same back-pressure, the same index update. The
+             * difference is the animated-centre GPU distance pass plus its readback against
+             * a worker-computed canonical-centre key with no readback at all.
+             */
+            distanceReadbackP95DeltaMs: number | null;
+            distanceReadbackFpsDelta: number | null;
+            /** A vs C: what the canonical-centre worker sort still costs over no sort. */
+            canonicalSortResidualP95Ms: number | null;
+            canonicalSortResidualFps: number | null;
+            /** C vs B, the end-to-end difference. */
             exactP95DeltaMs: number | null;
             effectiveFpsDelta: number | null;
-            /** How much of the B-over-A tail the LAM path closes. */
+            /** How much of the B-over-A tail each LAM path closes. */
             tailGapAboveNoSortB: number | null;
             tailGapAboveNoSortC: number | null;
+            tailGapAboveNoSortD: number | null;
             tailGapClosedShare: number | null;
+            tailGapClosedShareD: number | null;
             /** Reported whatever the validity: a contaminated run C is a fact on its own. */
             readbackPathExercisedInC: boolean;
+            /** D is invalid without it: the GPU distance pass must have run. */
+            readbackPathExercisedInD: boolean;
+            dUsedPrecomputedDistances: boolean;
             cMeetsTarget: boolean | null;
             bMeetsTarget: boolean | null;
+            dMeetsTarget: boolean | null;
         } | null;
     };
     glErrors: number;
@@ -242,6 +387,8 @@ export interface UikaLamSortOptions {
     measureMs: number;
     /** How many worst-difference frames to keep PNG captures for (§9). */
     captureCount: number;
+    /** How long a drain may take before it is recorded as having timed out. */
+    idleTimeoutMs: number;
     allowSoftware: boolean;
     /** Off by default: UIKA's SplatMesh uses float centres, see LAM_SORT_DEFAULTS. */
     integerBasedSort: boolean;
@@ -251,10 +398,11 @@ export interface UikaLamSortOptions {
 
 export const DEFAULT_LAM_SORT_OPTIONS: UikaLamSortOptions = {
     frames: null,
-    repeats: 2,
+    repeats: 3,
     warmupMs: 2000,
     measureMs: 8000,
     captureCount: 4,
+    idleTimeoutMs: 30000,
     allowSoftware: false,
     integerBasedSort: LAM_SORT_DEFAULTS.integerBasedSort,
     skipCorrectness: false,
@@ -288,6 +436,8 @@ export function lamSortOptionsFromUrl(): UikaLamSortOptions {
         if (measure !== null) o.measureMs = measure;
         const captures = num('lamCaptures', 0);
         if (captures !== null) o.captureCount = Math.floor(captures);
+        const idle = num('lamIdleTimeoutMs', 1000);
+        if (idle !== null) o.idleTimeoutMs = idle;
         if (q.has('allowSoftware')) o.allowSoftware = q.get('allowSoftware') === '1';
         if (q.has('lamIntSort')) o.integerBasedSort = q.get('lamIntSort') === '1';
         if (q.has('lamSkipCorrectness')) o.skipCorrectness = q.get('lamSkipCorrectness') === '1';
@@ -367,6 +517,19 @@ export class UikaLamSortPoC {
                 summary: null,
                 structural: null,
                 visualVerdict: 'REQUIRES_HUMAN_INSPECTION',
+                bVsD: {
+                    frames: [],
+                    framesCompared: 0,
+                    framesWithIdenticalIndexOrder: 0,
+                    framesPixelIdentical: 0,
+                    worstDifferingIndexPositions: null,
+                    worstDifferentPixels: null,
+                    worstMaxRgbaByteDelta: null,
+                    allDepthKeysIdentical: true,
+                    allKeySequencesIdentical: true,
+                    framesWithBothOrdersMonotonic: 0,
+                    verdict: 'NOT_RUN',
+                },
                 visualNotes: [
                     'The LAM-reference order is the canonical-centre depth order, not the '
                     + 'exact depth order of the animated geometry being drawn, so a '
@@ -444,6 +607,12 @@ export class UikaLamSortPoC {
                 dynamicMode: LAM_SORT_DEFAULTS.dynamicMode,
                 usePrecomputedDistances: LAM_SORT_DEFAULTS.usePrecomputedDistances,
                 deviationsFromLamDefaults: [
+                    'integerBasedSort: LAM\'s Viewer.js default is TRUE. This PoC runs float '
+                    + 'throughout, including variant D\'s precomputed distances, because UIKA\'s '
+                    + 'SplatMesh is built with integerBasedDistancesComputation=false and this '
+                    + 'gate does not change the numeric representation of the splat data. An '
+                    + 'integer variant is a separate decision, to be taken only if these '
+                    + 'results call for it.',
                     'gpuAcceleratedSort: LAM render.ts passes true, which routes the depth keys '
                     + 'through SplatMesh.computeDistancesOnGPU + fenceSync + getBufferSubData. '
                     + '§2 removes that path, so this PoC runs the same unmodified worker with '
@@ -585,6 +754,7 @@ export class UikaLamSortPoC {
 
         r.correctness.frames = comparisons;
         r.correctness.summary = this.summariseCorrectness(comparisons);
+        await this.runBvsD(frames, handles);
         r.correctness.captures = await this.captureWorst(
             frames, comparisons, options, handles, viewer,
         );
@@ -603,10 +773,214 @@ export class UikaLamSortPoC {
         });
     }
 
+    /**
+     * B vs D. Both sorts are given the SAME depth keys: the animated-centre GPU distance
+     * pass, its fence and its getBufferSubData, which is the only distance pass in this
+     * PoC and the one variant B already uses. The keys are captured once per frame and
+     * compared too, so "the keys were the same" is a measurement rather than an argument.
+     */
+    private async runBvsD(frames: number[], handles: any): Promise<void> {
+        const r = this.report!;
+        const viewer = this.viewer();
+        const host = this.host!;
+        const out = r.correctness.bVsD;
+
+        const splatCount = handles.splatMesh.getSplatCount();
+        const keysFromB = new Float32Array(splatCount);
+        const keysFromD = new Float32Array(splatCount);
+
+        viewer.setSortSuspended(true);
+        this.live.phase = 'B vs D';
+        try {
+            for (let i = 0; i < frames.length; i++) {
+                if (this.abort) break;
+                const frame = frames[i];
+                this.live.frame = frame;
+                this.live.step = `B vs D frame ${frame} (${i + 1}/${frames.length})`;
+
+                const held = this.replay.holdFrame(frame);
+                this.runtime.applyWeights(new Float32Array(held.weights));
+                this.pass!.markDirty();
+                this.pass!.run();
+
+                // --- B: the same GPU distance pass, then the main-thread counting sort.
+                viewer.setDiagnosticExternalSortDriver(null);
+                host.setDistanceSource(null);
+                viewer.setDistanceProvider((m: any, o: Float32Array) => this.pass!
+                    .computeDistances(m, o)
+                    .then(() => { keysFromB.set(o); }));
+                await this.sortOnce(viewer, 'the exact animated-centre sort');
+                const exactIndexes: Uint32Array | null = viewer.getDiagnosticSortedIndexes();
+                const exactFrame = await this.nextFramePixels();
+
+                // --- D: the same GPU distance pass, then the vendored LAM worker.
+                viewer.setDistanceProvider(null);
+                host.setDistanceSource((m: any, o: Float32Array) => this.pass!
+                    .computeDistances(m, o)
+                    .then(() => { keysFromD.set(o); }));
+                viewer.setDiagnosticExternalSortDriver(this.driver());
+                await this.sortOnce(viewer, 'the LAM exact-distance sort');
+                const lamIndexes = host.getSortedIndexes();
+                const lamFrame = await this.nextFramePixels();
+
+                out.frames.push(this.compareBvsD(
+                    frame, exactIndexes, lamIndexes, keysFromB, keysFromD,
+                    splatCount, exactFrame, lamFrame,
+                ));
+                out.framesCompared++;
+            }
+        } finally {
+            viewer.setDiagnosticExternalSortDriver(null);
+            viewer.setDistanceProvider(null);
+            host.setDistanceSource(null);
+            viewer.setSortSuspended(false);
+        }
+
+        out.framesWithIdenticalIndexOrder = out.frames.filter((f) => f.identicalIndexOrder).length;
+        out.framesPixelIdentical = out.frames.filter((f) => f.pixelIdentical).length;
+        out.allDepthKeysIdentical = out.frames.every((f) => f.identicalDepthKeys);
+        out.allKeySequencesIdentical = out.frames.length > 0
+            && out.frames.every((f) => f.identicalKeySequence);
+        out.framesWithBothOrdersMonotonic = out.frames
+            .filter((f) => f.exactOrderMonotonic && f.lamOrderMonotonic).length;
+        const worst = (pick: (f: UikaLamBvsDComparison) => number) => {
+            if (out.frames.length === 0) return null;
+            let value = -Infinity;
+            let frame = -1;
+            for (const f of out.frames) {
+                const v = pick(f);
+                if (v > value) { value = v; frame = f.frame; }
+            }
+            return { value, frame };
+        };
+        out.worstDifferingIndexPositions = worst((f) => f.differingIndexPositions);
+        out.worstDifferentPixels = worst((f) => f.differentPixels);
+        out.worstMaxRgbaByteDelta = worst((f) => f.maxRgbaByteDelta);
+        out.verdict = out.framesCompared === 0
+            ? 'NOT_RUN'
+            : (out.framesWithIdenticalIndexOrder === out.framesCompared
+                && out.framesPixelIdentical === out.framesCompared
+                ? 'IDENTICAL'
+                : (out.allKeySequencesIdentical ? 'TIE_ORDER_DIFFERS' : 'ORDER_DIFFERS'));
+    }
+
+    private compareBvsD(
+        frame: number,
+        exactIndexes: Uint32Array | null,
+        lamIndexes: Uint32Array | null,
+        keysFromB: Float32Array,
+        keysFromD: Float32Array,
+        splatCount: number,
+        exact: UikaDrawingBufferHash,
+        lam: UikaDrawingBufferHash,
+    ): UikaLamBvsDComparison {
+        let differingIndexPositions = 0;
+        let firstDifferingIndexPosition: number | null = null;
+        let firstDifferingPair: { exact: number; lam: number } | null = null;
+        let sameIndexMultiset = false;
+        const compared = exactIndexes && lamIndexes
+            ? Math.min(exactIndexes.length, lamIndexes.length) : 0;
+        if (exactIndexes && lamIndexes) {
+            for (let i = 0; i < compared; i++) {
+                if (exactIndexes[i] === lamIndexes[i]) continue;
+                differingIndexPositions++;
+                if (firstDifferingIndexPosition === null) {
+                    firstDifferingIndexPosition = i;
+                    firstDifferingPair = { exact: exactIndexes[i], lam: lamIndexes[i] };
+                }
+            }
+            // Both must at least draw the same set of splats; a difference there would be a
+            // defect, not a tie-break.
+            const seen = new Uint8Array(splatCount);
+            let ok = exactIndexes.length === lamIndexes.length;
+            if (ok) {
+                for (let i = 0; i < compared; i++) seen[exactIndexes[i]]++;
+                for (let i = 0; i < compared && ok; i++) {
+                    if (seen[lamIndexes[i]] === 0) ok = false; else seen[lamIndexes[i]]--;
+                }
+                if (ok) for (let i = 0; i < splatCount; i++) if (seen[i] !== 0) { ok = false; break; }
+            }
+            sameIndexMultiset = ok;
+        }
+
+        let maxDepthKeyAbsDifference = 0;
+        for (let i = 0; i < splatCount; i++) {
+            const d = Math.abs(keysFromB[i] - keysFromD[i]);
+            if (d > maxDepthKeyAbsDifference) maxDepthKeyAbsDifference = d;
+        }
+
+        // The key sequence each order produces, and whether each order is monotonic in it.
+        let identicalKeySequence = compared > 0;
+        let firstDifferingKeyPosition: number | null = null;
+        let maxKeySequenceAbsDifference = 0;
+        let exactMaxInversion = 0;
+        let lamMaxInversion = 0;
+        if (exactIndexes && lamIndexes) {
+            for (let i = 0; i < compared; i++) {
+                const ke = keysFromB[exactIndexes[i]];
+                const kl = keysFromD[lamIndexes[i]];
+                const d = Math.abs(ke - kl);
+                if (d > maxKeySequenceAbsDifference) maxKeySequenceAbsDifference = d;
+                if (d !== 0) {
+                    identicalKeySequence = false;
+                    if (firstDifferingKeyPosition === null) firstDifferingKeyPosition = i;
+                }
+                if (i > 0) {
+                    // Back to front means the key must not increase along the draw order.
+                    const re = ke - keysFromB[exactIndexes[i - 1]];
+                    const rl = kl - keysFromD[lamIndexes[i - 1]];
+                    if (re > exactMaxInversion) exactMaxInversion = re;
+                    if (rl > lamMaxInversion) lamMaxInversion = rl;
+                }
+            }
+        }
+        const distinctKeys = new Set(Array.from(keysFromB.subarray(0, splatCount))).size;
+        let keyMin = Infinity;
+        let keyMax = -Infinity;
+        for (let i = 0; i < splatCount; i++) {
+            const k = keysFromB[i];
+            if (k < keyMin) keyMin = k;
+            if (k > keyMax) keyMax = k;
+        }
+        const keySpan = keyMax - keyMin;
+
+        const pixels = this.compareFrame(frame, 0, true, exact, lam);
+        return {
+            frame,
+            identicalIndexOrder: compared > 0 && differingIndexPositions === 0,
+            indexPositionsCompared: compared,
+            differingIndexPositions,
+            firstDifferingIndexPosition,
+            firstDifferingPair,
+            sameIndexMultiset,
+            identicalDepthKeys: maxDepthKeyAbsDifference === 0,
+            maxDepthKeyAbsDifference,
+            identicalKeySequence,
+            firstDifferingKeyPosition,
+            maxKeySequenceAbsDifference,
+            exactOrderMonotonic: exactMaxInversion === 0,
+            lamOrderMonotonic: lamMaxInversion === 0,
+            exactMaxInversion,
+            lamMaxInversion,
+            distinctKeys,
+            keyMin,
+            keyMax,
+            exactMaxInversionRelative: keySpan > 0 ? exactMaxInversion / keySpan : 0,
+            lamMaxInversionRelative: keySpan > 0 ? lamMaxInversion / keySpan : 0,
+            pixelIdentical: pixels.pixelIdentical,
+            differentPixels: pixels.differentPixels,
+            differentPixelRatio: pixels.differentPixelRatio,
+            maxRgbaByteDelta: pixels.maxRgbaByteDelta,
+            maxAlphaByteDelta: pixels.maxAlphaByteDelta,
+            exactHash: exact.hash,
+            lamHash: lam.hash,
+        };
+    }
+
     private driver(): UikaExternalSortDriver {
         const host = this.host!;
         return {
-            request: (mvp: ArrayLike<number>) => host.request(mvp),
+            request: (mvp: any) => host.request(mvp),
             isRunning: () => host.isRunning(),
         };
     }
@@ -839,11 +1213,7 @@ export class UikaLamSortPoC {
      */
     private async runPerformance(options: UikaLamSortOptions): Promise<void> {
         const r = this.report!;
-        const order: UikaLamRunName[] = [
-            'A-no-sort',
-            'B-exact-animated-centre-sort',
-            'C-lam-canonical-centre-worker-sort',
-        ];
+        const order = RUN_ORDER;
         for (let repeat = 1; repeat <= options.repeats; repeat++) {
             for (const name of order) {
                 if (this.abort) break;
@@ -862,6 +1232,9 @@ export class UikaLamSortPoC {
     ): Promise<UikaLamRunSample> {
         const viewer = this.viewer();
         const host = this.host!;
+        // Before anything is rewired: the previous run's sort must be finished. Installing
+        // a distance source while one is in flight is refused, by design.
+        await this.waitForSortIdle(viewer, options.idleTimeoutMs);
         const gl: WebGL2RenderingContext | null = viewer?.renderer?.getContext?.() ?? null;
         const ext = gl ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
         const timers = gl && ext ? new GpuTimerPool(gl, ext) : null;
@@ -869,16 +1242,29 @@ export class UikaLamSortPoC {
         this.pass!.setGpuTimer(timers as any);
 
         // Mode wiring. Only the sort differs between the three runs.
+        const distanceProvider = (m: any, out: Float32Array) => this.pass!.computeDistances(m, out);
         if (name === 'A-no-sort') {
             viewer.setDiagnosticExternalSortDriver(null);
-            viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+            host.setDistanceSource(null);
+            viewer.setDistanceProvider(distanceProvider);
             viewer.setSortSuspended(true);
         } else if (name === 'B-exact-animated-centre-sort') {
+            // Animated-centre GPU distance + fence + readback, then the main-thread sort.
             viewer.setDiagnosticExternalSortDriver(null);
-            viewer.setDistanceProvider((m: any, out: Float32Array) => this.pass!.computeDistances(m, out));
+            host.setDistanceSource(null);
+            viewer.setDistanceProvider(distanceProvider);
+            viewer.setSortSuspended(false);
+        } else if (name === 'D-lam-exact-distance-worker-sort') {
+            // The SAME distance provider as B — no second distance shader exists — with the
+            // keys handed to the vendored worker as precomputedDistances.
+            viewer.setDistanceProvider(null);
+            host.setDistanceSource(distanceProvider);
+            viewer.setDiagnosticExternalSortDriver(this.driver());
             viewer.setSortSuspended(false);
         } else {
+            // Canonical centres, keys computed inside the worker, no GPU distance pass.
             viewer.setDistanceProvider(null);
+            host.setDistanceSource(null);
             viewer.setDiagnosticExternalSortDriver(this.driver());
             viewer.setSortSuspended(false);
         }
@@ -897,7 +1283,9 @@ export class UikaLamSortPoC {
         // Let anything submitted during warm-up finish, so the measured window does not
         // report a completion it never paid for.
         this.live.phase = 'draining warm-up';
-        await this.waitForSortIdle(viewer, 10000);
+        const idleWaitStart = performance.now();
+        const idleBeforeMeasurement = await this.waitForSortIdle(viewer, options.idleTimeoutMs);
+        const idleWaitMs = performance.now() - idleWaitStart;
 
         const exactIntervals: number[] = [];
         let previousStart: number | null = null;
@@ -945,7 +1333,9 @@ export class UikaLamSortPoC {
         const framesAtWindowEnd = viewer.stats.renderedFrames;
 
         this.live.phase = 'draining';
-        await this.waitForSortIdle(viewer, 10000);
+        const drainStart = performance.now();
+        const drainedAfterMeasurement = await this.waitForSortIdle(viewer, options.idleTimeoutMs);
+        const drainWaitMs = performance.now() - drainStart;
         document.removeEventListener('visibilitychange', onVis);
         if (hiddenSince !== null) visibilityLostMs += performance.now() - hiddenSince;
         timers?.setCollecting(false);
@@ -972,7 +1362,8 @@ export class UikaLamSortPoC {
             gpuSortSubmission: summariseStage(timers?.sortMs ?? []),
             predeform: summariseStage(timers?.predeformMs ?? []),
             invalidGpuTimerSamples: timers?.invalidMs.length ?? 0,
-            worker: name === 'C-lam-canonical-centre-worker-sort'
+            worker: (name === 'C-lam-canonical-centre-worker-sort'
+                || name === 'D-lam-exact-distance-worker-sort')
                 ? {
                     sortRequested: hostStats.sortRequested,
                     sortSubmitted: hostStats.sortSubmitted,
@@ -983,7 +1374,10 @@ export class UikaLamSortPoC {
                     indexUpdateMs: summariseStage(hostStats.indexUpdateMsSamples),
                     submitMs: summariseStage(hostStats.submitMsSamples),
                     roundTripMs: summariseStage(hostStats.roundTripMsSamples),
+                    distanceStageMs: summariseStage(hostStats.distanceStageMsSamples),
+                    usePrecomputedDistances: name === 'D-lam-exact-distance-worker-sort',
                     workerErrors: hostStats.workerErrors,
+                    distanceErrors: hostStats.distanceErrors,
                     effectiveSortHz: seconds > 0 ? hostStats.sortCompleted / seconds : 0,
                 }
                 : null,
@@ -994,13 +1388,29 @@ export class UikaLamSortPoC {
                     predeformPasses: passStats.passCount,
                 }
                 : null,
+            gpuDistance: {
+                submitted: passStats.gpuDistanceSubmittedCount,
+                cpuCompletions: passStats.cpuCompletionCount,
+                readbacks: passStats.cpuReadbackCount,
+                fencePolls: passStats.fencePollCount,
+                gpuOnlySubmitted: passStats.gpuOnlyDistanceSubmittedCount,
+            },
             glErrors: viewer.stats.glErrorCount - glErrors0,
             pageErrors: this.pageErrors - pageErrors0,
             weightUploads: this.replay.getStats().weightUploadCount,
             visibilityLostMs,
+            idleBeforeMeasurement,
+            idleWaitMs,
+            drainedAfterMeasurement,
+            drainWaitMs,
+            submittedEqualsCompleted: (name === 'C-lam-canonical-centre-worker-sort'
+                || name === 'D-lam-exact-distance-worker-sort')
+                ? hostStats.sortSubmitted === hostStats.sortCompleted
+                : true,
         };
 
         viewer.setDiagnosticExternalSortDriver(null);
+        host.setDistanceSource(null);
         viewer.setSortSuspended(false);
         viewer.setGpuTimer?.(null);
         this.pass!.setGpuTimer(null as any);
@@ -1013,6 +1423,8 @@ export class UikaLamSortPoC {
         const workerP50s = mine.map((s) => s.worker?.workerSortMs.p50).filter((v): v is number => v !== undefined);
         const indexP50s = mine.map((s) => s.worker?.indexUpdateMs.p50).filter((v): v is number => v !== undefined);
         const hz = mine.map((s) => s.worker?.effectiveSortHz).filter((v): v is number => v !== undefined);
+        const distP50s = mine.map((s) => s.worker?.distanceStageMs.p50)
+            .filter((v): v is number => v !== undefined && v > 0);
         return {
             name,
             repeats: mine.length,
@@ -1023,6 +1435,7 @@ export class UikaLamSortPoC {
             meanGpuDrawP50Ms: mean(mine.map((s) => s.gpuDraw.p50)),
             meanWorkerSortP50Ms: workerP50s.length > 0 ? mean(workerP50s) : null,
             meanIndexUpdateP50Ms: indexP50s.length > 0 ? mean(indexP50s) : null,
+            meanDistanceStageP50Ms: distP50s.length > 0 ? mean(distP50s) : null,
             meanEffectiveSortHz: hz.length > 0 ? mean(hz) : null,
         };
     }
@@ -1039,16 +1452,24 @@ export class UikaLamSortPoC {
         const a = rollUps.find((x) => x.name === 'A-no-sort');
         const b = rollUps.find((x) => x.name === 'B-exact-animated-centre-sort');
         const c = rollUps.find((x) => x.name === 'C-lam-canonical-centre-worker-sort');
-        if (!a || !b || !c || a.repeats === 0 || b.repeats === 0 || c.repeats === 0) return null;
+        const d = rollUps.find((x) => x.name === 'D-lam-exact-distance-worker-sort');
+        if (!a || !b || !c || !d) return null;
+        if (a.repeats === 0 || b.repeats === 0 || c.repeats === 0 || d.repeats === 0) return null;
 
-        const cSamples = samples.filter((s) => s.name === 'C-lam-canonical-centre-worker-sort');
-        // Reported whether or not the comparison is valid: if any GPU sort-submission timer
-        // sample appears in run C then the GPU distance pass ran, and run C is not the
-        // readback-free path it is supposed to be.
-        const readbackPathExercisedInC = cSamples.some((s) => s.gpuSortSubmission.count > 0);
+        const of = (name: UikaLamRunName) => samples.filter((s) => s.name === name);
+        const cSamples = of('C-lam-canonical-centre-worker-sort');
+        const dSamples = of('D-lam-exact-distance-worker-sort');
+        // Read off the pre-deformation pass's own counters, not inferred from timings:
+        // C must have run no GPU distance pass, D must have run one on every submission.
+        const readbackPathExercisedInC = cSamples.some((s) => s.gpuDistance.submitted > 0
+            || s.gpuDistance.readbacks > 0);
+        const readbackPathExercisedInD = dSamples.some((s) => s.gpuDistance.submitted > 0
+            && s.gpuDistance.readbacks > 0);
+        const dUsedPrecomputedDistances = dSamples.length > 0
+            && dSamples.every((s) => s.worker?.usePrecomputedDistances === true);
 
         const invalidReasons: string[] = [];
-        for (const run of [a, b, c]) {
+        for (const run of [a, b, c, d]) {
             if (run.intervalSamples < MIN_INTERVALS_FOR_COMPARISON) {
                 invalidReasons.push(`${run.name} measured only ${run.intervalSamples} frame `
                     + `intervals over ${run.repeats} repeat(s); `
@@ -1056,38 +1477,97 @@ export class UikaLamSortPoC {
                     + 'comparable');
             }
         }
+        // D without its distance pass is not D, and the gate says so explicitly.
+        if (!readbackPathExercisedInD) {
+            invalidReasons.push('D-lam-exact-distance-worker-sort ran no GPU distance pass '
+                + 'with a readback; it is not the exact-distance variant and cannot be '
+                + 'compared against B or C');
+        }
+        if (!dUsedPrecomputedDistances) {
+            invalidReasons.push('D-lam-exact-distance-worker-sort did not submit with '
+                + 'usePrecomputedDistances = true');
+        }
+        if (dSamples.some((s) => (s.worker?.distanceErrors ?? 0) > 0)) {
+            invalidReasons.push('D-lam-exact-distance-worker-sort recorded GPU distance '
+                + 'errors');
+        }
+        for (const sample of samples) {
+            if (!sample.idleBeforeMeasurement) {
+                invalidReasons.push(`${sample.name} r${sample.repeat}: the warm-up drain `
+                    + `timed out after ${sample.idleWaitMs.toFixed(0)} ms, so a sort from `
+                    + 'warm-up could complete inside the measured window');
+            }
+            if (!sample.drainedAfterMeasurement) {
+                invalidReasons.push(`${sample.name} r${sample.repeat}: the post-window drain `
+                    + `timed out after ${sample.drainWaitMs.toFixed(0)} ms`);
+            }
+            if (!sample.submittedEqualsCompleted) {
+                invalidReasons.push(`${sample.name} r${sample.repeat}: submitted `
+                    + `${sample.worker?.sortSubmitted} sorts but completed `
+                    + `${sample.worker?.sortCompleted}`);
+            }
+        }
+
         if (invalidReasons.length > 0) {
             return {
                 valid: false,
                 invalidReasons,
+                workerMigrationP95DeltaMs: null,
+                workerMigrationFpsDelta: null,
+                distanceReadbackP95DeltaMs: null,
+                distanceReadbackFpsDelta: null,
+                canonicalSortResidualP95Ms: null,
+                canonicalSortResidualFps: null,
                 exactP95DeltaMs: null,
                 effectiveFpsDelta: null,
                 tailGapAboveNoSortB: null,
                 tailGapAboveNoSortC: null,
+                tailGapAboveNoSortD: null,
                 tailGapClosedShare: null,
+                tailGapClosedShareD: null,
                 readbackPathExercisedInC,
+                readbackPathExercisedInD,
+                dUsedPrecomputedDistances,
                 cMeetsTarget: null,
                 bMeetsTarget: null,
+                dMeetsTarget: null,
             };
         }
 
         const tailGapAboveNoSortB = b.meanExactP95Ms - a.meanExactP95Ms;
         const tailGapAboveNoSortC = c.meanExactP95Ms - a.meanExactP95Ms;
+        const tailGapAboveNoSortD = d.meanExactP95Ms - a.meanExactP95Ms;
+        const meets = (x: UikaLamRunRollUp) => x.meanEffectiveFPS >= LAM_SORT_TARGET.minFps
+            && x.meanExactP95Ms <= LAM_SORT_TARGET.maxExactWallP95Ms;
         return {
             valid: true,
             invalidReasons,
+            // B vs D: same keys, same readback, different sort.
+            workerMigrationP95DeltaMs: d.meanExactP95Ms - b.meanExactP95Ms,
+            workerMigrationFpsDelta: d.meanEffectiveFPS - b.meanEffectiveFPS,
+            // D vs C: same worker, same back-pressure, different distance source.
+            distanceReadbackP95DeltaMs: c.meanExactP95Ms - d.meanExactP95Ms,
+            distanceReadbackFpsDelta: c.meanEffectiveFPS - d.meanEffectiveFPS,
+            // A vs C: what the canonical worker sort still costs over no sort at all.
+            canonicalSortResidualP95Ms: c.meanExactP95Ms - a.meanExactP95Ms,
+            canonicalSortResidualFps: a.meanEffectiveFPS - c.meanEffectiveFPS,
             exactP95DeltaMs: c.meanExactP95Ms - b.meanExactP95Ms,
             effectiveFpsDelta: c.meanEffectiveFPS - b.meanEffectiveFPS,
             tailGapAboveNoSortB,
             tailGapAboveNoSortC,
+            tailGapAboveNoSortD,
             tailGapClosedShare: tailGapAboveNoSortB > 0
                 ? (tailGapAboveNoSortB - tailGapAboveNoSortC) / tailGapAboveNoSortB
                 : null,
+            tailGapClosedShareD: tailGapAboveNoSortB > 0
+                ? (tailGapAboveNoSortB - tailGapAboveNoSortD) / tailGapAboveNoSortB
+                : null,
             readbackPathExercisedInC,
-            cMeetsTarget: c.meanEffectiveFPS >= LAM_SORT_TARGET.minFps
-                && c.meanExactP95Ms <= LAM_SORT_TARGET.maxExactWallP95Ms,
-            bMeetsTarget: b.meanEffectiveFPS >= LAM_SORT_TARGET.minFps
-                && b.meanExactP95Ms <= LAM_SORT_TARGET.maxExactWallP95Ms,
+            readbackPathExercisedInD,
+            dUsedPrecomputedDistances,
+            cMeetsTarget: meets(c),
+            bMeetsTarget: meets(b),
+            dMeetsTarget: meets(d),
         };
     }
 

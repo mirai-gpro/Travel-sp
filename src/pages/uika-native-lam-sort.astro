@@ -93,9 +93,16 @@
     deadline: the only back-pressure is one sort in flight at a time. The visual dimension
     has no automatic verdict; inspect the captures for mouth interior, lips, teeth, nose,
     eyes and face silhouette yourself.
+    Four runs, round-robin: <strong>A</strong> no sort · <strong>B</strong> animated-centre
+    GPU distance + readback, main-thread counting sort · <strong>D</strong> the same keys
+    handed to the LAM worker with <code>usePrecomputedDistances = true</code> ·
+    <strong>C</strong> canonical centres, keys computed inside the worker, no readback.
+    B→D isolates the Worker/WASM migration, D→C isolates the GPU→CPU distance/readback
+    cost, A→C is what the canonical worker sort still costs.
     Query parameters: <code>?lamFrames=20,63,132</code>, <code>?lamRepeats=3</code>,
     <code>?lamMeasureMs=8000</code>, <code>?lamCaptures=6</code>,
-    <code>?lamIntSort=1</code>, <code>?allowSoftware=1</code>.
+    <code>?lamIntSort=1</code>, <code>?lamIdleTimeoutMs=30000</code>,
+    <code>?allowSoftware=1</code>.
   </p>
 
   <pre class="col" id="status">initializing…</pre>
@@ -172,8 +179,14 @@
              report?.correctness?.structural
                ? (report.correctness.structural.verdict === 'PASS' ? 'ok' : 'bad') : ''),
         cell('visual', report?.correctness?.visualVerdict ?? '—', 'warn'),
+        cell('B vs D', report?.correctness?.bVsD?.verdict ?? '—',
+             report?.correctness?.bVsD
+               ? (report.correctness.bVsD.verdict === 'IDENTICAL' ? 'ok'
+                  : (report.correctness.bVsD.verdict === 'NOT_RUN' ? '' : 'warn')) : ''),
         cell('readback in C', a ? (a.readbackPathExercisedInC ? 'YES' : 'no') : '—',
              a ? (a.readbackPathExercisedInC ? 'bad' : 'ok') : ''),
+        cell('readback in D', a ? (a.readbackPathExercisedInD ? 'yes' : 'NO') : '—',
+             a ? (a.readbackPathExercisedInD ? 'ok' : 'bad') : ''),
         cell('C meets target', a ? (a.cMeetsTarget ? 'YES' : 'no') : '—',
              a ? (a.cMeetsTarget ? 'ok' : 'bad') : ''),
       ].join('');
@@ -246,6 +259,53 @@
           }).join('')}</div>`;
       }
 
+      const bd = report.correctness?.bVsD;
+      if (bd && bd.framesCompared > 0) {
+        html += `<table>
+          <tr><th>B vs D — same depth keys, two sorts</th><th>value</th></tr>
+          <tr><td>verdict</td>
+              <td class="${bd.verdict === 'IDENTICAL' ? 'ok' : 'warn'}">${bd.verdict}</td></tr>
+          <tr><td>frames compared</td><td>${bd.framesCompared}</td></tr>
+          <tr><td>frames with an identical index order</td>
+              <td>${bd.framesWithIdenticalIndexOrder} / ${bd.framesCompared}</td></tr>
+          <tr><td>pixel-identical frames</td>
+              <td>${bd.framesPixelIdentical} / ${bd.framesCompared}</td></tr>
+          <tr><td>key sequences identical in every frame</td>
+              <td class="${bd.allKeySequencesIdentical ? 'ok' : 'warn'}">${bd.allKeySequencesIdentical ? 'yes — only tie order differs' : 'NO'}</td></tr>
+          <tr><td>frames where both orders are monotonic in the key</td>
+              <td>${bd.framesWithBothOrdersMonotonic} / ${bd.framesCompared}</td></tr>
+          <tr><td>depth keys identical in every frame</td>
+              <td class="${bd.allDepthKeysIdentical ? 'ok' : 'bad'}">${bd.allDepthKeysIdentical ? 'yes' : 'NO'}</td></tr>
+          <tr><td>worst differing index positions</td>
+              <td>${bd.worstDifferingIndexPositions ? `${bd.worstDifferingIndexPositions.value} (frame ${bd.worstDifferingIndexPositions.frame})` : '—'}</td></tr>
+          <tr><td>worst different pixels</td>
+              <td>${bd.worstDifferentPixels ? `${bd.worstDifferentPixels.value} (frame ${bd.worstDifferentPixels.frame})` : '—'}</td></tr>
+          <tr><td>worst max RGBA byte delta</td>
+              <td>${bd.worstMaxRgbaByteDelta ? `${bd.worstMaxRgbaByteDelta.value} (frame ${bd.worstMaxRgbaByteDelta.frame})` : '—'}</td></tr>
+        </table>`;
+        html += `<table>
+          <tr><th>B vs D frame</th><th>index order identical</th><th>differing positions</th>
+              <th>first differing (pos: B→D)</th><th>same splat set</th>
+              <th>max |key B − key D|</th><th>key seq identical</th>
+              <th>monotonic B / D</th><th>worst inversion / key range, B / D</th>
+              <th>distinct keys</th>
+              <th>different px</th><th>max RGBA delta</th></tr>
+          ${bd.frames.map((f: any) => `<tr>
+            <td>${f.frame}</td>
+            <td class="${f.identicalIndexOrder ? 'ok' : 'warn'}">${f.identicalIndexOrder ? 'yes' : 'no'}</td>
+            <td>${f.differingIndexPositions} / ${f.indexPositionsCompared}</td>
+            <td>${f.firstDifferingIndexPosition === null ? '—' : `${f.firstDifferingIndexPosition}: ${f.firstDifferingPair.exact}→${f.firstDifferingPair.lam}`}</td>
+            <td class="${f.sameIndexMultiset ? 'ok' : 'bad'}">${f.sameIndexMultiset ? 'yes' : 'NO'}</td>
+            <td>${sci(f.maxDepthKeyAbsDifference)}</td>
+            <td class="${f.identicalKeySequence ? 'ok' : 'warn'}">${f.identicalKeySequence ? 'yes' : `no (pos ${f.firstDifferingKeyPosition}, max ${sci(f.maxKeySequenceAbsDifference)})`}</td>
+            <td class="${f.exactOrderMonotonic && f.lamOrderMonotonic ? 'ok' : 'warn'}">${f.exactOrderMonotonic ? 'yes' : sci(f.exactMaxInversion)} / ${f.lamOrderMonotonic ? 'yes' : sci(f.lamMaxInversion)}</td>
+            <td>${sci(f.exactMaxInversionRelative)} / ${sci(f.lamMaxInversionRelative)}</td>
+            <td>${f.distinctKeys} <span style="color:#888">of ${f.indexPositionsCompared}</span></td>
+            <td>${f.differentPixels}</td><td>${f.maxRgbaByteDelta}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
       const st = report.correctness?.structural;
       if (st) {
         html += `<table>
@@ -259,7 +319,9 @@
         html += `<table>
           <tr><th>run</th><th>rep</th><th>FPS</th><th>frames (drain)</th><th>exact p50/p95 ms</th>
               <th>GPU draw p50/p95</th><th>predeform p50/p95</th>
-              <th>worker sort p50/p95</th><th>index update p50/p95</th><th>sort Hz</th></tr>
+              <th>worker sort p50/p95</th><th>index update p50/p95</th>
+              <th>distance stage p50/p95</th><th>GPU dist / readback</th><th>sort Hz</th>
+              <th>drains ok</th></tr>
           ${report.performance.samples.map((x: any) => `<tr>
             <td>${x.name}</td><td>${x.repeat}</td><td>${num(x.effectiveFPS)}</td>
             <td>${x.renderedFrames} (${x.framesDuringDrain})</td>
@@ -268,21 +330,27 @@
             <td>${stage(x.predeform)}</td>
             <td>${x.worker ? stage(x.worker.workerSortMs) : '—'}</td>
             <td>${x.worker ? stage(x.worker.indexUpdateMs) : '—'}</td>
+            <td>${x.worker && x.worker.distanceStageMs.count > 0 ? stage(x.worker.distanceStageMs) : '—'}</td>
+            <td>${x.gpuDistance.submitted} / ${x.gpuDistance.readbacks}</td>
             <td>${x.worker ? num(x.worker.effectiveSortHz) : (x.exactPath ? num(x.exactPath.effectiveSortHz) : '—')}</td>
+            <td class="${x.idleBeforeMeasurement && x.drainedAfterMeasurement && x.submittedEqualsCompleted ? 'ok' : 'bad'}">${x.idleBeforeMeasurement ? 'y' : 'N'}/${x.drainedAfterMeasurement ? 'y' : 'N'}/${x.submittedEqualsCompleted ? 'y' : 'N'}</td>
           </tr>`).join('')}
         </table>`;
       }
 
       if ((report.performance?.samples || []).some((x: any) => x.worker)) {
         html += `<table>
-          <tr><th>worker counters (§6)</th><th>requested</th><th>submitted</th><th>completed</th>
-              <th>skipped while running</th><th>skipped before ready</th><th>errors</th></tr>
+          <tr><th>worker counters (§6)</th><th>precomputed</th><th>requested</th><th>submitted</th>
+              <th>completed</th><th>skipped while running</th><th>skipped before ready</th>
+              <th>worker errors</th><th>distance errors</th></tr>
           ${report.performance.samples.filter((x: any) => x.worker).map((x: any) => `<tr>
             <td>${x.name} r${x.repeat}</td>
+            <td>${x.worker.usePrecomputedDistances ? 'true' : 'false'}</td>
             <td>${x.worker.sortRequested}</td><td>${x.worker.sortSubmitted}</td>
             <td>${x.worker.sortCompleted}</td><td>${x.worker.sortSkippedWhileRunning}</td>
             <td>${x.worker.sortSkippedBeforeReady}</td>
             <td class="${x.worker.workerErrors === 0 ? 'ok' : 'bad'}">${x.worker.workerErrors}</td>
+            <td class="${x.worker.distanceErrors === 0 ? 'ok' : 'bad'}">${x.worker.distanceErrors}</td>
           </tr>`).join('')}
         </table>`;
       }
@@ -291,7 +359,7 @@
         html += `<table>
           <tr><th>roll-up (means over repeats)</th><th>reps</th><th>intervals</th><th>FPS</th>
               <th>exact p95 ms</th><th>p95 spread</th><th>GPU draw p50</th>
-              <th>worker sort p50</th><th>index update p50</th></tr>
+              <th>worker sort p50</th><th>index update p50</th><th>distance stage p50</th></tr>
           ${report.performance.rollUps.map((x: any) => `<tr>
             <td>${x.name}</td><td>${x.repeats}</td>
             <td class="${x.intervalSamples >= 30 ? '' : 'bad'}">${x.intervalSamples}</td>
@@ -300,6 +368,7 @@
             <td>${num(x.meanGpuDrawP50Ms)}</td>
             <td>${x.meanWorkerSortP50Ms === null ? '—' : num(x.meanWorkerSortP50Ms)}</td>
             <td>${x.meanIndexUpdateP50Ms === null ? '—' : num(x.meanIndexUpdateP50Ms)}</td>
+            <td>${x.meanDistanceStageP50Ms === null ? '—' : num(x.meanDistanceStageP50Ms)}</td>
           </tr>`).join('')}
         </table>`;
       }
@@ -310,14 +379,26 @@
           <tr><th>analysis (§10)</th><th>value</th></tr>
           <tr><td>comparison valid</td>
               <td class="${a.valid ? 'ok' : 'bad'}">${a.valid ? 'yes' : 'NO — see status below'}</td></tr>
+          <tr><td>B → D: LAM Worker/WASM migration, p95</td><td>${num(a.workerMigrationP95DeltaMs)} ms</td></tr>
+          <tr><td>B → D: migration, FPS</td><td>${num(a.workerMigrationFpsDelta)}</td></tr>
+          <tr><td>D → C: GPU distance + readback cost, p95</td><td>${num(a.distanceReadbackP95DeltaMs)} ms</td></tr>
+          <tr><td>D → C: readback cost, FPS</td><td>${num(a.distanceReadbackFpsDelta)}</td></tr>
+          <tr><td>A → C: canonical worker-sort residual, p95</td><td>${num(a.canonicalSortResidualP95Ms)} ms</td></tr>
+          <tr><td>A → C: residual, FPS lost</td><td>${num(a.canonicalSortResidualFps)}</td></tr>
           <tr><td>exact p95 C − B</td><td>${num(a.exactP95DeltaMs)} ms</td></tr>
           <tr><td>effective FPS C − B</td><td>${num(a.effectiveFpsDelta)}</td></tr>
           <tr><td>tail above no-sort, B</td><td>${num(a.tailGapAboveNoSortB)} ms</td></tr>
+          <tr><td>tail above no-sort, D</td><td>${num(a.tailGapAboveNoSortD)} ms</td></tr>
           <tr><td>tail above no-sort, C</td><td>${num(a.tailGapAboveNoSortC)} ms</td></tr>
           <tr><td>share of that tail closed by C</td><td>${a.tailGapClosedShare === null ? '—' : `${(a.tailGapClosedShare * 100).toFixed(1)} %`}</td></tr>
           <tr><td>GPU distance/readback exercised in C</td>
               <td class="${a.readbackPathExercisedInC ? 'bad' : 'ok'}">${a.readbackPathExercisedInC ? 'YES — run C is contaminated' : 'no'}</td></tr>
+          <tr><td>GPU distance/readback exercised in D</td>
+              <td class="${a.readbackPathExercisedInD ? 'ok' : 'bad'}">${a.readbackPathExercisedInD ? 'yes' : 'NO — run D is not the exact-distance variant'}</td></tr>
+          <tr><td>D submitted with usePrecomputedDistances</td>
+              <td class="${a.dUsedPrecomputedDistances ? 'ok' : 'bad'}">${a.dUsedPrecomputedDistances ? 'true' : 'FALSE'}</td></tr>
           <tr><td>B meets 30 fps / 33.3 ms p95</td><td class="${a.bMeetsTarget === null ? '' : (a.bMeetsTarget ? 'ok' : 'bad')}">${a.bMeetsTarget === null ? '—' : (a.bMeetsTarget ? 'yes' : 'no')}</td></tr>
+          <tr><td>D meets 30 fps / 33.3 ms p95</td><td class="${a.dMeetsTarget === null ? '' : (a.dMeetsTarget ? 'ok' : 'bad')}">${a.dMeetsTarget === null ? '—' : (a.dMeetsTarget ? 'yes' : 'no')}</td></tr>
           <tr><td>C meets 30 fps / 33.3 ms p95</td><td class="${a.cMeetsTarget === null ? '' : (a.cMeetsTarget ? 'ok' : 'bad')}">${a.cMeetsTarget === null ? '—' : (a.cMeetsTarget ? 'yes' : 'no')}</td></tr>
         </table>`;
       }
