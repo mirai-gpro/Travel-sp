@@ -64,6 +64,7 @@
     <button id="tail" disabled>Run DPR1 Tail Isolation</button>
     <button id="fence" disabled>Run Fence Poll Isolation</button>
     <button id="phase" disabled>Run Sort Phase PoC</button>
+    <button id="levers" disabled>Run Completion Lever Isolation</button>
     <button id="stop" disabled>Stop</button>
     <button id="export" disabled>Export JSON</button>
     <button id="copy" disabled>Copy Results</button>
@@ -112,6 +113,7 @@
       tail: document.getElementById('tail') as HTMLButtonElement,
       fence: document.getElementById('fence') as HTMLButtonElement,
       phase: document.getElementById('phase') as HTMLButtonElement,
+      levers: document.getElementById('levers') as HTMLButtonElement,
       stop: document.getElementById('stop') as HTMLButtonElement,
       export: document.getElementById('export') as HTMLButtonElement,
       copy: document.getElementById('copy') as HTMLButtonElement,
@@ -294,7 +296,8 @@
           <tr><th>tail run</th><th>buffer</th><th>fps</th><th>exact p50</th><th>exact p95</th>
               <th>exact p99</th><th>polled p95</th><th>fence p95</th><th>readback p95</th>
               <th>cpu sort p95</th><th>index p95</th><th>total p95</th><th>inv fail</th>
-              <th>poll</th><th>phase</th><th>polls p50</th><th>req/sub/done/skip</th><th>valid</th></tr>
+              <th>poll</th><th>phase</th><th>mode</th><th>cadence</th><th>Hz</th>
+              <th>polls p50</th><th>req/sub/done/skip</th><th>valid</th></tr>
           ${report.runs.map((x: any) => `<tr>
             <td>${x.name}</td>
             <td>${x.buffer.drawingBufferWidth}×${x.buffer.drawingBufferHeight}</td>
@@ -311,15 +314,22 @@
             <td class="${x.sortLifecycle.lifecycleInvariantFailures === 0 ? 'ok' : 'bad'}">${x.sortLifecycle.lifecycleInvariantFailures}</td>
             <td>${x.fencePollStrategy}</td>
             <td class="${x.phaseStateMismatches ? 'bad' : ''}">${x.sortSubmissionPhase}</td>
+            <td>${x.completionMode ?? '—'}</td>
+            <td>${x.sortMinIntervalMs === null || x.sortMinIntervalMs === undefined ? 'uncapped' : `${x.sortMinIntervalMs}ms`}</td>
+            <td>${x.cadence ? x.cadence.actualDistanceSubmissionHz.toFixed(2) : '—'}</td>
             <td>${x.sortLifecycle.fencePolls.p50}</td>
             <td class="${x.completionPathExercised === false ? 'bad' : ''}">${x.sortCounters.sortRequestedCount}/${x.sortCounters.sortSubmittedCount}/${x.sortCounters.sortCompletedCount}/${x.sortCounters.sortPendingSkipCount}</td>
             <td class="${x.valid ? 'ok' : 'bad'}">${x.valid ? 'yes' : 'no'}</td>
           </tr>`).join('')}
         </table>
-        <p class="note">classification: <b>${report.classification}</b>
+        <p class="note">classification: <b>${report.classification ?? report.selection}</b>
           &middot; sort pipeline tail confirmed: ${report.sortPipelineTailConfirmed === null ? '—' : (report.sortPipelineTailConfirmed ? 'yes' : 'no')}
           &middot; residual above target: ${num(report.residualTailAboveTargetMs)} ms
           &middot; lifecycle invariant failures: ${(report.runs || []).reduce((s: number, x: any) => s + x.sortLifecycle.lifecycleInvariantFailures, 0)}
+          ${report.analysis && report.analysis.frequencyImprovementMs !== undefined ? `<br>B ${num(report.analysis.bMeanP95)} (spread ${num(report.analysis.bSpreadMs)}) / current ${num(report.analysis.currentMeanP95)} (${num(report.analysis.currentSpreadMs)}) / 4Hz ${num(report.analysis.f4MeanP95)} (${num(report.analysis.f4SpreadMs)}) / gpu-only ${num(report.analysis.g4MeanP95)} (${num(report.analysis.g4SpreadMs)}) ms
+            <br>frequency ${num(report.analysis.frequencyImprovementMs)} ms vs noise ${num(report.analysis.frequencyNoiseFloorMs)} &rarr; <b>${report.frequencyVerdict}</b>
+            &middot; sync/readback ${num(report.analysis.syncReadbackImprovementMs)} ms vs noise ${num(report.analysis.syncReadbackNoiseFloorMs)} &rarr; <b>${report.syncReadbackVerdict}</b>
+            <br>GPU distance residual ${num(report.analysis.gpuDistanceResidualMs)} ms &middot; cadence ${report.analysis.f4MeanHz ? report.analysis.f4MeanHz.toFixed(2) : '—'} / ${report.analysis.g4MeanHz ? report.analysis.g4MeanHz.toFixed(2) : '—'} Hz valid=${report.analysis.cadenceValid} &middot; selection <b>${report.selection}</b>` : ''}
           ${report.analysis && report.analysis.preDrawMeanP95 !== undefined ? `<br>pre-draw mean ${num(report.analysis.preDrawMeanP95)} (spread ${num(report.analysis.preDrawSpreadMs)}) / post-draw mean ${num(report.analysis.postDrawMeanP95)} (spread ${num(report.analysis.postDrawSpreadMs)}) / no-sort ${num(report.analysis.noSortP95)} ms &middot; improvement ${num(report.analysis.phaseImprovementMs)} of gap ${num(report.analysis.originalGapMs)} ms &middot; state mismatches ${report.analysis.phaseStateMismatches}` : ''}
           ${report.analysis && report.analysis.closedShare !== undefined && report.analysis.c0P95 !== undefined ? `<br>no-sort ${num(report.analysis.noSortP95)} / C0 ${num(report.analysis.c0P95)} / best ${report.analysis.bestPollRun ?? '—'} ${num(report.analysis.bestPollP95)} ms &middot; gap ${num(report.analysis.originalGapMs)} closed ${num(report.analysis.closedByPollingMs)} residual ${num(report.analysis.residualGapMs)} ms &middot; C0 spread ${num(report.analysis.c0RepeatabilityMs)} ms` : ''}</p>`;
       }
@@ -342,6 +352,7 @@
       btn.tail.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.fence.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.phase.disabled = !runtime.report.ready || busy || !replay.getFixture();
+      btn.levers.disabled = !runtime.report.ready || busy || !replay.getFixture();
       btn.stop.disabled = !busy;
       btn.export.disabled = !report;
       btn.copy.disabled = !report;
@@ -423,6 +434,19 @@
       } catch (error: any) {
         lastError = error?.message || String(error);
         console.error('[UIKA GATE4B2B2]', error);
+      }
+      renderStatus();
+    });
+
+    btn.levers.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await tail.runCompletionLevers(tailOptionsFromUrl());
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4B2B3]', error);
       }
       renderStatus();
     });

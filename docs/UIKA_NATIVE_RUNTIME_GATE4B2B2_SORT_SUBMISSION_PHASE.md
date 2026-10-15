@@ -2,8 +2,13 @@
 
 Spec: UIKA Native Runtime v1.1 Gate 4B-2B-2.
 Route: `/uika-native-predeform-benchmark`, sixth button — **Run Sort Phase PoC**.
-Status: PoC delivered and self-tested. The measurement has to be taken on the machine with
-the real GPU, so §6 is PENDING until that run comes back.
+Status: complete. `POST_DRAW_PHASE_NOT_PRIMARY` — submitting the distance pass after the
+draw is **12.55 ms slower** at p95 (closedShare −30.84 %), 12.6x the measured repeat
+spread, so it is a regression and not a null result (§6). All five runs valid with every
+new guard clean. One classifier bug found in the export and fixed: the noise test compared
+the signed improvement, so a large negative effect read as `UNRESOLVED` (§6.1). Next step
+per §15: compare a completion-path frequency reduction against removing the GPU-to-CPU
+readback.
 
 ---
 
@@ -92,7 +97,8 @@ Each run now:
 
 ```text
 warm up
-wait until no sort is in flight          (sortPending == false, 5 s cap)
+wait until no sort is in flight          (sortPending == false, idleTimeoutMs cap,
+                                         default 10 s; sorting is suspended while waiting)
 reset the counters, open the window
 measure
 close the window, then drain the in-flight sort before reading the counters
@@ -164,38 +170,130 @@ closedShare        = phaseImprovementMs / originalGapMs
 ```
 
 ```text
-closedShare >= 0.5, effect > 2x the larger spread   POST_DRAW_PHASE_EFFECTIVE
-0.2 < closedShare < 0.5, effect > noise             POST_DRAW_PHASE_PARTIAL
-closedShare <= 0.2, effect > noise                  POST_DRAW_PHASE_NOT_PRIMARY
-effect < 2x the larger spread                       UNRESOLVED
-a run invalid, or any invariant failure             UNRESOLVED
+closedShare >= 0.5, |effect| > 2x the larger spread  POST_DRAW_PHASE_EFFECTIVE
+0.2 < closedShare < 0.5, |effect| > noise            POST_DRAW_PHASE_PARTIAL
+closedShare <= 0.2, |effect| > noise                 POST_DRAW_PHASE_NOT_PRIMARY
+|effect| < 2x the larger spread                      UNRESOLVED
+a run invalid, or any invariant failure              UNRESOLVED
 ```
+
+The noise test is on the **magnitude**. A large negative effect — post-draw measurably
+slower — is a measured regression, reported as `phaseRegressionMs`, not an absent effect;
+testing the signed value conflated the two, which is the bug §6.1 records.
 
 The 0.5, 0.2 and 2x figures are decision rules chosen for this gate, not measured
 quantities.
 
 ---
 
-## 6. Results — PENDING (real GPU)
+## 6. Results — real GPU
+
+AMD Radeon(TM) 860M Graphics (D3D11) / 759 x 759 / pixelRatio 1.0, 30 s per run,
+2026-10-14T12:21-12:24Z.
+
+Every gate this gate added is clean in all five runs:
 
 ```text
-GPU / browser / drawingBuffer                                      PENDING
-
-B-no-sort-reference      fps, exact p50/p90/p95/p99/max            PENDING
-P0-pre-draw              the same + draw, distance, fence, readback, lifecycle   PENDING
-P0-pre-draw-repeat       the same                                  PENDING
-P1-post-draw             the same                                  PENDING
-P1-post-draw-repeat      the same                                  PENDING
-
-preDrawMeanP95 / postDrawMeanP95 / spreads                          PENDING
-phaseImprovementMs / originalGapMs / closedShare                    PENDING
-phaseStateMismatches (must be 0)                                    PENDING
-submittedEqualsCompleted (must hold) / idleBeforeMeasurement        PENDING
-lifecycleInvariantFailures (must be 0)                              PENDING
-CLASSIFICATION                                                      PENDING
+submittedEqualsCompleted   true        idleBeforeMeasurement    true
+drainedAfterMeasurement    true        phaseStateMismatches     0
+lifecycleInvariantFailures 0           completionPathExercised  true (B: n/a)
+GL errors 0                page errors 0                visibilityLostMs 0
+idle wait 2 - 99 ms        drain wait 3 - 121 ms
 ```
 
-Nothing above is estimated or extrapolated.
+So the §8 warm-up-spill fix and the §7 state assertion both held on the real GPU, and
+`submitted == completed` exactly in every run (234/234, 237/237, 194/194, 197/197).
+
+```text
+run                     fps     exact p50   p90     p95     p99     max
+B-no-sort-reference    46.35     19.70     26.80   43.40   68.30   75.90
+P0-pre-draw            45.06      8.40     80.40   84.60   88.10  104.10
+P0-pre-draw-repeat     45.15      8.40     78.60   83.60   88.90  111.60
+P1-post-draw           45.49      8.50     83.20   96.60  101.40  119.40
+P1-post-draw-repeat    45.17      8.40     86.60   96.70  101.20  121.80
+```
+
+```text
+pre-draw  mean p95   84.10 ms     spread 1.00 ms
+post-draw mean p95   96.65 ms     spread 0.10 ms
+no-sort        p95   43.40 ms
+
+phaseImprovementMs   -12.55 ms        (post-draw is SLOWER)
+originalGapMs         40.70 ms
+closedShare          -30.84 %
+```
+
+### 6.1 Classification
+
+```text
+POST_DRAW_PHASE_NOT_PRIMARY
+and post-draw is a measured regression of 12.55 ms at p95
+```
+
+The effect magnitude is 12.55 ms against a larger repeat spread of 1.00 ms — **12.6x the
+noise** — so this is not a null result: submitting the distance pass after the draw is
+reliably worse. `closedShare` is −30.84 %, which is below the 0.2 rule, so §13's
+`POST_DRAW_PHASE_NOT_PRIMARY` is the classification.
+
+**The exported JSON says `UNRESOLVED`, and that was a classifier bug, now fixed.** The
+noise test compared the *signed* improvement against the noise floor, so an effect that was
+large but negative read as "below the noise floor" — conflating "too small to tell" with
+"clearly worse in the other direction". The test now uses the magnitude, and a negative
+effect is reported as `phaseRegressionMs` with its own line in `classificationBasis`. The
+per-run numbers in that export are unaffected; only the one derived label was wrong.
+
+### 6.2 What moved, and what did not
+
+```text
+                        pre-draw        post-draw      change
+GPU draw p50            19.41 / 19.44   19.44 / 19.49  unchanged
+GPU distance p50         0.45 / 0.47     0.76 / 0.79   x1.68
+GPU distance p95         0.83 / 0.87     1.64 / 1.65   x1.94
+fence elapsed p50      111.20 /108.90  133.80 /134.30  +24.0 ms
+fence elapsed p95      126.70 /131.40  158.50 /159.10  +29.8 ms
+sorts submitted            234 / 237       194 / 197   -17 %
+pendingSkip                515 / 506       649 / 631   +25 %
+effectiveFPS             45.06 /45.15     45.49 /45.17 unchanged
+```
+
+The draw is untouched by the phase — identical to two decimal places in all five runs. What
+moving the submission did was make the distance pass itself slower, make its fence longer,
+and cut sort throughput by 17 %. Why the GPU queue behaves that way is not established
+here and is not asserted.
+
+### 6.3 Two further observations, recorded without explanation
+
+**The tail is not confined to frames where a sort completes.** From the frame correlation:
+
+```text
+P0-pre-draw          frames with a completion  233   p95  86.80 ms
+                     frames without            1119  p95  80.80 ms
+P1-post-draw         with                      193   p95 100.10 ms
+                     without                   1166  p95  94.90 ms
+```
+
+Frames in which no sort completed still carry a ~80-95 ms p95. Whatever produces the tail
+is present on frames that complete nothing.
+
+**The distribution is bimodal, and the no-sort run is not simply "faster".** Every
+C-condition run sits at p50 8.4 ms with p90 near 80 ms — most frames are fast and roughly a
+tenth are slow. The no-sort reference is the opposite shape: p50 19.70 ms, p95 43.40 ms, a
+tighter spread with a higher median. Both run at about 45-46 fps.
+
+**The residual tail is larger in this run.** The no-sort p95 of 43.40 ms is 10.1 ms above
+the 33.3 ms target, where Gate 4B-2B-0 and 4B-2B-1 measured 34.6 and 34.8 ms. So B itself
+varies by ~9 ms between sessions, which is worth remembering before reading any single
+gap figure too closely.
+
+### 6.4 What this selects (§15)
+
+```text
+POST_DRAW_PHASE_NOT_PRIMARY
+-> queue phase does not solve it. The next step compares a completion-path FREQUENCY
+   reduction against removing the GPU-to-CPU readback entirely.
+```
+
+Not started here (§11). Post-draw is not a candidate to keep: it is slower.
 
 ---
 

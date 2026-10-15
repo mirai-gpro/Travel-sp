@@ -89,6 +89,10 @@ export interface UikaSortLifecycleRecorder {
     /** A counter only: runSort() is entered even while a sort is in flight. */
     requested?(): void;
     pendingSkip?(at: number): void;
+    /** Gate 4B-2B-3: the cadence gate held this request back; sortDirty stays set. */
+    cadenceSkip?(at: number): void;
+    /** Gate 4B-2B-3: the cadence gate let this request through. */
+    cadenceEligible?(at: number): void;
     submitStart?(at: number): void;
     submitEnd?(at: number): void;
     cpuSortStart?(at: number): void;
@@ -301,6 +305,9 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     private frameTickHook: ((tick: UikaFrameTick) => void) | null = null;
     private sortStage: UikaSortStage = 'full';
     private sortSubmissionPhase: UikaSortSubmissionPhase = 'pre-draw';
+    /** Gate 4B-2B-3 §4: minimum interval between sort submissions. null = production. */
+    private sortMinIntervalMs: number | null = null;
+    private lastSortSubmitAt = Number.NEGATIVE_INFINITY;
     /** Bumped on every weight upload, so a frame can tell whether the weights moved. */
     private weightUploadSeq = 0;
     /** Gate 4B-2B-2: frames where the post-draw sort would have read changed state. */
@@ -622,6 +629,21 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return this.sortSubmissionPhase;
     }
 
+    /**
+     * Gate 4B-2B-3 §4. Diagnostic only; `null` is the production semantics and the
+     * default. With a value set, a frame that arrives before the interval has elapsed does
+     * NOT submit — and does not clear `sortDirty`, so the request is not forgotten and the
+     * next eligible frame submits the newest state.
+     */
+    setDiagnosticSortMinIntervalMs(intervalMs: number | null): void {
+        this.sortMinIntervalMs = intervalMs;
+        this.lastSortSubmitAt = Number.NEGATIVE_INFINITY;
+    }
+
+    getDiagnosticSortMinIntervalMs(): number | null {
+        return this.sortMinIntervalMs;
+    }
+
     /** Gate 4B-2B-2 §8: is a sort in flight right now? */
     isSortPending(): boolean {
         return this.sortPending;
@@ -837,6 +859,17 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
             return;
         }
         if (this.sortSuspended) return;
+
+        // Gate 4B-2B-3 §4: the cadence gate. sortDirty is deliberately left set.
+        if (this.sortMinIntervalMs !== null) {
+            const now = performance.now();
+            if (now - this.lastSortSubmitAt < this.sortMinIntervalMs) {
+                this.sortLifecycle?.cadenceSkip?.(now);
+                return;
+            }
+            this.sortLifecycle?.cadenceEligible?.(now);
+            this.lastSortSubmitAt = now;
+        }
 
         this.mvpMatrix.copy(this.camera.matrixWorld).invert();
         this.mvpMatrix.premultiply(this.camera.projectionMatrix);
