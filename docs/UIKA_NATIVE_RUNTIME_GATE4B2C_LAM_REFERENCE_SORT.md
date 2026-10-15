@@ -9,6 +9,7 @@ direction and the PoC that replaces it.
 | acceptance | `gate4b2c-v1-structural-pass-plus-human-visual` |
 | production integration | none |
 | status | harness complete and self-tested; awaiting the real-GPU run |
+| variants | A no-sort · B exact animated-centre + main-thread sort · D exact animated-centre + LAM worker · C canonical-centre + LAM worker |
 
 ---
 
@@ -87,7 +88,7 @@ Read off the LAM fork's `Viewer.js` and `render.ts`:
 | `enableSIMDInSort` | `true` (default) | `true` | same |
 | `splatSortDistanceMapPrecision` | `16` → 65,536 buckets | `16` | same |
 | `dynamicMode` | `false` | `false` | same |
-| `gpuAcceleratedSort` | **`true`** (`render.ts`) | **not used** | §2 removes the GPU distance / fence / readback path. The same unmodified worker is run with `usePrecomputedDistances: false`, where the WebAssembly module computes the depth keys itself from the uploaded centres. That is the upstream default path, not a new one. |
+| `gpuAcceleratedSort` | **`true`** (`render.ts`) | **variant D reproduces it; variant C does not** | The real LAM runtime uses GPU distance → `fenceSync` → `getBufferSubData` → Worker/WASM sort. Variant **D** is that arrangement, with UIKA's animated-centre distance pass in place of `SplatMesh.computeDistancesOnGPU` and `usePrecomputedDistances: true`. Variant **C** keeps the canonical-centre, readback-free adaptation; it is a deliberate UIKA adaptation and is **not** a reproduction of the LAM runtime. |
 | `integerBasedSort` | **`true`** (default) | **`false`** | LAM passes this one flag to *both* `createSortWorker` and the `SplatMesh` constructor as `integerBasedDistancesComputation` (`Viewer.js:367-368`), so the uploaded centre array and the way the worker reads it always agree. UIKA's `SplatMesh` is built with `integerBasedDistancesComputation = false` and §1 keeps it that way, so float centres are uploaded and the worker is told to read float centres. `?lamIntSort=1` runs the integer variant instead (centres then come from `getIntegerCenters()` explicitly). |
 
 Both deviations are carried in the report as `sortConfiguration.deviationsFromLamDefaults`,
@@ -142,11 +143,31 @@ measured it), `indexUpdateMs`, `submitMs`, `roundTripMs`, `workerErrors` and
 Measured round-robin (A, B, C, A, B, C, …) so that session drift lands on all three
 equally, `?lamRepeats=N` samples each, means compared rather than first runs.
 
-| run | sort |
-| --- | --- |
-| `A-no-sort` | sorting suspended; everything else identical |
-| `B-exact-animated-centre-sort` | the existing path: animated-centre GPU distance pass, fence, readback, CPU counting sort |
-| `C-lam-canonical-centre-worker-sort` | the LAM reference canonical-centre Worker/WASM sort |
+| run | depth keys | sort |
+| --- | --- | --- |
+| `A-no-sort` | — | sorting suspended; everything else identical |
+| `B-exact-animated-centre-sort` | animated centre, GPU distance pass + fence + `getBufferSubData` | project-owned main-thread counting sort |
+| `D-lam-exact-distance-worker-sort` | **the same**, from the same function object | vendored LAM Worker/WASM, `usePrecomputedDistances: true` |
+| `C-lam-canonical-centre-worker-sort` | canonical centre, computed inside the worker, no readback | vendored LAM Worker/WASM, `usePrecomputedDistances: false` |
+
+What each pair isolates:
+
+| pair | difference | question |
+| --- | --- | --- |
+| B → D | only the sort implementation | the LAM Worker/WASM migration effect |
+| D → C | only the distance source and its readback | the GPU→CPU distance/readback cost |
+| A → C | the whole canonical worker sort | what that sort still costs over no sort |
+
+No second distance shader exists. `measureRun` builds **one** `distanceProvider` closure over
+`UikaPredeformPass.computeDistances` and hands the same object to `viewer.setDistanceProvider`
+for B and to `host.setDistanceSource` for D. In D the host sets `running` **before** the GPU
+distance pass, because that pass is part of the submission; otherwise one frame could start
+several distance passes.
+
+D is invalid unless all of these hold, and the harness refuses the comparison when they do not:
+`readbackPathExercisedInD` (the pre-deformation pass's own counters show a GPU distance
+submission **and** a readback), `dUsedPrecomputedDistances`, `distanceErrors == 0`, and, for
+every run, the warm-up drain and post-window drain both completed and `submitted == completed`.
 
 `readbackPathExercisedInC` is reported explicitly: if any GPU sort-submission timer sample
 appears in run C, run C was contaminated and its numbers do not answer the question.
@@ -210,9 +231,15 @@ Target, unchanged from the tail gates: 30 fps and an exact wall p95 of 33.3 ms.
 
 ## 11. Not done
 
-No production integration, no Gate 5 Live, no Gaussian reduction, no basis reduction, no
-LOD, no half float, no new GPU sort implementation, and no project-written sort algorithm
-inside the worker.
+No production integration, no Gate 5 Live, no canonical-sort adoption, no readback
+elimination, no integer-sort migration, no Gaussian reduction, no basis reduction, no LOD,
+no half float, no new GPU sort implementation, and no project-written sort algorithm inside
+the worker.
+
+`integerBasedSort` stays `false` for **every** variant, D included, so D's precomputed
+distances are float. LAM's own default is `true`. This gate does not change the numeric
+representation of the splat data; an integer variant is a separate decision to be taken
+only if these results call for it. The deviation is carried in every report.
 
 ---
 
@@ -295,6 +322,56 @@ Two harness defects that this self-test found and that are fixed:
    produced run A with one rendered frame — zero intervals, p95 0.00 ms — and the analysis
    reported "100 % of the tail closed" from it. `MIN_INTERVALS_FOR_COMPARISON = 30` now
    refuses the comparison instead of estimating it.
+
+### 12.1.1 B vs D — measured, and it does NOT match
+
+The gate's own expectation was that two sorts given the same depth keys should produce the
+same order. **They do not**, and the harness measured why rather than arguing about it.
+
+Frame 20, SwiftShader, both sorts fed from the same `computeDistances` call:
+
+| measurement | value |
+| --- | --- |
+| depth keys handed to the two sorts | **bit-identical** (`maxDepthKeyAbsDifference = 0`) |
+| same splat multiset | yes |
+| index positions differing | **132,487 / 133,541**, first at position 10 (B→128348, D→131730) |
+| **distinct depth keys among the splats** | **133,355 / 133,541** |
+| emitted key sequences identical | **no**, first differing at position 10, max difference 4.3805e-04 |
+| depth key range | [-0.0607986, 0.2073789], span 0.2681775 |
+| B worst local inversion | 4.0829e-06 = **1.5225e-05** of the range |
+| D worst local inversion | 4.4565e-04 = **1.6618e-03** of the range |
+| framebuffer | 95,143 differing pixels, max RGBA byte delta 17, max alpha byte delta 2 |
+
+Reading these in order:
+
+1. With 133,355 distinct keys among 133,541 splats there is almost no exact tie, so the
+   disagreement is **not** tie-breaking. The verdict is `ORDER_DIFFERS`, not
+   `TIE_ORDER_DIFFERS`.
+2. Neither order is exactly monotonic in the raw float key, which is expected of any
+   bucketed counting sort. What differs is by how much: the project-owned sorter's worst
+   local inversion is 1/65,700 of the key range, the LAM worker's is 1/602 — about 109x
+   coarser, although both are configured with `1 << 16` buckets.
+3. No claim is made here about what the WebAssembly module does internally. The numbers
+   above are measurements of its output; its bucket mapping is not readable from this
+   repository.
+
+Consequence for the gate: **D is not "B's order produced by a worker"** — it is a different
+order. A B→D performance difference therefore carries both the migration cost and whatever
+the coarser ordering costs or saves, and must not be read as migration cost alone. The
+framebuffer difference B vs D (95,143 px) is of the same order as B vs C (106,165 px on the
+same frame), which is consistent with the two worker variants sharing a sort and differing
+only in where their keys came from.
+
+### 12.1.2 Two more harness defects the variant-D self-test found
+
+1. Variant D reported **1 submitted, 2 completed**. The GPU distance pass alone measured a
+   p50 of **9,305 ms** on this renderer, outrunning the fixed 10 s warm-up drain, so a
+   warm-up sort completed inside the measured window. The drain timeout is now an option
+   (`?lamIdleTimeoutMs=`, default 30 s) and every run records `idleBeforeMeasurement`,
+   `drainedAfterMeasurement` and `submittedEqualsCompleted`. Any run failing one of them
+   invalidates the whole comparison instead of being averaged in.
+2. `host.setDistanceSource()` refuses to run while a sort is in flight, so `measureRun` now
+   drains before it rewires anything.
 
 ### 12.2 Real GPU
 
