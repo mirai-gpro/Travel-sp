@@ -8,7 +8,7 @@ direction and the PoC that replaces it.
 | route | `/uika-native-lam-sort` (new; every earlier diagnostic route untouched) |
 | acceptance | `gate4b2c-v1-structural-pass-plus-human-visual` |
 | production integration | none |
-| status | harness complete and self-tested; awaiting the real-GPU run |
+| status | real-GPU A/B/C/D measured; STOP per §"STOP" — nothing adopted |
 | variants | A no-sort · B exact animated-centre + main-thread sort · D exact animated-centre + LAM worker · C canonical-centre + LAM worker |
 
 ---
@@ -373,6 +373,136 @@ only in where their keys came from.
 2. `host.setDistanceSource()` refuses to run while a sort is in flight, so `measureRun` now
    drains before it rewires anything.
 
-### 12.2 Real GPU
+### 12.2 Real GPU — A / B / C / D
 
-_pending_
+ANGLE (AMD, AMD Radeon(TM) 860M Graphics (0x00001114) Direct3D11 vs_5_0 ps_5_0, D3D11),
+Chrome 155, Windows, devicePixelRatio 1.5 with `setDrawingBufferScale(1/dpr)` so the
+drawing buffer is 879 x 879 at pixelRatio 1.0. 3 repeats, round-robin A, B, D, C.
+Run 2026-10-16T04:32:27Z, 3 min 39 s. GL errors 0, page errors 0.
+
+**Every validity condition held, so the comparison is reported as valid**
+(`analysis.valid = true`, `invalidReasons` empty):
+
+```
+readbackPathExercisedInD   true     D ran a GPU distance submission AND a readback
+dUsedPrecomputedDistances  true     every D submission used usePrecomputedDistances
+readbackPathExercisedInC   false    C ran no GPU distance pass at all
+distanceErrors             0
+workerErrors               0
+drains (warm-up / post / submitted==completed)   all 12 samples y/y/y
+interval samples per run   A 1310, B 973, D 1297, C 1285   (>= 30 required)
+```
+
+#### Means over 3 repeats
+
+| run | FPS | exact wall p50 | exact wall p95 | p95 spread | GPU draw p50 | predeform p50 | sort Hz |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A no-sort | 43.72 | 24.30 | **45.97** | 5.80 | 19.92 | 2.41 | — |
+| B exact + main-thread sort | 32.43 | 8.40 | **118.40** | 2.90 | 26.51 | 2.97 | 5.88 |
+| D exact + LAM worker | 43.25 | 8.40 | **98.93** | 1.50 | 19.62 | 1.90 | 7.45 |
+| C canonical + LAM worker | 42.88 | 24.37 | **46.90** | 6.20 | 20.49 | 2.01 | 42.84 |
+
+Worker stages, D and C (p50):
+
+| | worker sort | index update | distance stage (GPU pass + fence + readback) | round trip |
+| --- | ---: | ---: | ---: | ---: |
+| D | 1.10 ms | 0.00 ms | **130.0 ms** (p95 154.6) | 1.60 ms |
+| C | 1.00 ms | 0.00 ms | — (no distance pass) | 23.90 ms |
+
+#### The three questions
+
+| pair | isolates | p95 | FPS |
+| --- | --- | ---: | ---: |
+| **B → D** | the LAM Worker/WASM migration alone | **−19.47 ms** | **+10.82** |
+| **D → C** | the GPU→CPU distance pass and its readback | **−52.03 ms** | −0.37 |
+| **A → C** | what the canonical worker sort still costs | **+0.93 ms** | −0.84 |
+
+Share of the B-over-A sort tail closed: **C 98.71 %**, **D 26.88 %**.
+
+#### What the numbers say
+
+1. **C removes essentially the whole sort tail** — but D → C is not a single-variable
+   experiment and the 52.03 ms must not be attributed to the readback alone. Three things
+   change together between D and C: the GPU→CPU readback is removed, the sort key moves
+   from the animated centre to the canonical centre, and the distance computation moves
+   from the GPU to the WebAssembly worker. What C establishes is that **a sort arranged
+   this way costs nothing measurable**: C's p95 sits 0.93 ms above the no-sort run — inside
+   both runs' own p95 spread (A 5.80, C 6.20) — while sorting at 42.84 Hz, once per
+   rendered frame. D, which keeps the readback, still carries 52.97 ms of tail above A.
+
+   The attribution to the GPU→CPU completion boundary rests on **two gates together**, not
+   on this one: Gate 4B-2B-3 compared the *same* GPU distance work with and without the CPU
+   readback and already measured a large difference, and this gate shows the arrangement
+   without the readback landing on the no-sort baseline. Taken together the completion /
+   readback boundary is the principal source of the UIKA 133K sort tail; that is a
+   cross-gate conclusion, and a single D → C number is not a substitute for it.
+2. **Moving the sort to the worker helps, but does not remove the tail.** B → D is a real
+   19.47 ms p95 improvement and +10.82 fps, 6.7x and far outside the p95 spreads — yet D's
+   p95 is still 98.93 ms.
+3. **The readback bounds the sort rate.** D's distance stage p50 is 130.0 ms, and D sorts
+   at 7.45 Hz; 1/0.130 s = 7.7 Hz. B is slower still at 5.88 Hz. C, with no readback, sorts
+   at the frame rate.
+4. **B and D render in bursts.** Their wall p50 is 8.40 ms against a p95 near 100–120 ms,
+   while A and C sit at p50 ≈ 24.3 ms with p95 ≈ 46 ms. The readback lumps its cost into a
+   few frames rather than spreading it.
+5. **None of the four meets the 30 fps / 33.3 ms p95 target** — including **A, which does no
+   sorting at all** (p95 45.97 ms, 12.67 ms above target). Whatever remains of the tail at
+   that point is not the sort. This gate records that and decides nothing about it.
+6. **B's GPU draw p50 is 26.51 ms against 19.62–20.49 ms for the other three** (+6.59 ms
+   over A). Measured, and not explained here.
+
+#### Correctness, exact animated-centre sort vs C canonical-centre sort (192 frames)
+
+Structural contract **PASS**: 192/192 compared, 0 GL errors, 0 page errors, 0 worker
+errors, 389 sorts submitted and 389 completed, both modes rendering 133,541/133,541.
+
+| | value |
+| --- | --- |
+| pixel-identical frames | 1 / 192 |
+| worst different pixels | 57,844 = 7.4865 % (frame 20) |
+| mean different-pixel ratio | 6.8264 % |
+| worst max RGBA byte delta | 60 (frame 132) |
+| worst max alpha byte delta | 3 (frame 21) |
+| frames with an alpha difference | 191 / 192 |
+
+The difference is spread over the whole head — the 8 x 8 tile totals are non-zero in 46 of
+64 tiles, heaviest in the upper-middle band (hair and forehead) and nowhere concentrated in
+a single region.
+
+**Visual gate: still `REQUIRES_HUMAN_INSPECTION`.** On the six worst frames the two renders
+are, at full frame and at 3x magnification over the mouth, not distinguishable by the
+author of this document: the mouth interior, lip edges, teeth, nose and silhouette match,
+and the difference mask is a diffuse speckle over hair strands and skin shading rather than
+a layering failure. That is an observation offered alongside the captures, not a PASS.
+
+#### B vs D — measured again on the real GPU, and it still does not match
+
+192 frames, and the SwiftShader result reproduces exactly:
+
+| | value |
+| --- | --- |
+| frames with identical index order | **0 / 192** |
+| frames pixel-identical | 0 / 192 |
+| depth keys bit-identical in every frame | **yes (192/192, max difference 0)** |
+| same splat multiset in every frame | yes (192/192) |
+| differing index positions | mean 132,512 of 133,541 (min 132,450, max 132,578) |
+| emitted key sequences identical | **no (0/192)**, max difference 4.8865e-04 |
+| distinct depth keys | 133,308 – 133,375 of 133,541 |
+| worst local inversion, project sorter | 1.5255e-05 of the key range |
+| worst local inversion, LAM worker | 1.8111e-03 of the key range (**≈ 119x coarser**) |
+| framebuffer | mean 52,110 differing pixels, max 53,226; max RGBA delta 33, max alpha delta 3 |
+
+With 133,308+ distinct keys among 133,541 splats this is not tie-breaking. Both orders are
+bucketed and neither is exactly monotonic in the raw float key, but the two bucket
+granularities differ by about two orders of magnitude although both are configured with
+`1 << 16` buckets. No claim is made about the WebAssembly module's internals.
+
+**Consequence: the B → D figure above is not migration cost alone.** D does not reproduce
+B's order; it produces a coarser one. −19.47 ms p95 and +10.82 fps is the combined effect of
+moving the sort off the main thread and of ordering more coarsely, and this gate does not
+separate them.
+
+#### Not decided
+
+Per §"STOP": no production integration, no Live Gate 5, no canonical-sort adoption, no
+readback elimination, no integer-sort migration.
