@@ -421,10 +421,21 @@ Share of the B-over-A sort tail closed: **C 98.71 %**, **D 26.88 %**.
 
 #### What the numbers say
 
-1. **The GPU→CPU readback is essentially the whole sort tail.** C's p95 sits 0.93 ms above
-   the no-sort run — inside both runs' own p95 spread (A 5.80, C 6.20) — while its sort
-   runs at 42.84 Hz, i.e. once per rendered frame. D, which keeps the readback, still
-   carries 52.97 ms of tail above A.
+1. **C removes essentially the whole sort tail** — but D → C is not a single-variable
+   experiment and the 52.03 ms must not be attributed to the readback alone. Three things
+   change together between D and C: the GPU→CPU readback is removed, the sort key moves
+   from the animated centre to the canonical centre, and the distance computation moves
+   from the GPU to the WebAssembly worker. What C establishes is that **a sort arranged
+   this way costs nothing measurable**: C's p95 sits 0.93 ms above the no-sort run — inside
+   both runs' own p95 spread (A 5.80, C 6.20) — while sorting at 42.84 Hz, once per
+   rendered frame. D, which keeps the readback, still carries 52.97 ms of tail above A.
+
+   The attribution to the GPU→CPU completion boundary rests on **two gates together**, not
+   on this one: Gate 4B-2B-3 compared the *same* GPU distance work with and without the CPU
+   readback and already measured a large difference, and this gate shows the arrangement
+   without the readback landing on the no-sort baseline. Taken together the completion /
+   readback boundary is the principal source of the UIKA 133K sort tail; that is a
+   cross-gate conclusion, and a single D → C number is not a substitute for it.
 2. **Moving the sort to the worker helps, but does not remove the tail.** B → D is a real
    19.47 ms p95 improvement and +10.82 fps, 6.7x and far outside the p95 spreads — yet D's
    p95 is still 98.93 ms.
