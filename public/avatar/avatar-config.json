@@ -52,5 +52,13 @@
     "voiceModel": "ja-JP-Chirp3-HD-Algieba",
     "liveVoice": "Algieba",
     "camera": { "posY": 1.82, "posZ": 0.45, "targetY": 1.68 }
+  },
+  {
+    "id": "uika-b-20k",
+    "name": "UIKA B 20K (PoC)",
+    "modelUrl": "/avatar/uika-b-20k.zip",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
   }
 ]
