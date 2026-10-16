@@ -5,7 +5,7 @@
 | route | `/uika-native-lam-baseline` (new; every earlier route untouched) |
 | subject | the **production** LAM avatar, mounted through the unmodified `LAMWebSocketManager` |
 | nature | **instrumentation only** |
-| status | **measured on the real GPU — `UIKA_RUNTIME_BEHIND_LAM`** |
+| status | **measured on the real GPU, twice — `UIKA_RUNTIME_BEHIND_LAM` both times** |
 
 ---
 
@@ -169,12 +169,15 @@ The report puts LAM beside the frozen Gate 4B-2C numbers. The UIKA rows carry th
 
 | | FPS | wall p50 | wall p95 | p95 spread | GPU draw p50 | splats | meets 30 fps / 33.3 ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| **LAM reference (production path)** | **119.96** | **8.30** | **9.40** | **0.60** | **4.17** | 20,018 | **yes** |
+| **LAM reference, §9.2 run (120 Hz display)** | **119.96** | **8.30** | **9.40** | **0.60** | **4.17** | 20,018 | **yes** |
+| **LAM reference, §9.3 run (60 Hz display)** | **60.02** | **16.67** | **19.03** | **0.40** | **7.16** | 20,018 | **yes** |
 | UIKA A no-sort | 43.72 | 24.27 | 45.97 | 5.80 | 19.92 | 133,541 | no |
 | UIKA C canonical + LAM Worker/WASM | 42.88 | 24.37 | 46.90 | 6.20 | 20.49 | 133,541 | no |
 
-**Verdict: `UIKA_RUNTIME_BEHIND_LAM`.** The gap is 37.50 ms against a combined repeat
-spread of 6.80 ms — 5.5x the spread, far outside the noise the rule was written to absorb.
+**Verdict: `UIKA_RUNTIME_BEHIND_LAM` in both runs.** The gap is 37.50 ms against a combined
+repeat spread of 6.80 ms in the first and 27.87 ms against 6.60 ms in the second — 5.5x and
+4.2x the spread. LAM meets the 30 fps / 33.3 ms gate at both display refresh rates. §9.3
+records why the *magnitude* of the gap should not be quoted as a single number.
 
 **What this table cannot settle.** LAM and UIKA differ in at least three ways at once: the
 Gaussian count (6.67x), the sort arrangement (LAM runs the D-shaped GPU-distance + readback
@@ -278,37 +281,47 @@ on the same display, is missing roughly two of every three refreshes.
 
 #### Where the difference actually is
 
-Two decompositions, both of which have to be read as indications rather than per-frame
-arithmetic: a wall percentile and a GPU-time percentile are independent orderings, so
-subtracting one from the other does not decompose any single frame.
+> **Corrected after the second run (§9.3).** This section first presented a "wall p50 minus
+> GPU draw p50" decomposition and read the ~4 ms left over as a non-draw overhead that was
+> the same in all three runs. That reading was wrong. LAM is vsync-locked — its wall p50 is
+> exactly one refresh period at both refresh rates measured — so for LAM that remainder is
+> mostly **waiting for the next vsync**, not work. Comparing it against UIKA's remainder,
+> whose composition is unknown and whose display state was not recorded, was not a
+> like-for-like decomposition, and the conclusion drawn from it ("there is no median-level
+> scheduling deficit to find") was not supported. The corrected reading is below.
 
-**At the median, UIKA's frame is explained by its GPU draw.**
+**LAM is vsync-locked, at whatever the display is doing.**
 
-| | wall p50 | GPU draw p50 | difference |
-| --- | ---: | ---: | ---: |
-| LAM | 8.30 | 4.17 | **4.13** |
-| UIKA A no-sort | 24.27 | 19.92 | **4.35** |
-| UIKA C | 24.37 | 20.49 | **3.88** |
+| | display | wall p50 | one refresh period | GPU draw p50 |
+| --- | --- | ---: | ---: | ---: |
+| LAM, §9.2 run | 120 Hz | 8.30 | 8.33 | 4.17 |
+| LAM, §9.3 run | 60 Hz | 16.67 | 16.67 | 7.16 |
 
-The non-draw part of the median frame is essentially the same in all three — about 4 ms.
-UIKA's median is slower because its draw is 4.9x LAM's, against 6.67x the Gaussians. There
-is no median-level scheduling deficit to find.
+In both runs LAM lands on exactly one refresh period, with the GPU draw taking roughly half
+of it. Its frame time is set by the display, not by its own work.
 
-**The difference is a tail that LAM does not have.**
+UIKA's two runs were measured in an earlier session whose refresh rate was not recorded, so
+UIKA's wall p50 of 24.27 / 24.37 ms **cannot** be decomposed the same way here. What can be
+said is that UIKA C's GPU draw p50 of 20.49 ms puts a 48.8 fps ceiling on it before anything
+else is counted, and it measured 42.88 fps.
+
+**The difference that survives both runs is a tail LAM does not have.**
 
 | | p95 − p50 |
 | --- | ---: |
-| LAM | **1.10** |
+| LAM, §9.2 run (120 Hz) | **1.10** |
+| LAM, §9.3 run (60 Hz) | **2.37** |
 | UIKA A no-sort | **21.70** |
 | UIKA C | **22.53** |
 
-LAM's frame time barely moves: p50 8.30, p95 9.40, spread across repeats 0.60 ms. UIKA's
-p95 sits 22 ms above its own median, and that is true of the run that does **no sorting at
-all**. Whatever produces it is present in UIKA with the sort removed, and absent from LAM.
+LAM's frame time barely moves — 1.1 ms between its median and its 95th percentile at
+120 Hz, 2.4 ms at 60 Hz, with a run-to-run p95 spread of 0.60 / 0.40 ms. UIKA's p95 sits
+22 ms above its own median, and that is true of the run that does **no sorting at all**.
+Whatever produces it is present in UIKA with the sort removed, and absent from LAM.
 
-Also worth noting against UIKA C's draw-rate ceiling: 20.49 ms of GPU draw implies at most
-48.8 fps, and UIKA C measured 42.88. UIKA is running near its own draw ceiling; LAM's
-4.17 ms implies ~240 fps and is capped at 120 by the display.
+This is the finding that depends on neither the display state, nor the decomposition above,
+nor the absolute magnitudes questioned in §9.3: a frame-time distribution with a 22 ms tail
+against one with a 1–2 ms tail. Each comparison is of a run against **itself**.
 
 #### Sort behaviour (§5)
 
@@ -339,6 +352,54 @@ was a median of 18.1–19.2 ms before the read (p95 ~40 ms), and the expression 
 took was still within one fixture frame of what the clock was asking for. At 30 fps one
 frame is 33.3 ms, so LAM's expression pipeline is holding the audio clock to within one
 frame while rendering at four times the expression rate.
+
+### 9.3 Real GPU, second run — same verdict, and a caveat that limits every magnitude
+
+Run 2026-10-16T10:45:55Z, same machine, same avatar, same 879 x 879 drawing buffer, three
+repeats of 12 s, again clean: GL errors 0, page errors 0, visibility never lost, 719–720
+intervals per repeat, nothing un-instrumented. Confirmed a distinct run rather than a
+re-export: the report hashes differ and the timestamps are five hours apart.
+
+**The display was at 60 Hz this time, and LAM locked to it exactly.**
+
+| repeat | FPS | frames | wall p50 | p90 | p95 | p99 | max | GPU draw p50 | sort sub / comp | sort Hz |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 60.00 | 720 | 16.70 | 18.40 | 19.30 | 21.50 | 35.80 | 7.02 | 720 / 240 | 20.00 |
+| 2 | 60.05 | 721 | 16.70 | 18.30 | 18.90 | 20.30 | 35.00 | 7.29 | 721 / 241 | 20.07 |
+| 3 | 60.03 | 721 | 16.60 | 18.30 | 18.90 | 20.30 | 27.70 | 7.16 | 721 / 241 | 20.06 |
+
+Means: **60.02 fps, wall p50 16.67 ms, p95 19.03 ms (spread 0.40), GPU draw p50 7.16 ms.**
+Verdict unchanged — **`UIKA_RUNTIME_BEHIND_LAM`**, gap 27.87 ms against a combined repeat
+spread of 6.60 ms. LAM still meets the 30 fps / 33.3 ms gate, with its p95 at 57 % of it.
+
+Expression behaviour is unchanged and still the reference: **192 / 192** fixture frames
+rendered in every repeat, **0 skips**, max jump 1, render lag p50 0 / p95 1 / max 1 frame,
+with the driver's last push a median 14.8–25.3 ms before the read. Each 30 fps expression is
+now held across about 2.0 render frames (721 reads / 367 selections) instead of 3.9 — exactly
+what halving the render rate should do.
+
+#### The caveat: this machine's GPU throughput is not stable between sessions
+
+**The same avatar, the same buffer and the same machine measured a GPU draw p50 of 4.17 ms
+in §9.2 and 7.16 ms here — a factor of 1.72 on identical work.** The worker sort moved the
+same way (0.1–0.2 ms → 0.3–0.4 ms). No cause is asserted: the harness records GPU timings,
+not clock or power state.
+
+The consequence is methodological and it applies to everything above:
+
+* The UIKA rows come from the **Gate 4B-2C session**, hours earlier, with the machine in an
+  unknown state. Comparing LAM's milliseconds against UIKA's across sessions is therefore
+  unreliable **in magnitude**.
+* The **verdict survives both LAM states** — 37.50 ms against a 6.80 ms spread in one run,
+  27.87 ms against 6.60 ms in the other — so "UIKA C is outside LAM's runtime envelope"
+  stands. The *size* of the gap does not have a single trustworthy value.
+* The shape-based findings survive too, because each compares a run against **itself**:
+  LAM's p95 − p50 of 1.1–2.4 ms against UIKA's 21.7–22.5 ms, and LAM's zero expression
+  skips.
+
+To put a reliable magnitude on the gap, UIKA and LAM must be measured **in the same
+session**. That is a measurement-method point, not a decision, and this gate does not act
+on it.
 
 #### What this does and does not establish
 
