@@ -16,4 +16,5 @@ export type {
     UikaFrameTick,
     UikaSortStage,
     UikaSortSubmissionPhase,
+    UikaExternalSortDriver,
 } from './uika-gaussian-viewer';

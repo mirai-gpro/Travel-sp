@@ -76,16 +76,49 @@ every change is marked with a `UIKA MODIFICATION` comment:
 Full rationale, with the measurements behind each change:
 `docs/UIKA_NATIVE_RUNTIME_GATE3B_FORK_BOUNDARY.md` §5.
 
+Taken from the **LAM fork**, not from upstream 0.4.6 — 2 files, added for the LAM
+reference sort PoC:
+
+| file | provenance |
+| --- | --- |
+| `worker/SortWorker.js` | `gaussian-splat-renderer-for-lam@0.0.9-alpha.1` `src/worker/SortWorker.js`, from that package's own source map. The `sortWorker()` body and `createSortWorker()` are byte-identical to it; only the five `import` lines were rewritten (see below). |
+| `worker/sorter-wasm.js` | the four base64 `.wasm` payloads as the LAM bundle inlines them (`var SorterWasm = "AGFzbQ…"`). Each one is byte-identical to the same literal in `@mkkellogg/gaussian-splats-3d@0.4.6`, verified by SHA-256 over the literal text. |
+
+Why the LAM fork and not upstream for `SortWorker.js`: relative to upstream 0.4.6 the LAM
+fork makes exactly one change to that file, and the PoC is a LAM-reference comparison, so
+the LAM behaviour is the one kept.
+
+```
+-  const renderCount = Math.min(e.data.sort.splatRenderCount || 0, uploadedSplatCount);
+-  const sortCount   = Math.min(e.data.sort.splatSortCount   || 0, uploadedSplatCount);
++  const renderCount = e.data.sort.splatRenderCount;
++  const sortCount   = e.data.sort.splatSortCount;
+```
+
+UIKA uploads all 133,541 canonical centres in one range before the first sort is
+submitted, so the removed clamp is a no-op either way.
+
+The `import` rewrite in `worker/SortWorker.js`:
+
+```
+-  import SorterWasm from './sorter.wasm';                        (and three more)
++  import { SorterWasm, … } from './sorter-wasm.js';
+```
+
+This project's Astro/Vite build has no rollup wasm-to-base64 plugin, which is what turned
+those four `.wasm` imports into base64 string literals in the LAM bundle. `sorter-wasm.js`
+holds the same literals, so `createSortWorker()`'s `atob(sourceWasm)` is unchanged.
+
 ## Not forked
 
 `Viewer.js`, `OrbitControls.js`, `SceneHelper.js`, `ArrowHelper.js`, `ui/**`,
-`raycaster/**`, `webxr/**`, `worker/SortWorker.js` (and its four `.wasm` blobs),
-`loaders/splat/**`, `loaders/ksplat/**`, `loaders/SceneFormat.js` and
-`loaders/Utils.js` are not part of this fork.
+`raycaster/**`, `webxr/**`, `loaders/splat/**`, `loaders/ksplat/**`,
+`loaders/SceneFormat.js` and `loaders/Utils.js` are not part of this fork.
 
-`../uika-gaussian-viewer.ts` replaces `Viewer.js` and contains no third-party code.
-The depth sort is a project-owned counting sort, so no upstream worker or WebAssembly
-blob is vendored.
+`../uika-gaussian-viewer.ts` replaces `Viewer.js` and contains no third-party code. Its
+own depth sort is a project-owned counting sort fed by the GPU distance pass; the vendored
+`worker/` is used only by the LAM reference sort PoC
+(`../../lam-sort/uika-lam-sort-host.ts`), never by the production path.
 
 ## Upstream package is untouched
 

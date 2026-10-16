@@ -135,6 +135,29 @@ export type UikaSortStage = 'full' | 'distance' | 'distance+cpuSort';
  */
 export type UikaSortSubmissionPhase = 'pre-draw' | 'post-draw';
 
+/**
+ * LAM reference sort PoC (Gate 4B-2C) diagnostic only.
+ *
+ * When a driver is installed the viewer's own sort path — the GPU distance transform
+ * feedback pass, the fence, the readback and the project-owned counting sort — is not
+ * entered at all. The driver owns the whole sort, including the render-index update. The
+ * existing path is left in place, untouched, as the comparison baseline.
+ *
+ * `request()` follows the LAM reference policy: it is called on every rendered frame and
+ * returns null when the driver dropped the request because one sort was already running.
+ */
+export interface UikaExternalSortDriver {
+    /**
+     * @param modelViewProj the THREE.Matrix4 the viewer built for this sort — projection *
+     *        view * mesh world. The Matrix4 itself, not its elements, because a driver may
+     *        need to hand it to the existing GPU distance pass, which takes a Matrix4.
+     * @returns a promise that settles when this submission's indexes are applied, or null
+     *          if the driver dropped the request because one sort was already running.
+     */
+    request(modelViewProj: any): Promise<void> | null;
+    isRunning(): boolean;
+}
+
 /** Gate 4B-1 / 4B-2A diagnostic: a fingerprint of one rendered frame. */
 export interface UikaDrawingBufferHash {
     width: number;
@@ -312,6 +335,12 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     private weightUploadSeq = 0;
     /** Gate 4B-2B-2: frames where the post-draw sort would have read changed state. */
     private phaseStateMismatches = 0;
+    /** Gate 4B-2C: an external sort driver replacing the whole sort path. null = production. */
+    private externalSortDriver: UikaExternalSortDriver | null = null;
+    /** Gate 4B-2C: sort requests the external driver dropped, as the viewer counted them. */
+    private externalSortDropped = 0;
+    /** Gate 4B-2C: the completion of the most recently submitted sort, whichever path ran. */
+    private lastSortCompletion: Promise<void> | null = null;
 
     /**
      * The production basis loop, exactly as SplatMaterial.js emits it. Matching this
@@ -644,8 +673,36 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         return this.sortMinIntervalMs;
     }
 
+    /**
+     * Gate 4B-2C §2 / §3. Install or clear the external (LAM reference) sort driver.
+     *
+     * With a driver installed the viewer requests a sort on every rendered frame and the
+     * driver decides whether to submit — that is the LAM back-pressure policy (§5), and it
+     * is why this does not go through `sortDirty`. With no driver nothing changes: the
+     * production route never calls this.
+     */
+    setDiagnosticExternalSortDriver(driver: UikaExternalSortDriver | null): void {
+        this.externalSortDriver = driver;
+        this.externalSortDropped = 0;
+        this.sortDirty = true;
+    }
+
+    getDiagnosticExternalSortDriver(): UikaExternalSortDriver | null {
+        return this.externalSortDriver;
+    }
+
+    /**
+     * Gate 4B-2C diagnostic only: a copy of the index order the viewer's own counting sort
+     * most recently applied. Used to compare the main-thread sort against the LAM worker
+     * sort element by element rather than only through the framebuffer.
+     */
+    getDiagnosticSortedIndexes(): Uint32Array | null {
+        return this.sortedIndexes ? this.sortedIndexes.slice(0, this.splatCount) : null;
+    }
+
     /** Gate 4B-2B-2 §8: is a sort in flight right now? */
     isSortPending(): boolean {
+        if (this.externalSortDriver) return this.externalSortDriver.isRunning();
         return this.sortPending;
     }
 
@@ -726,6 +783,8 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
             basisCount: this.splatMesh ? this.splatMesh.uikaBasisCount : 0,
             glErrorCount: this.glErrorCount,
             phaseStateMismatches: this.phaseStateMismatches,
+            externalSortDropped: this.externalSortDropped,
+            externalSortDriverInstalled: this.externalSortDriver !== null,
             timing: { ...this.lastTiming },
             hasFlameModel: this.splatMesh ? this.splatMesh.flameModel !== undefined : null,
             hasSkeleton: this.splatMesh ? this.splatMesh.skeleton !== undefined : null,
@@ -854,7 +913,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
     private runSort(): void {
         if (!this.splatMesh || !this.renderer || !this.camera) return;
         this.sortLifecycle?.requested?.();
-        if (this.sortPending) {
+        if (this.sortPending || this.externalSortDriver?.isRunning()) {
             this.sortLifecycle?.pendingSkip?.(performance.now());
             return;
         }
@@ -875,6 +934,25 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         this.mvpMatrix.premultiply(this.camera.projectionMatrix);
         this.mvpMatrix.multiply(this.splatMesh.matrixWorld);
 
+        // Gate 4B-2C: the external driver owns the sort. No GPU distance pass, no fence,
+        // no readback, no counting sort on this thread — and no stage truncation, because
+        // the driver's own completion applies the render indexes.
+        if (this.externalSortDriver) {
+            const pending = this.externalSortDriver.request(this.mvpMatrix);
+            if (pending === null) {
+                this.externalSortDropped++;
+                return;
+            }
+            this.sortDirty = false;
+            this.sortRuns++;
+            this.sortLifecycle?.submitStart?.(performance.now());
+            this.sortLifecycle?.submitEnd?.(performance.now());
+            this.lastSortCompletion = pending
+                .then(() => { this.sortLifecycle?.completed?.(performance.now()); })
+                .catch((error: any) => { this.sortLifecycle?.failed?.(performance.now(), error); });
+            return;
+        }
+
         this.sortPending = true;
         this.sortDirty = false;
         this.sortRuns++;
@@ -887,7 +965,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         this.gpuTimer?.endSort();
         this.sortLifecycle?.submitEnd?.(performance.now());
         const stage = this.sortStage;
-        sortPromise
+        this.lastSortCompletion = sortPromise
             .then(() => {
                 if (stage !== 'distance') {
                     this.sortLifecycle?.cpuSortStart?.(performance.now());
@@ -907,6 +985,41 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
                 this.sortLifecycle?.failed?.(performance.now(), error);
                 throw error;
             });
+    }
+
+    /**
+     * Gate 4B-2C diagnostic only. Submit exactly one sort through whichever path is
+     * installed and resolve when its render indexes have been applied.
+     *
+     * This exists so a frame-by-frame correctness comparison can place a known order in
+     * front of a known draw. It does not re-implement anything: it runs `runSort()`, so
+     * the exact-sort mode measures the production GPU distance pass and the project-owned
+     * counting sort, and the LAM mode measures the vendored worker.
+     *
+     * The caller is responsible for there being no sort already in flight
+     * (`isSortPending()`); sorting is normally suspended around this call so that the
+     * viewer's own per-frame submissions cannot interleave.
+     *
+     * @returns false when the path declined to submit (a dropped request), true otherwise.
+     */
+    async runDiagnosticSortOnce(): Promise<boolean> {
+        if (!this.splatMesh || !this.renderer || !this.camera) return false;
+        const wasSuspended = this.sortSuspended;
+        const wasInterval = this.sortMinIntervalMs;
+        this.sortSuspended = false;
+        this.sortMinIntervalMs = null;
+        const runsBefore = this.sortRuns;
+        this.lastSortCompletion = null;
+        try {
+            this.sortDirty = true;
+            this.runSort();
+            if (this.sortRuns === runsBefore || !this.lastSortCompletion) return false;
+            await this.lastSortCompletion;
+            return true;
+        } finally {
+            this.sortSuspended = wasSuspended;
+            this.sortMinIntervalMs = wasInterval;
+        }
     }
 
     render(): void {
@@ -931,7 +1044,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         let sortMs = 0;
         if (!postDraw) {
             const sortStarted = performance.now();
-            if (this.sortDirty) this.runSort();
+            if (this.sortDirty || this.externalSortDriver) this.runSort();
             sortMs = performance.now() - sortStarted;
         }
 
@@ -945,7 +1058,7 @@ export class UikaGaussianViewer implements UikaGaussianRenderer {
         if (postDraw) {
             if (this.sortStateKey() !== stateBeforeDraw) this.phaseStateMismatches++;
             const sortStarted = performance.now();
-            if (this.sortDirty) this.runSort();
+            if (this.sortDirty || this.externalSortDriver) this.runSort();
             sortMs = performance.now() - sortStarted;
         }
         const sortSubmitted = this.sortRuns !== sortRunsBefore;
