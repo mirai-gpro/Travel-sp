@@ -1,0 +1,352 @@
+---
+// UIKA Native Runtime v1.1 — Gate 4C: LAM reference baseline benchmark.
+//
+// Measures the LAM avatar that is already in production, on the same machine, with the
+// same real-A2E stimulus UIKA Gate 4B-2C used. Instrumentation only: the LAM path is
+// mounted exactly as production mounts it and nothing in it is modified.
+//
+// This route does NOT use the UIKA renderer. It mounts LAMWebSocketManager with the
+// production avatar, so `?uika133k=1` must not be set.
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UIKA Native v1 — Gate 4C LAM reference baseline</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: #111; color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    .col { width: min(880px, calc(100vw - 32px)); }
+    /* The container is sized in script so that container x devicePixelRatio lands on the
+       879 x 879 drawing buffer UIKA was measured at. LAM's own devicePixelRatio is NOT
+       touched: it feeds the splat scale maths as well as the renderer. */
+    #lamAvatarContainer {
+      position: relative; overflow: hidden; background: #000; border: 1px solid #444;
+      margin: 0 auto;
+    }
+    #lamAvatarContainer :global(canvas) { display: block; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 10px 14px; border: 1px solid #555; background: #222; color: #eee; cursor: pointer; font: inherit; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.primary { background: #1d4ed8; border-color: #2563eb; }
+    #live {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px;
+      padding: 12px; border: 1px solid #444; background: #181818;
+    }
+    #live div { display: flex; flex-direction: column; gap: 2px; }
+    #live .k { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    #live .v { font-size: 15px; }
+    .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; }
+    pre {
+      margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px;
+      border: 1px solid #444; background: #181818; max-height: 50vh; overflow-y: auto;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 10px; }
+    th, td { border: 1px solid #333; padding: 4px 6px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: #888; font-weight: normal; }
+    .note { color: #999; font-size: 12px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>UIKA Native v1 — Gate 4C LAM reference baseline</h1>
+
+  <div id="lamAvatarContainer"></div>
+
+  <div class="col row">
+    <button id="mount" class="primary">Mount production LAM</button>
+    <button id="run" disabled>Run Baseline</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="export" disabled>Export JSON</button>
+    <button id="copy" disabled>Copy Results</button>
+  </div>
+
+  <div class="col" id="live"></div>
+  <div class="col" id="tables"></div>
+
+  <p class="col note">
+    Keep this tab visible and in the foreground for the whole run, and keep DevTools closed.
+    This page mounts the <strong>production</strong> LAM avatar through the unmodified
+    <code>LAMWebSocketManager</code> and instruments it with wrappers that call through and
+    are removed afterwards — no render policy, sort policy, cadence, frame-selection rule or
+    expression value is changed. LAM is fed the same real-A2E fixture UIKA Gate 4B-2C used,
+    at the same 30 fps, through the production expression path including the JP mouth
+    correction. No audio is played, so the AudioContext is a clock only: this measures
+    runtime timing, not lip-sync quality.
+    Query parameters: <code>?lamRepeats=3</code>, <code>?lamMeasureMs=12000</code>,
+    <code>?lamModel=/avatar/meruru.zip</code>,
+    <code>?lamExprPath=cache|provider</code>, <code>?lamCssPx=</code>,
+    <code>?allowSoftware=1</code>.
+  </p>
+
+  <pre class="col" id="status">idle — press “Mount production LAM”.</pre>
+
+  <script>
+    import { LAMWebSocketManager } from '../scripts/chat/lam-websocket-manager';
+    import { collectGpuInfo } from '../scripts/chat/uika-native/uika-native-benchmark';
+    import { UikaLamBaseline, lamBaselineOptionsFromUrl, ABSOLUTE_GATE }
+      from '../scripts/chat/uika-native/uika-lam-baseline';
+    import fixture from '../scripts/chat/uika-native/fixtures/a2e-real-capture-gate3.json';
+
+    const TARGET_DRAWING_BUFFER = 879;
+
+    const container = document.getElementById('lamAvatarContainer');
+    const statusEl = document.getElementById('status');
+    const liveEl = document.getElementById('live');
+    const tablesEl = document.getElementById('tables');
+    if (!(container instanceof HTMLElement) || !(statusEl instanceof HTMLElement)
+        || !(liveEl instanceof HTMLElement) || !(tablesEl instanceof HTMLElement)) {
+      throw new Error('UIKA Gate 4C: page elements missing');
+    }
+
+    const btn = {
+      mount: document.getElementById('mount') as HTMLButtonElement,
+      run: document.getElementById('run') as HTMLButtonElement,
+      stop: document.getElementById('stop') as HTMLButtonElement,
+      export: document.getElementById('export') as HTMLButtonElement,
+      copy: document.getElementById('copy') as HTMLButtonElement,
+    };
+
+    const options = lamBaselineOptionsFromUrl();
+    const dpr = window.devicePixelRatio || 1;
+    let cssPx = Math.round(TARGET_DRAWING_BUFFER / dpr);
+    try {
+      const q = new URLSearchParams(location.search);
+      if (q.has('lamCssPx')) {
+        const v = Number(q.get('lamCssPx'));
+        if (Number.isFinite(v) && v >= 64) cssPx = Math.round(v);
+      }
+    } catch { /* noop */ }
+    container.style.width = `${cssPx}px`;
+    container.style.height = `${cssPx}px`;
+
+    const baseline = new UikaLamBaseline();
+    let manager: any = null;
+    let report: any = null;
+    let lastError: string | null = null;
+    (window as any).__uikaLamBaseline = baseline;
+
+    const cell = (k: string, v: string, cls = '') =>
+      `<div><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
+    const num = (v: any, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—');
+    const stage = (x: any) => (x === 'not instrumented' ? 'not instrumented'
+      : (x ? `${num(x.p50)} / ${num(x.p95)}` : '—'));
+
+    const renderLive = () => {
+      const l: any = baseline.getLive();
+      const viewerCanvas = container.querySelector('canvas');
+      const gpu = collectGpuInfo(viewerCanvas as HTMLCanvasElement | null);
+      const s = report?.subject;
+      liveEl.innerHTML = [
+        cell('tab visible', document.visibilityState, document.visibilityState === 'visible' ? 'ok' : 'bad'),
+        cell('hardware GPU', gpu.isSoftware ? 'NO (software)' : (gpu.unmaskedAvailable ? 'YES' : 'UNKNOWN'),
+             gpu.isSoftware ? 'bad' : (gpu.unmaskedAvailable ? 'ok' : 'warn')),
+        cell('GPU', (gpu.renderer || '—').slice(0, 44)),
+        cell('step', baseline.isRunning() ? `${l.step} · ${l.phase}` : (report ? 'finished' : (manager ? 'mounted' : 'idle')),
+             baseline.isRunning() ? 'warn' : ''),
+        cell('container CSS', `${cssPx} × ${cssPx} @ dpr ${dpr}`),
+        cell('drawing buffer', s ? `${s.drawingBufferWidth}×${s.drawingBufferHeight}` : '—'),
+        cell('renderer pixelRatio', s ? num(s.rendererPixelRatio) : '—'),
+        cell('LAM splats', s && s.splatCount !== null ? String(s.splatCount) : '—'),
+        cell('expression frame', String(l.frame ?? '—')),
+        cell('live FPS', l.fps ? l.fps.toFixed(2) : '—'),
+        cell('live p95', l.p95 ? `${l.p95.toFixed(2)} ms` : '—'),
+        cell('verdict', report?.verdict ?? '—',
+             report ? (report.verdict === 'UIKA_WITHIN_LAM_RUNTIME_ENVELOPE' ? 'ok'
+                       : (report.verdict === 'UIKA_RUNTIME_BEHIND_LAM' ? 'bad' : 'warn')) : ''),
+      ].join('');
+    };
+
+    const renderTables = () => {
+      if (!report) { tablesEl.innerHTML = ''; return; }
+      let html = '';
+
+      if (report.subject) {
+        const s = report.subject;
+        html += `<table>
+          <tr><th>subject (read back, not assumed)</th><th>value</th></tr>
+          <tr><td>model</td><td>${s.modelUrl}</td></tr>
+          <tr><td>splats</td><td>${s.splatCount === null ? '—' : s.splatCount}</td></tr>
+          <tr><td>drawing buffer</td><td>${s.drawingBufferWidth} × ${s.drawingBufferHeight}</td></tr>
+          <tr><td>renderer pixelRatio / devicePixelRatio</td><td>${num(s.rendererPixelRatio)} / ${num(s.devicePixelRatio)}</td></tr>
+          <tr><td>canvas CSS</td><td>${s.cssWidth} × ${s.cssHeight}</td></tr>
+          <tr><td>renderMode</td><td>${String(s.renderMode)}</td></tr>
+          <tr><td>gpuAcceleratedSort / integerBasedSort</td><td>${String(s.sortPolicy?.gpuAcceleratedSort)} / ${String(s.sortPolicy?.integerBasedSort)}</td></tr>
+          <tr><td>sharedMemoryForWorkers / distance map precision</td><td>${String(s.sortPolicy?.sharedMemoryForWorkers)} / ${String(s.sortPolicy?.splatSortDistanceMapPrecision)}</td></tr>
+          <tr><td>loop</td><td>${s.loop}</td></tr>
+        </table>`;
+      }
+
+      if (report.expressionSource) {
+        const e = report.expressionSource;
+        html += `<table>
+          <tr><th>expression source</th><th>value</th></tr>
+          <tr><td>path</td><td>${e.mode}</td></tr>
+          <tr><td>fixture</td><td>${e.fixture} — ${e.frames} frames @ ${e.fps} fps, ${e.names} names</td></tr>
+          <tr><td>clock</td><td>${e.clock}</td></tr>
+          <tr><td>JP mouth correction</td><td>${e.jpMouthCorrection}</td></tr>
+        </table>`;
+      }
+
+      if ((report.runs || []).length > 0) {
+        html += `<table>
+          <tr><th>LAM run</th><th>FPS</th><th>frames (drain)</th><th>intervals</th>
+              <th>wall p50 / p95</th><th>p90 / p99 / max</th>
+              <th>GPU draw p50/p95</th><th>three.render per frame</th>
+              <th>sort sub / comp</th><th>sort Hz</th></tr>
+          ${report.runs.map((x: any) => `<tr>
+            <td>r${x.repeat}</td><td>${num(x.effectiveFPS)}</td>
+            <td>${x.renderedFrames} (${x.framesDuringDrain})</td>
+            <td class="${x.wallInterval.count >= 30 ? '' : 'bad'}">${x.wallInterval.count}</td>
+            <td>${num(x.wallInterval.p50)} / ${num(x.wallInterval.p95)}</td>
+            <td>${num(x.wallInterval.p90)} / ${num(x.wallInterval.p99)} / ${num(x.wallInterval.max)}</td>
+            <td>${stage(x.gpuDraw)}</td>
+            <td>${num(x.threeRenderCallsPerFrame.p50, 1)}</td>
+            <td>${x.sortSubmissions} / ${x.sortCompletions}</td>
+            <td>${num(x.effectiveSortHz)}</td>
+          </tr>`).join('')}
+        </table>`;
+
+        html += `<table>
+          <tr><th>LAM stages (p50 / p95 ms)</th><th>sort submission</th><th>worker sort</th>
+              <th>index update</th><th>invalid GPU timer samples</th><th>page errors</th></tr>
+          ${report.runs.map((x: any) => `<tr>
+            <td>r${x.repeat}</td><td>${stage(x.sortSubmission)}</td><td>${stage(x.workerSort)}</td>
+            <td>${stage(x.indexUpdate)}</td><td>${x.invalidGpuTimerSamples}</td>
+            <td class="${x.pageErrors === 0 ? 'ok' : 'bad'}">${x.pageErrors}</td>
+          </tr>`).join('')}
+        </table>`;
+
+        html += `<table>
+          <tr><th>expression (§7)</th><th>reads</th><th>selected</th><th>distinct rendered</th>
+              <th>driver ticks</th><th>held</th><th>skips</th><th>max jump</th>
+              <th>render lag p50 / max</th><th>ms since last push p50 / max</th></tr>
+          ${report.runs.map((x: any) => `<tr>
+            <td>r${x.repeat}</td>
+            <td>${x.expression.expressionReads}</td>
+            <td>${x.expression.selectedFrames}</td>
+            <td>${x.expression.distinctRenderedFrames}</td>
+            <td>${x.expression.driverTicks}</td>
+            <td>${x.expression.sameExpressionHeldFrames}</td>
+            <td>${x.expression.expressionFrameSkips}</td>
+            <td>${x.expression.maxExpressionFrameJump}</td>
+            <td>${num(x.expression.renderLag.p50, 1)} / ${num(x.expression.renderLag.max, 1)}</td>
+            <td>${x.expression.msSinceLastPush.count === 0 ? 'n/a (provider)' : `${num(x.expression.msSinceLastPush.p50)} / ${num(x.expression.msSinceLastPush.max)}`}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
+      if ((report.comparison || []).length > 0) {
+        html += `<table>
+          <tr><th>§8 comparison (means over repeats)</th><th>reps</th><th>FPS</th>
+              <th>wall p50</th><th>wall p95</th><th>p95 spread</th><th>GPU draw p50</th>
+              <th>meets 30fps / 33.3ms</th></tr>
+          ${report.comparison.map((x: any) => `<tr>
+            <td>${x.name}</td><td>${x.repeats}</td><td>${num(x.fps)}</td>
+            <td>${num(x.p50)}</td><td>${num(x.p95)}</td><td>${num(x.p95Spread)}</td>
+            <td>${x.gpuDrawP50 === null ? 'not instrumented' : num(x.gpuDrawP50)}</td>
+            <td class="${x.meetsAbsoluteGate ? 'ok' : 'bad'}">${x.meetsAbsoluteGate ? 'yes' : 'no'}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
+      tablesEl.innerHTML = html;
+    };
+
+    const renderStatus = () => {
+      btn.mount.disabled = manager !== null;
+      btn.run.disabled = manager === null || baseline.isRunning();
+      btn.stop.disabled = !baseline.isRunning();
+      btn.export.disabled = report === null;
+      btn.copy.disabled = report === null;
+      renderLive();
+      renderTables();
+      statusEl.textContent = [
+        lastError ? `ERROR: ${lastError}` : null,
+        `absolute gate carried so far: ${ABSOLUTE_GATE.minFps} fps / `
+          + `${ABSOLUTE_GATE.maxWallP95Ms} ms p95 — Gate 4C may put it in question, and `
+          + 'does not change it',
+        report ? `verdict: ${report.verdict}` : null,
+        report?.verdictBasis?.length ? `basis:\n  - ${report.verdictBasis.join('\n  - ')}` : null,
+        report?.notInstrumented?.length
+          ? `NOT INSTRUMENTED:\n  - ${report.notInstrumented.join('\n  - ')}` : null,
+        report?.notes?.length ? `notes:\n  - ${report.notes.join('\n  - ')}` : null,
+      ].filter(Boolean).join('\n\n');
+    };
+
+    btn.mount.addEventListener('click', async () => {
+      lastError = null;
+      btn.mount.disabled = true;
+      statusEl.textContent = 'mounting the production LAM avatar…';
+      try {
+        if (new URLSearchParams(location.search).get('uika133k') === '1') {
+          throw new Error('?uika133k=1 is set; Gate 4C must measure the production LAM path');
+        }
+        manager = new LAMWebSocketManager();
+        await manager.initialize({ containerElement: container, modelUrl: options.modelUrl });
+        if (!manager.isLoaded?.()) throw new Error('the LAM model did not load');
+        // Diagnostic handle for this page only; the manager itself is not modified.
+        (window as any).__uikaLamManager = manager;
+      } catch (error: any) {
+        manager = null;
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4C MOUNT]', error);
+      }
+      renderStatus();
+    });
+
+    btn.run.addEventListener('click', async () => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await baseline.run(manager, fixture as any,
+          'uika-native/fixtures/a2e-real-capture-gate3.json', options);
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA GATE4C]', error);
+        report = baseline.getReport();
+      }
+      renderStatus();
+    });
+
+    btn.stop.addEventListener('click', () => baseline.stop());
+
+    btn.export.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `uika-lam-baseline-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    });
+
+    btn.copy.addEventListener('click', async () => {
+      try {
+        // The per-read expression samples are large; drop them from the copied text.
+        const slim = report
+          ? { ...report, runs: (report.runs || []).map((r: any) => ({
+              ...r, expressionSamples: `${(r.expressionSamples || []).length} samples omitted; use Export JSON`,
+            })) }
+          : null;
+        await navigator.clipboard.writeText(JSON.stringify(slim, null, 2));
+        btn.copy.textContent = 'Copied';
+        setTimeout(() => { btn.copy.textContent = 'Copy Results'; }, 1500);
+      } catch (error: any) {
+        lastError = `clipboard: ${error?.message || error}`;
+        renderStatus();
+      }
+    });
+
+    renderStatus();
+    window.setInterval(renderStatus, 500);
+  </script>
+</body>
+</html>
