@@ -132,5 +132,13 @@
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
     "liveVoice": "Leda",
     "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+  {
+    "id": "uika-b80-skin",
+    "name": "UIKA B80 Skin",
+    "modelUrl": "/avatar/uika-b80-skin.zip",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
   }
 ]
