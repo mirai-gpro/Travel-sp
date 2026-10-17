@@ -186,5 +186,13 @@
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
     "liveVoice": "Leda",
     "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
+  },
+  {
+    "id": "uika-full133-skin",
+    "name": "UIKA FULL 133K",
+    "modelUrl": "/avatar/uika-full133-skin.zip",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.73, "posZ": 0.45, "targetY": 1.67 }
   }
 ]
