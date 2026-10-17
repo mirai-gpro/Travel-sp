@@ -17,6 +17,9 @@ import type { ExpressionFrame } from './live-audio-manager';
 import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
 import { isUika133kMode, applyUika133kMode } from './uika-133k-mode';
 import { getDiagMode, createA2EReplayPlayer, A2EReplayPlayer } from './a2e-replay';
+// PoC 限定: ?skinMode=multi / aligned のときだけ splat shader を 4 influence LBS へ
+// 差し替える。既定 (?skinMode なし / =head) では何もしないので、出荷版の挙動は変わらない。
+import { installMultiBoneSkinning, getSkinMode } from './poc/multibone-skinning';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -224,6 +227,11 @@ export class LAMWebSocketManager {
                 camera.updateProjectionMatrix();
                 console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z, 'target.y=', controls?.target?.y);
             }
+
+            // PoC: multi-bone skinning (既定は何もしない)
+            const skinMode = getSkinMode();
+            installMultiBoneSkinning(this.renderer, skinMode)
+                .then(p => console.log('[PoC skinMode]', JSON.stringify(p)));
 
             this.isModelLoaded = true;
             console.log('[LAMWebSocketManager] モデルロード完了');

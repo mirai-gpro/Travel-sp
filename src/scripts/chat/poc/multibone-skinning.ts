@@ -1,0 +1,234 @@
+// src/scripts/chat/poc/multibone-skinning.ts
+//
+// PoC 限定。`?skinMode=multi` のときだけ、splat の vertex shader を
+// head ボーン 1 本駆動から **4 influence の LBS** へ差し替える。
+//
+// 【背景 (実測)】
+// 出荷版 `gaussian-splat-renderer-for-lam` の splat vertex shader は、
+// `skinIndex` / `skinWeight` を attribute として GPU へ渡しているのに、
+// 最終 position には使っていない:
+//
+//     if (headBoneIndex >= 0.0) {
+//         mat4 boneMat = getBoneMatrix0( headBoneIndex );
+//         skinned += boneMat * skinVertex * 1.0;
+//     }
+//     // skinned += boneMatX * skinVertex * skinWeight.x;   <- 4 行ともコメントアウト
+//     ...
+//
+// `headBoneIndex` の実測値は 110 (= `head`)。通常 LAM アバターも B80 も、
+// 全 splat がこの 1 本で動いている。
+//
+// 【skinVertex が何か (shader のコードで確定させたもの、推測ではない)】
+//
+//     splatCenter = centersColorsTexture の値            // = offset.ply.xyz + POSITION
+//     splatCenter += Σ (bsWeight * flameModelTexture)    // = Σ w_k * morph_k
+//     transformed  = splatCenter
+//     skinVertex   = vec4(transformed, 1.0)
+//
+// つまり `skinVertex` は **mesh 頂点ではなく Gaussian の中心そのもの** で、
+// offset.ply と morph を既に含んでいる。したがって指示書 §10 が言う
+// 「V だけ skin して O を素のまま足す」状態にはなっておらず、
+// Stage A は中心に対する素直な 4-weight LBS でよい。
+//
+// 【Runtime への介入範囲】
+// `material.vertexShader` の文字列を差し替えて `needsUpdate` を立てるだけ。
+// uniform / attribute / bone texture / asset には触らない。
+// `?skinMode=multi` が無ければ **何もしない** (既定は出荷版のまま)。
+
+import { DataTexture, FloatType, NearestFilter, RGBAFormat } from 'three';
+
+export type SkinMode = 'head' | 'multi' | 'aligned';
+
+// ---------------------------------------------------------------------------
+// index domain の実測 (shader と renderer のコードで確定したもの)
+//
+//   center:  getDataUV() が `getRealIndex(int(splatIndex), internal)` を使う
+//            → **splatIndex attribute の「値」** が source splat を指す
+//   skin:    `attribute vec4 skinIndex / skinWeight` を素で読む
+//            → **draw slot (instance 番号)** がそのまま index になる
+//
+//   SplatMesh.updateRenderIndexes(globalIndexes) が毎 sort で
+//   `geometry.attributes.splatIndex.set(globalIndexes)` を実行する一方、
+//   skinIndex / skinWeight は `setSkinAttibutes === false` のガードで
+//   **一度だけ**書かれ、以後並べ替えられない。
+//
+//   つまり sort 後は
+//       center source = splatIndex[i]
+//       skin   source = i
+//   となり対応が壊れる。`aligned` モードはこれを texture 経由に直して
+//   center と同じ splatIndex で skin を引く。
+// ---------------------------------------------------------------------------
+
+/** 出荷版 shader の該当ブロック。ここが見つからなければ何もしない。 */
+const HEAD_ONLY_BLOCK = `                if (headBoneIndex >= 0.0)
+                {
+                    mat4 boneMat = getBoneMatrix0( headBoneIndex );
+                    skinned += boneMat * skinVertex * 1.0;
+                }`;
+
+/** Stage A: 素直な 4 influence LBS。weight 合計が 0 の点だけ head へ退避する。 */
+const MULTI_BONE_BLOCK = `                // [PoC multibone] 出荷版の head ボーン 1 本駆動を 4 influence LBS へ置換
+                float wSum = skinWeight.x + skinWeight.y + skinWeight.z + skinWeight.w;
+                if (wSum > 0.0) {
+                    skinned += boneMatX * skinVertex * skinWeight.x;
+                    skinned += boneMatY * skinVertex * skinWeight.y;
+                    skinned += boneMatZ * skinVertex * skinWeight.z;
+                    skinned += boneMatW * skinVertex * skinWeight.w;
+                    skinned /= wSum;
+                } else if (headBoneIndex >= 0.0) {
+                    mat4 boneMat = getBoneMatrix0( headBoneIndex );
+                    skinned += boneMat * skinVertex * 1.0;
+                }`;
+
+/** center と同じ splatIndex で skin を引く版。 */
+const ALIGNED_BLOCK = `                // [PoC aligned] center と同じ splatIndex で JOINTS/WEIGHTS を引く
+                ivec2 _skSize = textureSize(skinIndexTexture, 0);
+                int _skI = int(splatIndex);
+                ivec2 _skUV = ivec2(_skI % _skSize.x, _skI / _skSize.x);
+                vec4 aIdx = texelFetch(skinIndexTexture, _skUV, 0);
+                vec4 aW   = texelFetch(skinWeightTexture, _skUV, 0);
+                mat4 aMX = getBoneMatrix0( aIdx.x );
+                mat4 aMY = getBoneMatrix0( aIdx.y );
+                mat4 aMZ = getBoneMatrix0( aIdx.z );
+                mat4 aMW = getBoneMatrix0( aIdx.w );
+                float aSum = aW.x + aW.y + aW.z + aW.w;
+                if (aSum > 0.0) {
+                    skinned += aMX * skinVertex * aW.x;
+                    skinned += aMY * skinVertex * aW.y;
+                    skinned += aMZ * skinVertex * aW.z;
+                    skinned += aMW * skinVertex * aW.w;
+                    skinned /= aSum;
+                } else if (headBoneIndex >= 0.0) {
+                    mat4 boneMat = getBoneMatrix0( headBoneIndex );
+                    skinned += boneMat * skinVertex * 1.0;
+                }`;
+
+export function getSkinMode(): SkinMode {
+    try {
+        const v = new URLSearchParams(window.location.search).get('skinMode');
+        return v === 'multi' || v === 'aligned' ? v : 'head';
+    } catch (e) {
+        return 'head';
+    }
+}
+
+export interface SkinPatchResult {
+    mode: SkinMode;
+    applied: boolean;
+    reason: string;
+    /** 差し替え後の shader に 4 influence 行が「有効な形で」入っているか */
+    activeInfluenceLines: number;
+    headOnlyLineActive: boolean;
+}
+
+/**
+ * `material` が生える前に呼ばれることがあるので、現れるまで rAF で待ってから当てる。
+ * 結果は `window.__multiBoneSkinPatch` に入る。
+ */
+/** `skinIndex`/`skinWeight` を splatIndex で引ける texture にして uniform へ入れる。
+ *
+ * renderer が束ねている three ではなく、依存として入っている `three` を直接使う。
+ * three の texture は `isTexture` などで duck-typing されるので、
+ * 別インスタンスでも WebGLRenderer 側は受け付ける。
+ * (renderer 内部の遅延生成オブジェクトに依存しないための措置) */
+function buildSkinTextures(material: any, geometry: any): { w: number; h: number } | null {
+    const si = geometry.getAttribute('skinIndex');
+    const sw = geometry.getAttribute('skinWeight');
+    if (!si || !sw) return null;
+
+    const n = si.count;
+    const w = Math.ceil(Math.sqrt(n));
+    const h = Math.ceil(n / w);
+    const idx = new Float32Array(w * h * 4);
+    const wt = new Float32Array(w * h * 4);
+    for (let i = 0; i < n; i++) {
+        idx[i * 4] = si.getX(i); idx[i * 4 + 1] = si.getY(i);
+        idx[i * 4 + 2] = si.getZ(i); idx[i * 4 + 3] = si.getW(i);
+        wt[i * 4] = sw.getX(i); wt[i * 4 + 1] = sw.getY(i);
+        wt[i * 4 + 2] = sw.getZ(i); wt[i * 4 + 3] = sw.getW(i);
+    }
+    const mk = (data: Float32Array) => {
+        const t = new DataTexture(data, w, h, RGBAFormat, FloatType);
+        t.minFilter = NearestFilter;
+        t.magFilter = NearestFilter;
+        t.generateMipmaps = false;
+        t.needsUpdate = true;
+        return t;
+    };
+    material.uniforms = material.uniforms || {};
+    material.uniforms.skinIndexTexture = { value: mk(idx) };
+    material.uniforms.skinWeightTexture = { value: mk(wt) };
+    return { w, h };
+}
+
+export function installMultiBoneSkinning(renderer: any, mode: SkinMode,
+                                         maxTries = 600): Promise<SkinPatchResult> {
+    return new Promise((resolve) => {
+        let tries = 0;
+        const tick = () => {
+            const hasMaterial =
+                typeof renderer?.viewer?.splatMesh?.material?.vertexShader === 'string';
+            const hasSkinAttrs =
+                !!renderer?.viewer?.splatMesh?.geometry?.getAttribute?.('skinIndex');
+            const ready = hasMaterial && (mode !== 'aligned' || hasSkinAttrs);
+            if (ready || mode === 'head' || ++tries >= maxTries) {
+                const r = applyMultiBoneSkinning(renderer, mode);
+                (window as any).__multiBoneSkinPatch = r;
+                resolve(r);
+                return;
+            }
+            requestAnimationFrame(tick);
+        };
+        tick();
+    });
+}
+
+/**
+ * renderer の splat material の vertex shader を差し替える。
+ * `mode === 'head'` のときは何もしない (出荷版のまま)。
+ */
+export function applyMultiBoneSkinning(renderer: any, mode: SkinMode): SkinPatchResult {
+    const fail = (reason: string): SkinPatchResult => ({
+        mode, applied: false, reason,
+        activeInfluenceLines: 0, headOnlyLineActive: true,
+    });
+    if (mode === 'head') return fail('skinMode=head のため出荷版のまま');
+
+    const material = renderer?.viewer?.splatMesh?.material;
+    if (!material || typeof material.vertexShader !== 'string') {
+        return fail('splatMesh.material.vertexShader が見つからない');
+    }
+    const src: string = material.vertexShader;
+    if (!src.includes('USE_SKINNING')) return fail('shader に USE_SKINNING が無い');
+    if (src.indexOf(HEAD_ONLY_BLOCK) < 0) {
+        return fail('出荷版の head ボーン駆動ブロックが見つからない (renderer 版が違う)');
+    }
+
+    let patched: string;
+    if (mode === 'aligned') {
+        const size = buildSkinTextures(material, renderer.viewer.splatMesh.geometry);
+        if (!size) return fail('skinIndex / skinWeight attribute が無い');
+        const UNIFORM_ANCHOR = '        #ifdef USE_SKINNING\n            uniform mat4 bindMatrix;';
+        if (src.indexOf(UNIFORM_ANCHOR) < 0) return fail('uniform 挿入位置が見つからない');
+        patched = src
+            .replace(UNIFORM_ANCHOR,
+                '        uniform highp sampler2D skinIndexTexture;\n'
+                + '        uniform highp sampler2D skinWeightTexture;\n' + UNIFORM_ANCHOR)
+            .replace(HEAD_ONLY_BLOCK, ALIGNED_BLOCK);
+        if (patched === src) return fail('aligned 用の置換点が見つからない');
+    } else {
+        patched = src.replace(HEAD_ONLY_BLOCK, MULTI_BONE_BLOCK);
+    }
+    material.vertexShader = patched;
+    material.needsUpdate = true;
+
+    const active = (patched.match(/^\s*skinned\s*\+=\s*boneMat[XYZW]\s*\*\s*skinVertex\s*\*\s*skinWeight\.[xyzw];/gm) || []).length;
+    const headActive = /^\s*skinned\s*\+=\s*boneMat\s*\*\s*skinVertex\s*\*\s*1\.0;/m.test(
+        patched.replace(/} else if \(headBoneIndex[\s\S]*?\n {16}}/, ''));
+    return {
+        mode, applied: true,
+        reason: 'vertexShader を 4 influence LBS へ差し替えた',
+        activeInfluenceLines: active,
+        headOnlyLineActive: headActive,
+    };
+}
