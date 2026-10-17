@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Expected values for the Gate 3 real A2E fixture, as measured by the sender and",
+    "recorded in the v1.1 Gate 3 execution instruction (sections 2-5).",
+    "These are checked against the file once it lands, so that transit damage —",
+    "prettify, rounding, smoothing, interpolation, frame thinning, chunk",
+    "reconstruction or channel reorder — is caught before Gate 3 runs.",
+    "This file contains NO expression data: only the file's own fingerprint and",
+    "summary statistics."
+  ],
+  "file": "a2e-real-capture-gate3.json",
+  "sha256": "54f581aca7c5994cf4a818f71e7673a1bd689767097ab5b692e5dad65be2e24b",
+  "bytes": 214357,
+
+  "fps": 30,
+  "expressionNameCount": 52,
+  "frameCount": 192,
+  "frameWidth": 52,
+  "chunkCount": 6,
+  "durationSeconds": 6.4,
+
+  "nonNumeric": 0,
+  "nan": 0,
+  "inf": 0,
+  "globalMin": 0.0,
+  "globalMax": 0.9002304077148438,
+
+  "chunkFrameCounts": [6, 26, 64, 34, 36, 26],
+  "chunkFrameCountSum": 192,
+  "chunkPerfMsMonotonic": true,
+
+  "tongueOut": {
+    "index": 51,
+    "nonZeroFrames": 192,
+    "totalFrames": 192,
+    "maxAbs": 0.0014989759,
+    "maxAbsTolerance": 1e-9,
+    "note": "non-zero in the capture and left untouched; dropped by the mapper only"
+  },
+
+  "channelMax": {
+    "jawOpen": 0.3598918318748474,
+    "mouthStretchLeft": 0.3514883816242218,
+    "mouthStretchRight": 0.3514883816242218,
+    "mouthFunnel": 0.08393868803977966,
+    "mouthPucker": 0.30823880434036255,
+    "eyeBlinkLeft": 0.886151909828186,
+    "eyeBlinkRight": 0.886151909828186
+  },
+  "channelMin": {
+    "jawOpen": 0.0
+  }
+}

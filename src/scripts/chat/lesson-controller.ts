@@ -5,6 +5,7 @@
 // アバター + A2Eリップシンク搭載、ショップ検索・予約機能を除外
 import { CoreController } from './core-controller';
 import { AudioManager } from './audio-manager';
+import { isUika133kMode } from './uika-133k-mode';
 
 declare const io: any;
 
@@ -67,11 +68,35 @@ export class LessonController extends CoreController {
     }
   }
 
+  /**
+   * UIKA 133K のときだけ、Live 開始前にアバターの初期化完了を待つ。
+   *
+   * 通常 LAM では即 return するので既存の起動順序は変わらない。
+   * UIKA では LAMAvatarController.initialize() が renderer ロードと
+   * 初期 morph warm-up (window.__uikaStatus) の完了まで待つ。
+   */
+  private async prepareUikaAvatarBeforeLive(): Promise<void> {
+    if (!isUika133kMode()) return;
+
+    const controller = (window as any).__lamAvatarController;
+    if (!controller) {
+      throw new Error('UIKA: LAMAvatarController が見つかりません');
+    }
+    this.lamAvatarController = controller;
+
+    console.log('[UIKA INIT] avatar preparation before Live start');
+    await controller.initialize(this.liveAudioManager);
+    console.log('[UIKA INIT] avatar READY; Live start permitted');
+  }
+
   // ========================================
   // 🎯 セッション初期化をオーバーライド（LiveAPI統一）
   // ========================================
   protected async initializeSession() {
     try {
+      // UIKA 133K のみ: renderer + 初期 morph warm-up 完了まで Live を開始しない
+      await this.prepareUikaAvatarBeforeLive();
+
       if (this.sessionId) {
         try {
           await fetch(`${this.apiBase}/api/session/end`, {

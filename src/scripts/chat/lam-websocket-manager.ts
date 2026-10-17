@@ -14,8 +14,11 @@
 
 import * as GaussianSplats3D from 'gaussian-splat-renderer-for-lam';
 import type { ExpressionFrame } from './live-audio-manager';
-// PoC 限定: ?skinMode=multi のときだけ splat shader を 4 influence LBS へ差し替える。
-// 既定 (?skinMode なし / =head) では何もしないので、出荷版の挙動は変わらない。
+import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
+import { isUika133kMode, applyUika133kMode } from './uika-133k-mode';
+import { getDiagMode, createA2EReplayPlayer, A2EReplayPlayer } from './a2e-replay';
+// PoC 限定: ?skinMode=multi / aligned のときだけ splat shader を 4 influence LBS へ
+// 差し替える。既定 (?skinMode なし / =head) では何もしないので、出荷版の挙動は変わらない。
 import { installMultiBoneSkinning, getSkinMode } from './poc/multibone-skinning';
 
 export interface LAMConfig {
@@ -48,7 +51,61 @@ export class LAMWebSocketManager {
     private _prevMouthValues: Record<string, number> = {};  // スムージング用前フレーム値
 
     // 現在適用中の expression フレーム
+    // (通常 LAM 経路: AudioSyncPlayer の rAF が updateExpression() で更新する cache)
     private currentExpression: ExpressionFrame | null = null;
+
+    /**
+     * expression フレームの直接取得関数 (UIKA mode 専用、任意)。
+     *
+     * 通常 LAM は
+     *   AudioSyncPlayer の rAF
+     *     → LiveAudioManager.getCurrentExpressionFrame()
+     *     → updateExpression() → currentExpression cache
+     *     → renderer.getExpressionData()
+     * という経路で、描画が間引かれると **cache に残った古いフレーム**を使う。
+     *
+     * これが設定されている場合は `_getExpressionData()` がこの関数を直接呼び、
+     * **その描画瞬間の AudioContext.currentTime に対応するフレーム**を使う。
+     * UIKA mode だけ `() => liveAudioManager.getCurrentExpressionFrame()` を渡す。
+     */
+    private expressionProvider: (() => ExpressionFrame | null) | null = null;
+
+    /**
+     * 【診断専用】UIKA 診断 URL のときだけ設定される。
+     * `exprPath` と、`LiveAudioManager` の read-only 同期スナップショット取得関数。
+     * 通常 LAM では設定されないので、ログも出ない。
+     */
+    private exprTrace: {
+        path: string;
+        getState: () => {
+            playbackMs: number; bufferFrames: number; fps: number;
+            requestedFrame: number; selectedFrame: number; clamped: boolean;
+        };
+    } | null = null;
+
+    // ===== 診断専用: 人工 morph プローブ (?morphProbe=1) =====
+    // A2E / Socket.IO / AudioContext / expression buffer / provider・cache を
+    // すべて外し、performance.now() から直接作った jawOpen だけを renderer へ渡す。
+    // 通常 LAM と UIKA が **この同じ分岐**を通るので、違うのはモデルだけになる。
+    private readonly morphProbe: boolean = getDiagMode() === 'morphProbe';
+    private _probeTimes: number[] = [];
+    private _probeLogAt = 0;
+
+    // ===== 診断専用: 実 A2E 固定リプレイ (?a2eReplay=1) =====
+    // morphProbe とは完全に別モード (同時指定は a2e-replay.ts 側で両方無効化)。
+    // frame の取得元だけを固定データに差し替え、name マッピング / 日本語口形補正 /
+    // renderer への受け渡しは本番とまったく同じ経路を通す。
+    private readonly a2eReplay: boolean = getDiagMode() === 'a2eReplay';
+    private replayPlayer: A2EReplayPlayer | null = null;
+    private replayInitTried = false;
+
+    // トレース間引き用 (console spam を避ける)
+    private _traceRenderAt = 0;
+    private _traceRenderSel = -1;
+    private _traceRenderClamped: boolean | null = null;
+    private _traceCacheAt = 0;
+    private _traceCacheSel = -1;
+    private _traceCacheClamped: boolean | null = null;
 
     // チャット状態（Idle / Listening / Thinking / Responding）
     private chatState: string = 'Idle';
@@ -62,6 +119,15 @@ export class LAMWebSocketManager {
      */
     async initialize(config: LAMConfig): Promise<void> {
         try {
+            // ★ 新規ユーザー対応: モードのデフォルトアバター情報をlocalStorageに確実に設定
+            const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
+            // UIKA Native 133K hidden PoC (?uika133k=1) では avatar-config を触らない。
+            // 通常利用者の localStorage / ZIP 取得に一切影響させないため。
+            const uikaMode = isUika133kMode();
+            if (!uikaMode) {
+                await ensureDefaultAvatarInStorage(mode);
+            }
+
             this.renderer = await GaussianSplats3D.GaussianSplatRenderer.getInstance(
                 config.containerElement,
                 config.modelUrl,
@@ -73,9 +139,21 @@ export class LAMWebSocketManager {
                 }
             );
 
+            if (uikaMode) {
+                // ===== UIKA Native 133K hidden PoC =====
+                // 通常の avatar-config camera / orbit-limits / 初期6° polar 補正は
+                // 一切適用しない。meta.json の camera と H_head = 恒等だけを使う。
+                // gate の判定は splat mesh が揃ってから uika-133k-mode 側が出す。
+                applyUika133kMode(this.renderer, { getChatState: () => this.chatState });
+                console.log('[LAMWebSocketManager][UIKA133K] mode 適用開始 '
+                            + '(gate 判定は window.__uikaStatus を参照)');
+                this.isModelLoaded = true;
+                console.log('[LAMWebSocketManager] モデルロード完了 (UIKA133K)');
+                return;
+            }
+
             // カメラ位置を調整してアバターの顔サイズ・位置を制御
             // avatar-config.json のcameraパラメータをlocalStorageから読み込み
-            const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
             let camParams = { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // デフォルト
             try {
                 const storedCamera = localStorage.getItem(`selectedCamera_${mode}`);
@@ -96,6 +174,53 @@ export class LAMWebSocketManager {
                 const controls = this.renderer.viewer.controls;
                 if (controls) {
                     controls.target.set(0, camParams.targetY, 0);
+
+                    // ★ カーソル操作の可動域制限（orbit-limits.jsonから読み込み）
+                    try {
+                        const resp = await fetch('/avatar/orbit-limits.json');
+                        if (resp.ok) {
+                            const limits = await resp.json();
+                            if (typeof limits.minPolarAngle === 'number') controls.minPolarAngle = limits.minPolarAngle;
+                            if (typeof limits.maxPolarAngle === 'number') controls.maxPolarAngle = limits.maxPolarAngle;
+                            if (typeof limits.minAzimuthAngle === 'number') controls.minAzimuthAngle = limits.minAzimuthAngle;
+                            if (typeof limits.maxAzimuthAngle === 'number') controls.maxAzimuthAngle = limits.maxAzimuthAngle;
+                            if (typeof limits.minDistance === 'number') controls.minDistance = limits.minDistance;
+                            if (typeof limits.maxDistance === 'number') controls.maxDistance = limits.maxDistance;
+                            console.log('[LAMWebSocketManager] orbit-limits適用:', limits);
+                        }
+                    } catch (e) {
+                        console.warn('[LAMWebSocketManager] orbit-limits.json読み込み失敗、制限なし', e);
+                    }
+
+                    // 初期カメラ角度を6°下向きに補正（カーソルで下にドラッグしたのと同等）
+                    // 症状: アバターの視線がカメラ上方を向き、おでこ～頭頂部の面積が小さい
+                    // 仕組み: 内蔵OrbitControls に setPolarAngle は無いため、camera.position を
+                    //         target まわりに球面座標で回転させる。次フレームの update() が
+                    //         position から spherical を再計算するので結果が維持される。
+                    // 方向: ドラッグ下=phi減少=カメラが上側に回る=額が大きく見える
+                    //       → 現 phi から 6° 引く
+                    {
+                        const tx = controls.target.x, ty = controls.target.y, tz = controls.target.z;
+                        const dx = camera.position.x - tx;
+                        const dy = camera.position.y - ty;
+                        const dz = camera.position.z - tz;
+                        const radius = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                        const horiz = Math.sqrt(dx * dx + dz * dz);
+                        const currentPhi = Math.atan2(horiz, dy);       // polar angle (0=真上, π/2=水平, π=真下)
+                        const currentTheta = Math.atan2(dx, dz);        // azimuth
+                        const newPhi = currentPhi - (6 * Math.PI / 180);
+                        // 球面座標 → 直交座標
+                        const sinPhi = Math.sin(newPhi);
+                        const newDx = radius * sinPhi * Math.sin(currentTheta);
+                        const newDy = radius * Math.cos(newPhi);
+                        const newDz = radius * sinPhi * Math.cos(currentTheta);
+                        camera.position.set(tx + newDx, ty + newDy, tz + newDz);
+                        console.log('[LAMWebSocketManager] 初期phi調整:',
+                                    `${(currentPhi * 180 / Math.PI).toFixed(1)}° → ${(newPhi * 180 / Math.PI).toFixed(1)}°`,
+                                    'radius=', radius.toFixed(3),
+                                    'newPos=', camera.position.x.toFixed(3), camera.position.y.toFixed(3), camera.position.z.toFixed(3));
+                    }
+
                     controls.update();
                 }
 
@@ -122,7 +247,127 @@ export class LAMWebSocketManager {
     private _getExpressionData(): Record<string, number> {
         const result: Record<string, number> = {};
 
-        if (!this.currentExpression) {
+        // ===== 診断専用: 人工 morph プローブ =====
+        // `?morphProbe=1` のときだけ、A2E 経路を一切通さず
+        // performance.now() から毎フレーム直接 jawOpen を算出して返す。
+        // 累積カウンタや setInterval は使わないので、描画フレームが飛んでも
+        // 「その時刻に対応する正しい jawOpen」になる。
+        // 日本語口形補正や A2E 後処理はこの経路では通さない (両モデルへ同一値を入れる)。
+        if (this.morphProbe) {
+            const now = performance.now();
+            for (const name of this.expressionNames) result[name] = 0;
+            const phase = (now % 1000) / 1000;
+            const jawOpen = 0.4 - 0.4 * Math.cos(phase * Math.PI * 2);
+            result.jawOpen = jawOpen;
+
+            // renderer の呼び出し間隔だけを測る (直近 120 サンプル、2 秒ごとに 1 行)
+            this._probeTimes.push(now);
+            if (this._probeTimes.length > 120) this._probeTimes.shift();
+            if (now - this._probeLogAt >= 2000) {
+                this._probeLogAt = now;
+                const t = this._probeTimes;
+                if (t.length > 2) {
+                    const d: number[] = [];
+                    for (let i = 1; i < t.length; i++) d.push(t[i] - t[i - 1]);
+                    d.sort((a, b) => a - b);
+                    const q = (pp: number) => d[Math.min(d.length - 1, Math.floor(pp * d.length))];
+                    const p50 = q(0.5);
+                    console.log(
+                        '[MORPH PROBE]'
+                        + ' avatar=' + (isUika133kMode() ? 'UIKA' : 'LAM')
+                        + ' samples=' + t.length
+                        + ' p50Ms=' + p50.toFixed(1)
+                        + ' p95Ms=' + q(0.95).toFixed(1)
+                        + ' maxMs=' + d[d.length - 1].toFixed(1)
+                        + ' approxFps=' + (p50 > 0 ? (1000 / p50).toFixed(1) : '-')
+                        + ' jawOpen=' + jawOpen.toFixed(3)
+                    );
+                }
+            }
+            return result;
+        }
+
+        // frame の取得元だけが通常 LAM と UIKA で違う。
+        // provider があれば描画瞬間に直接引く (古い cache を使わない)。
+        // 以降の処理 (全0 の静止状態 / 日本語口形補正) は両経路で完全に同じ。
+        let frame: ExpressionFrame | null;
+        if (this.a2eReplay) {
+            // ?a2eReplay=1: Live 通信を一切使わず、保存済みの実 A2E シーケンスから
+            // 「現在時刻に対応する frame」を選ぶ。以降の処理は本番と同一。
+            if (!this.replayInitTried) {
+                this.replayInitTried = true;
+                this.replayPlayer = createA2EReplayPlayer();
+                if (this.replayPlayer) {
+                    // name マッピングも本番と同じにするため capture 時の名前順をそのまま使う
+                    this.setExpressionNames(this.replayPlayer.expressionNames);
+                }
+            }
+            frame = this.replayPlayer ? this.replayPlayer.getFrame() : null;
+        } else {
+            frame = this.expressionProvider
+                ? this.expressionProvider()
+                : this.currentExpression;
+        }
+
+        // ===== 診断ログ (TRACE A2E RENDER) =====
+        // renderer が expression を読んだ瞬間の同期状態。frame の選び方は変えていない。
+        if (this.exprTrace && !this.a2eReplay) {
+            try {
+                const st = this.exprTrace.getState();
+                const now = performance.now();
+
+                // --- 画面表示用の集計 (DevTools を開かずに読めるようにする) ---
+                const w = window as any;
+                let agg = w.__uikaA2EStats;
+                if (!agg || agg.exprPath !== this.exprTrace.path) {
+                    agg = w.__uikaA2EStats = {
+                        exprPath: this.exprTrace.path,
+                        renderTimes: [] as number[],
+                        clampCount: 0, clampTotalMs: 0, clampMaxMs: 0,
+                        clampOpenAt: null as number | null,
+                        maxLag: 0,
+                        firstExprPlaybackMs: null as number | null,
+                        firstExprCoverageMs: null as number | null,
+                        catchUpPlaybackMs: null as number | null,
+                        last: null as any,
+                    };
+                }
+                agg.renderTimes.push(now);
+                if (agg.renderTimes.length > 4000) agg.renderTimes.shift();
+                const lag = st.requestedFrame - st.selectedFrame;
+                if (lag > agg.maxLag) agg.maxLag = lag;
+                if (st.bufferFrames > 0 && agg.firstExprPlaybackMs === null) {
+                    agg.firstExprPlaybackMs = st.playbackMs;
+                    agg.firstExprCoverageMs = st.bufferFrames / st.fps * 1000;
+                }
+                if (st.clamped && agg.clampOpenAt === null && st.bufferFrames > 0) {
+                    agg.clampOpenAt = now; agg.clampCount++;
+                } else if (!st.clamped && agg.clampOpenAt !== null) {
+                    const dur = now - agg.clampOpenAt;
+                    agg.clampTotalMs += dur;
+                    if (dur > agg.clampMaxMs) agg.clampMaxMs = dur;
+                    agg.clampOpenAt = null;
+                    if (agg.catchUpPlaybackMs === null) agg.catchUpPlaybackMs = st.playbackMs;
+                }
+                agg.last = st;
+                if (this._shouldTrace(now, this._traceRenderAt, this._traceRenderSel,
+                                      this._traceRenderClamped, st.selectedFrame, st.clamped)) {
+                    this._traceRenderAt = now;
+                    this._traceRenderSel = st.selectedFrame;
+                    this._traceRenderClamped = st.clamped;
+                    console.log(
+                        `[TRACE A2E RENDER] exprPath=${this.exprTrace.path} `
+                        + `perfMs=${now.toFixed(1)} playbackMs=${st.playbackMs.toFixed(1)} `
+                        + `fps=${st.fps} bufferFrames=${st.bufferFrames} `
+                        + `coverageMs=${(st.bufferFrames / st.fps * 1000).toFixed(1)} `
+                        + `requestedFrame=${st.requestedFrame} selectedFrame=${st.selectedFrame} `
+                        + `clamped=${st.clamped} frame=${frame ? 'yes' : 'null'}`
+                    );
+                }
+            } catch (e) { /* noop */ }
+        }
+
+        if (!frame) {
             // 静止状態: 全て0
             for (const name of this.expressionNames) {
                 result[name] = 0;
@@ -130,7 +375,7 @@ export class LAMWebSocketManager {
             return result;
         }
 
-        const values = this.currentExpression.values;
+        const values = frame.values;
         for (let i = 0; i < Math.min(values.length, this.expressionNames.length); i++) {
             result[this.expressionNames[i]] = values[i];
         }
@@ -205,9 +450,69 @@ export class LAMWebSocketManager {
 
     /**
      * expression フレームを更新
+     * (通常 LAM 経路。AudioSyncPlayer の rAF から呼ばれる)
      */
     updateExpression(frame: ExpressionFrame | null): void {
         this.currentExpression = frame;
+
+        // ===== 診断ログ (TRACE A2E CACHE) =====
+        // AudioSyncPlayer の rAF が cache を更新した瞬間。代入処理は変えていない。
+        if (this.exprTrace) {
+            try {
+                const st = this.exprTrace.getState();
+                const now = performance.now();
+                if (this._shouldTrace(now, this._traceCacheAt, this._traceCacheSel,
+                                      this._traceCacheClamped, st.selectedFrame, st.clamped)) {
+                    this._traceCacheAt = now;
+                    this._traceCacheSel = st.selectedFrame;
+                    this._traceCacheClamped = st.clamped;
+                    console.log(
+                        `[TRACE A2E CACHE] exprPath=${this.exprTrace.path} `
+                        + `perfMs=${now.toFixed(1)} playbackMs=${st.playbackMs.toFixed(1)} `
+                        + `fps=${st.fps} bufferFrames=${st.bufferFrames} `
+                        + `coverageMs=${(st.bufferFrames / st.fps * 1000).toFixed(1)} `
+                        + `requestedFrame=${st.requestedFrame} selectedFrame=${st.selectedFrame} `
+                        + `clamped=${st.clamped} frame=${frame ? 'yes' : 'null'}`
+                    );
+                }
+            } catch (e) { /* noop */ }
+        }
+    }
+
+    /**
+     * expression フレームの直接取得関数を設定する (UIKA mode 専用)。
+     * 設定すると `_getExpressionData()` は cache ではなくこの関数を使う。
+     * `null` を渡すと通常 LAM 経路 (cache) に戻る。
+     */
+    setExpressionProvider(provider: (() => ExpressionFrame | null) | null): void {
+        this.expressionProvider = provider;
+    }
+
+    /**
+     * 【診断専用】トレースを有効にする。UIKA 診断 URL からのみ呼ばれる。
+     */
+    setExpressionTrace(
+        path: string,
+        getState: () => {
+            playbackMs: number; bufferFrames: number; fps: number;
+            requestedFrame: number; selectedFrame: number; clamped: boolean;
+        },
+    ): void {
+        this.exprTrace = { path, getState };
+    }
+
+    /**
+     * 間引き判定: 250ms 経過 / clamped の変化 / selectedFrame が 10 フレーム超飛んだ
+     * のいずれかで true。
+     */
+    private _shouldTrace(
+        now: number, lastAt: number, prevSel: number, prevClamped: boolean | null,
+        sel: number, clamped: boolean,
+    ): boolean {
+        if (now - lastAt >= 250) return true;
+        if (prevClamped !== clamped) return true;
+        if (prevSel >= 0 && Math.abs(sel - prevSel) > 10) return true;
+        return false;
     }
 
     /**
@@ -248,5 +553,7 @@ export class LAMWebSocketManager {
         this.renderer = null;
         this.isModelLoaded = false;
         this.currentExpression = null;
+        this.expressionProvider = null;
+        this.exprTrace = null;
     }
 }
