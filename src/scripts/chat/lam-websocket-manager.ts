@@ -23,6 +23,9 @@ import { installMultiBoneSkinning, getSkinMode } from './poc/multibone-skinning'
 // PoC 限定: ?gpuSort=0 のときだけ splat sort の GPU 距離計算を切る。
 // 既定 (フラグ無し) では何もしないので、出荷版の挙動は変わらない。
 import { installSortMode, getSortMode } from './poc/sort-mode';
+// PoC 限定: ?morphFast=1 / ?sortMode=10fps / ?centersProbe=1。
+// いずれも未指定なら何もしないので、出荷版の挙動は変わらない。
+import { installRenderPerf, getAvatarIdForDiag } from './poc/render-perf';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -233,6 +236,10 @@ export class LAMWebSocketManager {
 
             // PoC: multi-bone skinning (既定は何もしない)
             const skinMode = getSkinMode();
+            // PoC: FULL133 renderer cadence 回復 A/B (既定は何もしない)
+            installRenderPerf(this.renderer)
+                .then(p => console.log('[PoC renderPerf]', JSON.stringify(p)));
+
             // PoC: splat sort の距離計算経路 (既定は何もしない)
             const sortMode = getSortMode();
             installSortMode(this.renderer, sortMode)
@@ -283,6 +290,7 @@ export class LAMWebSocketManager {
                     console.log(
                         '[MORPH PROBE]'
                         + ' avatar=' + (isUika133kMode() ? 'UIKA' : 'LAM')
+                        + ' avatarId=' + getAvatarIdForDiag()
                         + ' samples=' + t.length
                         + ' p50Ms=' + p50.toFixed(1)
                         + ' p95Ms=' + q(0.95).toFixed(1)
