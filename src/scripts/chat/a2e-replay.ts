@@ -41,6 +41,39 @@ export interface CapturedA2E {
 
 export type DiagMode = 'none' | 'morphProbe' | 'a2eReplay' | 'conflict';
 
+/**
+ * 【診断専用・read-only】リプレイ中の「描画 cadence」と「A2E frame 選択」の集計。
+ *
+ * **frame の選び方は一切変えない。** `A2EReplayPlayer.getFrame()` が決めた
+ * index を後から観測して数えるだけ。定義:
+ *
+ *     ΔselectedFrame === 0  -> repeat (同じ A2E frame を 2 回以上描いた)
+ *     ΔselectedFrame  >  1  -> skip   (A2E frame を飛ばした / 補間は無いので丸ごと欠落)
+ *
+ * ループ折り返し (末尾 gap) をまたぐ差分は jump として数えない。
+ */
+export interface A2EReplayStats {
+    /** renderer が expression を読んだ回数 (= getFrame 呼び出し回数) */
+    readCount: number;
+    /** 直近に選ばれた replay frame index (gap 中は -1) */
+    selectedFrame: number;
+    /** 同じ frame を連続で選んだ回数 */
+    repeats: number;
+    /** frame index が 2 以上飛んだ回数 */
+    skips: number;
+    /** 飛ばされた frame の総数 (Σ(Δ-1)) */
+    skippedFrames: number;
+    /** 最大 jump 幅 (Δ の最大値) */
+    maxJump: number;
+    /** getFrame 呼び出し間隔 ms */
+    p50Ms: number | null;
+    p95Ms: number | null;
+    maxMs: number | null;
+    approxFps: number | null;
+    /** A2E の 1 frame ぶんの時間 (= 1000 / fps)。判定の基準値。 */
+    frameBudgetMs: number;
+}
+
 function queryParam(name: string): string | null {
     try {
         return new URLSearchParams(window.location.search).get(name);
@@ -76,6 +109,18 @@ export function getDiagMode(): DiagMode {
 
 export function isA2ECaptureMode(): boolean {
     return queryParam('a2eCapture') === '1';
+}
+
+/**
+ * 【診断専用】`?a2eTrace=1`
+ *
+ * 通常 avatar 経路 (avatar-config 経由の B80 / FULL133 など) のまま
+ * `setExpressionTrace()` だけを有効にするためのフラグ。
+ * uika133k mode には入れず、`expressionProvider` も設定しないので、
+ * cache path の動作は本番とまったく同じまま trace だけが増える。
+ */
+export function isA2ETraceMode(): boolean {
+    return queryParam('a2eTrace') === '1';
 }
 
 // ===================================================================
@@ -198,6 +243,17 @@ export class A2EReplayPlayer {
     private readonly start: number;
     private hudAt = 0;
 
+    // ---- 診断専用 counter (選択ロジックには一切関与しない) ----
+    private readCount = 0;
+    private prevIndex = -1;
+    private repeats = 0;
+    private skips = 0;
+    private skippedFrames = 0;
+    private maxJump = 0;
+    private lastReadAt: number | null = null;
+    private readonly gaps: number[] = [];
+    private hooksInstalled = false;
+
     constructor(data: CapturedA2E) {
         this.data = data;
         this.durationMs = (data.frames.length / data.fps) * 1000;
@@ -225,26 +281,136 @@ export class A2EReplayPlayer {
      * 末尾の静止区間では null (= 全 0 / 口閉じ) を返す。
      */
     getFrame(): ExpressionFrame | null {
-        const elapsed = performance.now() - this.start;
+        const now = performance.now();
+        const elapsed = now - this.start;
         const loop = Math.floor(elapsed / this.periodMs);
         const t = elapsed - loop * this.periodMs;
         const total = this.data.frames.length;
 
+        this.countRead(now);
+        this.installWindowHooks();
+
         if (t >= this.durationMs) {
-            this.showHud(`A2E REPLAY  frame --- / ${total}  (gap)  loop=${loop + 1}`);
+            // gap 区間。折り返しを jump として数えないよう prevIndex を畳む。
+            this.prevIndex = -1;
+            this.showHudThrottled(now, () => `A2E REPLAY  frame --- / ${total}  (gap)  loop=${loop + 1}`);
             return null;
         }
 
         const index = Math.min(total - 1, Math.floor((t / 1000) * this.data.fps));
-        this.showHud(`A2E REPLAY  frame ${index + 1} / ${total}  loop=${loop + 1}`);
+        this.countIndex(index);
+        this.showHudThrottled(now, () =>
+            `A2E REPLAY  frame ${index + 1} / ${total}  loop=${loop + 1}\n`
+            + this.hudStatsLine());
         return { values: this.data.frames[index] };
     }
 
-    private showHud(text: string): void {
-        const now = performance.now();
+    // ===============================================================
+    // 以下は診断専用。frame の選び方には一切関与しない (観測のみ)。
+    // ===============================================================
+
+    /** getFrame 呼び出し間隔を記録する (= renderer の expression 読み出し cadence)。 */
+    private countRead(now: number): void {
+        this.readCount++;
+        if (this.lastReadAt !== null) {
+            this.gaps.push(now - this.lastReadAt);
+            if (this.gaps.length > 4000) this.gaps.shift();
+        }
+        this.lastReadAt = now;
+    }
+
+    /** 選ばれた index の連続性を記録する。repeat / skip の定義は A2EReplayStats 参照。 */
+    private countIndex(index: number): void {
+        if (this.prevIndex >= 0) {
+            const d = index - this.prevIndex;
+            if (d === 0) {
+                this.repeats++;
+            } else if (d > 1) {
+                this.skips++;
+                this.skippedFrames += d - 1;
+                if (d > this.maxJump) this.maxJump = d;
+            }
+            // d < 0 は起きない想定 (gap で prevIndex を畳んでいる)。起きても数えない。
+        }
+        this.prevIndex = index;
+    }
+
+    private percentile(sorted: number[], p: number): number {
+        return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+    }
+
+    get stats(): A2EReplayStats {
+        const sorted = this.gaps.slice().sort((a, b) => a - b);
+        const p50 = sorted.length > 2 ? this.percentile(sorted, 0.5) : null;
+        return {
+            readCount: this.readCount,
+            selectedFrame: this.prevIndex,
+            repeats: this.repeats,
+            skips: this.skips,
+            skippedFrames: this.skippedFrames,
+            maxJump: this.maxJump,
+            p50Ms: p50,
+            p95Ms: sorted.length > 2 ? this.percentile(sorted, 0.95) : null,
+            maxMs: sorted.length > 0 ? sorted[sorted.length - 1] : null,
+            approxFps: p50 && p50 > 0 ? 1000 / p50 : null,
+            frameBudgetMs: 1000 / this.data.fps,
+        };
+    }
+
+    /** cold / warm を分けて測るための reset。累積 counter だけを 0 に戻す。 */
+    resetStats(): void {
+        this.readCount = 0;
+        this.repeats = 0;
+        this.skips = 0;
+        this.skippedFrames = 0;
+        this.maxJump = 0;
+        this.gaps.length = 0;
+        this.lastReadAt = null;
+        // prevIndex は連続性の基準なので畳む (reset 直後の 1 回を jump にしない)
+        this.prevIndex = -1;
+    }
+
+    /**
+     * `window.__a2eReplayStats` を **getter** として 1 回だけ生やす。
+     *
+     * 毎フレーム `this.stats` を作ると percentile のための sort が
+     * 描画コールバックの中で走り、**測ろうとしている frame time 自体を
+     * 太らせてしまう**。読まれたときだけ計算する。
+     * 毎フレームの処理は O(1) の counter 更新だけに保つ。
+     */
+    private installWindowHooks(): void {
+        if (this.hooksInstalled) return;
+        this.hooksInstalled = true;
+        const w = window as any;
+        try {
+            Object.defineProperty(w, '__a2eReplayStats', {
+                configurable: true,
+                get: () => this.stats,
+            });
+        } catch {
+            // defineProperty が通らない環境では諦める (計測は HUD 側で読める)
+        }
+        w.__a2eReplayStatsReset = () => { this.resetStats(); return 'reset'; };
+    }
+
+    private hudStatsLine(): string {
+        const s = this.stats;
+        const f = (v: number | null) => (v === null ? '--' : v.toFixed(1));
+        return (
+            `budget=${s.frameBudgetMs.toFixed(1)}ms  p50=${f(s.p50Ms)}  p95=${f(s.p95Ms)}\n`
+            + `rep=${s.repeats}  skip=${s.skips}(${s.skippedFrames}f)  maxJump=${s.maxJump}`
+        );
+    }
+
+    /**
+     * HUD は 100ms に 1 回だけ更新する。
+     * **文字列の構築 (percentile の sort を含む) も throttle の内側で行う**ので、
+     * 毎フレームのコストにはならない。
+     */
+    private showHudThrottled(now: number, build: () => string): void {
         if (now - this.hudAt < 100) return;
         this.hudAt = now;
-        hud(text);
+        hud(build());
     }
 }
 

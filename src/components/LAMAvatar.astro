@@ -129,6 +129,7 @@ const {
   import { AudioSyncPlayer } from '../scripts/chat/audio-sync-player';
   import type { LiveAudioManager, ExpressionFrame } from '../scripts/chat/live-audio-manager';
   import { getUikaExprPath } from '../scripts/chat/uika-133k-mode';
+  import { isA2ETraceMode } from '../scripts/chat/a2e-replay';
 
   /**
    * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
@@ -208,6 +209,21 @@ const {
           + (exprPath === 'provider'
               ? ' (renderer 直接取得 = 現状維持)'
               : ' (AudioSyncPlayer cache = 通常 LAM と同じ timeline)')
+        );
+      } else if (isA2ETraceMode()) {
+        // ===== 診断専用 (?a2eTrace=1) =====
+        // 通常 avatar 経路 (avatar-config 経由の B80 / FULL133 など) のまま
+        // setExpressionTrace() だけを有効にする。
+        //   - uika133k mode には入れない (ZIP / camera / localStorage を触らない)
+        //   - setExpressionProvider() は呼ばない
+        //     => _getExpressionData() は従来どおり currentExpression cache を読む
+        // つまり本番の cache path の挙動は変えず、trace だけが増える。
+        this.lamManager.setExpressionTrace(
+          'cache',
+          () => liveAudioManager.getExpressionSyncDebugState()
+        );
+        console.log(
+          '[TRACE] a2eTrace=1 (通常 avatar 経路のまま trace のみ有効 / cache path は本番と同一)'
         );
       }
       try {
