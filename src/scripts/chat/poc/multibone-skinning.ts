@@ -35,7 +35,12 @@
 // uniform / attribute / bone texture / asset には触らない。
 // `?skinMode=multi` が無ければ **何もしない** (既定は出荷版のまま)。
 
-import { DataTexture, FloatType, NearestFilter, RGBAFormat } from 'three';
+// `three` は **`aligned` のときだけ** 動的 import する。
+// static import にすると、既定 (`?skinMode` なし = head) でも renderer が束ねている
+// three とは別の three がバンドルへ入り、
+// "WARNING: Multiple instances of Three.js being imported." を出したうえに
+// 本番利用者に不要な three をダウンロード・パースさせてしまう。
+// PoC のために本番経路へコストを足さないため遅延させる。
 
 export type SkinMode = 'head' | 'multi' | 'aligned';
 
@@ -131,10 +136,12 @@ export interface SkinPatchResult {
  * three の texture は `isTexture` などで duck-typing されるので、
  * 別インスタンスでも WebGLRenderer 側は受け付ける。
  * (renderer 内部の遅延生成オブジェクトに依存しないための措置) */
-function buildSkinTextures(material: any, geometry: any): { w: number; h: number } | null {
+async function buildSkinTextures(material: any, geometry: any): Promise<{ w: number; h: number } | null> {
     const si = geometry.getAttribute('skinIndex');
     const sw = geometry.getAttribute('skinWeight');
     if (!si || !sw) return null;
+
+    const { DataTexture, FloatType, NearestFilter, RGBAFormat } = await import('three');
 
     const n = si.count;
     const w = Math.ceil(Math.sqrt(n));
@@ -172,9 +179,10 @@ export function installMultiBoneSkinning(renderer: any, mode: SkinMode,
                 !!renderer?.viewer?.splatMesh?.geometry?.getAttribute?.('skinIndex');
             const ready = hasMaterial && (mode !== 'aligned' || hasSkinAttrs);
             if (ready || mode === 'head' || ++tries >= maxTries) {
-                const r = applyMultiBoneSkinning(renderer, mode);
-                (window as any).__multiBoneSkinPatch = r;
-                resolve(r);
+                applyMultiBoneSkinning(renderer, mode).then((r) => {
+                    (window as any).__multiBoneSkinPatch = r;
+                    resolve(r);
+                });
                 return;
             }
             requestAnimationFrame(tick);
@@ -187,7 +195,7 @@ export function installMultiBoneSkinning(renderer: any, mode: SkinMode,
  * renderer の splat material の vertex shader を差し替える。
  * `mode === 'head'` のときは何もしない (出荷版のまま)。
  */
-export function applyMultiBoneSkinning(renderer: any, mode: SkinMode): SkinPatchResult {
+export async function applyMultiBoneSkinning(renderer: any, mode: SkinMode): Promise<SkinPatchResult> {
     const fail = (reason: string): SkinPatchResult => ({
         mode, applied: false, reason,
         activeInfluenceLines: 0, headOnlyLineActive: true,
@@ -206,7 +214,7 @@ export function applyMultiBoneSkinning(renderer: any, mode: SkinMode): SkinPatch
 
     let patched: string;
     if (mode === 'aligned') {
-        const size = buildSkinTextures(material, renderer.viewer.splatMesh.geometry);
+        const size = await buildSkinTextures(material, renderer.viewer.splatMesh.geometry);
         if (!size) return fail('skinIndex / skinWeight attribute が無い');
         const UNIFORM_ANCHOR = '        #ifdef USE_SKINNING\n            uniform mat4 bindMatrix;';
         if (src.indexOf(UNIFORM_ANCHOR) < 0) return fail('uniform 挿入位置が見つからない');
