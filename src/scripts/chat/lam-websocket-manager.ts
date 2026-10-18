@@ -20,6 +20,9 @@ import { getDiagMode, createA2EReplayPlayer, A2EReplayPlayer } from './a2e-repla
 // PoC 限定: ?skinMode=multi / aligned のときだけ splat shader を 4 influence LBS へ
 // 差し替える。既定 (?skinMode なし / =head) では何もしないので、出荷版の挙動は変わらない。
 import { installMultiBoneSkinning, getSkinMode } from './poc/multibone-skinning';
+// PoC 限定: ?gpuSort=0 のときだけ splat sort の GPU 距離計算を切る。
+// 既定 (フラグ無し) では何もしないので、出荷版の挙動は変わらない。
+import { installSortMode, getSortMode } from './poc/sort-mode';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -230,6 +233,11 @@ export class LAMWebSocketManager {
 
             // PoC: multi-bone skinning (既定は何もしない)
             const skinMode = getSkinMode();
+            // PoC: splat sort の距離計算経路 (既定は何もしない)
+            const sortMode = getSortMode();
+            installSortMode(this.renderer, sortMode)
+                .then(p => console.log('[PoC gpuSort]', JSON.stringify(p)));
+
             installMultiBoneSkinning(this.renderer, skinMode)
                 .then(p => console.log('[PoC skinMode]', JSON.stringify(p)));
 
