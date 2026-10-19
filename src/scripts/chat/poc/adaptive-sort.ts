@@ -169,9 +169,14 @@ export async function installAdaptiveSort(renderer: any, maxTries = 600): Promis
 }
 
 function apply(renderer: any, s: AdaptiveSortStats): void {
+    const v = renderer?.viewer;
+    // 診断用。stock で early-return する場合も埋めておく
+    // (実機ログで avatarId="" / splatCount=0 のまま出て紛らわしかった)。
+    s.avatarId = getAvatarIdForDiag();
+    s.splatCount = Number(v?.splatMesh?.getSplatCount?.() ?? 0);
+
     if (s.mode === 'stock') { s.reason = 'sortPolicy 未指定のため出荷版のまま'; return; }
 
-    const v = renderer?.viewer;
     if (!v || typeof v.runSplatSort !== 'function') {
         s.reason = 'viewer.runSplatSort が見つからない';
         return;
@@ -186,8 +191,6 @@ function apply(renderer: any, s: AdaptiveSortStats): void {
     }
 
     // FULL133 だけに適用する (指示書 §4 / §28)。
-    s.avatarId = getAvatarIdForDiag();
-    s.splatCount = Number(v.splatMesh?.getSplatCount?.() ?? 0);
     if (s.avatarId !== FULL133_AVATAR_ID || s.splatCount !== FULL133_SPLAT_COUNT) {
         s.reason = `FULL133 専用。avatarId=${s.avatarId} splatCount=${s.splatCount} のため適用しない`;
         return;
