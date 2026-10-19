@@ -421,6 +421,7 @@ export class LAMWebSocketManager {
                     && d.length >= 1000,
                 runConfig: (window as any).__runConfig ?? null,
                 renderPerf: (window as any).__renderPerf ?? null,
+                adaptiveSort: (window as any).__adaptiveSort ?? null,
             };
             console.log('[MORPH PROBE TOTAL]', JSON.stringify(r));
             return r;
