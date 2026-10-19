@@ -408,16 +408,21 @@ export class LAMWebSocketManager {
                 droppedGaps: self._probeGaps,
                 backgroundEvents: self._probeHidden,
                 resizeEvents: self._probeResized,
-                // 計測窓の viewport。runConfig.viewport はロード時なので別物になり得る。
+                // 計測窓の viewport。これが run の正本。
+                // `runConfig.viewport` はページロード時のスナップショットなので、
+                // ロード後に DevTools の配置を変えた run では別の値になる。
+                // **計測窓の外での resize は欠陥ではない**ので runValid には入れない。
+                // 窓の中が一貫していること (start === end かつ resizeEvents === 0) だけを見る。
                 viewportAtStart: self._probeViewportAtStart,
                 viewportAtEnd: vpNow,
+                /** 参考情報。false なら「ロード後に resize した」という意味で、
+                 *  run 間の比較には `viewportAtStart` を使う。 */
                 viewportMatchesRunConfig: vpNow === (window as any).__runConfig?.viewport,
                 runValid: (window as any).__runConfig?.valid === true
                     && self._probeHidden === 0
                     && self._probeGaps === 0
                     && self._probeResized === 0
                     && self._probeViewportAtStart === vpNow
-                    && vpNow === (window as any).__runConfig?.viewport
                     && d.length >= 1000,
                 runConfig: (window as any).__runConfig ?? null,
                 renderPerf: (window as any).__renderPerf ?? null,
