@@ -160,26 +160,61 @@ export class LAMWebSocketManager {
 
             // カメラ位置を調整してアバターの顔サイズ・位置を制御
             // avatar-config.json のcameraパラメータをlocalStorageから読み込み
-            let camParams = { posY: 1.73, posZ: 0.4, targetY: 1.62 }; // デフォルト
+            // offsetX: 横位置の平行移動 (pan)。camera.position.x と controls.target.x を
+            //   **同じ量だけ** 動かすので、見る角度は変わらず画面内で左右にスライドするだけ。
+            //   + で被写体が画面左へ、- で右へ動く (カメラの右方向 = world +x のため)。
+            //   既定 0 = 従来どおり。avatar-config.json の camera に書ける。
+            let camParams = { posY: 1.73, posZ: 0.4, targetY: 1.62, offsetX: 0 }; // デフォルト
             try {
                 const storedCamera = localStorage.getItem(`selectedCamera_${mode}`);
                 if (storedCamera) {
                     const parsed = JSON.parse(storedCamera);
-                    camParams = { posY: parsed.posY ?? 1.73, posZ: parsed.posZ ?? 0.4, targetY: parsed.targetY ?? 1.62 };
+                    camParams = {
+                        posY: parsed.posY ?? 1.73,
+                        posZ: parsed.posZ ?? 0.4,
+                        targetY: parsed.targetY ?? 1.62,
+                        offsetX: parsed.offsetX ?? 0,
+                    };
                 }
             } catch (e) {
                 // パース失敗時はデフォルト使用
             }
 
+            // 【調整用】URL で一時上書きできる (実機で数値を詰めてから config へ焼く)。
+            //   ?camOffsetX=0.02&camTargetY=1.64&camPosY=1.73&camPosZ=0.45
+            // 未指定の項目は config の値のまま。既定では何も変わらない。
+            try {
+                const q = new URLSearchParams(window.location.search);
+                const num = (k: string) => {
+                    const v = q.get(k);
+                    if (v === null) return undefined;
+                    const n = Number(v);
+                    return Number.isFinite(n) ? n : undefined;
+                };
+                const ov = {
+                    posY: num('camPosY'), posZ: num('camPosZ'),
+                    targetY: num('camTargetY'), offsetX: num('camOffsetX'),
+                };
+                const applied: string[] = [];
+                for (const k of ['posY', 'posZ', 'targetY', 'offsetX'] as const) {
+                    if (ov[k] !== undefined) { camParams[k] = ov[k] as number; applied.push(`${k}=${ov[k]}`); }
+                }
+                if (applied.length) {
+                    console.log('[LAMWebSocketManager] camera URL 上書き:', applied.join(' '));
+                }
+            } catch (e) { /* noop */ }
+
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
                 camera.position.z = camParams.posZ;
                 camera.position.y = camParams.posY;
+                // pan: camera と target を同量ずらす (角度は変えない)
+                camera.position.x = camParams.offsetX;
 
                 // 注視点（controls.target）を顔〜首の高さに合わせる
                 const controls = this.renderer.viewer.controls;
                 if (controls) {
-                    controls.target.set(0, camParams.targetY, 0);
+                    controls.target.set(camParams.offsetX, camParams.targetY, 0);
 
                     // ★ カーソル操作の可動域制限（orbit-limits.jsonから読み込み）
                     try {
@@ -231,7 +266,11 @@ export class LAMWebSocketManager {
                 }
 
                 camera.updateProjectionMatrix();
-                console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z, 'target.y=', controls?.target?.y);
+                console.log('[LAMWebSocketManager] カメラ位置調整:',
+                            'posY=', camParams.posY, 'posZ=', camParams.posZ,
+                            'targetY=', camParams.targetY, 'offsetX=', camParams.offsetX,
+                            '=> camera=', camera.position.x.toFixed(4), camera.position.y.toFixed(4), camera.position.z.toFixed(4),
+                            'target=', controls?.target?.x?.toFixed(4), controls?.target?.y?.toFixed(4));
             }
 
             // PoC: multi-bone skinning (既定は何もしない)
