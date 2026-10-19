@@ -103,6 +103,12 @@ export class LAMWebSocketManager {
     private _probeAll: number[] = [];
     private _probeAllLast: number | null = null;
     private _probeApiInstalled = false;
+    /** 統計から外した長い中断の回数 (tab 非前面 / スリープ等)。run の有効性判定に使う。 */
+    private _probeGaps = 0;
+    /** 計測中に tab が非前面になった回数。1 以上なら run は無効 (指示書 §8)。 */
+    private _probeHidden = 0;
+    /** 計測中に viewport が変わった回数。1 以上なら A/B 比較に使えない (指示書 §5)。 */
+    private _probeResized = 0;
 
     // ===== 診断専用: 実 A2E 固定リプレイ (?a2eReplay=1) =====
     // morphProbe とは完全に別モード (同時指定は a2e-replay.ts 側で両方無効化)。
@@ -319,10 +325,31 @@ export class LAMWebSocketManager {
      */
     private _installMorphProbeApi(): void {
         const self = this;
+        // tab が非前面になったら記録する。rAF が止まるので、その run は無効 (§8)。
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') self._probeHidden++;
+        });
+        // A1 と D1 で viewport が 1707x898 / 1152x898 と違っていた (DevTools の
+        // ドッキング変更)。4 run で揃っていないと A/B 比較にならないので数える。
+        window.addEventListener('resize', () => { self._probeResized++; });
+        /** warm-up 後にこれ 1 回で済むようにする (指示書 §12 / §13)。
+         *  reset → 指定秒待つ → __morphProbe() を自動で出す。
+         *  待っている間は画面も tab も触らないこと。 */
+        (window as any).__morphProbeRun = (seconds = 60) => {
+            (window as any).__morphProbeReset();
+            const until = new Date(Date.now() + seconds * 1000).toLocaleTimeString();
+            console.log(`[MORPH PROBE] 計測開始。${seconds} 秒後 (${until}) に自動で結果を出します。`
+                + ' この間 tab / window を一切触らないでください。');
+            setTimeout(() => (window as any).__morphProbe(), seconds * 1000);
+            return `measuring ${seconds}s`;
+        };
         (window as any).__morphProbeReset = () => {
             self._probeAll = [];
             self._probeAllLast = null;
-            return 'reset';
+            self._probeGaps = 0;
+            self._probeHidden = 0;
+            self._probeResized = 0;
+            return 'reset (warm-up 後の計測開始点をここにしました)';
         };
         (window as any).__morphProbe = () => {
             const d = self._probeAll.slice().sort((a, b) => a - b);
@@ -334,10 +361,15 @@ export class LAMWebSocketManager {
             const p50 = q(0.5);
             const p95 = q(0.95);
             const over = d.filter(x => x >= budgetMs).length;
+            // mean も出す。[A2E Sync] の offsetMs 差 / 60 は「60 フレームの平均」なので、
+            // 過去のログの数字と突き合わせられるのは p50 ではなく mean。
+            const mean = d.reduce((a, b) => a + b, 0) / d.length;
             const r = {
                 samples: d.length,
                 p50Ms: +p50.toFixed(2),
                 p95Ms: +p95.toFixed(2),
+                p99Ms: +q(0.99).toFixed(2),
+                meanMs: +mean.toFixed(2),
                 maxMs: +d[d.length - 1].toFixed(2),
                 minMs: +d[0].toFixed(2),
                 approxFps: +(1000 / p50).toFixed(1),
@@ -345,6 +377,18 @@ export class LAMWebSocketManager {
                 overBudget: over + '/' + d.length,
                 overBudgetPct: +(100 * over / d.length).toFixed(1),
                 verdict: p95 < budgetMs ? 'PASS' : (p50 < budgetMs ? 'PARTIAL' : 'FAIL'),
+                // run の有効性 (指示書 §9)。
+                // droppedGaps は「統計から外した雑音」ではなく、foreground 中に
+                // rAF が 500ms 以上止まった = 製品上の重大 stutter 候補なので、
+                // 1 回でも出たらその run は正式比較に使わない。
+                droppedGaps: self._probeGaps,
+                backgroundEvents: self._probeHidden,
+                resizeEvents: self._probeResized,
+                runValid: (window as any).__runConfig?.valid === true
+                    && self._probeHidden === 0
+                    && self._probeGaps === 0
+                    && self._probeResized === 0
+                    && d.length >= 1000,
                 runConfig: (window as any).__runConfig ?? null,
                 renderPerf: (window as any).__renderPerf ?? null,
             };
@@ -383,6 +427,9 @@ export class LAMWebSocketManager {
                 if (d > 0 && d < 500) {
                     this._probeAll.push(d);
                     if (this._probeAll.length > 20000) this._probeAll.shift();
+                } else {
+                    // rAF が止まっていた区間。統計には入れないが、回数は残す。
+                    this._probeGaps++;
                 }
             }
             this._probeAllLast = now;
