@@ -6,6 +6,10 @@ export interface CameraParams {
   posY: number;
   posZ: number;
   targetY: number;
+  /** 横位置の平行移動 (pan)。camera.position.x と controls.target.x を同量ずらすので
+   *  見る角度は変わらず、画面内で左右にスライドするだけ。
+   *  + で被写体が画面左へ、- で右へ。未指定なら 0 (従来どおり)。 */
+  offsetX?: number;
 }
 
 export interface AvatarDef {
