@@ -109,6 +109,10 @@ export class LAMWebSocketManager {
     private _probeHidden = 0;
     /** 計測中に viewport が変わった回数。1 以上なら A/B 比較に使えない (指示書 §5)。 */
     private _probeResized = 0;
+    /** 計測開始時点の viewport。`runConfig.viewport` はページロード時の
+     *  スナップショットなので、ロード後に DevTools の配置を変えると計測窓の実態と
+     *  食い違う (実測: runConfig=1707x898 / 計測窓=1152x898)。計測窓の正本はこちら。 */
+    private _probeViewportAtStart: string | null = null;
 
     // ===== 診断専用: 実 A2E 固定リプレイ (?a2eReplay=1) =====
     // morphProbe とは完全に別モード (同時指定は a2e-replay.ts 側で両方無効化)。
@@ -347,6 +351,7 @@ export class LAMWebSocketManager {
                 return `aborted: viewport=${vp} (expected ${expectViewport})`;
             }
             (window as any).__morphProbeReset();
+            self._probeViewportAtStart = vp;
             const until = new Date(Date.now() + seconds * 1000).toLocaleTimeString();
             console.log(`[MORPH PROBE] 計測開始。viewport=${vp}@${window.devicePixelRatio}。`
                 + ` ${seconds} 秒後 (${until}) に自動で結果を出します。`
@@ -360,9 +365,11 @@ export class LAMWebSocketManager {
             self._probeGaps = 0;
             self._probeHidden = 0;
             self._probeResized = 0;
+            self._probeViewportAtStart = `${window.innerWidth}x${window.innerHeight}`;
             return 'reset (warm-up 後の計測開始点をここにしました)';
         };
         (window as any).__morphProbe = () => {
+            const vpNow = `${window.innerWidth}x${window.innerHeight}`;
             const d = self._probeAll.slice().sort((a, b) => a - b);
             if (d.length < 2) {
                 return { samples: d.length, verdict: 'INSUFFICIENT' };
@@ -395,10 +402,16 @@ export class LAMWebSocketManager {
                 droppedGaps: self._probeGaps,
                 backgroundEvents: self._probeHidden,
                 resizeEvents: self._probeResized,
+                // 計測窓の viewport。runConfig.viewport はロード時なので別物になり得る。
+                viewportAtStart: self._probeViewportAtStart,
+                viewportAtEnd: vpNow,
+                viewportMatchesRunConfig: vpNow === (window as any).__runConfig?.viewport,
                 runValid: (window as any).__runConfig?.valid === true
                     && self._probeHidden === 0
                     && self._probeGaps === 0
                     && self._probeResized === 0
+                    && self._probeViewportAtStart === vpNow
+                    && vpNow === (window as any).__runConfig?.viewport
                     && d.length >= 1000,
                 runConfig: (window as any).__runConfig ?? null,
                 renderPerf: (window as any).__renderPerf ?? null,
