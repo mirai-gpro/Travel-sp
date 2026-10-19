@@ -335,13 +335,24 @@ export class LAMWebSocketManager {
         /** warm-up 後にこれ 1 回で済むようにする (指示書 §12 / §13)。
          *  reset → 指定秒待つ → __morphProbe() を自動で出す。
          *  待っている間は画面も tab も触らないこと。 */
-        (window as any).__morphProbeRun = (seconds = 60) => {
+        (window as any).__morphProbeRun = (seconds = 60, expectViewport?: string) => {
+            // viewport 不一致で run を 3 回無駄にしたので、開始前にここで弾く。
+            // DevTools のドッキング位置を変えると viewport が変わり、
+            // 指示書 §5 / §38 の「4 run で viewport が違ったら比較無効」に引っかかる。
+            const vp = `${window.innerWidth}x${window.innerHeight}`;
+            if (expectViewport && vp !== expectViewport) {
+                console.error(`[MORPH PROBE] 計測を開始しませんでした。`
+                    + ` viewport=${vp} ですが ${expectViewport} を期待しています。`
+                    + ' DevTools のドッキング位置 / window サイズを直してリロードしてください。');
+                return `aborted: viewport=${vp} (expected ${expectViewport})`;
+            }
             (window as any).__morphProbeReset();
             const until = new Date(Date.now() + seconds * 1000).toLocaleTimeString();
-            console.log(`[MORPH PROBE] 計測開始。${seconds} 秒後 (${until}) に自動で結果を出します。`
+            console.log(`[MORPH PROBE] 計測開始。viewport=${vp}@${window.devicePixelRatio}。`
+                + ` ${seconds} 秒後 (${until}) に自動で結果を出します。`
                 + ' この間 tab / window を一切触らないでください。');
             setTimeout(() => (window as any).__morphProbe(), seconds * 1000);
-            return `measuring ${seconds}s`;
+            return `measuring ${seconds}s at ${vp}`;
         };
         (window as any).__morphProbeReset = () => {
             self._probeAll = [];
