@@ -30,6 +30,7 @@ import { installRenderPerf, getAvatarIdForDiag } from './poc/render-perf';
 import { logRunConfig } from './poc/run-guard';
 // PoC: FULL133 adaptive sort (camera 変化時のみ sort。既定は何もしない)
 import { installAdaptiveSort } from './poc/adaptive-sort';
+import { installFrameCost } from './poc/frame-cost';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -314,6 +315,11 @@ export class LAMWebSocketManager {
             void Promise.all([pPerf, pGpuSort, pSkin])
                 .then(() => installAdaptiveSort(this.renderer))
                 .then(p => console.log('[PoC adaptiveSort]', JSON.stringify(p)))
+                // frame cost は **最後**。morph / sort の wrapper を外側から
+                // 包んで「実際に掛かった時間」を測るので、全部入った後でないと
+                // 出荷版の関数を直接包んでしまう (指示書 §13)。
+                .then(() => installFrameCost(this.renderer))
+                .then(p => console.log('[PoC frameCost]', JSON.stringify(p)))
                 .then(() => logRunConfig(this.renderer, getDiagMode()))
                 .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e));
 

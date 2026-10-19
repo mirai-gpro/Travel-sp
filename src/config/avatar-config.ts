@@ -25,6 +25,10 @@ export interface AvatarDef {
    *  未指定 = 出荷版 ('stock')。`?sortPolicy=` で上書きできる。
    *  `src/scripts/chat/poc/adaptive-sort.ts` が読む。 */
   sortPolicy?: 'stock' | 'adaptive-gpu' | 'adaptive-cpu';
+  /** runMorphUpdate fast-path の既定値 (PoC)。
+   *  未指定 = 出荷版 (無効)。`?morphFast=1` / `=0` で上書きできる。
+   *  `src/scripts/chat/poc/render-perf.ts` が読む。 */
+  morphFast?: boolean;
 }
 
 /** デフォルトのアバター一覧（JSONロード失敗時のフォールバック） */

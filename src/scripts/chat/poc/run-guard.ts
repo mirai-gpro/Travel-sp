@@ -36,6 +36,7 @@ export interface RunConfig {
     headOnlyLineActive: boolean;
     alignedLookupActive: boolean;
     morphFast: 'on' | 'off';
+    morphFastSource: string;
     morphFastApplied: boolean;
     sortMode: 'full' | '10fps';
     sortApplied: boolean;
@@ -108,7 +109,9 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
         activeInfluenceLines: Number(patch.activeInfluenceLines ?? 0),
         headOnlyLineActive: patch.headOnlyLineActive === true,
         alignedLookupActive: patch.alignedLookupActive === true,
-        morphFast: getMorphFastMode(),
+        // URL 指定が無い場合は avatar-config 由来になるので、実際に決まった値を使う。
+        morphFast: (perf?.morphFast?.mode as 'on' | 'off') ?? getMorphFastMode(),
+        morphFastSource: String(perf?.morphFast?.source ?? 'unknown'),
         morphFastApplied: perf?.morphFast?.applied === true,
         sortMode: getSortModeFlag(),
         sortApplied: perf?.sort?.applied === true,
@@ -150,7 +153,8 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
 
     // morphFast / sortMode: 指定 = 適用 が一致しているか。
     if ((cfg.morphFast === 'on') !== cfg.morphFastApplied) {
-        bad.push(`morphFast=${cfg.morphFast} なのに applied=${cfg.morphFastApplied}`);
+        bad.push(`morphFast=${cfg.morphFast} なのに applied=${cfg.morphFastApplied}`
+            + ` (${perf?.morphFast?.reason ?? '理由不明'})`);
     }
     if ((cfg.sortMode === '10fps') !== cfg.sortApplied) {
         bad.push(`sortMode=${cfg.sortMode} なのに applied=${cfg.sortApplied}`);
@@ -176,7 +180,7 @@ export function logRunConfig(renderer: any, diagMode: string): RunConfig {
         + ' influenceLines=' + c.activeInfluenceLines
         + ' alignedLookup=' + c.alignedLookupActive
         + ' headOnlyLine=' + c.headOnlyLineActive
-        + ' morphFast=' + c.morphFast + '/' + c.morphFastApplied
+        + ' morphFast=' + c.morphFast + '/' + c.morphFastApplied + '/' + c.morphFastSource
         + ' sortMode=' + c.sortMode + '/' + c.sortApplied
         + ' sortPolicy=' + c.sortPolicy + '/' + c.sortPolicyApplied
         + '/' + c.sortPolicyBackend + '/' + c.sortPolicySource

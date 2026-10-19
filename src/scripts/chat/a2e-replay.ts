@@ -421,9 +421,11 @@ export function createA2EReplayPlayer(): A2EReplayPlayer | null {
     const data = loadCapturedA2E();
     if (!data) {
         console.error(
-            '[A2E REPLAY] capture データがありません。先に ?a2eCapture=1 で 1 回発話して録ってください。'
+            '[A2E REPLAY] capture データがありません。'
+            + 'repo の実 capture を使うなら console で `await __a2eCaptureLoadFixture()` を'
+            + '1 回実行してリロードしてください。新規に録るなら ?a2eCapture=1 で 1 回発話します。'
         );
-        hud('A2E REPLAY  capture データ無し -> ?a2eCapture=1 で 1 回録ってください');
+        hud('A2E REPLAY  capture 無し -> await __a2eCaptureLoadFixture() か ?a2eCapture=1');
         return null;
     }
     const player = new A2EReplayPlayer(data);
@@ -453,6 +455,36 @@ if (typeof window !== 'undefined') {
         try {
             window.localStorage.setItem(STORAGE_KEY, json);
             return 'stored';
+        } catch (e) {
+            return String(e);
+        }
+    };
+    /**
+     * repo に入っている実 A2E capture を localStorage へ入れる。
+     *
+     * `src/scripts/chat/uika-native/fixtures/a2e-real-capture-gate3.json` は
+     * `CapturedA2E` と同じ形 (`fps` / `expression_names` / `frames` / `chunks`
+     * / `capturedAt`) なので、そのまま replay の入力に使える。
+     * これがあるので **Replay のたびに録り直す必要は無い**。
+     *
+     * dynamic import なので、呼ばない限り bundle には載らない。
+     *
+     *     await __a2eCaptureLoadFixture()      // 1 回だけ
+     *     // その後 ?a2eReplay=1 でリロード
+     */
+    w.__a2eCaptureLoadFixture = async () => {
+        try {
+            const mod = await import('./uika-native/fixtures/a2e-real-capture-gate3.json');
+            const data = (mod as any).default ?? mod;
+            window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+            capture = null;
+            const loaded = loadCapturedA2E();
+            if (!loaded) return 'fixture の形式が CapturedA2E と一致しません';
+            const msg = `stored: frames=${loaded.frames.length} `
+                + `names=${loaded.expression_names.length} fps=${loaded.fps} `
+                + `capturedAt=${loaded.capturedAt}`;
+            console.log('[A2E CAPTURE] ' + msg);
+            return msg;
         } catch (e) {
             return String(e);
         }

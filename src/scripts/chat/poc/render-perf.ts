@@ -50,6 +50,8 @@
 // node_modules (production dependency) は書き換えない。
 // フラグ未指定なら**何もしない** (出荷版の挙動のまま)。
 
+import { loadAvatarConfig } from '../../../config/avatar-config';
+
 export type MorphFastMode = 'off' | 'on';
 export type SortModeFlag = 'full' | '10fps';
 
@@ -68,10 +70,54 @@ function param(name: string): string | null {
     }
 }
 
-/** 既定は出荷挙動 (off)。`?morphFast=1` のときだけ有効。 */
+/** `?morphFast=` の値を読む。指定が無ければ `null` (= 既定に任せる)。
+ *
+ * `0` / `off` / `false` は **明示的な off** として扱う。avatar-config 側で
+ * on にした後も URL で切り戻せるようにするため、「未指定」と区別する。 */
+function parseMorphFast(v: string | null | undefined): MorphFastMode | null {
+    if (v === '1' || v === 'on' || v === 'true') return 'on';
+    if (v === '0' || v === 'off' || v === 'false') return 'off';
+    return null;
+}
+
+/** `?morphFast=` の指定だけを見る。無ければ `null`。 */
+export function getMorphFastOverride(): MorphFastMode | null {
+    return parseMorphFast(param('morphFast'));
+}
+
+/** 既定は出荷挙動 (off)。`?morphFast=1` のときだけ有効。
+ *
+ * **URL だけを見る同期版。** avatar-config を含めた実効値は
+ * `resolveMorphFast()` / `window.__renderPerf.morphFast.mode` を見ること。 */
 export function getMorphFastMode(): MorphFastMode {
-    const v = param('morphFast');
-    return v === '1' || v === 'on' ? 'on' : 'off';
+    return getMorphFastOverride() ?? 'off';
+}
+
+/**
+ * 実際に使う morphFast モードを決める。優先順位は adaptive sort の
+ * `resolveSortPolicy()` と同じ:
+ *
+ *   1. `?morphFast=` (debug / override)
+ *   2. avatar-config.json のアバター定義の `morphFast`
+ *   3. 'off' (出荷挙動)
+ *
+ * avatar-config のキーは avatar ごとなので、FULL133 で on にしても
+ * 他の avatar には一切効かない。
+ */
+export async function resolveMorphFast(): Promise<{ mode: MorphFastMode; source: string }> {
+    const override = getMorphFastOverride();
+    if (override) return { mode: override, source: 'url' };
+    try {
+        const avatars = await loadAvatarConfig();
+        const id = getAvatarIdForDiag();
+        const def = avatars.find((a: { id: string }) => a.id === id);
+        if (typeof def?.morphFast === 'boolean') {
+            return { mode: def.morphFast ? 'on' : 'off', source: 'avatar-config' };
+        }
+    } catch (e) {
+        console.warn('[PoC morphFast] avatar-config の読み込みに失敗。off を使います:', e);
+    }
+    return { mode: 'off', source: 'default' };
 }
 
 /** 既定は出荷挙動 (full)。`?sortMode=10fps` のときだけ間引く。 */
@@ -111,6 +157,8 @@ export interface RenderPerfStats {
     avatarId: string;
     morphFast: {
         mode: MorphFastMode;
+        /** mode の決定元: 'url' | 'avatar-config' | 'default' */
+        source: string;
         applied: boolean;
         reason: string;
         fullRuns: number;
@@ -181,15 +229,16 @@ function hashStrided(arr: Float32Array, stride: number): number {
     return h >>> 0;
 }
 
-export function installRenderPerf(renderer: any, maxTries = 600): Promise<RenderPerfStats> {
-    const morphMode = getMorphFastMode();
+export async function installRenderPerf(renderer: any, maxTries = 600): Promise<RenderPerfStats> {
+    // avatar-config を読むので await する。URL 指定があればそこで即決まる。
+    const { mode: morphMode, source: morphSource } = await resolveMorphFast();
     const sortMode = getSortModeFlag();
     const probe = isCentersProbeMode();
 
     const stats: RenderPerfStats = {
         avatarId: getAvatarIdForDiag(),
         morphFast: {
-            mode: morphMode, applied: false, reason: '', fullRuns: 0,
+            mode: morphMode, source: morphSource, applied: false, reason: '', fullRuns: 0,
             fastFrames: 0, fallbackCount: 0, lastError: null,
         },
         sort: {
@@ -208,7 +257,7 @@ export function installRenderPerf(renderer: any, maxTries = 600): Promise<Render
     };
     (window as any).__renderPerf = stats;
 
-    return new Promise((resolve) => {
+    return await new Promise<RenderPerfStats>((resolve) => {
         let tries = 0;
         const tick = () => {
             const v = renderer?.viewer;

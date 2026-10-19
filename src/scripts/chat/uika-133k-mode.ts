@@ -111,10 +111,21 @@ export function getUikaExprPath(): UikaExprPath {
     return 'provider';
 }
 
-/** `?morphFast=off` で無効化できる。既定は有効。 */
+/** `?morphFast=off` / `=0` / `=false` で無効化できる。既定は有効。
+ *
+ * **同名パラメータが PoC 側にもある** (`poc/render-perf.ts:getMorphFastMode`)。
+ * あちらは「既定 off / `1`|`on` で有効」なので既定が逆である。
+ * `?morphFast=0` を「off を意味しない」と読むと、同じ URL で
+ * 一方が on・他方が off という取り違えが起きる。off を意味する綴りは
+ * すべて off として扱い、どちらの経路でも `0` が off になるようにする。
+ *
+ * なお両経路は `isUika133kMode()` (`?uika133k=1`) で相互排他なので
+ * (`lam-websocket-manager.ts:167-178` が uika 経路で早期 return する)、
+ * 同時に効くことはない。これは取り違え防止のための統一。 */
 export function getUikaMorphFast(): boolean {
     try {
-        return new URLSearchParams(window.location.search).get('morphFast') !== 'off';
+        const v = new URLSearchParams(window.location.search).get('morphFast');
+        return !(v === 'off' || v === '0' || v === 'false');
     } catch { /* noop */ }
     return true;
 }
