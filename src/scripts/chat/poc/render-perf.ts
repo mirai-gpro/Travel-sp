@@ -122,13 +122,25 @@ export interface RenderPerfStats {
         mode: SortModeFlag;
         applied: boolean;
         reason: string;
+        /** wrapper が呼ばれた総数 */
         calls: number;
-        accepted: number;
-        skipped: number;
-        acceptRate: number | null;
-        /** 呼ばれた時点で前回の sort がまだ走っていた回数 (read-only 観測) */
-        overlapAtEntry: number;
-        /** accept した sort の promise 解決までの時間 ms */
+        /** **実際に新しい sort が始まった**回数 (orig 呼び出し前後で sortRunning が
+         *  false -> true に変わったもの)。throttle clock はこれだけで進む。 */
+        started: number;
+        /** 100ms 制限で飛ばした回数 */
+        throttled: number;
+        /** 呼ばれた時点で既に前の sort が走っていた回数。
+         *  renderer 本体 (`Viewer.js:2401`) が `Promise.resolve(true)` で弾くので
+         *  素通しし、**throttle clock は進めない**。 */
+        overlapSkipped: number;
+        /** throttle を通して orig へ入れたのに sort が始まらなかった回数
+         *  (`!initialized` / `getSplatCount() <= 0` 等)。通常は 0。 */
+        enteredButNotStarted: number;
+        /** started / calls */
+        startRate: number | null;
+        /** 実効 sort 周波数 [Hz] = started / (最後の start - 最初の start) */
+        effectiveSortHz: number | null;
+        /** 実際に始まった sort の promise 解決までの時間 ms */
         completionP50Ms: number | null;
         completionP95Ms: number | null;
     };
@@ -181,8 +193,9 @@ export function installRenderPerf(renderer: any, maxTries = 600): Promise<Render
             fastFrames: 0, fallbackCount: 0, lastError: null,
         },
         sort: {
-            mode: sortMode, applied: false, reason: '', calls: 0, accepted: 0,
-            skipped: 0, acceptRate: null, overlapAtEntry: 0,
+            mode: sortMode, applied: false, reason: '', calls: 0, started: 0,
+            throttled: 0, overlapSkipped: 0, enteredButNotStarted: 0,
+            startRate: null, effectiveSortHz: null,
             completionP50Ms: null, completionP95Ms: null,
         },
         centersProbe: {
@@ -346,7 +359,30 @@ function installMorphFast(v: any, stats: RenderPerfStats): void {
     s.reason = 'runMorphUpdate を fast-path へ差し替えた (初期化完了までは完全実行)';
 }
 
-/** B. runSplatSort を 10Hz へ間引く (§13 / §14 / §16)。camera モードは作らない (§15)。 */
+/** B. runSplatSort を 10Hz へ間引く (§13 / §14 / §16)。camera モードは作らない (§15)。
+ *
+ * ## throttle clock を進める条件 (重要)
+ * 元の `runSplatSort` には早期 return が 3 つある (`Viewer.js:2400-2404`):
+ *
+ *     if (!this.initialized)              return Promise.resolve(false)
+ *     if (this.sortRunning)               return Promise.resolve(true)
+ *     if (getSplatCount() <= 0)           return Promise.resolve(false)
+ *
+ * このうち `sortRunning` は実測で頻発する (出荷状態で 74 回中 37 回)。
+ * wrapper 側で「通した」と数えて clock を進めてしまうと、
+ * **実際には新しい sort が始まっていないのに次の 100ms を抑制**してしまい、
+ * 実効 sort rate が意図より低くなる。計測値 (accepted) も
+ * 「sort を開始した回数」を意味しなくなる。
+ *
+ * そこで:
+ *   - `sortRunning` が true の呼び出しは **orig を素通し**して本体に
+ *     `Promise.resolve(true)` を返させる (出荷版と戻り値を変えない)。
+ *     `overlapSkipped` に数え、**clock は進めない**。
+ *   - orig へ入れた場合も、`sortRunning` が false -> true に変わったときだけ
+ *     「実際に始まった」と見なして `started++` し、**そのときだけ clock を進める**。
+ *     (`sortRunning = true` は `Viewer.js:2428` で同期的に立つ。
+ *      false へ戻すのは worker の onmessage なので非同期。)
+ */
 function installSortMode(v: any, stats: RenderPerfStats): void {
     const s = stats.sort;
     if (s.mode === 'full') { s.reason = 'sortMode 未指定のため出荷版のまま'; return; }
@@ -354,41 +390,64 @@ function installSortMode(v: any, stats: RenderPerfStats): void {
 
     const orig = v.runSplatSort;            // arrow property なので bind 不要
     let firstDone = false;
-    let lastAcceptedAt = -Infinity;
+    let lastStartedAt = -Infinity;
+    let firstStartAt: number | null = null;
     const completions: number[] = [];
 
-    const accept = (force: any, forceSortAll: any) => {
-        lastAcceptedAt = performance.now();
-        s.accepted++;
+    const refresh = () => {
+        s.startRate = s.calls > 0 ? s.started / s.calls : null;
+        if (firstStartAt !== null && s.started > 1 && lastStartedAt > firstStartAt) {
+            s.effectiveSortHz = (s.started - 1) / ((lastStartedAt - firstStartAt) / 1000);
+        }
+    };
+
+    /** orig へ入れる。**実際に始まったときだけ** clock を進める。 */
+    const enter = (force: any, forceSortAll: any) => {
         const t0 = performance.now();
         const p = orig(force, forceSortAll);
-        // read-only の観測。sort の挙動自体は変えない。
-        try {
-            Promise.resolve(p).then(() => {
-                completions.push(performance.now() - t0);
-                if (completions.length > 2000) completions.shift();
-                const sorted = completions.slice().sort((x, y) => x - y);
-                s.completionP50Ms = pct(sorted, 0.5);
-                s.completionP95Ms = pct(sorted, 0.95);
-            });
-        } catch (e) { /* noop */ }
+        if (v.sortRunning === true) {
+            // 新しい sort が始まった
+            s.started++;
+            lastStartedAt = t0;
+            if (firstStartAt === null) firstStartAt = t0;
+            try {
+                Promise.resolve(p).then(() => {
+                    completions.push(performance.now() - t0);
+                    if (completions.length > 2000) completions.shift();
+                    const sorted = completions.slice().sort((x, y) => x - y);
+                    s.completionP50Ms = pct(sorted, 0.5);
+                    s.completionP95Ms = pct(sorted, 0.95);
+                });
+            } catch (e) { /* noop */ }
+        } else {
+            // initialized / splatCount 等の別の早期 return。clock は進めない。
+            s.enteredButNotStarted++;
+        }
+        refresh();
         return p;
     };
 
     v.runSplatSort = function (force?: any, forceSortAll?: any) {
         s.calls++;
-        if (v.sortRunning) s.overlapAtEntry++;
-        s.acceptRate = s.calls > 0 ? s.accepted / s.calls : null;
-        if (!firstDone) { firstDone = true; return accept(force, forceSortAll); }
-        if (performance.now() - lastAcceptedAt < SORT_MIN_INTERVAL_MS) {
-            s.skipped++;
-            s.acceptRate = s.accepted / s.calls;
-            // 元の実装が早期 return で返すのと同じ値 (`Viewer.js:2401`)
+        // 1) 本体が sortRunning で弾く呼び出し。素通しして clock は進めない。
+        if (v.sortRunning) {
+            s.overlapSkipped++;
+            refresh();
+            return orig(force, forceSortAll);
+        }
+        // 2) 初回は必ず通す
+        if (!firstDone) {
+            firstDone = true;
+            return enter(force, forceSortAll);
+        }
+        // 3) 10Hz 制限
+        if (performance.now() - lastStartedAt < SORT_MIN_INTERVAL_MS) {
+            s.throttled++;
+            refresh();
+            // 元の実装が早期 return で返すのと同じ値 (`Viewer.js:2400` / `2402`)
             return Promise.resolve(false);
         }
-        const r = accept(force, forceSortAll);
-        s.acceptRate = s.accepted / s.calls;
-        return r;
+        return enter(force, forceSortAll);
     };
     s.applied = true;
     s.reason = `runSplatSort を最大 ${1000 / SORT_MIN_INTERVAL_MS}Hz へ間引いた`;
