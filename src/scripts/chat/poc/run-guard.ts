@@ -17,6 +17,7 @@
 
 import { getSkinMode, type SkinMode } from './multibone-skinning';
 import { getMorphFastMode, getSortModeFlag, getAvatarIdForDiag } from './render-perf';
+import { getSortPolicy, type SortPolicy } from './adaptive-sort';
 
 /** FULL133 の Gaussian 数。`tools/uika_to_lam/build_full133.py` の出力と一致する値。 */
 const EXPECTED_SPLATS_FULL133 = 133541;
@@ -38,6 +39,9 @@ export interface RunConfig {
     morphFastApplied: boolean;
     sortMode: 'full' | '10fps';
     sortApplied: boolean;
+    sortPolicy: SortPolicy;
+    sortPolicyApplied: boolean;
+    sortPolicyBackend: 'gpu' | 'cpu' | null;
     gpuAcceleratedSort: boolean | null;
     diagMode: string;
     build: string;
@@ -88,6 +92,7 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
     const skinMode = getSkinMode();
     const patch = (window as any).__multiBoneSkinPatch ?? {};
     const perf = (window as any).__renderPerf ?? {};
+    const adaptive = (window as any).__adaptiveSort ?? {};
     const avatarId = getAvatarIdForDiag();
     const splatCount = Number(v?.splatMesh?.getSplatCount?.() ?? 0);
     const expectedSplatCount = avatarId === FULL133_AVATAR_ID ? EXPECTED_SPLATS_FULL133 : null;
@@ -106,6 +111,9 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
         morphFastApplied: perf?.morphFast?.applied === true,
         sortMode: getSortModeFlag(),
         sortApplied: perf?.sort?.applied === true,
+        sortPolicy: getSortPolicy(),
+        sortPolicyApplied: adaptive?.applied === true,
+        sortPolicyBackend: adaptive?.backend ?? null,
         gpuAcceleratedSort: typeof v?.gpuAcceleratedSort === 'boolean' ? v.gpuAcceleratedSort : null,
         diagMode,
         build: findBundle(/lam-websocket-manager/),
@@ -144,6 +152,10 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
     if ((cfg.sortMode === '10fps') !== cfg.sortApplied) {
         bad.push(`sortMode=${cfg.sortMode} なのに applied=${cfg.sortApplied}`);
     }
+    if ((cfg.sortPolicy !== 'stock') !== cfg.sortPolicyApplied) {
+        bad.push(`sortPolicy=${cfg.sortPolicy} なのに applied=${cfg.sortPolicyApplied}`
+            + ` (${adaptive?.reason ?? '理由不明'})`);
+    }
 
     cfg.valid = bad.length === 0;
     return cfg;
@@ -163,6 +175,8 @@ export function logRunConfig(renderer: any, diagMode: string): RunConfig {
         + ' headOnlyLine=' + c.headOnlyLineActive
         + ' morphFast=' + c.morphFast + '/' + c.morphFastApplied
         + ' sortMode=' + c.sortMode + '/' + c.sortApplied
+        + ' sortPolicy=' + c.sortPolicy + '/' + c.sortPolicyApplied
+        + '/' + c.sortPolicyBackend
         + ' gpuAcceleratedSort=' + c.gpuAcceleratedSort
         + ' diagMode=' + c.diagMode
         + ' build=' + c.build

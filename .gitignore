@@ -27,3 +27,4 @@ pnpm-debug.log*
 .idea/
 
 .vercel
+tools/poc-tests/.adaptive-sort.cjs

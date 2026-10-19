@@ -28,6 +28,8 @@ import { installSortMode, getSortMode } from './poc/sort-mode';
 import { installRenderPerf, getAvatarIdForDiag } from './poc/render-perf';
 // PoC: 性能計測 run の前提条件チェック (計測の有効性判定のみ。描画は変えない)
 import { logRunConfig } from './poc/run-guard';
+// PoC: FULL133 adaptive sort (camera 変化時のみ sort。既定は何もしない)
+import { installAdaptiveSort } from './poc/adaptive-sort';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -307,7 +309,11 @@ export class LAMWebSocketManager {
             // 3 つの install がすべて確定してから run の前提条件を 1 行で出す。
             // `window.__multiBoneSkinPatch` / `window.__renderPerf` が揃ってからでないと
             // applied の判定ができないため、ここで待つ (isModelLoaded はブロックしない)。
+            // adaptive sort は **最後**に入れる。gpuAcceleratedSort の実値を見て
+            // backend を決めるので、installSortMode より後でないと取り違える。
             void Promise.all([pPerf, pGpuSort, pSkin])
+                .then(() => installAdaptiveSort(this.renderer))
+                .then(p => console.log('[PoC adaptiveSort]', JSON.stringify(p)))
                 .then(() => logRunConfig(this.renderer, getDiagMode()))
                 .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e));
 
