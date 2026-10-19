@@ -31,6 +31,7 @@
  */
 
 import { getAvatarIdForDiag, getSortModeFlag } from './render-perf';
+import { loadAvatarConfig } from '../../../config/avatar-config';
 
 export type SortPolicy = 'stock' | 'adaptive-gpu' | 'adaptive-cpu';
 
@@ -44,20 +45,56 @@ const EPS_QUATERNION = 1e-5;
 const EPS_PROJECTION = 1e-6;
 const EPS_TARGET = 1e-5;
 
-/** `?sortPolicy=` — 既定は出荷挙動 (stock)。`adaptive` は gpu backend の別名。 */
-export function getSortPolicy(): SortPolicy {
+function parsePolicy(v: string | null | undefined): SortPolicy | null {
+    if (v === 'adaptive' || v === 'adaptive-gpu') return 'adaptive-gpu';
+    if (v === 'adaptive-cpu') return 'adaptive-cpu';
+    if (v === 'stock') return 'stock';
+    return null;
+}
+
+/** `?sortPolicy=` の値。無ければ `null`。`adaptive` は gpu backend の別名。 */
+export function getSortPolicyOverride(): SortPolicy | null {
     try {
-        const v = new URLSearchParams(window.location.search).get('sortPolicy');
-        if (v === 'adaptive' || v === 'adaptive-gpu') return 'adaptive-gpu';
-        if (v === 'adaptive-cpu') return 'adaptive-cpu';
-        return 'stock';
+        return parsePolicy(new URLSearchParams(window.location.search).get('sortPolicy'));
     } catch (e) {
-        return 'stock';
+        return null;
     }
+}
+
+/** 同期版。URL の指定だけを見る (run-guard の表示用)。 */
+export function getSortPolicy(): SortPolicy {
+    return getSortPolicyOverride() ?? 'stock';
+}
+
+/**
+ * 実際に使う policy を決める。優先順位:
+ *
+ *   1. `?sortPolicy=` (debug / override。指示書 §27)
+ *   2. avatar-config.json のアバター定義の `sortPolicy`
+ *   3. 'stock' (出荷挙動)
+ *
+ * これにより、実測で backend が決まった後は **avatar-config.json を 1 行
+ * 書き換えるだけ**で本番適用でき、通常利用時に URL パラメータが不要になる。
+ */
+export async function resolveSortPolicy(): Promise<{ policy: SortPolicy; source: string }> {
+    const override = getSortPolicyOverride();
+    if (override) return { policy: override, source: 'url' };
+    try {
+        const avatars = await loadAvatarConfig();
+        const id = getAvatarIdForDiag();
+        const def = avatars.find((a: { id: string }) => a.id === id);
+        const fromConfig = parsePolicy(def?.sortPolicy);
+        if (fromConfig) return { policy: fromConfig, source: 'avatar-config' };
+    } catch (e) {
+        console.warn('[PoC adaptiveSort] avatar-config の読み込みに失敗。stock を使います:', e);
+    }
+    return { policy: 'stock', source: 'default' };
 }
 
 export interface AdaptiveSortStats {
     mode: SortPolicy;
+    /** policy の決定元: 'url' | 'avatar-config' | 'default' */
+    source: string;
     applied: boolean;
     reason: string;
     backend: 'gpu' | 'cpu' | null;
@@ -98,10 +135,10 @@ function pct(sorted: number[], p: number): number | null {
 }
 
 /** `viewer` が生えるまで rAF で待ってから当てる。結果は `window.__adaptiveSort`。 */
-export function installAdaptiveSort(renderer: any, maxTries = 600): Promise<AdaptiveSortStats> {
-    const mode = getSortPolicy();
+export async function installAdaptiveSort(renderer: any, maxTries = 600): Promise<AdaptiveSortStats> {
+    const { policy: mode, source } = await resolveSortPolicy();
     const stats: AdaptiveSortStats = {
-        mode, applied: false, reason: '', backend: null,
+        mode, source, applied: false, reason: '', backend: null,
         avatarId: '', splatCount: 0,
         calls: 0, initialSorts: 0, cameraChangeEvents: 0, projectionChangeEvents: 0,
         started: 0, completed: 0,

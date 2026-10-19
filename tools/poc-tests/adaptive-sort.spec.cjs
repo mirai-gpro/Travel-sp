@@ -28,6 +28,16 @@ function makeEnv(search) {
     };
     global.document = { addEventListener: () => {}, visibilityState: 'visible' };
     global.performance = { now: () => Date.now() };
+    // avatar-config.json は URL override が無いときだけ読まれる。
+    // ここでは FULL133 に sortPolicy を持たせない (= 出荷既定) 状態を模す。
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ([
+            { id: 'uika-full133-skin', name: 'UIKA FULL 133K',
+              modelUrl: '/avatar/uika-full133-skin.zip', voiceModel: 'x' },
+            { id: 'meruru', name: 'メルル', modelUrl: '/avatar/meruru.zip', voiceModel: 'x' },
+        ]),
+    });
     global.requestAnimationFrame = (f) => setTimeout(() => f(Date.now()), 0);
     return listeners;
 }
@@ -198,6 +208,44 @@ function makeViewer() {
     ok(st6.fallbackCount === 1 && st6.lastError !== null && v6.runSplatSort === orig6,
        '例外で出荷版へ戻し fallbackCount を記録',
        `fallbackCount=${st6.fallbackCount} lastError=${st6.lastError}`);
+
+    // ========== case 7: avatar-config 由来の policy (URL パラメータ不要) ==========
+    // 実測で backend が決まった後の本番適用経路。
+    makeEnv('');
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ([
+            { id: 'uika-full133-skin', name: 'UIKA FULL 133K',
+              modelUrl: '/avatar/uika-full133-skin.zip', voiceModel: 'x',
+              sortPolicy: 'adaptive-cpu' },
+        ]),
+    });
+    delete require.cache[modPath];
+    const m7 = require(modPath);
+    const v7 = makeViewer();
+    const st7 = await m7.installAdaptiveSort({ viewer: v7 });
+    ok(st7.applied === true && st7.mode === 'adaptive-cpu'
+        && st7.source === 'avatar-config' && v7.gpuAcceleratedSort === false,
+       '★ URL なしで avatar-config から adaptive-cpu が有効になる',
+       `mode=${st7.mode} source=${st7.source}`);
+
+    // URL override が avatar-config より優先される
+    makeEnv('?sortPolicy=stock');
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ([
+            { id: 'uika-full133-skin', name: 'x',
+              modelUrl: '/avatar/uika-full133-skin.zip', voiceModel: 'x',
+              sortPolicy: 'adaptive-cpu' },
+        ]),
+    });
+    delete require.cache[modPath];
+    const m8 = require(modPath);
+    const v8 = makeViewer();
+    const orig8 = v8.runSplatSort;
+    const st8 = await m8.installAdaptiveSort({ viewer: v8 });
+    ok(st8.applied === false && st8.source === 'url' && v8.runSplatSort === orig8,
+       '?sortPolicy=stock が avatar-config を上書きする', `source=${st8.source}`);
 
     console.log('');
     console.log(failures === 0 ? '=== 全テスト PASS ===' : `=== ${failures} 件 FAIL ===`);

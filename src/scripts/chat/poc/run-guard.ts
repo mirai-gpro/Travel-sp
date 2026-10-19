@@ -40,6 +40,7 @@ export interface RunConfig {
     sortMode: 'full' | '10fps';
     sortApplied: boolean;
     sortPolicy: SortPolicy;
+    sortPolicySource: string;
     sortPolicyApplied: boolean;
     sortPolicyBackend: 'gpu' | 'cpu' | null;
     gpuAcceleratedSort: boolean | null;
@@ -111,7 +112,9 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
         morphFastApplied: perf?.morphFast?.applied === true,
         sortMode: getSortModeFlag(),
         sortApplied: perf?.sort?.applied === true,
-        sortPolicy: getSortPolicy(),
+        // URL 指定が無い場合は avatar-config 由来になるので、実際に決まった値を使う。
+        sortPolicy: (adaptive?.mode as SortPolicy) ?? getSortPolicy(),
+        sortPolicySource: String(adaptive?.source ?? 'unknown'),
         sortPolicyApplied: adaptive?.applied === true,
         sortPolicyBackend: adaptive?.backend ?? null,
         gpuAcceleratedSort: typeof v?.gpuAcceleratedSort === 'boolean' ? v.gpuAcceleratedSort : null,
@@ -176,7 +179,7 @@ export function logRunConfig(renderer: any, diagMode: string): RunConfig {
         + ' morphFast=' + c.morphFast + '/' + c.morphFastApplied
         + ' sortMode=' + c.sortMode + '/' + c.sortApplied
         + ' sortPolicy=' + c.sortPolicy + '/' + c.sortPolicyApplied
-        + '/' + c.sortPolicyBackend
+        + '/' + c.sortPolicyBackend + '/' + c.sortPolicySource
         + ' gpuAcceleratedSort=' + c.gpuAcceleratedSort
         + ' diagMode=' + c.diagMode
         + ' build=' + c.build

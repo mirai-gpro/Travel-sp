@@ -21,6 +21,10 @@ export interface AvatarDef {
   voiceModel: string; // REST TTS用音声モデル名（例: ja-JP-Chirp3-HD-Leda）
   liveVoice?: string; // LiveAPI用音声名（例: Leda）
   camera?: CameraParams; // カメラパラメータ
+  /** splat sort policy の既定値 (PoC)。
+   *  未指定 = 出荷版 ('stock')。`?sortPolicy=` で上書きできる。
+   *  `src/scripts/chat/poc/adaptive-sort.ts` が読む。 */
+  sortPolicy?: 'stock' | 'adaptive-gpu' | 'adaptive-cpu';
 }
 
 /** デフォルトのアバター一覧（JSONロード失敗時のフォールバック） */
