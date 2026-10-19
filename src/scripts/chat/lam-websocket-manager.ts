@@ -26,6 +26,8 @@ import { installSortMode, getSortMode } from './poc/sort-mode';
 // PoC 限定: ?morphFast=1 / ?sortMode=10fps / ?centersProbe=1。
 // いずれも未指定なら何もしないので、出荷版の挙動は変わらない。
 import { installRenderPerf, getAvatarIdForDiag } from './poc/render-perf';
+// PoC: 性能計測 run の前提条件チェック (計測の有効性判定のみ。描画は変えない)
+import { logRunConfig } from './poc/run-guard';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -96,6 +98,11 @@ export class LAMWebSocketManager {
     private readonly morphProbe: boolean = getDiagMode() === 'morphProbe';
     private _probeTimes: number[] = [];
     private _probeLogAt = 0;
+    // 累積版 (指示書 §9: warm-up を除いた 30 秒以上を 1 つの数字で出すため)。
+    // 直近 120 サンプルの sliding window だけでは run 全体の p50 が出せない。
+    private _probeAll: number[] = [];
+    private _probeAllLast: number | null = null;
+    private _probeApiInstalled = false;
 
     // ===== 診断専用: 実 A2E 固定リプレイ (?a2eReplay=1) =====
     // morphProbe とは完全に別モード (同時指定は a2e-replay.ts 側で両方無効化)。
@@ -276,16 +283,23 @@ export class LAMWebSocketManager {
             // PoC: multi-bone skinning (既定は何もしない)
             const skinMode = getSkinMode();
             // PoC: FULL133 renderer cadence 回復 A/B (既定は何もしない)
-            installRenderPerf(this.renderer)
-                .then(p => console.log('[PoC renderPerf]', JSON.stringify(p)));
+            const pPerf = installRenderPerf(this.renderer)
+                .then(p => { console.log('[PoC renderPerf]', JSON.stringify(p)); return p; });
 
             // PoC: splat sort の距離計算経路 (既定は何もしない)
             const sortMode = getSortMode();
-            installSortMode(this.renderer, sortMode)
-                .then(p => console.log('[PoC gpuSort]', JSON.stringify(p)));
+            const pGpuSort = installSortMode(this.renderer, sortMode)
+                .then(p => { console.log('[PoC gpuSort]', JSON.stringify(p)); return p; });
 
-            installMultiBoneSkinning(this.renderer, skinMode)
-                .then(p => console.log('[PoC skinMode]', JSON.stringify(p)));
+            const pSkin = installMultiBoneSkinning(this.renderer, skinMode)
+                .then(p => { console.log('[PoC skinMode]', JSON.stringify(p)); return p; });
+
+            // 3 つの install がすべて確定してから run の前提条件を 1 行で出す。
+            // `window.__multiBoneSkinPatch` / `window.__renderPerf` が揃ってからでないと
+            // applied の判定ができないため、ここで待つ (isModelLoaded はブロックしない)。
+            void Promise.all([pPerf, pGpuSort, pSkin])
+                .then(() => logRunConfig(this.renderer, getDiagMode()))
+                .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e));
 
             this.isModelLoaded = true;
             console.log('[LAMWebSocketManager] モデルロード完了');
@@ -293,6 +307,50 @@ export class LAMWebSocketManager {
             console.error('[LAMWebSocketManager] 初期化エラー:', error);
             this.isModelLoaded = false;
         }
+    }
+
+    /**
+     * `?morphProbe=1` の累積統計を console から読めるようにする (読み取りのみ)。
+     *
+     * - `__morphProbeReset()` : warm-up 後にここで 0 クリアしてから本計測に入る
+     * - `__morphProbe()`      : run 全体の p50 / p95 / max / approxFps / samples
+     *
+     * percentile の計算は呼ばれたときだけ行う (毎フレーム sort しない)。
+     */
+    private _installMorphProbeApi(): void {
+        const self = this;
+        (window as any).__morphProbeReset = () => {
+            self._probeAll = [];
+            self._probeAllLast = null;
+            return 'reset';
+        };
+        (window as any).__morphProbe = () => {
+            const d = self._probeAll.slice().sort((a, b) => a - b);
+            if (d.length < 2) {
+                return { samples: d.length, verdict: 'INSUFFICIENT' };
+            }
+            const q = (pp: number) => d[Math.min(d.length - 1, Math.floor(pp * d.length))];
+            const budgetMs = 1000 / 30;          // A2E frame_rate = 30 (live-audio-manager.ts:66)
+            const p50 = q(0.5);
+            const p95 = q(0.95);
+            const over = d.filter(x => x >= budgetMs).length;
+            const r = {
+                samples: d.length,
+                p50Ms: +p50.toFixed(2),
+                p95Ms: +p95.toFixed(2),
+                maxMs: +d[d.length - 1].toFixed(2),
+                minMs: +d[0].toFixed(2),
+                approxFps: +(1000 / p50).toFixed(1),
+                budgetMs: +budgetMs.toFixed(2),
+                overBudget: over + '/' + d.length,
+                overBudgetPct: +(100 * over / d.length).toFixed(1),
+                verdict: p95 < budgetMs ? 'PASS' : (p50 < budgetMs ? 'PARTIAL' : 'FAIL'),
+                runConfig: (window as any).__runConfig ?? null,
+                renderPerf: (window as any).__renderPerf ?? null,
+            };
+            console.log('[MORPH PROBE TOTAL]', JSON.stringify(r));
+            return r;
+        };
     }
 
     /**
@@ -317,6 +375,21 @@ export class LAMWebSocketManager {
             // renderer の呼び出し間隔だけを測る (直近 120 サンプル、2 秒ごとに 1 行)
             this._probeTimes.push(now);
             if (this._probeTimes.length > 120) this._probeTimes.shift();
+
+            // 累積: run 全体の p50/p95/max を 1 つの数字で出せるようにする。
+            if (this._probeAllLast !== null) {
+                const d = now - this._probeAllLast;
+                // tab 非前面などで rAF が止まった区間は統計から外す。
+                if (d > 0 && d < 500) {
+                    this._probeAll.push(d);
+                    if (this._probeAll.length > 20000) this._probeAll.shift();
+                }
+            }
+            this._probeAllLast = now;
+            if (!this._probeApiInstalled) {
+                this._probeApiInstalled = true;
+                this._installMorphProbeApi();
+            }
             if (now - this._probeLogAt >= 2000) {
                 this._probeLogAt = now;
                 const t = this._probeTimes;

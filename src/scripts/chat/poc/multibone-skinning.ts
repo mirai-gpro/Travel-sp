@@ -124,6 +124,9 @@ export interface SkinPatchResult {
     /** 差し替え後の shader に 4 influence 行が「有効な形で」入っているか */
     activeInfluenceLines: number;
     headOnlyLineActive: boolean;
+    /** `aligned` のとき、splatIndex 基準の skin lookup が本当に有効になっているか。
+     *  shader 側の texelFetch と material 側の uniform が **両方** 揃って true。 */
+    alignedLookupActive: boolean;
 }
 
 /**
@@ -199,6 +202,7 @@ export async function applyMultiBoneSkinning(renderer: any, mode: SkinMode): Pro
     const fail = (reason: string): SkinPatchResult => ({
         mode, applied: false, reason,
         activeInfluenceLines: 0, headOnlyLineActive: true,
+        alignedLookupActive: false,
     });
     if (mode === 'head') return fail('skinMode=head のため出荷版のまま');
 
@@ -230,13 +234,25 @@ export async function applyMultiBoneSkinning(renderer: any, mode: SkinMode): Pro
     material.vertexShader = patched;
     material.needsUpdate = true;
 
-    const active = (patched.match(/^\s*skinned\s*\+=\s*boneMat[XYZW]\s*\*\s*skinVertex\s*\*\s*skinWeight\.[xyzw];/gm) || []).length;
+    // MULTI_BONE_BLOCK は `boneMatX * skinVertex * skinWeight.x`、
+    // ALIGNED_BLOCK は `aMX * skinVertex * aW.x`。両方を数える。
+    const active = (patched.match(
+        /^\s*skinned\s*\+=\s*(?:boneMat[XYZW]\s*\*\s*skinVertex\s*\*\s*skinWeight\.[xyzw]|aM[XYZW]\s*\*\s*skinVertex\s*\*\s*aW\.[xyzw]);/gm,
+    ) || []).length;
     const headActive = /^\s*skinned\s*\+=\s*boneMat\s*\*\s*skinVertex\s*\*\s*1\.0;/m.test(
         patched.replace(/} else if \(headBoneIndex[\s\S]*?\n {16}}/, ''));
+    // aligned は shader の texelFetch と uniform の両方が揃って初めて有効。
+    const alignedLookupActive = mode === 'aligned'
+        && patched.includes('texelFetch(skinIndexTexture')
+        && patched.includes('texelFetch(skinWeightTexture')
+        && !!material.uniforms?.skinIndexTexture?.value
+        && !!material.uniforms?.skinWeightTexture?.value;
+
     return {
         mode, applied: true,
         reason: 'vertexShader を 4 influence LBS へ差し替えた',
         activeInfluenceLines: active,
         headOnlyLineActive: headActive,
+        alignedLookupActive,
     };
 }

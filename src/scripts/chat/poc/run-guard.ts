@@ -1,0 +1,179 @@
+/**
+ * PoC: 性能計測 run の前提条件チェック (指示書 §5 / §6)
+ *
+ * 目的は **計測の有効性判定だけ**。描画も lip-sync も一切変えない。
+ *
+ * 計測を始める前に「この run は本当に測りたい条件になっているか」を 1 行で出す。
+ * 過去に `?morphFast=1&sortMode=10fps` で測った D が、実は
+ * `skinMode=head / applied=false` のままだったため、
+ * 「FULL133 + aligned multi-bone の性能」ではない数字を採ってしまった。
+ * 同じ取り違えを二度とやらないための gate。
+ *
+ * 1 項目でも期待と違えば `RUN_VALID=false` を出す。
+ * **描画は止めない** (アプリを壊さないため)。止める代わりに
+ * `console.error` で目立たせ、`window.__runConfig.valid === false` を残す。
+ * 集計する側がこれを見て run を破棄する。
+ */
+
+import { getSkinMode, type SkinMode } from './multibone-skinning';
+import { getMorphFastMode, getSortModeFlag, getAvatarIdForDiag } from './render-perf';
+
+/** FULL133 の Gaussian 数。`tools/uika_to_lam/build_full133.py` の出力と一致する値。 */
+const EXPECTED_SPLATS_FULL133 = 133541;
+
+/** splat 数の検証を掛ける avatarId。これ以外では件数を記録するだけで判定しない。 */
+const FULL133_AVATAR_ID = 'uika-full133-skin';
+
+export interface RunConfig {
+    avatarId: string;
+    splatCount: number;
+    expectedSplatCount: number | null;
+    skinMode: SkinMode;
+    multiBoneApplied: boolean;
+    multiBoneReason: string;
+    activeInfluenceLines: number;
+    headOnlyLineActive: boolean;
+    alignedLookupActive: boolean;
+    morphFast: 'on' | 'off';
+    morphFastApplied: boolean;
+    sortMode: 'full' | '10fps';
+    sortApplied: boolean;
+    gpuAcceleratedSort: boolean | null;
+    diagMode: string;
+    build: string;
+    rendererBundle: string;
+    chrome: string;
+    gl: string;
+    viewport: string;
+    dpr: number;
+    /** 期待と違った項目。空なら valid。 */
+    violations: string[];
+    valid: boolean;
+}
+
+/** 読み込まれている renderer の bundle 名。版の指紋として使う (推測値を書かない)。 */
+function findBundle(pattern: RegExp): string {
+    try {
+        const hit = performance.getEntriesByType('resource')
+            .map((e) => e.name)
+            .filter((n) => pattern.test(n))
+            .pop();
+        return hit ? hit.split('/').pop()! : 'unknown';
+    } catch (e) {
+        return 'unknown';
+    }
+}
+
+/** GPU / ANGLE backend。renderer 自身の context から取る (別 context を作らない)。 */
+function readGlInfo(renderer: any): string {
+    try {
+        const gl = renderer?.viewer?.renderer?.getContext?.();
+        if (!gl) return 'unknown (context 取得不可)';
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        if (!ext) return String(gl.getParameter(gl.VERSION));
+        return String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL));
+    } catch (e) {
+        return 'unknown';
+    }
+}
+
+/**
+ * 期待条件を渡して検証する。
+ *
+ * `expect` を省略すると URL パラメータがそのまま期待値になる
+ * (= 「指定したとおりに効いているか」だけを見る)。
+ */
+export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
+    const v = renderer?.viewer;
+    const skinMode = getSkinMode();
+    const patch = (window as any).__multiBoneSkinPatch ?? {};
+    const perf = (window as any).__renderPerf ?? {};
+    const avatarId = getAvatarIdForDiag();
+    const splatCount = Number(v?.splatMesh?.getSplatCount?.() ?? 0);
+    const expectedSplatCount = avatarId === FULL133_AVATAR_ID ? EXPECTED_SPLATS_FULL133 : null;
+
+    const cfg: RunConfig = {
+        avatarId,
+        splatCount,
+        expectedSplatCount,
+        skinMode,
+        multiBoneApplied: patch.applied === true,
+        multiBoneReason: String(patch.reason ?? '(未実行)'),
+        activeInfluenceLines: Number(patch.activeInfluenceLines ?? 0),
+        headOnlyLineActive: patch.headOnlyLineActive === true,
+        alignedLookupActive: patch.alignedLookupActive === true,
+        morphFast: getMorphFastMode(),
+        morphFastApplied: perf?.morphFast?.applied === true,
+        sortMode: getSortModeFlag(),
+        sortApplied: perf?.sort?.applied === true,
+        gpuAcceleratedSort: typeof v?.gpuAcceleratedSort === 'boolean' ? v.gpuAcceleratedSort : null,
+        diagMode,
+        build: findBundle(/lam-websocket-manager/),
+        rendererBundle: findBundle(/gaussian-splat-renderer-for-lam/),
+        chrome: navigator.userAgent,
+        gl: readGlInfo(renderer),
+        viewport: `${window.innerWidth}x${window.innerHeight}`,
+        dpr: window.devicePixelRatio,
+        violations: [],
+        valid: false,
+    };
+
+    const bad = cfg.violations;
+    if (!cfg.avatarId || cfg.avatarId === 'unknown') bad.push('avatarId が取れない');
+    if (expectedSplatCount !== null && splatCount !== expectedSplatCount) {
+        bad.push(`splatCount=${splatCount} (期待 ${expectedSplatCount})`);
+    }
+    if (splatCount <= 0) bad.push('splatCount=0 (モデル未ロード)');
+
+    // skinMode: 指定したモードが本当に当たっているか。head 指定なら applied=false が正しい。
+    if (skinMode === 'head') {
+        if (cfg.multiBoneApplied) bad.push('skinMode=head なのに multiBone applied=true');
+    } else {
+        if (!cfg.multiBoneApplied) bad.push(`skinMode=${skinMode} なのに multiBone applied=false (${cfg.multiBoneReason})`);
+        if (cfg.activeInfluenceLines < 4) bad.push(`activeInfluenceLines=${cfg.activeInfluenceLines} (期待 4)`);
+    }
+    // 指示書 §5 の「sort-index-aligned skin lookup == active」。
+    if (skinMode === 'aligned' && !cfg.alignedLookupActive) {
+        bad.push('alignedLookupActive=false (splatIndex 基準の skin lookup が効いていない)');
+    }
+
+    // morphFast / sortMode: 指定 = 適用 が一致しているか。
+    if ((cfg.morphFast === 'on') !== cfg.morphFastApplied) {
+        bad.push(`morphFast=${cfg.morphFast} なのに applied=${cfg.morphFastApplied}`);
+    }
+    if ((cfg.sortMode === '10fps') !== cfg.sortApplied) {
+        bad.push(`sortMode=${cfg.sortMode} なのに applied=${cfg.sortApplied}`);
+    }
+
+    cfg.valid = bad.length === 0;
+    return cfg;
+}
+
+/** `[PERF RUN CONFIG]` を 1 行で出す (§6)。`window.__runConfig` にも残す。 */
+export function logRunConfig(renderer: any, diagMode: string): RunConfig {
+    const c = buildRunConfig(renderer, diagMode);
+    (window as any).__runConfig = c;
+    const line = '[PERF RUN CONFIG]'
+        + ' avatarId=' + c.avatarId
+        + ' splatCount=' + c.splatCount
+        + ' skinMode=' + c.skinMode
+        + ' multiBoneApplied=' + c.multiBoneApplied
+        + ' influenceLines=' + c.activeInfluenceLines
+        + ' alignedLookup=' + c.alignedLookupActive
+        + ' headOnlyLine=' + c.headOnlyLineActive
+        + ' morphFast=' + c.morphFast + '/' + c.morphFastApplied
+        + ' sortMode=' + c.sortMode + '/' + c.sortApplied
+        + ' gpuAcceleratedSort=' + c.gpuAcceleratedSort
+        + ' diagMode=' + c.diagMode
+        + ' build=' + c.build
+        + ' renderer=' + c.rendererBundle
+        + ' viewport=' + c.viewport + '@' + c.dpr
+        + ' gl="' + c.gl + '"'
+        + ' RUN_VALID=' + c.valid;
+    if (c.valid) {
+        console.log(line);
+    } else {
+        console.error(line + '\n  ↑ この run は性能集計に使えません: ' + c.violations.join(' / '));
+    }
+    return c;
+}
