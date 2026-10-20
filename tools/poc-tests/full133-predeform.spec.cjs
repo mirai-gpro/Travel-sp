@@ -67,7 +67,7 @@ function makeEnv(search, opts = {}) {
 /** 必要なだけの偽 WebGL2 context */
 function makeGl(opts = {}) {
     let id = 1;
-    const calls = { drawArrays: 0, framebufferTexture2D: 0, uniform1fv: 0 };
+    const calls = { drawArrays: 0, framebufferTexture2D: 0, uniform1fv: 0, viewports: [] };
     return {
         calls,
         FRAMEBUFFER: 1, COLOR_ATTACHMENT0: 2, TEXTURE_2D: 3, FRAMEBUFFER_COMPLETE: 0x8cd5,
@@ -92,7 +92,8 @@ function makeGl(opts = {}) {
         checkFramebufferStatus: () => (opts.fbIncomplete ? 0x8cd6 : 0x8cd5),
         deleteFramebuffer: () => {},
         getParameter: (p) => (p === 21 ? new Int32Array([0, 0, 800, 600]) : null),
-        viewport: () => {}, enable: () => {}, disable: () => {},
+        viewport: (x, y, w, h) => { calls.viewports.push([x, y, w, h]); },
+        enable: () => {}, disable: () => {},
         useProgram: () => {}, activeTexture: () => {}, bindTexture: () => {},
         uniform1i: () => {}, uniform1fv: () => { calls.uniform1fv++; },
         drawArrays: () => { calls.drawArrays++; },
@@ -263,6 +264,19 @@ function loadMod() {
        'texture 寸法を canonical から取っている',
        `${s4.textureWidth}x${s4.textureHeight}`);
     ok(s4.bsCount === BS, 'bsCount を uniform から取っている');
+
+    // ---- prepass の fragment 数を有効 Gaussian 行だけに絞る ----
+    ok(s4.activeRows === 33,
+       '★ activeRows === 33  (ceil(133541 / 4096))', 'activeRows=' + s4.activeRows);
+    const pv = gl4.calls.viewports[0];
+    ok(pv && pv[0] === 0 && pv[1] === 0 && pv[2] === 4096 && pv[3] === 33,
+       '★ prepass の viewport が 4096x33', JSON.stringify(pv));
+    ok(pv[2] * pv[3] === 135168,
+       '★ fragment 数 135,168 (texture 全面 4,194,304 の約 1/31)',
+       `${pv[2] * pv[3]} / ${4096 * 1024}`);
+    ok(s4.textureWidth === 4096 && s4.textureHeight === 1024,
+       '★ texture の寸法そのものは変えていない',
+       `${s4.textureWidth}x${s4.textureHeight}`);
 
     // ---- dirty 判定 ----
     const d0 = gl4.calls.drawArrays;

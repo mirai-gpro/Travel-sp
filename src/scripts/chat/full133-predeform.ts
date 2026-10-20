@@ -115,6 +115,8 @@ export interface Full133PredeformStats {
     /** deformed center texture の寸法 */
     textureWidth: number;
     textureHeight: number;
+    /** prepass で実際に処理する行数。Gaussian が収まる最小行数だけを走らせる。 */
+    activeRows: number;
     /** prepass を実行した回数 (= expression が変化した回数) */
     passes: number;
     /** expression が変わらずスキップした回数 */
@@ -217,7 +219,8 @@ void main() {
     uvec4 cc = texelFetch(canonicalTex, tc, 0);
     int i = tc.y * canonicalWidth + tc.x;
     if (i >= splatCount) {
-        // padding texel。canonical をそのまま通す (未初期化を描かない)。
+        // 最終行の padding texel。viewport で行数は絞ってあるので、ここに来るのは
+        // 最終行の余りだけ。canonical をそのまま通す (未初期化を描かない)。
         outCenterColor = cc;
         return;
     }
@@ -281,6 +284,8 @@ interface Ctx {
     basisGl: WebGLTexture;
     width: number;
     height: number;
+    /** 有効 Gaussian が収まる行数。prepass の viewport 高さ。 */
+    activeRows: number;
     splatCount: number;
     bsCount: number;
     basisWidth: number;
@@ -296,7 +301,7 @@ export async function installFull133Predeform(
     const stats: Full133PredeformStats = {
         enabled: true, applied: false, reason: '',
         avatarId: '', splatCount: 0, bsCount: 0,
-        textureWidth: 0, textureHeight: 0,
+        textureWidth: 0, textureHeight: 0, activeRows: 0,
         passes: 0, skipped: 0,
         morphLoopRemoved: false, framebufferComplete: false,
         fallbackCount: 0, lastError: null,
@@ -395,6 +400,7 @@ function apply(renderer: any, stats: Full133PredeformStats): void {
     }
     stats.textureWidth = width;
     stats.textureHeight = height;
+    stats.activeRows = Math.ceil(stats.splatCount / width);
 
     // ---- 出力 texture。canonical とは別オブジェクトにする (指示書 §8) ----
     // three.js を新規 import せず、canonical texture の constructor を使う。
@@ -450,6 +456,7 @@ function apply(renderer: any, stats: Full133PredeformStats): void {
         vao: gl.createVertexArray(),
         deformedTex, canonicalGl, basisGl,
         width, height,
+        activeRows: Math.ceil(stats.splatCount / width),
         splatCount: stats.splatCount, bsCount, basisWidth,
         loc: {
             canonicalTex: gl.getUniformLocation(prog, 'canonicalTex'),
@@ -540,7 +547,14 @@ function runPass(ctx: Ctx, renderer: any, stats: Full133PredeformStats): void {
     const blend = gl.getParameter(gl.BLEND);
     try {
         gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.fbo);
-        gl.viewport(0, 0, ctx.width, ctx.height);
+        // texture 全体 (4096x1024 = 4.19M texel) を走らせない。
+        // Gaussian は 133,541 個しか無いので、収まる最小行数だけを処理する。
+        //     activeRows = ceil(133541 / 4096) = 33
+        //     4096 x 33 = 135,168 fragment  (全面の約 1/31)
+        // 33 行目以降の texel は main shader から一度も参照されないので、
+        // 初回 upload 時の canonical 内容のまま放置してよい。
+        // texture の寸法そのものは変えない (`centersColorsTextureSize` も不変)。
+        gl.viewport(0, 0, ctx.width, ctx.activeRows);
         gl.disable(gl.SCISSOR_TEST);
         gl.disable(gl.DEPTH_TEST);
         gl.disable(gl.BLEND);
