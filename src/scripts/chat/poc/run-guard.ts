@@ -16,7 +16,8 @@
  */
 
 import { getSkinMode, type SkinMode } from './multibone-skinning';
-import { getMorphFastMode, getSortModeFlag, getAvatarIdForDiag } from './render-perf';
+import { getSortModeFlag, getAvatarIdForDiag } from './render-perf';
+import { getMorphPath, type Full133MorphPath } from '../full133-runtime';
 import { getSortPolicy, type SortPolicy } from './adaptive-sort';
 
 /** FULL133 の Gaussian 数。`tools/uika_to_lam/build_full133.py` の出力と一致する値。 */
@@ -35,8 +36,11 @@ export interface RunConfig {
     activeInfluenceLines: number;
     headOnlyLineActive: boolean;
     alignedLookupActive: boolean;
-    morphFast: 'on' | 'off';
-    morphFastApplied: boolean;
+    morphPath: Full133MorphPath;
+    morphPathSource: string;
+    morphPathApplied: boolean;
+    /** steady-state path を通ったフレーム数。0 のまま進まなければ効いていない。 */
+    morphSteadyFrames: number;
     sortMode: 'full' | '10fps';
     sortApplied: boolean;
     sortPolicy: SortPolicy;
@@ -94,6 +98,7 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
     const patch = (window as any).__multiBoneSkinPatch ?? {};
     const perf = (window as any).__renderPerf ?? {};
     const adaptive = (window as any).__adaptiveSort ?? {};
+    const full133 = (window as any).__full133Runtime ?? {};
     const avatarId = getAvatarIdForDiag();
     const splatCount = Number(v?.splatMesh?.getSplatCount?.() ?? 0);
     const expectedSplatCount = avatarId === FULL133_AVATAR_ID ? EXPECTED_SPLATS_FULL133 : null;
@@ -108,8 +113,11 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
         activeInfluenceLines: Number(patch.activeInfluenceLines ?? 0),
         headOnlyLineActive: patch.headOnlyLineActive === true,
         alignedLookupActive: patch.alignedLookupActive === true,
-        morphFast: getMorphFastMode(),
-        morphFastApplied: perf?.morphFast?.applied === true,
+        // URL 指定が無い場合は avatar-config 由来になるので、実際に決まった値を使う。
+        morphPath: (full133?.mode as Full133MorphPath) ?? getMorphPath(),
+        morphPathSource: String(full133?.source ?? 'unknown'),
+        morphPathApplied: full133?.applied === true,
+        morphSteadyFrames: Number(full133?.steadyFrames ?? 0),
         sortMode: getSortModeFlag(),
         sortApplied: perf?.sort?.applied === true,
         // URL 指定が無い場合は avatar-config 由来になるので、実際に決まった値を使う。
@@ -148,9 +156,14 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
         bad.push('alignedLookupActive=false (splatIndex 基準の skin lookup が効いていない)');
     }
 
-    // morphFast / sortMode: 指定 = 適用 が一致しているか。
-    if ((cfg.morphFast === 'on') !== cfg.morphFastApplied) {
-        bad.push(`morphFast=${cfg.morphFast} なのに applied=${cfg.morphFastApplied}`);
+    // morphPath / sortMode: 指定 = 適用 が一致しているか。
+    if ((cfg.morphPath !== 'stock') !== cfg.morphPathApplied) {
+        bad.push(`morphPath=${cfg.morphPath} なのに applied=${cfg.morphPathApplied}`
+            + ` (${full133?.reason ?? '理由不明'})`);
+    }
+    if (full133?.fallbackCount > 0) {
+        bad.push(`FULL133 steady-state path が ${full133.fallbackCount} 回 fallback`
+            + ` (${full133?.lastError ?? '理由不明'})`);
     }
     if ((cfg.sortMode === '10fps') !== cfg.sortApplied) {
         bad.push(`sortMode=${cfg.sortMode} なのに applied=${cfg.sortApplied}`);
@@ -176,7 +189,8 @@ export function logRunConfig(renderer: any, diagMode: string): RunConfig {
         + ' influenceLines=' + c.activeInfluenceLines
         + ' alignedLookup=' + c.alignedLookupActive
         + ' headOnlyLine=' + c.headOnlyLineActive
-        + ' morphFast=' + c.morphFast + '/' + c.morphFastApplied
+        + ' morphPath=' + c.morphPath + '/' + c.morphPathApplied + '/' + c.morphPathSource
+        + ' steadyFrames=' + c.morphSteadyFrames
         + ' sortMode=' + c.sortMode + '/' + c.sortApplied
         + ' sortPolicy=' + c.sortPolicy + '/' + c.sortPolicyApplied
         + '/' + c.sortPolicyBackend + '/' + c.sortPolicySource

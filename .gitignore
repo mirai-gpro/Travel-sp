@@ -28,3 +28,5 @@ pnpm-debug.log*
 
 .vercel
 tools/poc-tests/.adaptive-sort.cjs
+# PoC ロジックテストの esbuild 出力 (生成物)
+tools/poc-tests/.*.cjs

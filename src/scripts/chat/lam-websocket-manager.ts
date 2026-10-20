@@ -23,13 +23,16 @@ import { installMultiBoneSkinning, getSkinMode } from './poc/multibone-skinning'
 // PoC 限定: ?gpuSort=0 のときだけ splat sort の GPU 距離計算を切る。
 // 既定 (フラグ無し) では何もしないので、出荷版の挙動は変わらない。
 import { installSortMode, getSortMode } from './poc/sort-mode';
-// PoC 限定: ?morphFast=1 / ?sortMode=10fps / ?centersProbe=1。
+// PoC 限定: ?sortMode=10fps / ?centersProbe=1 / ?frameCost=1。
+// FULL133 の morph path は PoC ではなく正式 runtime (full133-runtime.ts)。
 // いずれも未指定なら何もしないので、出荷版の挙動は変わらない。
 import { installRenderPerf, getAvatarIdForDiag } from './poc/render-perf';
 // PoC: 性能計測 run の前提条件チェック (計測の有効性判定のみ。描画は変えない)
 import { logRunConfig } from './poc/run-guard';
 // PoC: FULL133 adaptive sort (camera 変化時のみ sort。既定は何もしない)
 import { installAdaptiveSort } from './poc/adaptive-sort';
+import { installFrameCost } from './poc/frame-cost';
+import { installFull133Runtime } from './full133-runtime';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -312,8 +315,17 @@ export class LAMWebSocketManager {
             // adaptive sort は **最後**に入れる。gpuAcceleratedSort の実値を見て
             // backend を決めるので、installSortMode より後でないと取り違える。
             void Promise.all([pPerf, pGpuSort, pSkin])
+                // FULL133 の正式 steady-state morph path。avatar-config から選ばれる。
+                // multi-bone の shader patch が当たった後に入れる。
+                .then(() => installFull133Runtime(this.renderer))
+                .then(p => console.log('[FULL133 runtime]', JSON.stringify(p)))
                 .then(() => installAdaptiveSort(this.renderer))
                 .then(p => console.log('[PoC adaptiveSort]', JSON.stringify(p)))
+                // frame cost は **最後**。morph / sort の wrapper を外側から
+                // 包んで「実際に掛かった時間」を測るので、全部入った後でないと
+                // 出荷版の関数を直接包んでしまう (指示書 §13)。
+                .then(() => installFrameCost(this.renderer))
+                .then(p => console.log('[PoC frameCost]', JSON.stringify(p)))
                 .then(() => logRunConfig(this.renderer, getDiagMode()))
                 .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e));
 
@@ -408,16 +420,21 @@ export class LAMWebSocketManager {
                 droppedGaps: self._probeGaps,
                 backgroundEvents: self._probeHidden,
                 resizeEvents: self._probeResized,
-                // 計測窓の viewport。runConfig.viewport はロード時なので別物になり得る。
+                // 計測窓の viewport。これが run の正本。
+                // `runConfig.viewport` はページロード時のスナップショットなので、
+                // ロード後に DevTools の配置を変えた run では別の値になる。
+                // **計測窓の外での resize は欠陥ではない**ので runValid には入れない。
+                // 窓の中が一貫していること (start === end かつ resizeEvents === 0) だけを見る。
                 viewportAtStart: self._probeViewportAtStart,
                 viewportAtEnd: vpNow,
+                /** 参考情報。false なら「ロード後に resize した」という意味で、
+                 *  run 間の比較には `viewportAtStart` を使う。 */
                 viewportMatchesRunConfig: vpNow === (window as any).__runConfig?.viewport,
                 runValid: (window as any).__runConfig?.valid === true
                     && self._probeHidden === 0
                     && self._probeGaps === 0
                     && self._probeResized === 0
                     && self._probeViewportAtStart === vpNow
-                    && vpNow === (window as any).__runConfig?.viewport
                     && d.length >= 1000,
                 runConfig: (window as any).__runConfig ?? null,
                 renderPerf: (window as any).__renderPerf ?? null,

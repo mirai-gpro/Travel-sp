@@ -7,7 +7,8 @@
 // Gaussian 数を減らさずに budget 内へ戻せるかを、renderer 側の
 // **2 つの無駄**だけ切り替えて測る。
 //
-//   A. morphFast … runMorphUpdate() の毎フレーム全量再構築をやめる
+//   A. (移設済み) runMorphUpdate() の steady-state 化は FULL133 の正式 runtime
+//      `src/scripts/chat/full133-runtime.ts` が持つ。ここには残っていない。
 //   B. sortMode  … runSplatSort() を 10Hz へ間引く
 //
 // どちらも `uika-133k-mode.ts` (UIKA hidden mode 専用) に既にある実装の
@@ -27,38 +28,18 @@
 //        ライブラリ自身の「視線がほとんど変わっていなければ sort しない」早期 return
 //        (`Viewer.js:2420-2427`) が**毎回バイパスされる**
 //
-// 【なぜ center 再構築が無駄になりうるか】
-//   centers[i] = sceneTransform * splatBuffer.center[i] + morphedMesh[i]
-//   - `splatBuffer.center` は offset.ply 由来で静的
-//   - `morphedMesh` は `avatarMesh.geometry.attributes.position.array` のコピー。
-//     three.js は morph / skinning の結果を position attribute へ書き戻さない
-//     (どちらも shader 側)
-//   - A2E morph は `flameModelTexture` + `bsWeight` から shader で加算される経路
-//   つまり毎フレーム同じ結果を作り直して送り直している**可能性がある**。
-//   ただし通常 avatar 経路でそれが成り立つかは**実測する** (?centersProbe=1)。
-//   成り立たなければ morphFast は使わない。推測で強行しない。
-//
-// 【毎フレーム残すもの】
-//   - `skeleton.update()` / `boneRoot.updateMatrixWorld(true)`
-//       animation.glb の idle head/neck モーションが boneTexture0 へ反映される
-//   - `splatMesh.updateBoneMatrixTexture(useFlame)` (`SplatMesh.js:979`)
-//       A2E の `bsWeight` を小さな boneMatrix texture (4×32) へ書くのはここだけ。
-//       center/color texture には触らない。
-//
 // 【介入範囲】
-// `viewer.runMorphUpdate` / `viewer.runSplatSort` を instance レベルで差し替えるだけ。
+// `viewer.runSplatSort` を instance レベルで差し替えるだけ。
 // node_modules (production dependency) は書き換えない。
 // フラグ未指定なら**何もしない** (出荷版の挙動のまま)。
+//
+// center 再構築が steady-state で冗長である根拠と、それを止める実装は
+// `src/scripts/chat/full133-runtime.ts` の冒頭コメントにまとめてある。
 
-export type MorphFastMode = 'off' | 'on';
 export type SortModeFlag = 'full' | '10fps';
 
 /** 10fps モードで sort を通す最小間隔。指示書 §14 の「100ms 未満ならskip」。 */
 const SORT_MIN_INTERVAL_MS = 100;
-
-/** 初期化が揃うまで完全実行する最小フレーム数 (起動時のみのコスト)。
- *  ただしこれ単独では判定しない。実 ready 条件と AND で見る (§11)。 */
-const MIN_FULL_RUNS = 30;
 
 function param(name: string): string | null {
     try {
@@ -68,11 +49,9 @@ function param(name: string): string | null {
     }
 }
 
-/** 既定は出荷挙動 (off)。`?morphFast=1` のときだけ有効。 */
-export function getMorphFastMode(): MorphFastMode {
-    const v = param('morphFast');
-    return v === '1' || v === 'on' ? 'on' : 'off';
-}
+/* morphFast (runMorphUpdate の steady-state 化) はこの PoC から外し、
+ * FULL133 の正式 runtime へ移した: `src/scripts/chat/full133-runtime.ts`。
+ * `?morphPath=` / 旧 `?morphFast=` の解釈もそちらが持つ。 */
 
 /** 既定は出荷挙動 (full)。`?sortMode=10fps` のときだけ間引く。 */
 export function getSortModeFlag(): SortModeFlag {
@@ -109,15 +88,6 @@ export function getAvatarIdForDiag(): string {
 
 export interface RenderPerfStats {
     avatarId: string;
-    morphFast: {
-        mode: MorphFastMode;
-        applied: boolean;
-        reason: string;
-        fullRuns: number;
-        fastFrames: number;
-        fallbackCount: number;
-        lastError: string | null;
-    };
     sort: {
         mode: SortModeFlag;
         applied: boolean;
@@ -181,17 +151,12 @@ function hashStrided(arr: Float32Array, stride: number): number {
     return h >>> 0;
 }
 
-export function installRenderPerf(renderer: any, maxTries = 600): Promise<RenderPerfStats> {
-    const morphMode = getMorphFastMode();
+export async function installRenderPerf(renderer: any, maxTries = 600): Promise<RenderPerfStats> {
     const sortMode = getSortModeFlag();
     const probe = isCentersProbeMode();
 
     const stats: RenderPerfStats = {
         avatarId: getAvatarIdForDiag(),
-        morphFast: {
-            mode: morphMode, applied: false, reason: '', fullRuns: 0,
-            fastFrames: 0, fallbackCount: 0, lastError: null,
-        },
         sort: {
             mode: sortMode, applied: false, reason: '', calls: 0, started: 0,
             throttled: 0, overlapSkipped: 0, enteredButNotStarted: 0,
@@ -208,13 +173,13 @@ export function installRenderPerf(renderer: any, maxTries = 600): Promise<Render
     };
     (window as any).__renderPerf = stats;
 
-    return new Promise((resolve) => {
+    return await new Promise<RenderPerfStats>((resolve) => {
         let tries = 0;
         const tick = () => {
             const v = renderer?.viewer;
             const ready = v && typeof v.runMorphUpdate === 'function'
                 && typeof v.runSplatSort === 'function';
-            const nothingToDo = morphMode === 'off' && sortMode === 'full' && !probe;
+            const nothingToDo = sortMode === 'full' && !probe;
             if (ready || nothingToDo || ++tries >= maxTries) {
                 applyRenderPerf(renderer, stats);
                 resolve(stats);
@@ -229,29 +194,23 @@ export function installRenderPerf(renderer: any, maxTries = 600): Promise<Render
 function applyRenderPerf(renderer: any, stats: RenderPerfStats): void {
     const v = renderer?.viewer;
     if (!v) {
-        stats.morphFast.reason = 'viewer が見つからない';
         stats.sort.reason = 'viewer が見つからない';
         return;
     }
     if (v.__renderPerfHooked) {
-        stats.morphFast.reason = 'すでに適用済み';
         stats.sort.reason = 'すでに適用済み';
         return;
     }
     v.__renderPerfHooked = true;
 
-    // 順序が重要: probe を **最外側** に置く。
-    // 先に probe を入れると fast-path が probe をラップする形になり、
-    // fast 中は probe が呼ばれなくなって「morph 更新が止まっていないか」を
-    // 観測できない (§28 の判定ができない)。
-    installMorphFast(v, stats);
     installSortMode(v, stats);
     installCentersProbe(v, stats);
 }
 
 /**
  * `baseData.centers` が時間変化するかを実測する (§8 / §10)。
- * **runMorphUpdate を素通しした直後**の centers を見るので、morphFast=off で測ること。
+ * **runMorphUpdate を素通しした直後**の centers を見るので、
+ * `?morphPath=stock` (= steady-state 化を切った状態) で測ること。
  * ハッシュは Uint32 ビューを間引いて取る (全点を毎フレーム走査しない)。
  */
 function installCentersProbe(v: any, stats: RenderPerfStats): void {
@@ -307,56 +266,6 @@ function installCentersProbe(v: any, stats: RenderPerfStats): void {
         } catch (e) { /* 観測だけなので黙って無視 */ }
         return r;
     };
-}
-
-/** A. runMorphUpdate fast-path (§7 / §9 / §11 / §12)。 */
-function installMorphFast(v: any, stats: RenderPerfStats): void {
-    const s = stats.morphFast;
-    if (s.mode === 'off') { s.reason = 'morphFast 未指定のため出荷版のまま'; return; }
-    if (typeof v.runMorphUpdate !== 'function') { s.reason = 'runMorphUpdate が無い'; return; }
-
-    const orig = v.runMorphUpdate.bind(v);
-    let fullRuns = 0;
-    let ready = false;
-
-    (window as any).__renderPerfForceFullMorph = () => { ready = false; fullRuns = 0; return 'ok'; };
-
-    v.runMorphUpdate = function (...a: any[]) {
-        if (!ready) {
-            const r = orig(...a);
-            fullRuns++;
-            s.fullRuns = fullRuns;
-            // §11: マジック値だけに頼らず実 ready 条件と AND で判定する
-            const sm = v.splatMesh;
-            const initDone = v.setSkinAttibutes === true
-                && sm?.splatDataTextures?.['flameModel'] !== undefined
-                && sm?.splatDataTextures?.['boneMatrix'] !== undefined
-                && !!sm?.morphedMesh
-                && (sm?.bonesNum ?? 0) > 0
-                && (sm?.getSplatCount?.() ?? 0) > 0;
-            if (initDone && fullRuns >= MIN_FULL_RUNS) ready = true;
-            return r;
-        }
-        // centers は作り直さない。skeleton と bsWeight だけ更新する。
-        try {
-            if (v.useFlame === false) {
-                v.skinModel?.skeleton?.update?.();
-                v.boneRoot?.updateMatrixWorld?.(true);
-            }
-            v.splatMesh?.updateBoneMatrixTexture?.(v.useFlame === true);
-            s.fastFrames++;
-        } catch (e: any) {
-            // §12: 黙って壊れた状態で継続しない。完全実行へ戻す。
-            s.fallbackCount++;
-            s.lastError = String(e?.message ?? e);
-            ready = false;
-            fullRuns = 0;
-            console.warn('[PoC morphFast] fast-path で例外。完全実行へ戻します:', e);
-        }
-        return undefined;
-    };
-    s.applied = true;
-    s.reason = 'runMorphUpdate を fast-path へ差し替えた (初期化完了までは完全実行)';
 }
 
 /** B. runSplatSort を 10Hz へ間引く (§13 / §14 / §16)。camera モードは作らない (§15)。
