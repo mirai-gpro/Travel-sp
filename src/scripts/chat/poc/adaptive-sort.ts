@@ -56,10 +56,25 @@
  * Gaussian splat は順序依存の alpha 合成なので、重なりの多い部分
  * (口元 / 歯 / 唇の縁 / 髪) が最も崩れる。
  *
- * ロード後にこのフラグを切り替えることはできないので、`adaptive-cpu` は
- * **ロード時点で既に `gpuAcceleratedSort === false` の場合のみ**受け付ける。
- * それ以外では適用せず理由を残す。sort 頻度の削減自体は backend と独立なので
- * `adaptive-gpu` で得られる。
+ * `render.ts:104` が `gpuAcceleratedSort: true` をハードコードしているため
+ * 構築時オプションでは渡せない。そこで **renderer がロード時に送るはずだった
+ * のと同じメッセージを、こちらから送ってから** フラグを倒す:
+ *
+ *   `SplatMesh.getDataForDistancesComputation(0, count - 1)`
+ *       (`SplatMesh.js:589-598`。renderer 自身が `buildResults` を作るのと同じ API。
+ *        `integerBasedDistancesComputation` を見て int/float を選び `padFour=true`)
+ *   → `viewer.preSortMessages.push({ centers, sceneIndexes, range })`
+ *   → `viewer.gpuAcceleratedSort = false`
+ *
+ * `preSortMessages` は次の sort の直前に worker へ送られてから空にされる
+ * (`Viewer.js:2497-2504`)。worker はメッセージを順に処理するので、centers が
+ * WASM へ書かれた後に最初の cpu sort が走る。
+ *
+ * int/float の食い違いが起きないことも確認済み:
+ * `Viewer.js:361-375` が `new SplatMesh(..., this.gpuAcceleratedSort,
+ * this.integerBasedSort, ...)` と渡し、`SplatMesh.js:49-52` の引数 7 が
+ * `integerBasedDistancesComputation` なので、両者は構築時に必ず一致する。
+ * それでも実行時に一致を検証し、違えば適用しない。
  */
 
 import { getAvatarIdForDiag, getSortModeFlag } from './render-perf';
@@ -123,6 +138,58 @@ export async function resolveSortPolicy(): Promise<{ policy: SortPolicy; source:
     return { policy: 'stock', source: 'default' };
 }
 
+/**
+ * sort worker へ splat centers を渡す。cpu backend で深度を自前計算させるために
+ * 必須。renderer がロード時に行う処理 (`Viewer.js:1489-1500`) と同じ内容を、
+ * 同じ API (`SplatMesh.getDataForDistancesComputation`) で作って送る。
+ *
+ * 送れない条件が 1 つでもあれば **false を返して適用しない**。
+ * 中途半端に倒すと並び順が壊れるため、推測で続行しない。
+ */
+function primeSortWorkerCenters(v: any, s: AdaptiveSortStats): boolean {
+    const sm = v?.splatMesh;
+    if (typeof sm?.getDataForDistancesComputation !== 'function') {
+        s.reason = 'splatMesh.getDataForDistancesComputation が無いため '
+            + 'sort worker へ centers を渡せない';
+        return false;
+    }
+    if (!Array.isArray(v.preSortMessages)) {
+        s.reason = 'viewer.preSortMessages が配列でないため centers を渡せない';
+        return false;
+    }
+    // worker が centers を int として読むか float として読むかは
+    // `integerBasedSort`、centers を int/float どちらで作るかは
+    // `integerBasedDistancesComputation`。食い違うとビット列を取り違える。
+    if (sm.integerBasedDistancesComputation !== v.integerBasedSort) {
+        s.reason = `integerBasedSort=${v.integerBasedSort} と `
+            + `integerBasedDistancesComputation=${sm.integerBasedDistancesComputation} `
+            + 'が食い違うため centers を渡せない';
+        return false;
+    }
+    const count = Number(sm.getSplatCount?.() ?? 0);
+    if (count <= 0) {
+        s.reason = 'splatCount=0 のため centers を渡せない';
+        return false;
+    }
+    try {
+        const { centers, sceneIndexes } = sm.getDataForDistancesComputation(0, count - 1);
+        if (!centers?.buffer || !sceneIndexes?.buffer) {
+            s.reason = 'getDataForDistancesComputation が centers / sceneIndexes を返さない';
+            return false;
+        }
+        v.preSortMessages.push({
+            centers: centers.buffer,
+            sceneIndexes: sceneIndexes.buffer,
+            range: { from: 0, to: count - 1, count },
+        });
+        s.centersPrimed = count;
+        return true;
+    } catch (e: any) {
+        s.reason = 'centers の取得で例外: ' + String(e?.message ?? e);
+        return false;
+    }
+}
+
 export interface AdaptiveSortStats {
     mode: SortPolicy;
     /** policy の決定元: 'url' | 'avatar-config' | 'default' */
@@ -130,6 +197,8 @@ export interface AdaptiveSortStats {
     applied: boolean;
     reason: string;
     backend: 'gpu' | 'cpu' | null;
+    /** cpu backend へ切り替える前に sort worker へ渡した splat 数。0 なら未実施。 */
+    centersPrimed: number;
     avatarId: string;
     splatCount: number;
 
@@ -171,6 +240,7 @@ export async function installAdaptiveSort(renderer: any, maxTries = 600): Promis
     const { policy: mode, source } = await resolveSortPolicy();
     const stats: AdaptiveSortStats = {
         mode, source, applied: false, reason: '', backend: null,
+        centersPrimed: 0,
         avatarId: '', splatCount: 0,
         calls: 0, initialSorts: 0, cameraChangeEvents: 0, projectionChangeEvents: 0,
         started: 0, completed: 0,
@@ -228,18 +298,16 @@ function apply(renderer: any, s: AdaptiveSortStats): void {
         return;
     }
 
-    // cpu backend は **ロード時から** gpuAcceleratedSort === false の
-    // renderer でしか成立しない。後から代入すると sort worker が centers を
-    // 受け取っていないままゼロから深度を計算し、並び順が壊れる
-    // (冒頭コメント参照)。ここでフラグを書き換えることは絶対にしない。
+    // cpu backend へ切り替えるなら、**先に** sort worker へ splat centers を
+    // 渡す。渡さずにフラグだけ倒すと worker がゼロ埋めの centers で深度を
+    // 計算して並び順が壊れる (冒頭コメント参照)。
     if (s.mode === 'adaptive-cpu' && v.gpuAcceleratedSort !== false) {
-        s.reason = 'adaptive-cpu はロード後に適用できない。'
-            + 'sort worker への splat centers 送信は Viewer.js:1490 でロード時の '
-            + 'gpuAcceleratedSort により決まり、後から false にすると worker が '
-            + 'ゼロ埋めの centers で深度を計算して並び順が壊れる。'
-            + 'sort 頻度の削減は adaptive-gpu で得られる。';
-        console.error('[PoC adaptiveSort] ' + s.reason);
-        return;
+        const primed = primeSortWorkerCenters(v, s);
+        if (!primed) {
+            console.error('[PoC adaptiveSort] ' + s.reason);
+            return;
+        }
+        v.gpuAcceleratedSort = false;
     }
     // backend は宣言ではなく renderer の実値から決める。
     // `?gpuSort=0` が併用されていても取り違えないようにする。

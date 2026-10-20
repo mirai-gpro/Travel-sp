@@ -48,13 +48,26 @@ function makeViewer() {
     const v = {
         sortRunning: false,
         gpuAcceleratedSort: true,
+        // cpu backend の成立条件 (Viewer.js:361-375 / SplatMesh.js:589-598 と同じ形)
+        integerBasedSort: true,
+        preSortMessages: [],
         camera: {
             position: { x: 0, y: 1.75, z: 0.44 },
             quaternion: { x: 0, y: 0, z: 0, w: 1 },
             projectionMatrix: { elements: proj },
         },
         controls: { target: { x: 0, y: 1.64, z: 0 } },
-        splatMesh: { getSplatCount: () => 133541 },
+        splatMesh: {
+            getSplatCount: () => 133541,
+            integerBasedDistancesComputation: true,
+            getDataForDistancesComputation(start, end) {
+                const n = end - start + 1;
+                return {
+                    centers: new Int32Array(n * 4),      // padFour
+                    sceneIndexes: new Uint32Array(n),
+                };
+            },
+        },
         origCalls: 0,
         _resolve: null,
         runSplatSort(force, forceSortAll) {
@@ -153,33 +166,64 @@ function makeViewer() {
     console.log(`  skip 率 = ${skipRate.toFixed(1)}%  (出荷版は 0%、呼び出しのほぼ全部が sort 要求)`);
     console.log('');
 
-    // ========== case 2: adaptive-cpu は後付けでは適用しない ==========
+    // ========== case 2: adaptive-cpu は centers を渡してから切り替える ==========
     // 実機の外見劣化 (口元の depth order 崩れ) の原因になった回帰。
-    // sort worker への centers 送信は Viewer.js:1490 でロード時の
-    // gpuAcceleratedSort により決まるので、後から false にすると
-    // worker がゼロ埋め centers で深度を計算して並び順が壊れる。
+    // centers を渡さずにフラグだけ倒すと worker がゼロ埋め centers で
+    // 深度を計算して並び順が壊れる (Viewer.js:1489-1500 / SortWorker.js:85-98)。
     makeEnv('?sortPolicy=adaptive-cpu');
     delete require.cache[modPath];
     const m2 = require(modPath);
     const v2 = makeViewer();              // gpuAcceleratedSort = true でロード済み
-    const orig2 = v2.runSplatSort;
     const st2 = await m2.installAdaptiveSort({ viewer: v2 });
-    ok(st2.applied === false && v2.runSplatSort === orig2,
-       '★ adaptive-cpu はロード後には適用しない', st2.reason);
-    ok(v2.gpuAcceleratedSort === true,
-       '★ gpuAcceleratedSort を書き換えない (worker の centers と不整合になる)',
-       'gpuAcceleratedSort=' + v2.gpuAcceleratedSort);
+    ok(st2.applied === true && st2.backend === 'cpu',
+       'adaptive-cpu が適用される', `backend=${st2.backend} ${st2.reason}`);
+    ok(v2.preSortMessages.length === 1,
+       '★ sort worker へ centers を 1 通だけ渡す',
+       'preSortMessages=' + v2.preSortMessages.length);
+    const pre2 = v2.preSortMessages[0];
+    ok(pre2 && pre2.centers && pre2.sceneIndexes
+        && pre2.range.from === 0 && pre2.range.to === 133540
+        && pre2.range.count === 133541,
+       '★ renderer がロード時に送るのと同じ形 (centers / sceneIndexes / range)',
+       JSON.stringify(pre2 && pre2.range));
+    ok(st2.centersPrimed === 133541,
+       '★ 渡した splat 数を記録する', 'centersPrimed=' + st2.centersPrimed);
+    ok(v2.gpuAcceleratedSort === false,
+       '★ centers を渡した後に backend を倒す', 'gpu=' + v2.gpuAcceleratedSort);
 
-    // ロード時点で既に cpu だった renderer では使える
+    // centers を渡せない renderer では適用しない (倒しっぱなしにしない)
     makeEnv('?sortPolicy=adaptive-cpu');
     delete require.cache[modPath];
     const m2b = require(modPath);
     const v2b = makeViewer();
-    v2b.gpuAcceleratedSort = false;       // = ロード時から cpu だった renderer
+    delete v2b.splatMesh.getDataForDistancesComputation;
+    const orig2b = v2b.runSplatSort;
     const st2b = await m2b.installAdaptiveSort({ viewer: v2b });
-    ok(st2b.applied === true && st2b.backend === 'cpu',
-       'ロード時から gpuAcceleratedSort=false なら adaptive-cpu を受け付ける',
-       `backend=${st2b.backend}`);
+    ok(st2b.applied === false && v2b.gpuAcceleratedSort === true
+        && v2b.runSplatSort === orig2b,
+       '★ centers を渡せないなら適用せず backend も倒さない', st2b.reason);
+
+    // int/float の食い違いを検出して適用しない
+    makeEnv('?sortPolicy=adaptive-cpu');
+    delete require.cache[modPath];
+    const m2c = require(modPath);
+    const v2c = makeViewer();
+    v2c.splatMesh.integerBasedDistancesComputation = false;   // viewer は true
+    const st2c = await m2c.installAdaptiveSort({ viewer: v2c });
+    ok(st2c.applied === false && v2c.gpuAcceleratedSort === true,
+       '★ integerBasedSort の食い違いを検出して適用しない', st2c.reason);
+
+    // ロード時から cpu だった renderer では centers は既に worker にあるので渡さない
+    makeEnv('?sortPolicy=adaptive-cpu');
+    delete require.cache[modPath];
+    const m2d = require(modPath);
+    const v2d = makeViewer();
+    v2d.gpuAcceleratedSort = false;       // = ロード時から cpu
+    const st2d = await m2d.installAdaptiveSort({ viewer: v2d });
+    ok(st2d.applied === true && st2d.backend === 'cpu'
+        && v2d.preSortMessages.length === 0 && st2d.centersPrimed === 0,
+       '★ ロード時から cpu なら centers を二重送信しない',
+       `primed=${st2d.centersPrimed}`);
 
     // ========== case 3: stock は何もしない ==========
     makeEnv('');
@@ -246,8 +290,8 @@ function makeViewer() {
     ok(st7.mode === 'adaptive-cpu' && st7.source === 'avatar-config',
        '★ URL なしで avatar-config から policy が読まれる',
        `mode=${st7.mode} source=${st7.source}`);
-    ok(st7.applied === false && v7.gpuAcceleratedSort === true,
-       '★ avatar-config 経由でも adaptive-cpu は後付け適用しない', st7.reason);
+    ok(st7.applied === true && st7.backend === 'cpu' && v7.preSortMessages.length === 1,
+       '★ avatar-config 経由でも centers を渡してから cpu へ切り替える', st7.reason);
 
     // adaptive-gpu は avatar-config から有効になる (backend を触らないため)
     makeEnv('');

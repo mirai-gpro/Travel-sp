@@ -19,7 +19,7 @@ import { isUika133kMode, applyUika133kMode } from './uika-133k-mode';
 import { getDiagMode, createA2EReplayPlayer, A2EReplayPlayer } from './a2e-replay';
 // PoC 限定: ?skinMode=multi / aligned のときだけ splat shader を 4 influence LBS へ
 // 差し替える。既定 (?skinMode なし / =head) では何もしないので、出荷版の挙動は変わらない。
-import { installMultiBoneSkinning, getSkinMode } from './poc/multibone-skinning';
+import { installMultiBoneSkinning } from './poc/multibone-skinning';
 // PoC 限定: ?gpuSort=0 のときだけ splat sort の GPU 距離計算を切る。
 // 既定 (フラグ無し) では何もしないので、出荷版の挙動は変わらない。
 import { installSortMode, getSortMode } from './poc/sort-mode';
@@ -295,8 +295,6 @@ export class LAMWebSocketManager {
                             'target=', controls?.target?.x?.toFixed(4), controls?.target?.y?.toFixed(4));
             }
 
-            // PoC: multi-bone skinning (既定は何もしない)
-            const skinMode = getSkinMode();
             // PoC: FULL133 renderer cadence 回復 A/B (既定は何もしない)
             const pPerf = installRenderPerf(this.renderer)
                 .then(p => { console.log('[PoC renderPerf]', JSON.stringify(p)); return p; });
@@ -306,7 +304,8 @@ export class LAMWebSocketManager {
             const pGpuSort = installSortMode(this.renderer, sortMode)
                 .then(p => { console.log('[PoC gpuSort]', JSON.stringify(p)); return p; });
 
-            const pSkin = installMultiBoneSkinning(this.renderer, skinMode)
+            // multi-bone skinning。mode は avatar-config から決まる (URL で上書き可)。
+            const pSkin = installMultiBoneSkinning(this.renderer)
                 .then(p => { console.log('[PoC skinMode]', JSON.stringify(p)); return p; });
 
             // 3 つの install がすべて確定してから run の前提条件を 1 行で出す。
