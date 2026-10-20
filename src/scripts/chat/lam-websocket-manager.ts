@@ -33,6 +33,7 @@ import { logRunConfig } from './poc/run-guard';
 import { installAdaptiveSort } from './poc/adaptive-sort';
 import { installFrameCost } from './poc/frame-cost';
 import { installFull133Runtime } from './full133-runtime';
+import { installFull133Predeform } from './full133-predeform';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -318,6 +319,10 @@ export class LAMWebSocketManager {
                 // multi-bone の shader patch が当たった後に入れる。
                 .then(() => installFull133Runtime(this.renderer))
                 .then(p => console.log('[FULL133 runtime]', JSON.stringify(p)))
+                // GPU pre-deformation。aligned skin patch が当たった後の
+                // vertex shader から morph loop を外すので、skin patch より後。
+                .then(() => installFull133Predeform(this.renderer))
+                .then(p => console.log('[FULL133 predeform]', JSON.stringify(p)))
                 .then(() => installAdaptiveSort(this.renderer))
                 .then(p => console.log('[PoC adaptiveSort]', JSON.stringify(p)))
                 // frame cost は **最後**。morph / sort の wrapper を外側から
