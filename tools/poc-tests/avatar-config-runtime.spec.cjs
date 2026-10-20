@@ -25,8 +25,12 @@ const full = avatars.find(a => a.id === FULL133);
 ok(!!full, `${FULL133} エントリがある`);
 ok(full.morphPath === 'steady-state',
    '★ FULL133 の morphPath = steady-state', 'morphPath=' + full.morphPath);
-ok(full.sortPolicy === 'adaptive-cpu',
-   '★ FULL133 の sortPolicy = adaptive-cpu', 'sortPolicy=' + full.sortPolicy);
+// sortPolicy は未設定 = 出荷版 (stock)。
+// adaptive-cpu はロード後に gpuAcceleratedSort を false にできないため使えない
+// (sort worker が centers を受け取っておらず並び順が壊れる。adaptive-sort.ts 冒頭参照)。
+// adaptive-gpu は目視ゲート未実施なので既定にしない。
+ok(full.sortPolicy === undefined,
+   '★ FULL133 の sortPolicy は未設定 (出荷版 stock)', 'sortPolicy=' + full.sortPolicy);
 
 const others = avatars.filter(a => a.id !== FULL133);
 const strayMorph = others.filter(a => a.morphPath !== undefined || a.morphFast !== undefined);
