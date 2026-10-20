@@ -112,6 +112,7 @@
 
 import { loadAvatarConfig } from '../../config/avatar-config';
 import { getAvatarIdForDiag } from './poc/render-perf';
+import { updateFull133Predeform } from './full133-predeform';
 
 /** 適用対象。これ以外では何もしない。 */
 const FULL133_AVATAR_ID = 'uika-full133-skin';
@@ -361,6 +362,9 @@ function apply(renderer: any, stats: Full133RuntimeStats): void {
         // 完全実行で centers を作り直したので、不変条件の基準も取り直す。
         sceneTransformChanged();
         positionBufferChanged();
+        // canonical が更新され得たので、predeform も 1 回やり直させる。
+        (window as any).__full133PredeformForce?.();
+        updateFull133Predeform(renderer);
         return z;
     };
 
@@ -387,6 +391,10 @@ function apply(renderer: any, stats: Full133RuntimeStats): void {
             v.skinModel?.skeleton?.update?.();
             v.boneRoot?.updateMatrixWorld?.(true);
             v.splatMesh?.updateBoneMatrixTexture?.(false);
+            // GPU pre-deformation。51 blendshape の合成はここで 1 Gaussian 1 回だけ。
+            // expression が変わっていなければ GPU を一切触らない。
+            // predeform が無効なら何もしない (legacy は main shader 側で合成する)。
+            updateFull133Predeform(renderer);
             stats.steadyFrames++;
             return undefined;
         } catch (e: any) {
