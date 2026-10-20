@@ -42,6 +42,9 @@
 // 本番利用者に不要な three をダウンロード・パースさせてしまう。
 // PoC のために本番経路へコストを足さないため遅延させる。
 
+import { loadAvatarConfig } from '../../../config/avatar-config';
+import { getAvatarIdForDiag } from './render-perf';
+
 export type SkinMode = 'head' | 'multi' | 'aligned';
 
 // ---------------------------------------------------------------------------
@@ -108,17 +111,56 @@ const ALIGNED_BLOCK = `                // [PoC aligned] center と同じ splatIn
                     skinned += boneMat * skinVertex * 1.0;
                 }`;
 
-export function getSkinMode(): SkinMode {
+function parseSkinMode(v: string | null | undefined): SkinMode | null {
+    return v === 'multi' || v === 'aligned' || v === 'head' ? v : null;
+}
+
+/** `?skinMode=` の指定だけを見る。無ければ `null`。 */
+export function getSkinModeOverride(): SkinMode | null {
     try {
-        const v = new URLSearchParams(window.location.search).get('skinMode');
-        return v === 'multi' || v === 'aligned' ? v : 'head';
+        return parseSkinMode(new URLSearchParams(window.location.search).get('skinMode'));
     } catch (e) {
-        return 'head';
+        return null;
     }
+}
+
+/** 既定は出荷挙動 ('head')。
+ *
+ * **URL だけを見る同期版。** avatar-config を含めた実効値は
+ * `resolveSkinMode()` / `window.__multiBoneSkinPatch.mode` を見ること。 */
+export function getSkinMode(): SkinMode {
+    return getSkinModeOverride() ?? 'head';
+}
+
+/**
+ * 実際に使う skin mode を決める。優先順位:
+ *
+ *   1. `?skinMode=` (debug / override)
+ *   2. avatar-config.json のアバター定義の `skinMode`
+ *   3. 'head' (出荷挙動)
+ *
+ * avatar-config のキーは avatar ごとなので、FULL133 で aligned にしても
+ * 通常 LAM avatar / B80 / 20K avatar には一切効かない。
+ */
+export async function resolveSkinMode(): Promise<{ mode: SkinMode; source: string }> {
+    const override = getSkinModeOverride();
+    if (override) return { mode: override, source: 'url' };
+    try {
+        const avatars = await loadAvatarConfig();
+        const id = getAvatarIdForDiag();
+        const def = avatars.find((a: { id: string }) => a.id === id);
+        const fromConfig = parseSkinMode(def?.skinMode);
+        if (fromConfig) return { mode: fromConfig, source: 'avatar-config' };
+    } catch (e) {
+        console.warn('[PoC skinMode] avatar-config の読み込みに失敗。head を使います:', e);
+    }
+    return { mode: 'head', source: 'default' };
 }
 
 export interface SkinPatchResult {
     mode: SkinMode;
+    /** mode の決定元: 'url' | 'avatar-config' | 'default' */
+    source: string;
     applied: boolean;
     reason: string;
     /** 差し替え後の shader に 4 influence 行が「有効な形で」入っているか */
@@ -171,9 +213,11 @@ async function buildSkinTextures(material: any, geometry: any): Promise<{ w: num
     return { w, h };
 }
 
-export function installMultiBoneSkinning(renderer: any, mode: SkinMode,
-                                         maxTries = 600): Promise<SkinPatchResult> {
-    return new Promise((resolve) => {
+export async function installMultiBoneSkinning(renderer: any,
+                                               maxTries = 600): Promise<SkinPatchResult> {
+    // avatar-config を読むので await する。URL 指定があればそこで即決まる。
+    const { mode, source } = await resolveSkinMode();
+    return await new Promise<SkinPatchResult>((resolve) => {
         let tries = 0;
         const tick = () => {
             const hasMaterial =
@@ -182,7 +226,7 @@ export function installMultiBoneSkinning(renderer: any, mode: SkinMode,
                 !!renderer?.viewer?.splatMesh?.geometry?.getAttribute?.('skinIndex');
             const ready = hasMaterial && (mode !== 'aligned' || hasSkinAttrs);
             if (ready || mode === 'head' || ++tries >= maxTries) {
-                applyMultiBoneSkinning(renderer, mode).then((r) => {
+                applyMultiBoneSkinning(renderer, mode, source).then((r) => {
                     (window as any).__multiBoneSkinPatch = r;
                     resolve(r);
                 });
@@ -198,9 +242,11 @@ export function installMultiBoneSkinning(renderer: any, mode: SkinMode,
  * renderer の splat material の vertex shader を差し替える。
  * `mode === 'head'` のときは何もしない (出荷版のまま)。
  */
-export async function applyMultiBoneSkinning(renderer: any, mode: SkinMode): Promise<SkinPatchResult> {
+export async function applyMultiBoneSkinning(
+    renderer: any, mode: SkinMode, source = 'url',
+): Promise<SkinPatchResult> {
     const fail = (reason: string): SkinPatchResult => ({
-        mode, applied: false, reason,
+        mode, source, applied: false, reason,
         activeInfluenceLines: 0, headOnlyLineActive: true,
         alignedLookupActive: false,
     });
@@ -249,7 +295,7 @@ export async function applyMultiBoneSkinning(renderer: any, mode: SkinMode): Pro
         && !!material.uniforms?.skinWeightTexture?.value;
 
     return {
-        mode, applied: true,
+        mode, source, applied: true,
         reason: 'vertexShader を 4 influence LBS へ差し替えた',
         activeInfluenceLines: active,
         headOnlyLineActive: headActive,

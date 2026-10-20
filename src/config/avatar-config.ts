@@ -30,6 +30,10 @@ export interface AvatarDef {
    *  `?morphPath=` で上書きできる。
    *  `src/scripts/chat/full133-runtime.ts` が読む。 */
   morphPath?: 'stock' | 'steady-state';
+  /** splat skinning モードの既定値。未指定 = 出荷版 ('head' = head ボーン 1 本)。
+   *  'aligned' は splatIndex 基準の 4 influence LBS。`?skinMode=` で上書きできる。
+   *  `src/scripts/chat/poc/multibone-skinning.ts` が読む。 */
+  skinMode?: 'head' | 'multi' | 'aligned';
   /** @deprecated `morphPath` を使う。旧 PoC フラグの互換のためだけに読む。 */
   morphFast?: boolean;
 }

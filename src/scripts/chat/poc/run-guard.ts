@@ -31,6 +31,7 @@ export interface RunConfig {
     splatCount: number;
     expectedSplatCount: number | null;
     skinMode: SkinMode;
+    skinModeSource: string;
     multiBoneApplied: boolean;
     multiBoneReason: string;
     activeInfluenceLines: number;
@@ -94,8 +95,9 @@ function readGlInfo(renderer: any): string {
  */
 export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
     const v = renderer?.viewer;
-    const skinMode = getSkinMode();
     const patch = (window as any).__multiBoneSkinPatch ?? {};
+    // URL 指定が無い場合は avatar-config 由来になるので、実際に決まった値を使う。
+    const skinMode = (patch?.mode as SkinMode) ?? getSkinMode();
     const perf = (window as any).__renderPerf ?? {};
     const adaptive = (window as any).__adaptiveSort ?? {};
     const full133 = (window as any).__full133Runtime ?? {};
@@ -108,6 +110,7 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
         splatCount,
         expectedSplatCount,
         skinMode,
+        skinModeSource: String(patch.source ?? 'unknown'),
         multiBoneApplied: patch.applied === true,
         multiBoneReason: String(patch.reason ?? '(未実行)'),
         activeInfluenceLines: Number(patch.activeInfluenceLines ?? 0),
@@ -184,7 +187,7 @@ export function logRunConfig(renderer: any, diagMode: string): RunConfig {
     const line = '[PERF RUN CONFIG]'
         + ' avatarId=' + c.avatarId
         + ' splatCount=' + c.splatCount
-        + ' skinMode=' + c.skinMode
+        + ' skinMode=' + c.skinMode + '/' + c.multiBoneApplied + '/' + c.skinModeSource
         + ' multiBoneApplied=' + c.multiBoneApplied
         + ' influenceLines=' + c.activeInfluenceLines
         + ' alignedLookup=' + c.alignedLookupActive
