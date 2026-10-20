@@ -25,9 +25,41 @@
  * camera event が 100 回来ても sort が 100 個並ぶことは無い。
  *
  * 【介入範囲】
- * `renderer.viewer.runSplatSort` の差し替えと、cpu backend のときの
- * `viewer.gpuAcceleratedSort = false` のみ。node_modules は書き換えない。
+ * `renderer.viewer.runSplatSort` の差し替えのみ。node_modules は書き換えない。
  * FULL133 以外の avatar には一切適用しない (指示書 §4 / §28)。
+ *
+ * 【`adaptive-cpu` が使えない理由 — 実機で外見が劣化した原因】
+ * 以前の実装はロード後に `viewer.gpuAcceleratedSort = false` を代入していた。
+ * これは**壊れる**。理由は installed renderer 側の初期化順:
+ *
+ *   `Viewer.js:1489-1500` (splat buffer のビルド時、ロード中に 1 回だけ実行)
+ *       // If we aren't calculating the splat distances from the center on the GPU,
+ *       // the sorting worker needs splat centers ...
+ *       if (!this.gpuAcceleratedSort) {
+ *           this.preSortMessages.push({ centers, sceneIndexes, range })
+ *       }
+ *
+ * sort worker へ **splat centers を送るかどうかはロード時の
+ * `gpuAcceleratedSort` で決まる**。本アプリはロード時 true なので centers は
+ * 送られない。その後でフラグだけ false にすると:
+ *
+ *   - `Viewer.js:2440-2447` … `computeDistancesOnGPU` を呼ばなくなる
+ *   - `Viewer.js:2480`      … `usePrecomputedDistances: false` を送る
+ *   - `SortWorker.js:85-98` … centers を書く唯一の経路が一度も走っていないので
+ *                             WASM の centers 領域はゼロのまま
+ *                             (`uploadedSplatCount` は 0 のまま)
+ *   - `SortWorker.js:59`    … `sortIndexes(..., centersOffset, ...,
+ *                             usePrecomputedDistances=false, ...)` が
+ *                             **ゼロ埋めの centers から深度を計算する**
+ *
+ * 結果、全 splat の距離が同値になり、並び順が深度と無関係になる。
+ * Gaussian splat は順序依存の alpha 合成なので、重なりの多い部分
+ * (口元 / 歯 / 唇の縁 / 髪) が最も崩れる。
+ *
+ * ロード後にこのフラグを切り替えることはできないので、`adaptive-cpu` は
+ * **ロード時点で既に `gpuAcceleratedSort === false` の場合のみ**受け付ける。
+ * それ以外では適用せず理由を残す。sort 頻度の削減自体は backend と独立なので
+ * `adaptive-gpu` で得られる。
  */
 
 import { getAvatarIdForDiag, getSortModeFlag } from './render-perf';
@@ -196,13 +228,18 @@ function apply(renderer: any, s: AdaptiveSortStats): void {
         return;
     }
 
-    // cpu backend: GPU 距離計算 (transform feedback → fence → readback) を経路から外す。
-    if (s.mode === 'adaptive-cpu') {
-        if (typeof v.gpuAcceleratedSort !== 'boolean') {
-            s.reason = 'viewer.gpuAcceleratedSort が見つからない';
-            return;
-        }
-        v.gpuAcceleratedSort = false;
+    // cpu backend は **ロード時から** gpuAcceleratedSort === false の
+    // renderer でしか成立しない。後から代入すると sort worker が centers を
+    // 受け取っていないままゼロから深度を計算し、並び順が壊れる
+    // (冒頭コメント参照)。ここでフラグを書き換えることは絶対にしない。
+    if (s.mode === 'adaptive-cpu' && v.gpuAcceleratedSort !== false) {
+        s.reason = 'adaptive-cpu はロード後に適用できない。'
+            + 'sort worker への splat centers 送信は Viewer.js:1490 でロード時の '
+            + 'gpuAcceleratedSort により決まり、後から false にすると worker が '
+            + 'ゼロ埋めの centers で深度を計算して並び順が壊れる。'
+            + 'sort 頻度の削減は adaptive-gpu で得られる。';
+        console.error('[PoC adaptiveSort] ' + s.reason);
+        return;
     }
     // backend は宣言ではなく renderer の実値から決める。
     // `?gpuSort=0` が併用されていても取り違えないようにする。

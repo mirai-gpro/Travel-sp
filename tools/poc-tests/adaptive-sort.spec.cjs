@@ -153,14 +153,33 @@ function makeViewer() {
     console.log(`  skip 率 = ${skipRate.toFixed(1)}%  (出荷版は 0%、呼び出しのほぼ全部が sort 要求)`);
     console.log('');
 
-    // ========== case 2: adaptive-cpu ==========
+    // ========== case 2: adaptive-cpu は後付けでは適用しない ==========
+    // 実機の外見劣化 (口元の depth order 崩れ) の原因になった回帰。
+    // sort worker への centers 送信は Viewer.js:1490 でロード時の
+    // gpuAcceleratedSort により決まるので、後から false にすると
+    // worker がゼロ埋め centers で深度を計算して並び順が壊れる。
     makeEnv('?sortPolicy=adaptive-cpu');
     delete require.cache[modPath];
     const m2 = require(modPath);
-    const v2 = makeViewer();
+    const v2 = makeViewer();              // gpuAcceleratedSort = true でロード済み
+    const orig2 = v2.runSplatSort;
     const st2 = await m2.installAdaptiveSort({ viewer: v2 });
-    ok(st2.applied === true && st2.backend === 'cpu' && v2.gpuAcceleratedSort === false,
-       'adaptive-cpu は gpuAcceleratedSort=false', `backend=${st2.backend}`);
+    ok(st2.applied === false && v2.runSplatSort === orig2,
+       '★ adaptive-cpu はロード後には適用しない', st2.reason);
+    ok(v2.gpuAcceleratedSort === true,
+       '★ gpuAcceleratedSort を書き換えない (worker の centers と不整合になる)',
+       'gpuAcceleratedSort=' + v2.gpuAcceleratedSort);
+
+    // ロード時点で既に cpu だった renderer では使える
+    makeEnv('?sortPolicy=adaptive-cpu');
+    delete require.cache[modPath];
+    const m2b = require(modPath);
+    const v2b = makeViewer();
+    v2b.gpuAcceleratedSort = false;       // = ロード時から cpu だった renderer
+    const st2b = await m2b.installAdaptiveSort({ viewer: v2b });
+    ok(st2b.applied === true && st2b.backend === 'cpu',
+       'ロード時から gpuAcceleratedSort=false なら adaptive-cpu を受け付ける',
+       `backend=${st2b.backend}`);
 
     // ========== case 3: stock は何もしない ==========
     makeEnv('');
@@ -224,10 +243,30 @@ function makeViewer() {
     const m7 = require(modPath);
     const v7 = makeViewer();
     const st7 = await m7.installAdaptiveSort({ viewer: v7 });
-    ok(st7.applied === true && st7.mode === 'adaptive-cpu'
-        && st7.source === 'avatar-config' && v7.gpuAcceleratedSort === false,
-       '★ URL なしで avatar-config から adaptive-cpu が有効になる',
+    ok(st7.mode === 'adaptive-cpu' && st7.source === 'avatar-config',
+       '★ URL なしで avatar-config から policy が読まれる',
        `mode=${st7.mode} source=${st7.source}`);
+    ok(st7.applied === false && v7.gpuAcceleratedSort === true,
+       '★ avatar-config 経由でも adaptive-cpu は後付け適用しない', st7.reason);
+
+    // adaptive-gpu は avatar-config から有効になる (backend を触らないため)
+    makeEnv('');
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ([
+            { id: 'uika-full133-skin', name: 'UIKA FULL 133K',
+              modelUrl: '/avatar/uika-full133-skin.zip', voiceModel: 'x',
+              sortPolicy: 'adaptive-gpu' },
+        ]),
+    });
+    delete require.cache[modPath];
+    const m7b = require(modPath);
+    const v7b = makeViewer();
+    const st7b = await m7b.installAdaptiveSort({ viewer: v7b });
+    ok(st7b.applied === true && st7b.backend === 'gpu'
+        && st7b.source === 'avatar-config' && v7b.gpuAcceleratedSort === true,
+       '★ adaptive-gpu は avatar-config から有効になり backend を触らない',
+       `backend=${st7b.backend}`);
 
     // URL override が avatar-config より優先される
     makeEnv('?sortPolicy=stock');
