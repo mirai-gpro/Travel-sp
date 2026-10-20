@@ -25,9 +25,12 @@ export interface AvatarDef {
    *  未指定 = 出荷版 ('stock')。`?sortPolicy=` で上書きできる。
    *  `src/scripts/chat/poc/adaptive-sort.ts` が読む。 */
   sortPolicy?: 'stock' | 'adaptive-gpu' | 'adaptive-cpu';
-  /** runMorphUpdate fast-path の既定値 (PoC)。
-   *  未指定 = 出荷版 (無効)。`?morphFast=1` / `=0` で上書きできる。
-   *  `src/scripts/chat/poc/render-perf.ts` が読む。 */
+  /** morph path の既定値。未指定 = 出荷版 ('stock')。
+   *  'steady-state' は FULL133 専用の毎フレーム経路 (centers 再構築をしない)。
+   *  `?morphPath=` で上書きできる。
+   *  `src/scripts/chat/full133-runtime.ts` が読む。 */
+  morphPath?: 'stock' | 'steady-state';
+  /** @deprecated `morphPath` を使う。旧 PoC フラグの互換のためだけに読む。 */
   morphFast?: boolean;
 }
 
