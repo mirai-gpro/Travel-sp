@@ -140,9 +140,11 @@ const {
     from '../scripts/avatar-install/pwa-environment';
   import {
     mountPoster, renderInstallPrompt, renderRecoveryPrompt,
-    renderHomeScreenGuide, renderUpdateNotice,
+    renderHomeScreenGuide, renderUpdateNotice, renderUpdateReadyNotice,
   } from '../scripts/avatar-install/install-ui';
   import { ObjectUrlOwner } from '../scripts/avatar-install/avatar-cache';
+  import { markPendingReload, clearPendingReload, defaultGuardStore }
+    from '../scripts/avatar-install/pending-reload-guard';
 
   /**
    * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
@@ -168,8 +170,6 @@ const {
     private retryInitialize: (() => void) | null = null;
     /** renderer へ渡した blob URL。所有権はこちらが持ち、作り直し / 破棄時に revoke する。 */
     private readonly objectUrls = new ObjectUrlOwner();
-    /** 同じ起動で pending から active へ 1 回だけ fallback するためのフラグ。 */
-    private pendingFallbackUsed: boolean = false;
 
     constructor() {
       this.lamManager = new LAMWebSocketManager();
@@ -281,16 +281,13 @@ const {
           // renderer が実際にロードできた version だけを active にする (指示書 §15)。
           if (this.lamManager.isLoaded()) {
             await this.installManager.markLoadSucceeded(this.installAvatarId, installedVersion);
+            this._clearPendingReloadGuard();
           } else {
+            // markLoadFailed が pending を破棄し、activeVersion=v3 を維持する。
             await this.installManager.markLoadFailed(
               this.installAvatarId, installedVersion, 'renderer がロードできなかった');
-            // pending (v4) のロードに失敗したら、**この起動のうちに** active (v3) へ戻す。
-            // 次回まで待たせない。無限 retry を避けるため 1 回だけ。
-            if (isPendingVersion && !this.pendingFallbackUsed) {
-              this.pendingFallbackUsed = true;
-              console.warn('[AvatarInstall] pending のロードに失敗。active へ fallback します');
-              this.isInitialized = false;
-              this.retryInitialize?.();
+            if (isPendingVersion) {
+              this._recoverFromPendingLoadFailure(installedVersion);
               return;
             }
           }
@@ -388,7 +385,9 @@ const {
           const local = await this.installManager.resolveInstalled(selectedId);
           if (local.kind === 'LOCAL_READY') {
             this.installAvatarId = selectedId;
-            this._mountPoster(null);
+            // Poster は Registry に保存済みのものを使う。
+            // remote avatar-config.json の取得を Poster のために待たない。
+            this._mountPoster(local.posterUrl ?? null);
             console.log('[AvatarInstall] LOCAL_READY', selectedId, local.version,
                         local.isPending ? '(pending)' : '(active)');
             return { url: this._ownObjectUrl(local.objectUrl),
@@ -494,6 +493,38 @@ const {
     }
 
     /**
+     * pending (v4) の renderer load に失敗したときの復帰。
+     *
+     * 同じ session で再初期化しない。`LAMWebSocketManager.dispose()` は参照を
+     * null にするだけで renderer / WebGL / canvas を実際に破棄しないので、
+     * 一度失敗した renderer の上で作り直すのが安全だとは示せていない。
+     * ここでは pending を破棄済み (`markLoadFailed`) / `activeVersion=v3` 維持の
+     * 状態で reload し、次の起動を通常の v3 起動として成立させる。
+     *
+     * reload は 1 version につき 1 回だけ (sessionStorage guard)。
+     * 通常起動・初回 install・通常 update 経路はここを通らない。
+     */
+    private _recoverFromPendingLoadFailure(version: string): void {
+      const decision = markPendingReload(
+        defaultGuardStore(), this.installAvatarId ?? '', version);
+      if (decision !== 'RELOAD') {
+        console.warn('[AvatarInstall] pending', version,
+                     'の reload は行いません:', decision);
+        this._showFallback();
+        return;
+      }
+      console.warn('[AvatarInstall] pending', version,
+                   'のロードに失敗。破棄して active へ戻すため reload します');
+      this._revokeObjectUrl();
+      location.reload();
+    }
+
+    /** 正常に起動できたら guard を落とす (次の更新で再び 1 回 reload できる)。 */
+    private _clearPendingReloadGuard(): void {
+      clearPendingReload(defaultGuardStore(), this.installAvatarId ?? '');
+    }
+
+    /**
      * ユーザー承認後の install 実行。
      *
      * `isUpdate` の扱いが要点 (指示書 §15):
@@ -521,11 +552,8 @@ const {
           host.remove();
           console.log('[AvatarInstall] 更新準備完了。次回起動から適用します',
                       this.installAvatarId, entry.version);
-          renderUpdateNotice(this.containerEl, {
-            label: '更新準備が完了しました。次回起動から適用します',
-            sizeBytes: 0,
-            onUpdate: () => {}, onDismiss: () => {},
-          });
+          // download 案内 UI を再利用しない (「約0.0MB」になる)。
+          renderUpdateReadyNotice(this.containerEl);
           return;
         }
         host.querySelector('.avatar-install-card')?.remove();
@@ -615,6 +643,10 @@ const {
     dispose(): void {
       this.syncPlayer.dispose();
       this.lamManager.dispose();
+      // renderer へ渡した blob URL の所有権はこちら側。破棄時に必ず解放する。
+      this._revokeObjectUrl();
+      this.poster?.destroy();
+      this.poster = null;
       this.isInitialized = false;
     }
   }

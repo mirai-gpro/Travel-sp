@@ -15,6 +15,19 @@
 export const MANIFEST_URL = '/avatar/avatars-manifest.json';
 export const DEFAULT_MANIFEST_TIMEOUT_MS = 8000;
 
+/**
+ * この runtime が実際にロードできる package schema (互換性 gate)。
+ *
+ * ここに無い `runtimeSchema` の package は **download を始める前に** 除外する。
+ * 将来 `lam-full133-v2` を足すときは、この配列へ追加するだけで拡張できる。
+ */
+export const SUPPORTED_RUNTIME_SCHEMAS: readonly string[] = ['lam-full133-v1'];
+
+export function isSupportedRuntimeSchema(schema: string | null | undefined): boolean {
+    if (typeof schema !== 'string' || schema.length === 0) return false;
+    return SUPPORTED_RUNTIME_SCHEMAS.includes(schema);
+}
+
 export interface ManifestAvatarEntry {
     id: string;
     version: string;
@@ -39,10 +52,23 @@ function isEntry(v: any): v is ManifestAvatarEntry {
         && typeof v.runtimeSchema === 'string';
 }
 
+/**
+ * manifest を解釈する。
+ *
+ * 形式不正だけでなく、**この runtime が対応しない `runtimeSchema` の entry も
+ * ここで落とす**。`findEntry()` が返せない = install / update の対象にならない
+ * ので、非対応 package の download が始まることが構造的に無い。
+ */
 export function parseManifest(raw: unknown): AvatarsManifest | null {
     const d: any = raw;
     if (!d || typeof d.schemaVersion !== 'number' || !Array.isArray(d.avatars)) return null;
-    const avatars = d.avatars.filter(isEntry);
+    const wellFormed: ManifestAvatarEntry[] = d.avatars.filter(isEntry);
+    const avatars = wellFormed.filter((a) => isSupportedRuntimeSchema(a.runtimeSchema));
+    for (const a of wellFormed) {
+        if (isSupportedRuntimeSchema(a.runtimeSchema)) continue;
+        console.warn('[AvatarManifest] 非対応 runtimeSchema のため除外:',
+                     a.id, a.version, a.runtimeSchema);
+    }
     if (avatars.length === 0) return null;
     return { schemaVersion: d.schemaVersion, avatars };
 }

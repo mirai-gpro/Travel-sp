@@ -17,7 +17,8 @@ import {
     cacheKeyFor, createAvatarCache, toObjectUrl, type AvatarCache,
 } from './avatar-cache';
 import {
-    fetchManifest, findEntry, type AvatarsManifest, type ManifestAvatarEntry,
+    fetchManifest, findEntry, isSupportedRuntimeSchema,
+    type AvatarsManifest, type ManifestAvatarEntry,
 } from './avatar-manifest';
 import { queryStorage, requestPersist, type StorageStatus } from './storage-capabilities';
 
@@ -34,6 +35,8 @@ export interface InstallPolicyAvatar {
 export type AssetResolution =
     | { kind: 'LOCAL_READY'; avatarId: string; version: string; assetUrl: string;
         objectUrl: string; record: AvatarInstallRecord;
+        /** Registry に保存してある Poster。remote config を待たずに出せる。 */
+        posterUrl?: string;
         /** 次回起動から適用する候補 (pendingVersion) を試しているか */
         isPending: boolean }
     | { kind: 'INSTALL_REQUIRED'; avatarId: string; record?: AvatarInstallRecord;
@@ -140,7 +143,7 @@ export class AvatarInstallManager {
             if (ready) {
                 return { kind: 'LOCAL_READY', avatarId, version: rec.pendingVersion,
                          assetUrl: ready.assetUrl, objectUrl: ready.objectUrl,
-                         record: rec, isPending: true };
+                         posterUrl: ready.posterUrl, record: rec, isPending: true };
             }
             // pending の実体が無い / メタが欠けている = 更新が中断した。
             // active を壊さずに pending だけ捨てる。
@@ -163,7 +166,7 @@ export class AvatarInstallManager {
                 }
                 return { kind: 'LOCAL_READY', avatarId, version: activeVersion,
                          assetUrl: ready.assetUrl, objectUrl: ready.objectUrl,
-                         record: rec, isPending: false };
+                         posterUrl: ready.posterUrl, record: rec, isPending: false };
             }
             // Registry は active を指しているのに実体が無い = 不整合。
             // クラッシュさせず、黙って再 download もしない (指示書 §16)。
@@ -176,14 +179,30 @@ export class AvatarInstallManager {
                  reason: `activeVersion が無い (state=${rec.state})` };
     }
 
-    /** version の実体が揃っていれば renderer へ渡せる URL を作る。無ければ null。 */
+    /**
+     * version の実体が揃っていれば renderer へ渡せる URL を作る。無ければ null。
+     *
+     * 保存済みの `runtimeSchema` が非対応になった version は **渡さない**
+     * (この runtime でロードできない package を renderer に握らせない)。
+     * `runtimeSchema` 未記録の古い install は従来どおり許可する。
+     */
     private async loadVersion(rec: AvatarInstallRecord, version: string):
-        Promise<{ assetUrl: string; objectUrl: string } | null> {
+        Promise<{ assetUrl: string; objectUrl: string; posterUrl?: string } | null> {
         const meta = this.versionMeta(rec, version);
         if (!meta) return null;
+        const schema = meta.runtimeSchema ?? rec.runtimeSchema;
+        if (schema !== undefined && !isSupportedRuntimeSchema(schema)) {
+            console.warn('[AvatarInstall] 非対応 runtimeSchema のため使用しません:',
+                         rec.avatarId, version, schema);
+            return null;
+        }
         const res = await this.deps.cache.match(cacheKeyFor(rec.avatarId, version));
         if (!res) return null;
-        return { assetUrl: meta.assetUrl, objectUrl: await this.deps.toUrl(res) };
+        return {
+            assetUrl: meta.assetUrl,
+            objectUrl: await this.deps.toUrl(res),
+            posterUrl: meta.posterUrl ?? rec.posterUrl,
+        };
     }
 
     /**
@@ -196,6 +215,10 @@ export class AvatarInstallManager {
         onProgress?: (p: InstallProgress) => void,
     ): Promise<AvatarInstallRecord> {
         const emit = (p: InstallProgress) => { try { onProgress?.(p); } catch (e) { /* noop */ } };
+        // download を始める前に互換性 gate を通す (非対応 package は取得しない)。
+        if (!isSupportedRuntimeSchema(entry.runtimeSchema)) {
+            throw new Error(`非対応の runtimeSchema: ${entry.runtimeSchema}`);
+        }
         const prev = await this.deps.registry.get(avatarId);
         const base: AvatarInstallRecord = prev ?? {
             avatarId, version: entry.version, assetUrl: entry.assetUrl,
@@ -209,8 +232,11 @@ export class AvatarInstallManager {
             version: entry.version, assetUrl: entry.assetUrl, sha256: entry.sha256,
             size: entry.size, state: 'DOWNLOADING', persistGranted,
             lastError: null,
+            posterUrl: entry.posterUrl ?? prev?.posterUrl,
+            runtimeSchema: entry.runtimeSchema,
             versions: { ...(prev?.versions ?? {}), [entry.version]: {
                 assetUrl: entry.assetUrl, sha256: entry.sha256, size: entry.size,
+                posterUrl: entry.posterUrl, runtimeSchema: entry.runtimeSchema,
             } },
         }, base);
         emit({ state: 'DOWNLOADING', receivedBytes: 0, totalBytes: entry.size, ratio: 0 });
@@ -321,6 +347,12 @@ export class AvatarInstallManager {
         const manifest = await this.deps.manifestLoader();
         const entry = findEntry(manifest, avatarId);
         if (!entry) return { manifest, entry: null, updateAvailable: false };
+        if (!isSupportedRuntimeSchema(entry.runtimeSchema)) {
+            // 非対応 package は update 候補にしない (download を提案しない)。
+            console.warn('[AvatarInstall] 非対応 runtimeSchema のため update 対象外:',
+                         avatarId, entry.version, entry.runtimeSchema);
+            return { manifest, entry: null, updateAvailable: false };
+        }
         const rec = await this.deps.registry.get(avatarId);
         const current = rec?.activeVersion;
         const updateAvailable = !!current

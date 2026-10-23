@@ -232,6 +232,36 @@ export function renderHomeScreenGuide(host: HTMLElement, env: PwaEnvironment, o:
     void env;
 }
 
+/**
+ * 更新準備が終わったことだけを伝える通知。
+ *
+ * **download 案内 UI (`renderUpdateNotice`) を再利用しない。**
+ * sizeBytes を 0 にして流用すると「約0.0MB のダウンロードが必要です」という
+ * 誤った文面になるため、専用の文面だけを出す。
+ */
+export function renderUpdateReadyNotice(host: HTMLElement, o: {
+    onDismiss?: () => void;
+} = {}): void {
+    ensureStyle();
+    const card = document.createElement('div');
+    card.className = 'avatar-install-card';
+    card.style.position = 'absolute';
+    card.style.right = '0.75rem';
+    card.style.bottom = '0.75rem';
+    card.style.maxWidth = '16rem';
+    card.innerHTML = `
+        <h2>更新準備が完了しました。次回起動から新しいアバターを使用します。</h2>
+        <div class="avatar-install-actions">
+            <button type="button" class="avatar-install-btn is-secondary" data-act="close">閉じる</button>
+        </div>
+    `;
+    host.appendChild(card);
+    card.querySelector('[data-act="close"]')!.addEventListener('click', () => {
+        card.remove();
+        o.onDismiss?.();
+    });
+}
+
 /** 更新が見つかったときの軽い通知 (指示書 §19 / §20)。起動は止めない。 */
 export function renderUpdateNotice(host: HTMLElement, o: {
     label: string; sizeBytes: number; onUpdate: () => void; onDismiss?: () => void;

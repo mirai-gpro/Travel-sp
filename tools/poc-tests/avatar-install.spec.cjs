@@ -372,6 +372,199 @@ function makeDeps(opts = {}) {
         ok(m.parseManifest({ avatars: [] }) === null, 'schemaVersion 無しは弾く');
     }
 
+    // ================= 最終修正 5 点のテスト =================
+
+    const POSTER = '/avatar/posters/uika-full133.webp';
+    const entryWithPoster = (version, payload) =>
+        ({ ...entryFor(version, payload), posterUrl: POSTER });
+
+    // ---- A. Local-first 起動でも Registry だけで実 Poster が取れる ----
+    {
+        const payload = makePayload(11);
+        const h = build({ payload });
+        await h.manager.install(FULL133.id, entryWithPoster('v3', payload));
+        const r = await h.manager.resolveInstalled(FULL133.id);
+        ok(r.kind === 'LOCAL_READY' && r.posterUrl === POSTER,
+           '★ 1-A. LOCAL_READY が Registry 保存の posterUrl を返す', r.posterUrl);
+        const rec = await h.manager.getRecord(FULL133.id);
+        ok(rec.posterUrl === POSTER && rec.versions.v3.posterUrl === POSTER,
+           '★ 1-A. posterUrl が record と version meta の両方に残る');
+    }
+
+    // ---- B. avatar-config / manifest が取れない状態でも Poster が解決できる ----
+    {
+        const payload = makePayload(12);
+        const h = build({ payload });
+        await h.manager.install(FULL133.id, entryWithPoster('v3', payload));
+        // 以後は完全 offline (fetch も manifest も死んでいる) を模す
+        const offline = {
+            ...h.deps,
+            fetchImpl: async () => { throw new Error('offline'); },
+            manifestLoader: async () => { throw new Error('offline'); },
+        };
+        const { AvatarInstallManager: M } = require('./.avatar-install.cjs');
+        const r = await new M(offline).resolveInstalled(FULL133.id);
+        ok(r.kind === 'LOCAL_READY' && r.posterUrl === POSTER && h.fetchCalls.length === 1,
+           '★ 1-B. offline (config / manifest 不通) でも posterUrl が解決できる',
+           `fetch=${h.fetchCalls.length}`);
+    }
+
+    // ---- C. dispose で object URL を解放する ----
+    {
+        const src = require('fs').readFileSync(
+            require('path').join(__dirname, '../../src/components/LAMAvatar.astro'), 'utf8');
+        const body = src.slice(src.indexOf('    dispose(): void {'));
+        const end = body.indexOf('\n    }');
+        ok(end > 0 && body.slice(0, end).includes('this._revokeObjectUrl();'),
+           '★ 2. LAMAvatarController.dispose() が blob URL を revoke する');
+        ok(src.includes('this._revokeObjectUrl();\n        void this.initialize(')
+            || /retryInitialize[\s\S]{0,160}_revokeObjectUrl/.test(src),
+           '★ 2. retry 経路でも revoke する');
+        ok(/_showFallback\(\): void \{\s*\n[^}]*_revokeObjectUrl\(\)/.test(src),
+           '★ 2. fallback 経路でも revoke する');
+    }
+
+    // ---- D. pending load 失敗 → v3 へ戻り、reload guard は 1 回だけ ----
+    {
+        const p3 = makePayload(13);
+        const p4 = makePayload(14);
+        const e3 = entryWithPoster('v3', p3);
+        const e4 = entryWithPoster('v4', p4);
+        const h = build({ payloadFor: (u) => (String(u).includes('v4') ? p4 : p3) });
+        await h.manager.install(FULL133.id, e3);
+        await h.manager.install(FULL133.id, e4);
+        let rec = await h.manager.getRecord(FULL133.id);
+        ok(rec.activeVersion === 'v3' && rec.pendingVersion === 'v4',
+           '★ 3. update は active=v3 / pending=v4 のまま');
+
+        await h.manager.markLoadFailed(FULL133.id, 'v4', 'renderer がロードできなかった');
+        rec = await h.manager.getRecord(FULL133.id);
+        ok(rec.activeVersion === 'v3' && !rec.pendingVersion,
+           '★ 3. pending v4 の load 失敗で pending を破棄し active=v3 を維持');
+        ok(!h.cache.map.has('/__avatar-package__/uika-full133-skin/v4'),
+           '★ 3. 失敗した v4 の cache 実体を破棄する');
+        const after = await h.manager.resolveInstalled(FULL133.id);
+        ok(after.kind === 'LOCAL_READY' && after.version === 'v3' && after.isPending === false,
+           '★ 3. 次の起動は通常の v3 起動になる', after.version);
+    }
+    {
+        const g = require('./.pending-reload-guard.cjs');
+        const mem = new Map();
+        const store = {
+            getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+            setItem: (k, v) => mem.set(k, v),
+            removeItem: (k) => mem.delete(k),
+        };
+        const d1 = g.markPendingReload(store, FULL133.id, 'v4');
+        const d2 = g.markPendingReload(store, FULL133.id, 'v4');
+        ok(d1 === 'RELOAD' && d2 === 'ALREADY_RELOADED',
+           '★ 3. reload guard は同じ version で 1 回だけ RELOAD を返す', `${d1}/${d2}`);
+        g.clearPendingReload(store, FULL133.id);
+        ok(g.markPendingReload(store, FULL133.id, 'v5') === 'RELOAD',
+           '★ 3. 正常起動で guard が落ち、次の更新では再び 1 回 reload できる');
+        ok(g.markPendingReload(null, FULL133.id, 'v6') === 'GUARD_UNAVAILABLE',
+           '★ 3. guard を持てない環境では RELOAD を返さない (無限 reload 防止)');
+        const broken = { getItem: () => null, setItem: () => { throw new Error('full'); },
+                         removeItem: () => {} };
+        ok(g.markPendingReload(broken, FULL133.id, 'v7') === 'GUARD_UNAVAILABLE',
+           '★ 3. guard を保存できなければ RELOAD を返さない');
+    }
+
+    // ---- E. 非対応 runtimeSchema は download 開始前に除外する ----
+    {
+        const payload = makePayload(15);
+        const bad = { ...entryFor('v9', payload), runtimeSchema: 'lam-full133-v2' };
+        const h = build({ payload });
+        let threw = false;
+        try { await h.manager.install(FULL133.id, bad); } catch (e) { threw = true; }
+        ok(threw && h.fetchCalls.length === 0,
+           '★ 4. 非対応 runtimeSchema は download を始める前に install を拒否する',
+           `fetch=${h.fetchCalls.length}`);
+        ok((await h.manager.getRecord(FULL133.id)) === undefined,
+           '★ 4. 非対応 package は Registry にも残らない');
+    }
+    {
+        const m = require('./.avatar-manifest.cjs');
+        const payload = makePayload(16);
+        const good = entryFor('v3', payload);
+        const bad = { ...entryFor('v9', payload), runtimeSchema: 'lam-full133-v2' };
+        const parsed = m.parseManifest({ schemaVersion: 1, avatars: [good, bad] });
+        ok(parsed !== null && parsed.avatars.length === 1
+            && parsed.avatars[0].version === 'v3',
+           '★ 4. manifest 検証の段階で非対応 entry を落とす');
+        ok(m.parseManifest({ schemaVersion: 1, avatars: [bad] }) === null,
+           '★ 4. 対応 entry が 1 件も無ければ manifest は無効');
+        ok(m.isSupportedRuntimeSchema('lam-full133-v1') === true
+            && m.isSupportedRuntimeSchema('lam-full133-v2') === false
+            && m.isSupportedRuntimeSchema(undefined) === false,
+           '★ 4. SUPPORTED_RUNTIME_SCHEMAS が互換性 gate になっている');
+    }
+    {
+        // 非対応 schema の update は提案しない
+        const payload = makePayload(17);
+        const e3 = entryFor('v3', payload);
+        const bad = { ...entryFor('v9', payload), runtimeSchema: 'lam-full133-v2' };
+        const h = build({ payload, manifestLoader: async () =>
+            ({ schemaVersion: 1, avatars: [bad] }) });
+        await h.manager.install(FULL133.id, e3);
+        const r = await h.manager.checkForUpdate(FULL133.id);
+        ok(r.updateAvailable === false && r.entry === null,
+           '★ 4. 非対応 runtimeSchema は update 候補にしない');
+    }
+    {
+        // 保存済み version が非対応になったら renderer へ渡さない
+        const payload = makePayload(18);
+        const h = build({ payload });
+        await h.manager.install(FULL133.id, entryFor('v3', payload));
+        const raw = h.store.map.get(FULL133.id);
+        raw.runtimeSchema = 'lam-full133-v2';
+        raw.versions.v3.runtimeSchema = 'lam-full133-v2';
+        h.store.map.set(FULL133.id, raw);
+        const r = await h.manager.resolveInstalled(FULL133.id);
+        ok(r.kind === 'RECOVERY_REQUIRED',
+           '★ 4. 保存済みでも非対応 schema の package は renderer へ渡さない', r.kind);
+    }
+
+    // ---- F. 更新完了通知に「0.0MB」を出さない ----
+    {
+        const ui = require('./.install-ui.cjs');
+        const made = [];
+        const el = () => {
+            const node = {
+                style: {}, dataset: {}, className: '', textContent: '',
+                _html: '', children: [],
+                set innerHTML(v) { this._html = v; },
+                get innerHTML() { return this._html; },
+                appendChild(c) { this.children.push(c); return c; },
+                remove() {}, addEventListener() {},
+                querySelector() { return { addEventListener() {}, remove() {} }; },
+                setAttribute() {}, classList: { add() {}, remove() {} },
+            };
+            made.push(node);
+            return node;
+        };
+        global.document = {
+            getElementById: () => ({}),
+            createElement: () => el(),
+            head: { appendChild() {} },
+        };
+        const host = el();
+        ui.renderUpdateReadyNotice(host);
+        const html = host.children.map((c) => c.innerHTML).join('');
+        ok(html.includes('更新準備が完了しました。次回起動から新しいアバターを使用します。'),
+           '★ 5. 更新完了通知は専用の文面だけを出す');
+        ok(!/MB/.test(html) && !/ダウンロードが必要/.test(html),
+           '★ 5. 更新完了通知に「約0.0MB のダウンロードが必要です」を出さない', html);
+
+        const host2 = el();
+        ui.renderUpdateNotice(host2, { label: '新しいアバターデータがあります',
+            sizeBytes: 25532519, onUpdate() {}, onDismiss() {} });
+        const html2 = host2.children.map((c) => c.innerHTML).join('');
+        ok(/24\.3MB/.test(html2),
+           '★ 5. download 案内 UI 自体は従来どおり実サイズを出す', html2.match(/約[\d.]+MB/)?.[0]);
+        delete global.document;
+    }
+
     console.log(failures === 0 ? '\n=== 全テスト PASS ===' : `\n=== ${failures} 件 FAIL ===`);
     process.exit(failures === 0 ? 0 : 1);
 })();

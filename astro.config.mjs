@@ -27,6 +27,12 @@ export default defineConfig({
       // avatar-config.json だけ明示的に precache する。offline でも avatar 定義を
       // 読めるようにするための補助であって、local 起動の条件ではない。
       // avatars-manifest.json は precache しない (更新検知は常に最新を見る)。
+      //
+      // TODO(poster): Poster 実ファイルを用意したら、offline でも出せるように
+      //   ここへ 'avatar/posters/uika-full133.webp' を追加する。
+      //   現時点では実ファイルが存在しないため追加しない (build が壊れる)。
+      //   Poster 要件: FULL133 と同一カメラ (posY 1.704 / posZ 0.45 /
+      //   targetY 1.644 / offsetX 0.045)、neutral pose、同一背景、同一 crop。
       includeAssets: ['favicon.svg', 'apple-touch-icon.png', 'avatar/avatar-config.json'],
       manifest: {
         name: 'Travel AI',

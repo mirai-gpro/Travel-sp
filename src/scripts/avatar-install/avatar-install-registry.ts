@@ -31,6 +31,13 @@ export interface AvatarInstallRecord {
     /** download / 検証まで終わったが、次回起動から使う version */
     pendingVersion?: string;
 
+    /** install 時に manifest から保存する Poster。
+     *  これが無いと offline local-first 起動で Poster が出せない
+     *  (remote avatar-config.json を待たないため)。 */
+    posterUrl?: string;
+    /** install 時の package schema。互換性 gate に使う。 */
+    runtimeSchema?: string;
+
     installedAt?: number;
     lastVerifiedAt?: number;
     persistGranted?: boolean;
@@ -45,6 +52,10 @@ export interface AvatarVersionMeta {
     assetUrl: string;
     sha256: string;
     size: number;
+    /** version ごとの Poster。active / pending で差し替わっても追従できる。 */
+    posterUrl?: string;
+    /** version ごとの package schema。非対応なら renderer へ渡さない。 */
+    runtimeSchema?: string;
 }
 
 export interface KeyValueStore {
