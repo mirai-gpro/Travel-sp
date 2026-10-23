@@ -36,6 +36,13 @@ export interface AvatarDef {
   skinMode?: 'head' | 'multi' | 'aligned';
   /** @deprecated `morphPath` を使う。旧 PoC フラグの互換のためだけに読む。 */
   morphFast?: boolean;
+  /** asset の配布方式。未指定 = 従来どおり modelUrl を直接ロードする。
+   *  'local-package' を付けた avatar だけが、ユーザー承認のうえ端末へ
+   *  インストールしてローカルから起動する経路に入る。
+   *  `src/scripts/avatar-install/` が読む。 */
+  installPolicy?: 'local-package';
+  /** 3D が出るまで表示する静止画。未指定ならプレースホルダを出す。 */
+  posterUrl?: string;
 }
 
 /** デフォルトのアバター一覧（JSONロード失敗時のフォールバック） */

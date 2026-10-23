@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "avatars": [
+    {
+      "id": "uika-full133-skin",
+      "version": "2026.10.23.1",
+      "assetUrl": "/avatar/uika-full133-skin.zip?v=20261023.1",
+      "size": 25532519,
+      "sha256": "3aa82a884faa45911a24f34c2a3716629b3a00f375b3273a268d7cfdafa83528",
+      "runtimeSchema": "lam-full133-v1",
+      "posterUrl": "/avatar/posters/uika-full133.webp"
+    }
+  ]
+}

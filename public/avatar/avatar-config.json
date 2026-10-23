@@ -194,6 +194,8 @@
     "voiceModel": "ja-JP-Chirp3-HD-Leda",
     "liveVoice": "Leda",
     "camera": { "posY": 1.704, "posZ": 0.45, "targetY": 1.644, "offsetX": 0.045 },
+    "installPolicy": "local-package",
+    "posterUrl": "/avatar/posters/uika-full133.webp",
     "skinMode": "aligned",
     "sortPolicy": "adaptive-cpu",
     "morphPath": "steady-state"

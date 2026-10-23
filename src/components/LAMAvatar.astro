@@ -130,6 +130,18 @@ const {
   import type { LiveAudioManager, ExpressionFrame } from '../scripts/chat/live-audio-manager';
   import { getUikaExprPath } from '../scripts/chat/uika-133k-mode';
   import { isA2ETraceMode } from '../scripts/chat/a2e-replay';
+  import { loadAvatarConfig, type AvatarDef } from '../config/avatar-config';
+  import {
+    AvatarInstallManager, defaultDeps, usesLocalPackage,
+  } from '../scripts/avatar-install/avatar-install-manager';
+  import { fetchManifest, findEntry, type ManifestAvatarEntry }
+    from '../scripts/avatar-install/avatar-manifest';
+  import { getPwaEnvironment, shouldDeferInstallToHomeScreen }
+    from '../scripts/avatar-install/pwa-environment';
+  import {
+    mountPoster, renderInstallPrompt, renderRecoveryPrompt,
+    renderHomeScreenGuide, renderUpdateNotice,
+  } from '../scripts/avatar-install/install-ui';
 
   /**
    * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
@@ -147,6 +159,12 @@ const {
     private loadingEl: HTMLElement;
     private isInitialized: boolean = false;
     private useFallback: boolean = false;
+    /** FULL133 等の local package avatar のときだけ作る。 */
+    private installManager: AvatarInstallManager | null = null;
+    private installAvatarId: string | null = null;
+    private installAvatar: AvatarDef | null = null;
+    private poster: { revealRenderer(): void; destroy(): void } | null = null;
+    private retryInitialize: (() => void) | null = null;
 
     constructor() {
       this.lamManager = new LAMWebSocketManager();
@@ -162,6 +180,8 @@ const {
      */
     async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
       if (this.isInitialized) return;
+      // install / recovery の完了後に同じ引数でやり直せるようにしておく。
+      this.retryInitialize = () => { void this.initialize(liveAudioManager); };
 
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
@@ -226,13 +246,35 @@ const {
           '[TRACE] a2eTrace=1 (通常 avatar 経路のまま trace のみ有効 / cache path は本番と同一)'
         );
       }
+      // ===== asset resolution (指示書 §26) =====
+      // renderer の初期化とは分離する。FULL133 の local install 処理が
+      // LAM renderer 内部へ侵食しないようにここで解決だけを済ませる。
+      // uika133k は従来どおりの hidden PoC 経路なので install 機構を通さない。
+      let modelUrl = uika133k
+        ? '/avatar/uika-gakki-133k.zip'
+        : (config.modelUrl || '/avatar/meruru.zip');
+      let installedVersion: string | null = null;
+      if (!uika133k) {
+        const resolved = await this._resolveAsset(modelUrl);
+        if (!resolved) return;          // install / recovery / 案内 UI を出して待つ
+        modelUrl = resolved.url;
+        installedVersion = resolved.version;
+      }
+
       try {
         await this.lamManager.initialize({
           containerElement: this.containerEl,
-          modelUrl: uika133k
-            ? '/avatar/uika-gakki-133k.zip'
-            : (config.modelUrl || '/avatar/meruru.zip'),
+          modelUrl,
         });
+        if (installedVersion && this.installManager && this.installAvatarId) {
+          // renderer が実際にロードできた version だけを active にする (指示書 §15)。
+          if (this.lamManager.isLoaded()) {
+            await this.installManager.markLoadSucceeded(this.installAvatarId, installedVersion);
+          } else {
+            await this.installManager.markLoadFailed(
+              this.installAvatarId, installedVersion, 'renderer がロードできなかった');
+          }
+        }
 
         // UIKA 133K のときだけ、renderer と初期 morph warm-up の完了を待つ。
         // 通常 LAM はこの wait を通らない。
@@ -242,8 +284,12 @@ const {
 
         if (this.lamManager.isLoaded()) {
           this.loadingEl.classList.add('hidden');
+          // 3D の First Frame が出たので Poster をフェードアウトする (指示書 §17)。
+          this.poster?.revealRenderer();
+          this.poster = null;
           this.syncPlayer.start();
           this.isInitialized = true;
+          void this._checkUpdateInBackground();
           console.log('[LAMAvatar] 3Dアバター初期化完了');
         } else {
           this._showFallback();
@@ -298,6 +344,139 @@ const {
     /**
      * フォールバック表示（静止画アバター + CSSアニメーション）
      */
+    /**
+     * modelUrl から avatar 定義を引き、install 機構を通すかどうかを決める。
+     *
+     * 戻り値が null のときは install / recovery / 案内 UI を出して待機している。
+     * renderer は起動しない (破損 asset も remote への暗黙 fallback もしない)。
+     */
+    private async _resolveAsset(modelUrl: string):
+        Promise<{ url: string; version: string | null } | null> {
+      let avatar: AvatarDef | null = null;
+      try {
+        const list = await loadAvatarConfig();
+        avatar = list.find((a) => a.modelUrl === modelUrl) ?? null;
+      } catch (e) {
+        // avatar-config が読めなければ従来どおり remote URL で続行する。
+        return { url: modelUrl, version: null };
+      }
+      if (!usesLocalPackage(avatar as any)) {
+        return { url: modelUrl, version: null };
+      }
+
+      this.installAvatar = avatar;
+      this.installAvatarId = avatar!.id;
+      // 3D が出るまで黒画面にしない (指示書 §17)。やり直しで重ねない。
+      this.poster?.destroy();
+      this.poster = mountPoster(this.containerEl, { posterUrl: avatar!.posterUrl });
+      const host = (this.poster as any).root as HTMLElement;
+      this.loadingEl.classList.add('hidden');
+
+      const env = getPwaEnvironment();
+      if (!env.storageAvailable) {
+        // Cache Storage / IndexedDB が無い環境では従来どおり remote から読む。
+        this.installAvatarId = null;
+        return { url: modelUrl, version: null };
+      }
+
+      this.installManager = new AvatarInstallManager(defaultDeps());
+      const resolution = await this.installManager.resolveAvatarAsset(avatar as any);
+
+      if (resolution.kind === 'LOCAL_READY') {
+        console.log('[AvatarInstall] LOCAL_READY',
+                    resolution.avatarId, resolution.version);
+        return { url: resolution.objectUrl, version: resolution.version };
+      }
+      if (resolution.kind === 'LEGACY_REMOTE') {
+        this.installAvatarId = null;
+        return { url: resolution.assetUrl, version: null };
+      }
+
+      // ここから先は download が要る。iPhone Safari では先に入れさせない (指示書 §9)。
+      if (shouldDeferInstallToHomeScreen(env)) {
+        renderHomeScreenGuide(host, env, {});
+        console.log('[AvatarInstall] iOS Safari のためホーム画面追加を案内');
+        return null;
+      }
+
+      const entry = findEntry(await fetchManifest(), avatar!.id);
+      if (!entry) {
+        renderRecoveryPrompt(host, {
+          sizeBytes: 0,
+          reason: 'アバターの配布情報を取得できませんでした。通信状況をご確認ください。',
+          onRetry: () => this.retryInitialize?.(),
+        });
+        return null;
+      }
+
+      if (resolution.kind === 'RECOVERY_REQUIRED') {
+        console.warn('[AvatarInstall] RECOVERY_REQUIRED:', resolution.reason);
+        renderRecoveryPrompt(host, {
+          sizeBytes: entry.size, reason: resolution.reason,
+          onRetry: () => void this._runInstall(host, entry),
+        });
+        return null;
+      }
+
+      const storage = await this.installManager.describeInstall(entry);
+      const warning = storage.likelyInsufficient
+        ? '端末の空き容量が不足している可能性があります。'
+        : null;
+      renderInstallPrompt(host, {
+        sizeBytes: entry.size, storageWarning: warning,
+        onStart: () => void this._runInstall(host, entry),
+      });
+      return null;
+    }
+
+    /** ユーザー承認後の install 実行。完了したら初期化をやり直す。 */
+    private async _runInstall(host: HTMLElement, entry: ManifestAvatarEntry): Promise<void> {
+      if (!this.installManager || !this.installAvatarId) return;
+      const ui = renderInstallPrompt(host, {
+        sizeBytes: entry.size, storageWarning: null, onStart: () => {},
+      });
+      try {
+        const rec = await this.installManager.install(
+          this.installAvatarId, entry, (p) => ui.setProgress(p));
+        if (rec.state !== 'INSTALLED') {
+          ui.setProgress({ state: 'FAILED', receivedBytes: 0, totalBytes: entry.size,
+                           ratio: null, message: rec.lastError ?? '不明なエラー' });
+          return;
+        }
+        host.querySelector('.avatar-install-card')?.remove();
+        this.isInitialized = false;
+        this.retryInitialize?.();
+      } catch (e: any) {
+        ui.setProgress({ state: 'FAILED', receivedBytes: 0, totalBytes: entry.size,
+                         ratio: null, message: String(e?.message ?? e) });
+      }
+    }
+
+    /**
+     * 起動後に非同期で manifest を見る (指示書 §19)。
+     * 失敗しても現在の avatar 利用には影響させない。
+     */
+    private async _checkUpdateInBackground(): Promise<void> {
+      if (!this.installManager || !this.installAvatarId) return;
+      try {
+        const r = await this.installManager.checkForUpdate(this.installAvatarId);
+        if (!r.updateAvailable || !r.entry) return;
+        const entry = r.entry;
+        renderUpdateNotice(this.containerEl, {
+          label: '新しいアバターデータがあります',
+          sizeBytes: entry.size,
+          onUpdate: () => {
+            const host = document.createElement('div');
+            host.className = 'avatar-install-overlay';
+            this.containerEl.appendChild(host);
+            void this._runInstall(host, entry);
+          },
+        });
+      } catch (e) {
+        // 現在の avatar 利用を継続する。
+      }
+    }
+
     private _showFallback(): void {
       this.useFallback = true;
       this.containerEl.style.display = 'none';
