@@ -6,10 +6,17 @@
  * 通常の precache へ入れてはいけない (指示書 §2)。ここはユーザーが
  * install を承認したときだけ書き込む専用 cache。
  *
- * Service Worker にも手を入れていない。Workbox の `runtimeCaching` で
- * CacheFirst を張ると **cache miss のときに 25MB を勝手に download** して
- * しまい指示書 §8 に反するので、取得は必ず Install Manager 経由にし、
- * renderer へは cache から作った blob URL を渡す。
+ * renderer への受け渡しは **cache-only の Service Worker route** 経由にする。
+ * renderer (`GaussianSplatRenderer.getInstance`) は asset URL の pathname が
+ * `/<name>.zip` に一致することを要求するため (bundle 実コードの
+ * `pathname.match(/\/([^/]+?)\.zip/)`)、blob URL では起動できない。
+ *
+ * ただし Workbox の `runtimeCaching` CacheFirst は使わない。cache miss のときに
+ * 25MB を勝手に download してしまい指示書 §8 に反する。代わりに
+ * `public/sw-avatar-local.js` が `/avatar/local/` だけを **cache からのみ**返し、
+ * miss では network へ出さずエラーにする。この合成 path はサーバー上に実体が
+ * 無いので、SW が居ない場合でも 25MB の暗黙 download は起こらない
+ * (404 になり、通常の RECOVERY 経路へ落ちる)。
  */
 
 export const AVATAR_CACHE_NAME = 'travel-avatar-assets-v1';
@@ -25,14 +32,33 @@ export interface AvatarCache {
 }
 
 /**
- * version まで含めた cache key。version が変われば別エントリになる。
+ * local package を renderer へ渡すための合成 URL。
  *
- * **必ず origin root からの絶対 pathname にする。** 相対 key にすると
- * `/` と `/concierge` で別 URL へ解決され、Registry は共通なのに Cache だけが
- * route 依存になってしまう (同じ端末で 2 回 download する)。
+ * 条件:
+ *   - pathname が `/<name>.zip` に一致すること (renderer の必須チェック)
+ *   - サーバー上に実体が無い path であること (暗黙 download を作らない)
+ *   - origin root からの絶対 pathname であること。相対にすると `/` と
+ *     `/concierge` で別 URL へ解決され、Registry は共通なのに Cache だけが
+ *     route 依存になる (同じ端末で 2 回 download する)
+ *   - version を含むこと。version が変われば別エントリになる
+ *
+ * `sw-avatar-local.js` の `PREFIX` と必ず一致させる (spec で検証)。
+ */
+export const LOCAL_PACKAGE_PATH_PREFIX = '/avatar/local/';
+
+export function localPackageUrl(avatarId: string, version: string): string {
+    return `${LOCAL_PACKAGE_PATH_PREFIX}${encodeURIComponent(avatarId)}`
+        + `/${encodeURIComponent(version)}.zip`;
+}
+
+/**
+ * cache key。**起動 URL と同一文字列**にしてある。
+ *
+ * こうすると Service Worker 側は path を解釈せず `cache.match(pathname)` を
+ * 引くだけでよく、「key の作り方」が 2 箇所に分かれない。
  */
 export function cacheKeyFor(avatarId: string, version: string): string {
-    return `/__avatar-package__/${encodeURIComponent(avatarId)}/${encodeURIComponent(version)}`;
+    return localPackageUrl(avatarId, version);
 }
 
 class CacheStorageAvatarCache implements AvatarCache {
@@ -73,12 +99,11 @@ export function createAvatarCache(name = AVATAR_CACHE_NAME): AvatarCache {
 }
 
 /**
- * cache の Response から renderer へ渡せる URL を作る。
+ * cache の Response から blob URL を作る。
  *
- * 既存 renderer は `GaussianSplatRenderer.getInstance(div, assetUrl, ...)` という
- * URL ベースの contract を持つ。blob URL ならその contract を変えずに
- * ローカルの実体を渡せる。Service Worker の route を増やさずに済むので、
- * 「未インストールなのに勝手に 25MB を取りに行く」経路が原理的に作れない。
+ * **現在、起動経路では使っていない。** renderer が asset URL の pathname に
+ * `.zip` を要求するため、起動には `localPackageUrl()` + cache-only SW route を
+ * 使う。削除はユーザー承認待ちのため残している。
  */
 export async function toObjectUrl(res: Response): Promise<string> {
     const blob = await res.blob();

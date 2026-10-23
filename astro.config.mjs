@@ -60,7 +60,15 @@ export default defineConfig({
         // ★★★ 修正箇所: '/404' から '/index.html' に変更 ★★★
         // これでファイル未検出エラーがなくなり、SWが正常起動します
         navigateFallback: '/index.html',
-        globPatterns: ['**/*.{css,js,html,svg,png,ico,txt}']
+        globPatterns: ['**/*.{css,js,html,svg,png,ico,txt}'],
+
+        // avatar local package を Cache Storage からのみ返す cache-only route。
+        // 生成 SW の先頭で読み込まれる加算スクリプトで、Workbox の route 定義
+        // には触らない。network fallback を持たないので、未インストール状態で
+        // 25MB を暗黙に download する経路は作られない。
+        importScripts: ['/sw-avatar-local.js'],
+        // 自分自身は precache しない (SW から importScripts するだけ)。
+        globIgnores: ['**/node_modules/**/*', 'sw-avatar-local.js']
       }
     })
   ]

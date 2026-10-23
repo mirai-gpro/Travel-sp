@@ -233,6 +233,31 @@ export function renderHomeScreenGuide(host: HTMLElement, env: PwaEnvironment, o:
 }
 
 /**
+ * local package の配送に必要な Service Worker の制御が得られないときの案内。
+ *
+ * 自動 reload はしない (ユーザー操作で 1 回だけ)。
+ */
+export function renderReloadRequiredPrompt(host: HTMLElement, o: {
+    onReload: () => void;
+}): void {
+    ensureStyle();
+    host.querySelector('.avatar-install-card')?.remove();
+    const card = document.createElement('div');
+    card.className = 'avatar-install-card';
+    card.innerHTML = `
+        <h2>アプリの準備がもう少しで完了します</h2>
+        <p class="avatar-install-note">アバターデータは端末に保存済みです。
+        一度だけ再読み込みすると、保存済みデータから起動できます。</p>
+        <div class="avatar-install-actions">
+            <button type="button" class="avatar-install-btn" data-act="reload">再読み込み</button>
+        </div>
+    `;
+    host.appendChild(card);
+    card.querySelector('[data-act="reload"]')!
+        .addEventListener('click', () => o.onReload());
+}
+
+/**
  * 更新準備が終わったことだけを伝える通知。
  *
  * **download 案内 UI (`renderUpdateNotice`) を再利用しない。**

@@ -14,7 +14,7 @@ import {
     type KeyValueStore, createRegistryStore,
 } from './avatar-install-registry';
 import {
-    cacheKeyFor, createAvatarCache, toObjectUrl, type AvatarCache,
+    cacheKeyFor, createAvatarCache, localPackageUrl, type AvatarCache,
 } from './avatar-cache';
 import {
     fetchManifest, findEntry, isSupportedRuntimeSchema,
@@ -34,7 +34,8 @@ export interface InstallPolicyAvatar {
 
 export type AssetResolution =
     | { kind: 'LOCAL_READY'; avatarId: string; version: string; assetUrl: string;
-        objectUrl: string; record: AvatarInstallRecord;
+        /** renderer へ渡す URL。cache-only SW route 経由で解決される。 */
+        launchUrl: string; record: AvatarInstallRecord;
         /** Registry に保存してある Poster。remote config を待たずに出せる。 */
         posterUrl?: string;
         /** 次回起動から適用する候補 (pendingVersion) を試しているか */
@@ -61,8 +62,6 @@ export interface InstallManagerDeps {
     /** ArrayBuffer -> hex SHA-256 */
     sha256: (buf: ArrayBuffer) => Promise<string>;
     manifestLoader: () => Promise<AvatarsManifest | null>;
-    /** cache の Response -> renderer へ渡す URL */
-    toUrl: (res: Response) => Promise<string>;
     storage: {
         query: (required: number) => Promise<StorageStatus>;
         persist: () => Promise<boolean>;
@@ -78,7 +77,6 @@ export function defaultDeps(store?: KeyValueStore): InstallManagerDeps {
         fetchImpl: (...a: Parameters<typeof fetch>) => fetch(...a),
         sha256: webCryptoSha256,
         manifestLoader: () => fetchManifest(),
-        toUrl: toObjectUrl,
         storage: { query: queryStorage, persist: requestPersist },
         now: () => Date.now(),
     };
@@ -142,7 +140,7 @@ export class AvatarInstallManager {
             const ready = await this.loadVersion(rec, rec.pendingVersion);
             if (ready) {
                 return { kind: 'LOCAL_READY', avatarId, version: rec.pendingVersion,
-                         assetUrl: ready.assetUrl, objectUrl: ready.objectUrl,
+                         assetUrl: ready.assetUrl, launchUrl: ready.launchUrl,
                          posterUrl: ready.posterUrl, record: rec, isPending: true };
             }
             // pending の実体が無い / メタが欠けている = 更新が中断した。
@@ -165,7 +163,7 @@ export class AvatarInstallManager {
                     rec = await this.deps.registry.update(avatarId, { state: 'INSTALLED' });
                 }
                 return { kind: 'LOCAL_READY', avatarId, version: activeVersion,
-                         assetUrl: ready.assetUrl, objectUrl: ready.objectUrl,
+                         assetUrl: ready.assetUrl, launchUrl: ready.launchUrl,
                          posterUrl: ready.posterUrl, record: rec, isPending: false };
             }
             // Registry は active を指しているのに実体が無い = 不整合。
@@ -187,7 +185,7 @@ export class AvatarInstallManager {
      * `runtimeSchema` 未記録の古い install は従来どおり許可する。
      */
     private async loadVersion(rec: AvatarInstallRecord, version: string):
-        Promise<{ assetUrl: string; objectUrl: string; posterUrl?: string } | null> {
+        Promise<{ assetUrl: string; launchUrl: string; posterUrl?: string } | null> {
         const meta = this.versionMeta(rec, version);
         if (!meta) return null;
         const schema = meta.runtimeSchema ?? rec.runtimeSchema;
@@ -198,9 +196,10 @@ export class AvatarInstallManager {
         }
         const res = await this.deps.cache.match(cacheKeyFor(rec.avatarId, version));
         if (!res) return null;
+        void res;   // 実体の存在確認だけ。bytes は SW route が返す。
         return {
             assetUrl: meta.assetUrl,
-            objectUrl: await this.deps.toUrl(res),
+            launchUrl: localPackageUrl(rec.avatarId, version),
             posterUrl: meta.posterUrl ?? rec.posterUrl,
         };
     }
