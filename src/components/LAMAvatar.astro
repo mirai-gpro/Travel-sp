@@ -143,7 +143,7 @@ const {
     renderHomeScreenGuide, renderUpdateNotice, renderUpdateReadyNotice,
     renderReloadRequiredPrompt,
   } from '../scripts/avatar-install/install-ui';
-  import { waitForServiceWorkerControl }
+  import { waitForServiceWorkerControl, isServiceWorkerSupported }
     from '../scripts/avatar-install/sw-control';
   import { ObjectUrlOwner } from '../scripts/avatar-install/avatar-cache';
   import { markPendingReload, clearPendingReload, defaultGuardStore }
@@ -480,9 +480,16 @@ const {
      */
     private async _ensureLocalDelivery(): Promise<boolean> {
       if (await waitForServiceWorkerControl()) return true;
+      const host = (this.poster as any)?.root as HTMLElement | undefined;
+      if (!isServiceWorkerSupported()) {
+        // SW 非対応環境では reload しても制御は得られない。2D へ落とす。
+        console.warn('[AvatarInstall] Service Worker 非対応のため'
+                     + ' local package を渡せません');
+        this._showFallback();
+        return false;
+      }
       console.warn('[AvatarInstall] Service Worker の制御が無いため'
                    + ' local package を渡せません。再読み込みを案内します');
-      const host = (this.poster as any)?.root as HTMLElement | undefined;
       if (host) {
         renderReloadRequiredPrompt(host, { onReload: () => location.reload() });
       } else {
