@@ -698,6 +698,57 @@ function makeDeps(opts = {}) {
            '★ A. SW 非対応環境でも throw せず false');
     }
 
+    // ---- L. (回帰) ready() が解決しなくても起動処理を止めない ----
+    {
+        const { waitForServiceWorkerControl } = require('./.sw-control.cjs');
+        // install に失敗した SW が居ると navigator.serviceWorker.ready は
+        // 永久に解決しない。これを await すると起動が無言で停止する。
+        const t0 = Date.now();
+        const r = await waitForServiceWorkerControl({
+            isControlled: () => false,
+            ready: () => new Promise(() => {}),      // 永久に解決しない
+            onControllerChange: () => () => {},
+        }, 30, (cb, ms) => setTimeout(cb, ms));
+        ok(r === false && Date.now() - t0 < 2000,
+           '★ A. ready() が永久に解決しなくても timeout で false を返す',
+           `${Date.now() - t0}ms`);
+
+        // ready() が解決しないまま controllerchange で制御が付く場合も拾う
+        let controlled = false; let fire = () => {};
+        const p2 = waitForServiceWorkerControl({
+            isControlled: () => controlled,
+            ready: () => new Promise(() => {}),
+            onControllerChange: (cb) => { fire = cb; return () => { fire = () => {}; }; },
+        }, 1000, (cb, ms) => setTimeout(cb, ms));
+        setTimeout(() => { controlled = true; fire(); }, 5);
+        ok(await p2 === true,
+           '★ A. ready() 未解決でも controllerchange で制御が付けば true');
+    }
+
+    // ---- M. 生成 SW が install できる設定になっている ----
+    {
+        const fs = require('fs'), path = require('path');
+        const swPath = path.join(__dirname, '../../dist/sw.js');
+        if (!fs.existsSync(swPath)) {
+            console.log('SKIP  ★ A. dist/sw.js が無い (npx astro build 後に検証)');
+        } else {
+            const sw = fs.readFileSync(swPath, 'utf8');
+            const urls = [...sw.matchAll(/url:"([^"]+)"/g)].map((m) => m[1]);
+            const fb = sw.match(/createHandlerBoundToURL\("([^"]+)"\)/);
+            ok(!!fb && urls.includes(fb[1]),
+               '★ A. navigateFallback が precache manifest に実在する (non-precached-url 回帰)',
+               fb && fb[1]);
+            ok(!urls.includes('404'),
+               '★ A. 404 を precache しない (bad-precaching-response 回帰)');
+            ok(sw.includes('importScripts("/sw-avatar-local.js")'),
+               '★ A. 生成 SW が cache-only route を importScripts する');
+            ok(sw.indexOf('importScripts("/sw-avatar-local.js")') < sw.indexOf('registerRoute'),
+               '★ A. cache-only route の listener が Workbox より先に登録される');
+            ok(!urls.includes('sw-avatar-local.js') && !urls.some((u) => u.endsWith('.zip')),
+               '★ A. ZIP と SW script は precache に入らない');
+        }
+    }
+
     // ---- K. LAMAvatar は制御が無い場合に renderer を起動しない ----
     {
         const src = require('fs').readFileSync(

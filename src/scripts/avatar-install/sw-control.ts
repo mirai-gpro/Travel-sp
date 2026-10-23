@@ -21,6 +21,14 @@ export interface SwControlDeps {
     onControllerChange: (cb: () => void) => () => void;
 }
 
+export function isServiceWorkerSupported(): boolean {
+    try {
+        return typeof navigator !== 'undefined' && !!(navigator as any).serviceWorker;
+    } catch (e) {
+        return false;
+    }
+}
+
 export function defaultSwControlDeps(): SwControlDeps | null {
     try {
         if (typeof navigator === 'undefined') return null;
@@ -42,6 +50,12 @@ export function defaultSwControlDeps(): SwControlDeps | null {
 /**
  * SW の制御が得られたら true。得られなければ false (reload 案内へ回す)。
  * SW が使えない環境でも throw しない。
+ *
+ * **`ready()` の解決を待ってはいけない。** `navigator.serviceWorker.ready` は
+ * active な registration が出来るまで解決しないので、install に失敗した SW が
+ * 居る状態では永久に解決しない。await すると起動処理ごと停止する
+ * (実機でアバターが出ないまま無言で止まる症状の原因)。
+ * ここでは timeout を必ず効かせ、`ready()` は解決したら再確認するだけに使う。
  */
 export async function waitForServiceWorkerControl(
     deps: SwControlDeps | null = defaultSwControlDeps(),
@@ -52,20 +66,31 @@ export async function waitForServiceWorkerControl(
     if (!deps) return false;
     if (deps.isControlled()) return true;
 
-    let off: () => void = () => {};
-    const changed = new Promise<boolean>((resolve) => {
-        off = deps.onControllerChange(() => resolve(deps.isControlled()));
+    return new Promise<boolean>((resolve) => {
+        let settled = false;
+        let off: () => void = () => {};
+        const finish = (value: boolean) => {
+            if (settled) return;
+            settled = true;
+            try { off(); } catch (e) { /* noop */ }
+            resolve(value);
+        };
+
+        try {
+            off = deps.onControllerChange(() => {
+                if (deps.isControlled()) finish(true);
+            });
+        } catch (e) {
+            // 購読できなくても timeout で必ず終わる。
+        }
+
+        // timeout は常に効かせる (ここだけが唯一の終了保証)。
+        schedule(() => finish(deps.isControlled()), timeoutMs);
+
+        // ready() は待たない。解決したときだけ制御を再確認する。
+        void Promise.resolve()
+            .then(() => deps.ready())
+            .then(() => { if (deps.isControlled()) finish(true); })
+            .catch(() => undefined);
     });
-    const timedOut = new Promise<boolean>((resolve) => {
-        schedule(() => resolve(false), timeoutMs);
-    });
-    try {
-        await deps.ready().catch(() => undefined);
-        if (deps.isControlled()) return true;
-        return await Promise.race([changed, timedOut]);
-    } catch (e) {
-        return deps.isControlled();
-    } finally {
-        try { off(); } catch (e) { /* noop */ }
-    }
 }

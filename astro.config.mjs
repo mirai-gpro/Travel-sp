@@ -57,9 +57,12 @@ export default defineConfig({
         ]
       },
       workbox: {
-        // ★★★ 修正箇所: '/404' から '/index.html' に変更 ★★★
-        // これでファイル未検出エラーがなくなり、SWが正常起動します
-        navigateFallback: '/index.html',
+        // navigateFallback は **precache manifest に実在する URL** でなければ
+        // ならない。生成 manifest の index entry は clean URL の '/' で、
+        // '/index.html' は存在しない。'/index.html' を指定すると install 時に
+        //   non-precached-url :: [{"url":"/index.html"}]
+        // で SW が activate できず、active: null のままになる (実機で確認)。
+        navigateFallback: '/',
         globPatterns: ['**/*.{css,js,html,svg,png,ico,txt}'],
 
         // avatar local package を Cache Storage からのみ返す cache-only route。
@@ -67,8 +70,12 @@ export default defineConfig({
         // には触らない。network fallback を持たないので、未インストール状態で
         // 25MB を暗黙に download する経路は作られない。
         importScripts: ['/sw-avatar-local.js'],
-        // 自分自身は precache しない (SW から importScripts するだけ)。
-        globIgnores: ['**/node_modules/**/*', 'sw-avatar-local.js']
+        // 404.html は precache しない。clean URL の '/404' として登録され、
+        // 実際に GET すると Vercel は status 404 を返すため
+        //   bad-precaching-response :: [{"url":".../404","status":404}]
+        // で SW の install が失敗する (実機で確認)。deploy 自体には残る。
+        // sw-avatar-local.js も precache しない (SW から importScripts するだけ)。
+        globIgnores: ['**/node_modules/**/*', '404.html', 'sw-avatar-local.js']
       }
     })
   ]
