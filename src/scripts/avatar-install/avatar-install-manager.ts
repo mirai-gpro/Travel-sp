@@ -33,7 +33,9 @@ export interface InstallPolicyAvatar {
 
 export type AssetResolution =
     | { kind: 'LOCAL_READY'; avatarId: string; version: string; assetUrl: string;
-        objectUrl: string; record: AvatarInstallRecord }
+        objectUrl: string; record: AvatarInstallRecord;
+        /** 次回起動から適用する候補 (pendingVersion) を試しているか */
+        isPending: boolean }
     | { kind: 'INSTALL_REQUIRED'; avatarId: string; record?: AvatarInstallRecord;
         reason: string }
     | { kind: 'RECOVERY_REQUIRED'; avatarId: string; record: AvatarInstallRecord;
@@ -105,36 +107,83 @@ export class AvatarInstallManager {
             // 既存 LAM avatar は従来どおり remote URL をそのまま使う (指示書 §4 / §27)。
             return { kind: 'LEGACY_REMOTE', avatarId: avatar.id, assetUrl: avatar.modelUrl };
         }
-        const rec = await this.deps.registry.get(avatar.id);
+        return this.resolveInstalled(avatar.id);
+    }
+
+    /**
+     * **avatar-config を一切読まずに** Registry と Cache Storage だけで解決する。
+     *
+     * offline では `/avatar/avatar-config.json` の取得に失敗し得るが、
+     * インストール済み avatar の起動をそれに依存させてはいけない。
+     * 呼び出し側は selectedAvatarId さえ分かればここへ来られる。
+     *
+     * 優先順位 (更新途中で終了しても active が必ず起動できるようにする):
+     *   1. usable な pending があれば pending を試す
+     *   2. pending が欠落 / 不整合なら pending を破棄して active へ
+     *   3. usable な active があれば LOCAL_READY
+     *   4. active の実体が無ければ RECOVERY_REQUIRED
+     *   5. active 自体が無ければ INSTALL_REQUIRED
+     *
+     * record の global state (DOWNLOADING / VERIFYING / FAILED 等) は
+     * **この判断に使わない**。v4 の download 中にアプリが終了しても、
+     * v3 の実体が無事なら v3 で普通に起動できる必要がある。
+     */
+    async resolveInstalled(avatarId: string): Promise<AssetResolution> {
+        let rec = await this.deps.registry.get(avatarId);
         if (!rec) {
-            return { kind: 'INSTALL_REQUIRED', avatarId: avatar.id,
+            return { kind: 'INSTALL_REQUIRED', avatarId,
                      reason: 'Registry にレコードが無い (未インストール)' };
         }
-        // pending があれば今回はそちらを試す (指示書 §15)。失敗したら active へ戻す。
-        const target = rec.pendingVersion ?? rec.activeVersion;
-        if (!target || (rec.state !== 'INSTALLED' && rec.state !== 'READY')) {
-            return { kind: 'INSTALL_REQUIRED', avatarId: avatar.id, record: rec,
-                     reason: `state=${rec.state} / activeVersion=${rec.activeVersion ?? 'なし'}` };
+
+        if (rec.pendingVersion) {
+            const ready = await this.loadVersion(rec, rec.pendingVersion);
+            if (ready) {
+                return { kind: 'LOCAL_READY', avatarId, version: rec.pendingVersion,
+                         assetUrl: ready.assetUrl, objectUrl: ready.objectUrl,
+                         record: rec, isPending: true };
+            }
+            // pending の実体が無い / メタが欠けている = 更新が中断した。
+            // active を壊さずに pending だけ捨てる。
+            const dropped = rec.pendingVersion;
+            rec = await this.deps.registry.update(avatarId, {
+                pendingVersion: undefined,
+                lastError: `pending ${dropped} の実体が無いため破棄`,
+            });
+            await this.deps.cache.delete(cacheKeyFor(avatarId, dropped)).catch(() => false);
         }
-        const meta = this.versionMeta(rec, target);
-        if (!meta) {
-            return { kind: 'RECOVERY_REQUIRED', avatarId: avatar.id, record: rec,
-                     reason: `version ${target} のメタ情報が Registry にない` };
-        }
-        const key = cacheKeyFor(avatar.id, target);
-        const res = await this.deps.cache.match(key);
-        if (!res) {
-            // Registry は INSTALLED なのに Cache が無い = 不整合。
+
+        const activeVersion = rec.activeVersion;
+        if (activeVersion) {
+            const ready = await this.loadVersion(rec, activeVersion);
+            if (ready) {
+                if (rec.state !== 'INSTALLED') {
+                    // 更新が中断して DOWNLOADING / FAILED のまま残っていても、
+                    // active の実体が無事なら INSTALLED に戻して起動する。
+                    rec = await this.deps.registry.update(avatarId, { state: 'INSTALLED' });
+                }
+                return { kind: 'LOCAL_READY', avatarId, version: activeVersion,
+                         assetUrl: ready.assetUrl, objectUrl: ready.objectUrl,
+                         record: rec, isPending: false };
+            }
+            // Registry は active を指しているのに実体が無い = 不整合。
             // クラッシュさせず、黙って再 download もしない (指示書 §16)。
-            const next = await this.deps.registry.update(avatar.id, { state: 'MISSING' });
-            return { kind: 'RECOVERY_REQUIRED', avatarId: avatar.id, record: next,
+            const next = await this.deps.registry.update(avatarId, { state: 'MISSING' });
+            return { kind: 'RECOVERY_REQUIRED', avatarId, record: next,
                      reason: 'Cache Storage に実体が無い (eviction の可能性)' };
         }
-        const objectUrl = await this.deps.toUrl(res);
-        return {
-            kind: 'LOCAL_READY', avatarId: avatar.id, version: target,
-            assetUrl: meta.assetUrl, objectUrl, record: rec,
-        };
+
+        return { kind: 'INSTALL_REQUIRED', avatarId, record: rec,
+                 reason: `activeVersion が無い (state=${rec.state})` };
+    }
+
+    /** version の実体が揃っていれば renderer へ渡せる URL を作る。無ければ null。 */
+    private async loadVersion(rec: AvatarInstallRecord, version: string):
+        Promise<{ assetUrl: string; objectUrl: string } | null> {
+        const meta = this.versionMeta(rec, version);
+        if (!meta) return null;
+        const res = await this.deps.cache.match(cacheKeyFor(rec.avatarId, version));
+        if (!res) return null;
+        return { assetUrl: meta.assetUrl, objectUrl: await this.deps.toUrl(res) };
     }
 
     /**

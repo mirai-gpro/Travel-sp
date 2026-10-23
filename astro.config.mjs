@@ -24,7 +24,10 @@ export default defineConfig({
       manifestFilename: 'manifest.webmanifest',
       // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
-      includeAssets: ['favicon.svg', 'apple-touch-icon.png'],
+      // avatar-config.json だけ明示的に precache する。offline でも avatar 定義を
+      // 読めるようにするための補助であって、local 起動の条件ではない。
+      // avatars-manifest.json は precache しない (更新検知は常に最新を見る)。
+      includeAssets: ['favicon.svg', 'apple-touch-icon.png', 'avatar/avatar-config.json'],
       manifest: {
         name: 'Travel AI',
         short_name: 'Travel AI',

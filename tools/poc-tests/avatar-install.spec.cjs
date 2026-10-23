@@ -234,6 +234,133 @@ function makeDeps(opts = {}) {
         ok(r.kind === 'LOCAL_READY' && r.version === 'v3', '★ 次回起動は v3 で復帰', r.version);
     }
 
+    // ================= 修正 1〜6 の回帰 =================
+
+    // ---- 2. cache key が route に依存しない ----
+    {
+        const { cacheKeyFor } = require('./.avatar-cache.cjs');
+        const k = cacheKeyFor(FULL133.id, 'v3');
+        ok(k.startsWith('/__avatar-package__/'),
+           '★ cache key が origin root からの絶対 pathname', k);
+        const atRoot = new URL(k, 'https://example.test/').href;
+        const atConcierge = new URL(k, 'https://example.test/concierge').href;
+        ok(atRoot === atConcierge,
+           '★ / で install した key と /concierge で参照する key が同一',
+           `${atRoot} === ${atConcierge}`);
+        ok(cacheKeyFor('a/b', 'v 1').indexOf(' ') < 0, 'avatarId / version を escape する');
+    }
+
+    // ---- 1. avatar-config が読めなくても Registry + Cache で LOCAL_READY ----
+    {
+        const h = build({ payload: payload3 });
+        await h.manager.install(FULL133.id, entry3, () => {});
+        // avatar-config も manifest も取れない状況を模す
+        const h2 = build({ store: h.store, cache: h.cache, fetchFails: true,
+            manifestLoader: async () => { throw new Error('offline'); } });
+        const r = await h2.manager.resolveInstalled(FULL133.id);
+        ok(r.kind === 'LOCAL_READY' && r.version === 'v3',
+           '★ 1. avatar-config / manifest が取れなくても installed は LOCAL_READY', r.kind);
+        ok(h2.fetchCalls.length === 0, '★ 1. network を 1 度も叩かない');
+    }
+
+    // ---- 4. v4 DOWNLOADING 中に終了 → 次回は v3 で起動 ----
+    {
+        const h = build({ payload: payload3 });
+        await h.manager.install(FULL133.id, entry3, () => {});
+        // download 途中で落ちた状態を直接作る (state を DOWNLOADING のまま残す)
+        const rec = [...h.store.map.values()][0];
+        rec.state = 'DOWNLOADING';
+        rec.version = 'v4';
+        rec.versions.v4 = { assetUrl: '/x?v=v4', sha256: 'f'.repeat(64), size: 10 };
+        await h.store.put(FULL133.id, rec);
+
+        const h2 = build({ store: h.store, cache: h.cache });
+        const r = await h2.manager.resolveInstalled(FULL133.id);
+        ok(r.kind === 'LOCAL_READY' && r.version === 'v3' && r.isPending === false,
+           '★ 4. v4 DOWNLOADING 状態で再起動しても v3 が LOCAL_READY', `${r.kind}/${r.version}`);
+        const after = await h2.manager.getRecord(FULL133.id);
+        ok(after.state === 'INSTALLED', '中断状態の state を INSTALLED へ戻す', after.state);
+    }
+
+    // ---- 4/5. pending v4 の cache が無ければ v3 へ落ちる (Recovery にしない) ----
+    {
+        const payload4 = makePayload(7, 7000);
+        const entry4 = entryFor('v4c', payload4);
+        const h = build({ payload: payload3 });
+        await h.manager.install(FULL133.id, entry3, () => {});
+        const h2 = build({ store: h.store, cache: h.cache, payload: payload4 });
+        await h2.manager.install(FULL133.id, entry4, () => {});
+        // pending の実体だけを消す (eviction 相当)
+        const { cacheKeyFor } = require('./.avatar-cache.cjs');
+        h.cache.map.delete(cacheKeyFor(FULL133.id, 'v4c'));
+
+        const h3 = build({ store: h.store, cache: h.cache });
+        const r = await h3.manager.resolveInstalled(FULL133.id);
+        ok(r.kind === 'LOCAL_READY' && r.version === 'v3',
+           '★ 4. pending v4 の cache MISS なら v3 へ fallback (Recovery にしない)',
+           `${r.kind}/${r.version}`);
+        const after = await h3.manager.getRecord(FULL133.id);
+        ok(!after.pendingVersion, '★ 使えない pending は破棄する');
+    }
+
+    // ---- 5. v4 renderer load 失敗後、同じ起動で v3 を解決できる ----
+    {
+        const payload4 = makePayload(8, 8000);
+        const entry4 = entryFor('v4d', payload4);
+        const h = build({ payload: payload3 });
+        await h.manager.install(FULL133.id, entry3, () => {});
+        const h2 = build({ store: h.store, cache: h.cache, payload: payload4 });
+        await h2.manager.install(FULL133.id, entry4, () => {});
+
+        const h3 = build({ store: h.store, cache: h.cache });
+        const first = await h3.manager.resolveInstalled(FULL133.id);
+        ok(first.version === 'v4d' && first.isPending === true,
+           '★ 5. まず pending v4 を試す (isPending=true)');
+        await h3.manager.markLoadFailed(FULL133.id, 'v4d', 'renderer がロードできなかった');
+        const second = await h3.manager.resolveInstalled(FULL133.id);
+        ok(second.kind === 'LOCAL_READY' && second.version === 'v3'
+            && second.isPending === false,
+           '★ 5. 同じ起動のうちに v3 を解決できる', `${second.kind}/${second.version}`);
+    }
+
+    // ---- 3. update 完了は pendingVersion までで、active を動かさない ----
+    {
+        const payload4 = makePayload(11, 9000);
+        const entry4 = entryFor('v4e', payload4);
+        const h = build({ payload: payload3 });
+        await h.manager.install(FULL133.id, entry3, () => {});
+        const h2 = build({ store: h.store, cache: h.cache, payload: payload4 });
+        const rec = await h2.manager.install(FULL133.id, entry4, () => {});
+        ok(rec.activeVersion === 'v3' && rec.pendingVersion === 'v4e',
+           '★ 3. update 完了後も activeVersion は v3 のまま',
+           `active=${rec.activeVersion} pending=${rec.pendingVersion}`);
+        // 現在 session で解決し直しても v4 を active にはしない
+        const after = await h2.manager.getRecord(FULL133.id);
+        ok(after.activeVersion === 'v3',
+           '★ 3. install() 自体は active を書き換えない (再 initialize の材料を作らない)');
+    }
+
+    // ---- 6. object URL の dispose / retry cleanup ----
+    {
+        const { ObjectUrlOwner } = require('./.avatar-cache.cjs');
+        const freed = [];
+        const o = new ObjectUrlOwner((u) => freed.push(u));
+        o.own('blob:a');
+        ok(o.value === 'blob:a', 'object URL を所有する');
+        o.own('blob:b');
+        ok(freed.length === 1 && freed[0] === 'blob:a',
+           '★ 6. 差し替え時に前の object URL を revoke する', freed.join(','));
+        o.release();
+        ok(freed.length === 2 && freed[1] === 'blob:b' && o.value === null,
+           '★ 6. dispose / retry で現在の object URL を revoke する');
+        o.release();
+        ok(freed.length === 2, '★ 6. 二重 revoke しない');
+        const bad = new ObjectUrlOwner(() => { throw new Error('revoke 失敗'); });
+        bad.own('blob:c');
+        bad.release();
+        ok(bad.value === null, '★ 6. revoke が失敗しても所有権は手放す');
+    }
+
     // ---- manifest のバリデーション ----
     {
         const m = require('./.avatar-manifest.cjs');

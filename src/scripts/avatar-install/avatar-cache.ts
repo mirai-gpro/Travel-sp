@@ -24,9 +24,15 @@ export interface AvatarCache {
     keys(): Promise<string[]>;
 }
 
-/** version まで含めた cache key。version が変われば別エントリになる。 */
+/**
+ * version まで含めた cache key。version が変われば別エントリになる。
+ *
+ * **必ず origin root からの絶対 pathname にする。** 相対 key にすると
+ * `/` と `/concierge` で別 URL へ解決され、Registry は共通なのに Cache だけが
+ * route 依存になってしまう (同じ端末で 2 回 download する)。
+ */
 export function cacheKeyFor(avatarId: string, version: string): string {
-    return `avatar-package/${encodeURIComponent(avatarId)}/${encodeURIComponent(version)}`;
+    return `/__avatar-package__/${encodeURIComponent(avatarId)}/${encodeURIComponent(version)}`;
 }
 
 class CacheStorageAvatarCache implements AvatarCache {
@@ -77,4 +83,47 @@ export function createAvatarCache(name = AVATAR_CACHE_NAME): AvatarCache {
 export async function toObjectUrl(res: Response): Promise<string> {
     const blob = await res.blob();
     return URL.createObjectURL(blob);
+}
+
+/**
+ * blob URL の所有権を 1 箇所に持つ。
+ *
+ * `URL.createObjectURL()` したものを永久に保持しない。差し替え / retry /
+ * 破棄のたびに前のものを必ず `revokeObjectURL()` する。
+ *
+ * ロード完了直後の即時 revoke は採っていない。installed renderer の
+ * progressive load 経路が、返した promise の解決後に同じ URL を
+ * 再度読まないことを build 済み bundle から断定できなかったため。
+ */
+export class ObjectUrlOwner {
+    private current: string | null = null;
+    /** 解放した URL (テスト / 診断用) */
+    readonly revoked: string[] = [];
+
+    constructor(private readonly revoke: (url: string) => void =
+        (u) => URL.revokeObjectURL(u)) {}
+
+    /** 新しい URL を所有する。前のものは解放する。 */
+    own(url: string): string {
+        this.release();
+        this.current = url;
+        return url;
+    }
+
+    get value(): string | null {
+        return this.current;
+    }
+
+    /** 現在の URL を解放する。二重解放しない。 */
+    release(): void {
+        if (this.current === null) return;
+        const url = this.current;
+        this.current = null;
+        try {
+            this.revoke(url);
+            this.revoked.push(url);
+        } catch (e) {
+            // 解放できなくても起動は続ける。
+        }
+    }
 }

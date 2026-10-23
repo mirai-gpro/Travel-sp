@@ -142,6 +142,7 @@ const {
     mountPoster, renderInstallPrompt, renderRecoveryPrompt,
     renderHomeScreenGuide, renderUpdateNotice,
   } from '../scripts/avatar-install/install-ui';
+  import { ObjectUrlOwner } from '../scripts/avatar-install/avatar-cache';
 
   /**
    * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
@@ -165,6 +166,10 @@ const {
     private installAvatar: AvatarDef | null = null;
     private poster: { revealRenderer(): void; destroy(): void } | null = null;
     private retryInitialize: (() => void) | null = null;
+    /** renderer へ渡した blob URL。所有権はこちらが持ち、作り直し / 破棄時に revoke する。 */
+    private readonly objectUrls = new ObjectUrlOwner();
+    /** 同じ起動で pending から active へ 1 回だけ fallback するためのフラグ。 */
+    private pendingFallbackUsed: boolean = false;
 
     constructor() {
       this.lamManager = new LAMWebSocketManager();
@@ -181,7 +186,11 @@ const {
     async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
       if (this.isInitialized) return;
       // install / recovery の完了後に同じ引数でやり直せるようにしておく。
-      this.retryInitialize = () => { void this.initialize(liveAudioManager); };
+      // やり直す前に前回の blob URL を必ず解放する (所有権はこちら側)。
+      this.retryInitialize = () => {
+        this._revokeObjectUrl();
+        void this.initialize(liveAudioManager);
+      };
 
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
@@ -254,11 +263,13 @@ const {
         ? '/avatar/uika-gakki-133k.zip'
         : (config.modelUrl || '/avatar/meruru.zip');
       let installedVersion: string | null = null;
+      let isPendingVersion = false;
       if (!uika133k) {
         const resolved = await this._resolveAsset(modelUrl);
         if (!resolved) return;          // install / recovery / 案内 UI を出して待つ
         modelUrl = resolved.url;
         installedVersion = resolved.version;
+        isPendingVersion = resolved.isPending;
       }
 
       try {
@@ -273,6 +284,15 @@ const {
           } else {
             await this.installManager.markLoadFailed(
               this.installAvatarId, installedVersion, 'renderer がロードできなかった');
+            // pending (v4) のロードに失敗したら、**この起動のうちに** active (v3) へ戻す。
+            // 次回まで待たせない。無限 retry を避けるため 1 回だけ。
+            if (isPendingVersion && !this.pendingFallbackUsed) {
+              this.pendingFallbackUsed = true;
+              console.warn('[AvatarInstall] pending のロードに失敗。active へ fallback します');
+              this.isInitialized = false;
+              this.retryInitialize?.();
+              return;
+            }
           }
         }
 
@@ -351,45 +371,63 @@ const {
      * renderer は起動しない (破損 asset も remote への暗黙 fallback もしない)。
      */
     private async _resolveAsset(modelUrl: string):
-        Promise<{ url: string; version: string | null } | null> {
+        Promise<{ url: string; version: string | null; isPending: boolean } | null> {
+      const env = getPwaEnvironment();
+      if (!env.storageAvailable) {
+        // Cache Storage / IndexedDB が無い環境では従来どおり remote から読む。
+        return { url: modelUrl, version: null, isPending: false };
+      }
+
+      // ===== 1. Registry 優先 =====
+      // avatar-config.json の取得成功を local 起動の条件にしない (offline local-first)。
+      // selectedAvatarId だけ分かれば Registry + Cache Storage で解決できる。
+      const selectedId = this._selectedAvatarId();
+      this.installManager = new AvatarInstallManager(defaultDeps());
+      if (selectedId) {
+        try {
+          const local = await this.installManager.resolveInstalled(selectedId);
+          if (local.kind === 'LOCAL_READY') {
+            this.installAvatarId = selectedId;
+            this._mountPoster(null);
+            console.log('[AvatarInstall] LOCAL_READY', selectedId, local.version,
+                        local.isPending ? '(pending)' : '(active)');
+            return { url: this._ownObjectUrl(local.objectUrl),
+                     version: local.version, isPending: local.isPending };
+          }
+        } catch (e) {
+          console.warn('[AvatarInstall] Registry 解決に失敗:', e);
+        }
+      }
+
+      // ===== 2. ここで初めて avatar-config を読む =====
+      // 未インストール / 不整合のときだけ。どちらにせよ download が要る場面。
       let avatar: AvatarDef | null = null;
       try {
         const list = await loadAvatarConfig();
-        avatar = list.find((a) => a.modelUrl === modelUrl) ?? null;
+        avatar = list.find((a) => a.modelUrl === modelUrl)
+              ?? (selectedId ? list.find((a) => a.id === selectedId) ?? null : null);
       } catch (e) {
-        // avatar-config が読めなければ従来どおり remote URL で続行する。
-        return { url: modelUrl, version: null };
+        avatar = null;
       }
       if (!usesLocalPackage(avatar as any)) {
-        return { url: modelUrl, version: null };
+        this.installManager = null;
+        this.installAvatarId = null;
+        return { url: modelUrl, version: null, isPending: false };
       }
 
       this.installAvatar = avatar;
       this.installAvatarId = avatar!.id;
-      // 3D が出るまで黒画面にしない (指示書 §17)。やり直しで重ねない。
-      this.poster?.destroy();
-      this.poster = mountPoster(this.containerEl, { posterUrl: avatar!.posterUrl });
+      this._mountPoster(avatar!.posterUrl ?? null);
       const host = (this.poster as any).root as HTMLElement;
-      this.loadingEl.classList.add('hidden');
 
-      const env = getPwaEnvironment();
-      if (!env.storageAvailable) {
-        // Cache Storage / IndexedDB が無い環境では従来どおり remote から読む。
-        this.installAvatarId = null;
-        return { url: modelUrl, version: null };
-      }
-
-      this.installManager = new AvatarInstallManager(defaultDeps());
       const resolution = await this.installManager.resolveAvatarAsset(avatar as any);
-
       if (resolution.kind === 'LOCAL_READY') {
-        console.log('[AvatarInstall] LOCAL_READY',
-                    resolution.avatarId, resolution.version);
-        return { url: resolution.objectUrl, version: resolution.version };
+        return { url: this._ownObjectUrl(resolution.objectUrl),
+                 version: resolution.version, isPending: resolution.isPending };
       }
       if (resolution.kind === 'LEGACY_REMOTE') {
         this.installAvatarId = null;
-        return { url: resolution.assetUrl, version: null };
+        return { url: resolution.assetUrl, version: null, isPending: false };
       }
 
       // ここから先は download が要る。iPhone Safari では先に入れさせない (指示書 §9)。
@@ -413,24 +451,59 @@ const {
         console.warn('[AvatarInstall] RECOVERY_REQUIRED:', resolution.reason);
         renderRecoveryPrompt(host, {
           sizeBytes: entry.size, reason: resolution.reason,
-          onRetry: () => void this._runInstall(host, entry),
+          onRetry: () => void this._runInstall(host, entry, false),
         });
         return null;
       }
 
       const storage = await this.installManager.describeInstall(entry);
-      const warning = storage.likelyInsufficient
-        ? '端末の空き容量が不足している可能性があります。'
-        : null;
       renderInstallPrompt(host, {
-        sizeBytes: entry.size, storageWarning: warning,
-        onStart: () => void this._runInstall(host, entry),
+        sizeBytes: entry.size,
+        storageWarning: storage.likelyInsufficient
+          ? '端末の空き容量が不足している可能性があります。' : null,
+        onStart: () => void this._runInstall(host, entry, false),
       });
       return null;
     }
 
-    /** ユーザー承認後の install 実行。完了したら初期化をやり直す。 */
-    private async _runInstall(host: HTMLElement, entry: ManifestAvatarEntry): Promise<void> {
+    /** 選択中の avatarId。remote config を読まずに localStorage だけで決める。 */
+    private _selectedAvatarId(): string | null {
+      try {
+        const mode = location.pathname.includes('concierge') ? 'concierge' : 'lesson';
+        return localStorage.getItem(`selectedAvatar_${mode}`);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    private _mountPoster(posterUrl: string | null): void {
+      this.poster?.destroy();
+      this.poster = mountPoster(this.containerEl,
+                                { posterUrl: posterUrl ?? undefined });
+      this.loadingEl.classList.add('hidden');
+    }
+
+    /** blob URL の所有権を持つ。前のものがあれば revoke してから差し替える。 */
+    private _ownObjectUrl(url: string): string {
+      return this.objectUrls.own(url);
+    }
+
+    /** retry / 破棄時に直前の blob URL を解放する。 */
+    private _revokeObjectUrl(): void {
+      this.objectUrls.release();
+    }
+
+    /**
+     * ユーザー承認後の install 実行。
+     *
+     * `isUpdate` の扱いが要点 (指示書 §15):
+     *   初回   … 完了したら初期化をやり直して 3D を起動する
+     *   update … v3 ACTIVE のまま pendingVersion=v4 まで。
+     *            現在 session の renderer / syncPlayer / v3 には一切触らない。
+     *            v4 を試すのは次回の実起動時だけ。
+     */
+    private async _runInstall(host: HTMLElement, entry: ManifestAvatarEntry,
+                              isUpdate: boolean): Promise<void> {
       if (!this.installManager || !this.installAvatarId) return;
       const ui = renderInstallPrompt(host, {
         sizeBytes: entry.size, storageWarning: null, onStart: () => {},
@@ -441,6 +514,18 @@ const {
         if (rec.state !== 'INSTALLED') {
           ui.setProgress({ state: 'FAILED', receivedBytes: 0, totalBytes: entry.size,
                            ratio: null, message: rec.lastError ?? '不明なエラー' });
+          return;
+        }
+        if (isUpdate) {
+          // 現在 session では絶対に差し替えない。overlay を閉じて終わる。
+          host.remove();
+          console.log('[AvatarInstall] 更新準備完了。次回起動から適用します',
+                      this.installAvatarId, entry.version);
+          renderUpdateNotice(this.containerEl, {
+            label: '更新準備が完了しました。次回起動から適用します',
+            sizeBytes: 0,
+            onUpdate: () => {}, onDismiss: () => {},
+          });
           return;
         }
         host.querySelector('.avatar-install-card')?.remove();
@@ -469,7 +554,8 @@ const {
             const host = document.createElement('div');
             host.className = 'avatar-install-overlay';
             this.containerEl.appendChild(host);
-            void this._runInstall(host, entry);
+            // 現在 session の v3 は触らない。pendingVersion を用意するだけ。
+            void this._runInstall(host, entry, true);
           },
         });
       } catch (e) {
@@ -478,6 +564,8 @@ const {
     }
 
     private _showFallback(): void {
+      // 3D を諦めるので blob URL を保持し続けない。
+      this._revokeObjectUrl();
       this.useFallback = true;
       this.containerEl.style.display = 'none';
       this.loadingEl.classList.add('hidden');
