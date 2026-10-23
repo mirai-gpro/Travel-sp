@@ -141,7 +141,10 @@ const {
   import {
     mountPoster, renderInstallPrompt, renderRecoveryPrompt,
     renderHomeScreenGuide, renderUpdateNotice, renderUpdateReadyNotice,
+    renderReloadRequiredPrompt,
   } from '../scripts/avatar-install/install-ui';
+  import { waitForServiceWorkerControl }
+    from '../scripts/avatar-install/sw-control';
   import { ObjectUrlOwner } from '../scripts/avatar-install/avatar-cache';
   import { markPendingReload, clearPendingReload, defaultGuardStore }
     from '../scripts/avatar-install/pending-reload-guard';
@@ -389,8 +392,9 @@ const {
             // remote avatar-config.json の取得を Poster のために待たない。
             this._mountPoster(local.posterUrl ?? null);
             console.log('[AvatarInstall] LOCAL_READY', selectedId, local.version,
-                        local.isPending ? '(pending)' : '(active)');
-            return { url: this._ownObjectUrl(local.objectUrl),
+                        local.isPending ? '(pending)' : '(active)', local.launchUrl);
+            if (!(await this._ensureLocalDelivery())) return null;
+            return { url: local.launchUrl,
                      version: local.version, isPending: local.isPending };
           }
         } catch (e) {
@@ -421,7 +425,8 @@ const {
 
       const resolution = await this.installManager.resolveAvatarAsset(avatar as any);
       if (resolution.kind === 'LOCAL_READY') {
-        return { url: this._ownObjectUrl(resolution.objectUrl),
+        if (!(await this._ensureLocalDelivery())) return null;
+        return { url: resolution.launchUrl,
                  version: resolution.version, isPending: resolution.isPending };
       }
       if (resolution.kind === 'LEGACY_REMOTE') {
@@ -463,6 +468,27 @@ const {
         onStart: () => void this._runInstall(host, entry, false),
       });
       return null;
+    }
+
+    /**
+     * local package を renderer へ渡せる状態かを確かめる。
+     *
+     * 実体は cache-only の SW route (`/avatar/local/`) 経由で渡すので、page が
+     * SW に制御されている必要がある。初回訪問直後は制御が付くまで少し待つ。
+     * 待っても付かないときは **自動 reload せず**、再読み込みを案内する
+     * (データは端末に保存済みなので再 download は発生しない)。
+     */
+    private async _ensureLocalDelivery(): Promise<boolean> {
+      if (await waitForServiceWorkerControl()) return true;
+      console.warn('[AvatarInstall] Service Worker の制御が無いため'
+                   + ' local package を渡せません。再読み込みを案内します');
+      const host = (this.poster as any)?.root as HTMLElement | undefined;
+      if (host) {
+        renderReloadRequiredPrompt(host, { onReload: () => location.reload() });
+      } else {
+        this._showFallback();
+      }
+      return false;
     }
 
     /** 選択中の avatarId。remote config を読まずに localStorage だけで決める。 */

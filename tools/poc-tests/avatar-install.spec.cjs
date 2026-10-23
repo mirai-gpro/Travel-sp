@@ -88,7 +88,6 @@ function makeDeps(opts = {}) {
             sha256: async (buf) => sha256hex(buf),
             manifestLoader: opts.manifestLoader
                 ?? (async () => ({ schemaVersion: 1, avatars: opts.manifestAvatars ?? [] })),
-            toUrl: async (res) => 'blob:fake/' + (res.__key ?? 'x'),
             storage: {
                 query: async () => ({
                     supported: true, usage: 0, quota: 1e10, available: 1e10,
@@ -149,7 +148,7 @@ function makeDeps(opts = {}) {
             manifestLoader: async () => { throw new Error('manifest を待ってはいけない'); } });
         const r = await h2.manager.resolveAvatarAsset(FULL133);
         ok(r.kind === 'LOCAL_READY' && r.version === 'v3'
-            && String(r.objectUrl).startsWith('blob:'),
+            && r.launchUrl === '/avatar/local/uika-full133-skin/v3.zip',
            '★ 4. Registry INSTALLED + Cache HIT で LOCAL_READY (manifest を待たない)', r.kind);
         ok(h2.fetchCalls.length === 0, '★ 通常起動では asset を 1 度も fetch しない',
            'fetch=' + h2.fetchCalls.length);
@@ -240,7 +239,7 @@ function makeDeps(opts = {}) {
     {
         const { cacheKeyFor } = require('./.avatar-cache.cjs');
         const k = cacheKeyFor(FULL133.id, 'v3');
-        ok(k.startsWith('/__avatar-package__/'),
+        ok(k.startsWith('/avatar/local/'),
            '★ cache key が origin root からの絶対 pathname', k);
         const atRoot = new URL(k, 'https://example.test/').href;
         const atConcierge = new URL(k, 'https://example.test/concierge').href;
@@ -441,7 +440,7 @@ function makeDeps(opts = {}) {
         rec = await h.manager.getRecord(FULL133.id);
         ok(rec.activeVersion === 'v3' && !rec.pendingVersion,
            '★ 3. pending v4 の load 失敗で pending を破棄し active=v3 を維持');
-        ok(!h.cache.map.has('/__avatar-package__/uika-full133-skin/v4'),
+        ok(!h.cache.map.has('/avatar/local/uika-full133-skin/v4.zip'),
            '★ 3. 失敗した v4 の cache 実体を破棄する');
         const after = await h.manager.resolveInstalled(FULL133.id);
         ok(after.kind === 'LOCAL_READY' && after.version === 'v3' && after.isPending === false,
@@ -563,6 +562,153 @@ function makeDeps(opts = {}) {
         ok(/24\.3MB/.test(html2),
            '★ 5. download 案内 UI 自体は従来どおり実サイズを出す', html2.match(/約[\d.]+MB/)?.[0]);
         delete global.document;
+    }
+
+    // ================= 受け渡し契約 (cache-only SW route) =================
+
+    // ---- G. 起動 URL が renderer の必須チェックを通る ----
+    {
+        const { localPackageUrl, cacheKeyFor, LOCAL_PACKAGE_PATH_PREFIX }
+            = require('./.avatar-cache.cjs');
+        // renderer 実コードの検査式 (gaussian-splat-renderer-for-lam):
+        //   const { pathname } = urlParse(assetPath);
+        //   const matches = pathname.match(/\/([^/]+?)\.zip/);
+        //   if (!matches[1]) throw new Error('character model is not found');
+        const RENDERER_RE = /\/([^/]+?)\.zip/;
+        const url = localPackageUrl(FULL133.id, '2026.10.23.1');
+        const m = url.match(RENDERER_RE);
+        ok(!!m && m[1] === '2026.10.23.1',
+           '★ A. 起動 URL が renderer の /<name>.zip 検査を通る', url);
+        ok(url === cacheKeyFor(FULL133.id, '2026.10.23.1'),
+           '★ A. 起動 URL と cache key が同一文字列 (SW は path を解釈しない)');
+        ok(url.startsWith(LOCAL_PACKAGE_PATH_PREFIX) && url.startsWith('/'),
+           '★ A. SW route prefix 配下の絶対 path');
+        ok(!'blob:https://h/3f2b8c10-1d4e-4a7b-9f33-9a1c2d3e4f55'.match(RENDERER_RE),
+           '★ A. (回帰) blob URL は renderer 検査を通らない');
+        const manifestUrl = require('fs').readFileSync(
+            require('path').join(__dirname, '../../public/avatar/avatars-manifest.json'),
+            'utf8');
+        ok(!JSON.parse(manifestUrl).avatars.some((a) => a.assetUrl === url),
+           '★ A. 起動 path はサーバー実体 (manifest assetUrl) と別 (暗黙 download を作らない)');
+    }
+
+    // ---- H. SW script と avatar-cache.ts の定数が一致する ----
+    {
+        const fs = require('fs'), path = require('path');
+        const sw = fs.readFileSync(
+            path.join(__dirname, '../../public/sw-avatar-local.js'), 'utf8');
+        const ts = fs.readFileSync(
+            path.join(__dirname, '../../src/scripts/avatar-install/avatar-cache.ts'), 'utf8');
+        const swPrefix = sw.match(/PREFIX\s*=\s*'([^']+)'/);
+        const swCache = sw.match(/CACHE_NAME\s*=\s*'([^']+)'/);
+        const tsPrefix = ts.match(/LOCAL_PACKAGE_PATH_PREFIX\s*=\s*'([^']+)'/);
+        const tsCache = ts.match(/AVATAR_CACHE_NAME\s*=\s*'([^']+)'/);
+        ok(!!swPrefix && !!tsPrefix && swPrefix[1] === tsPrefix[1],
+           '★ A. SW の PREFIX が LOCAL_PACKAGE_PATH_PREFIX と一致',
+           `${swPrefix && swPrefix[1]} / ${tsPrefix && tsPrefix[1]}`);
+        ok(!!swCache && !!tsCache && swCache[1] === tsCache[1],
+           '★ A. SW の CACHE_NAME が AVATAR_CACHE_NAME と一致',
+           `${swCache && swCache[1]} / ${tsCache && tsCache[1]}`);
+        ok(!/fetch\s*\(/.test(sw.replace(/addEventListener\('fetch'/g, '')),
+           '★ A. SW script は network fetch を 1 箇所も持たない');
+
+        // 生成 SW へ importScripts されているか (build 設定側)
+        const cfg = fs.readFileSync(
+            path.join(__dirname, '../../astro.config.mjs'), 'utf8');
+        ok(/importScripts:\s*\['\/sw-avatar-local\.js'\]/.test(cfg),
+           '★ A. astro.config.mjs が SW script を importScripts する');
+        ok(/globIgnores:[^\]]*sw-avatar-local\.js/.test(cfg),
+           '★ A. SW script 自身は precache しない');
+    }
+
+    // ---- I. SW handler の挙動 (hit / miss / 無関係 path) ----
+    {
+        const fs = require('fs'), path = require('path');
+        const src = fs.readFileSync(
+            path.join(__dirname, '../../public/sw-avatar-local.js'), 'utf8');
+        const KEY = '/avatar/local/uika-full133-skin/v3.zip';
+        const cached = { __key: KEY, body: 'ZIPBYTES' };
+        const makeSelf = () => {
+            const listeners = [];
+            return {
+                listeners,
+                addEventListener: (t, cb) => { if (t === 'fetch') listeners.push(cb); },
+                caches: {
+                    open: async () => ({
+                        match: async (k) => (k === KEY ? cached : undefined),
+                    }),
+                },
+            };
+        };
+        const run = async (self, url, method = 'GET') => {
+            let responded = null;
+            const event = {
+                request: { url, method },
+                respondWith: (p) => { responded = p; },
+            };
+            self.listeners.forEach((cb) => cb(event));
+            return responded === null ? 'NOT_INTERCEPTED' : await responded;
+        };
+        const self1 = makeSelf();
+        new Function('self', src)(self1);
+        ok(self1.listeners.length === 1, '★ A. SW script は fetch listener を 1 本だけ足す');
+
+        const hit = await run(self1, 'https://h.test' + KEY);
+        ok(hit === cached, '★ A. cache HIT では保存済み Response を返す');
+
+        const miss = await run(self1, 'https://h.test/avatar/local/uika-full133-skin/v9.zip');
+        ok(miss && miss.status === 504,
+           '★ A. cache MISS では network へ出ず 504 を返す (25MB を暗黙 download しない)',
+           miss && String(miss.status));
+
+        const other = await run(self1, 'https://h.test/avatar/uika-full133-skin.zip');
+        ok(other === 'NOT_INTERCEPTED',
+           '★ A. prefix 外 (サーバー実体の URL) には干渉しない', String(other));
+        const nav = await run(self1, 'https://h.test/concierge');
+        ok(nav === 'NOT_INTERCEPTED', '★ A. 通常 navigation には干渉しない');
+        const post = await run(self1, 'https://h.test' + KEY, 'POST');
+        ok(post === 'NOT_INTERCEPTED', '★ A. GET 以外には干渉しない');
+    }
+
+    // ---- J. SW 制御が無いときは renderer へ渡さない ----
+    {
+        const { waitForServiceWorkerControl } = require('./.sw-control.cjs');
+        const immediate = (cb) => cb();
+        ok(await waitForServiceWorkerControl(
+            { isControlled: () => true, ready: async () => {}, onControllerChange: () => () => {} },
+            10, immediate) === true,
+           '★ A. 既に制御されていれば待たずに true');
+
+        let controlled = false;
+        let fire = () => {};
+        const deps = {
+            isControlled: () => controlled,
+            ready: async () => { controlled = false; },
+            onControllerChange: (cb) => { fire = cb; return () => { fire = () => {}; }; },
+        };
+        const p = waitForServiceWorkerControl(deps, 1000, (cb, ms) => setTimeout(cb, ms));
+        setTimeout(() => { controlled = true; fire(); }, 5);
+        ok(await p === true, '★ A. controllerchange で制御が付けば true');
+
+        ok(await waitForServiceWorkerControl(
+            { isControlled: () => false, ready: async () => {},
+              onControllerChange: () => () => {} }, 10, immediate) === false,
+           '★ A. 制御が付かなければ false (自動 reload しない)');
+        ok(await waitForServiceWorkerControl(null, 10, immediate) === false,
+           '★ A. SW 非対応環境でも throw せず false');
+    }
+
+    // ---- K. LAMAvatar は制御が無い場合に renderer を起動しない ----
+    {
+        const src = require('fs').readFileSync(
+            require('path').join(__dirname, '../../src/components/LAMAvatar.astro'), 'utf8');
+        ok((src.match(/if \(!\(await this\._ensureLocalDelivery\(\)\)\) return null;/g) || [])
+            .length === 2,
+           '★ A. LOCAL_READY の 2 経路とも配送可否を確認してから renderer へ渡す');
+        ok(/renderReloadRequiredPrompt\(host, \{ onReload/.test(src),
+           '★ A. 制御が無いときは再読み込みを案内する (自動 reload しない)');
+        ok(!/_ownObjectUrl\((local|resolution)\./.test(src),
+           '★ A. 起動 URL を blob URL として所有しない');
     }
 
     console.log(failures === 0 ? '\n=== 全テスト PASS ===' : `\n=== ${failures} 件 FAIL ===`);
