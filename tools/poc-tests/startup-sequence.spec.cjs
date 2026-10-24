@@ -94,6 +94,52 @@ const concierge = read('src/scripts/chat/concierge-controller.ts');
        '★ 3. 固定 sleep ではなく rAF ポーリングで待つ');
 }
 
+// ---- 5. splash 解除のタイミング ----
+{
+    const hideAt = core.indexOf('void this._hideSplashWhenReady();');
+    const resetAt = core.indexOf('await this.resetAppContent();');
+    ok(hideAt > 0 && resetAt > 0 && hideAt < resetAt,
+       '★ 5. splash 解除を resetAppContent (= 挨拶 gate) より前に開始する',
+       `hide@${hideAt} < reset@${resetAt}`);
+    ok(!/await this\.resetAppContent\(\);[\s\S]{0,400}?setTimeout\([\s\S]{0,200}?splashOverlay/.test(core),
+       '★ 5. splash 解除タイマーを挨拶 gate の後ろに置かない (残留の原因)');
+    ok(/setTimeout\(\(\) => \{[\s\S]{0,200}?this\._hideSplash\(\);[\s\S]{0,40}?\}, 10000\);/.test(core),
+       '★ 5. 10 秒の安全網は残す (gate が解決しなくても splash を外す)');
+    const hideBody = core.slice(core.indexOf('private async _hideSplashWhenReady'),
+                                core.indexOf('private async _hideSplashWhenReady') + 1000);
+    ok(/await c\.waitUntilSettled\(\)/.test(hideBody),
+       '★ 5. splash は「確定」待ちで外す (案内カードを splash で隠さない)');
+    ok(!/waitUntilVisible/.test(
+        core.slice(core.indexOf('private async _hideSplashWhenReady'),
+                   core.indexOf('private async _hideSplashWhenReady') + 1000)),
+       '★ 5. splash 解除に「表示」待ちを使わない');
+    ok(/waitUntilSettled\(\): Promise<void>/.test(lam)
+        && /_markAvatarSettled\(\): void/.test(lam),
+       '★ 5. settled gate が LAMAvatar 側にある');
+    // 案内 UI を出して待つ経路すべてで settled にする
+    const settledCalls = (lam.match(/this\._markAvatarSettled\(\);/g) || []).length;
+    ok(settledCalls >= 6,
+       '★ 5. install / recovery / 案内 / reload の各待機経路で settled にする',
+       `calls=${settledCalls}`);
+    ok(/_markAvatarSettled\(\);\n      if \(this\.avatarVisibleResolved\)/.test(lam),
+       '★ 5. 表示完了時は settled も同時に満たす');
+}
+
+// ---- 6. 待機アニメを二重に出さない ----
+{
+    ok(/getElementById\('splashOverlay'\)/.test(lam)
+        && /private _showWaitingAnimation\(\): void/.test(lam),
+       '★ 6. splash が出ている間はアバター側の待機アニメを出さない');
+    const init = lam.slice(lam.indexOf('this.initializeStarted = true;'),
+                           lam.indexOf('this.initializeStarted = true;') + 200);
+    ok(/this\._showWaitingAnimation\(\);/.test(init),
+       '★ 6. initialize 開始時に待機アニメの表示を判定する');
+    const mount = lam.slice(lam.indexOf('private _mountPoster('),
+                            lam.indexOf('private _mountPoster(') + 600);
+    ok(/this\._showWaitingAnimation\(\);/.test(mount),
+       '★ 6. Poster 表示時も同じ判定を通す');
+}
+
 // ---- 4. アバター起動の並行化 ----
 for (const [name, src] of [['lesson', lesson], ['concierge', concierge]]) {
     const linkAt = src.indexOf('void this.linkLamAvatar();');
