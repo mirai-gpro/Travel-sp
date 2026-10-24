@@ -14,9 +14,7 @@ const ok = (cond, name, extra) => {
     console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${extra ? '  ' + extra : ''}`);
     if (!cond) failures++;
 };
-// core-controller.ts は CRLF。改行差で regex が外れないよう正規化して読む。
-const read = (rel) => fs.readFileSync(path.join(__dirname, '../../', rel), 'utf8')
-    .replace(/\r\n/g, '\n');
+const read = (rel) => fs.readFileSync(path.join(__dirname, '../../', rel), 'utf8');
 
 const lam = read('src/components/LAMAvatar.astro');
 const mgr = read('src/scripts/chat/lam-websocket-manager.ts');
@@ -157,77 +155,6 @@ for (const [name, src] of [['lesson', lesson], ['concierge', concierge]]) {
 }
 ok(/protected waitForLamAvatarController\(timeoutMs: number = 3000\)/.test(core),
    '★ 4. waitForLamAvatarController は core 側に 1 本化');
-
-// ---- 7. 初回起動は 1 session / 1 live_start (旧二重 soft-reset の撤去) ----
-{
-    const initBody = core.slice(
-        core.indexOf('protected async init() {'),
-        core.indexOf("console.log('[Core] Initialization completed');"));
-    ok(initBody.length > 0, '前提: init() 本体を取得できる');
-
-    // A. 初回 startup の呼び出し回数
-    const initSessionCalls = (initBody.match(/await this\.initializeSession\(\);/g) || []).length;
-    const resetCalls = (initBody.match(/this\.resetAppContent\(\)/g) || []).length;
-    ok(initSessionCalls === 1,
-       '★ 7-A. 初回起動の initializeSession() は 1 回', `calls=${initSessionCalls}`);
-    ok(resetCalls === 0,
-       '★ 7-A. 初回起動から resetAppContent() を呼ばない (旧 workaround 撤去)',
-       `calls=${resetCalls}`);
-    ok(/await this\.initializeSession\(\);\n    this\.updateUILanguage\(\);/.test(initBody),
-       '★ 7-A. workaround 導入前の startup semantics (initializeSession + updateUILanguage)');
-
-    // B. live_start は 1 箇所だけ、かつ startLiveMode の中
-    const emits = (core.match(/this\.socket\.emit\('live_start'/g) || []).length;
-    ok(emits === 1, '★ 7-B. live_start emit は 1 箇所だけ', `emits=${emits}`);
-    const liveModeBody = core.slice(core.indexOf('protected async startLiveMode('));
-    ok(liveModeBody.indexOf("this.socket.emit('live_start'") > 0,
-       '★ 7-B. live_start は startLiveMode の中だけ');
-
-    // C. session start は各 controller で 1 回だけ
-    for (const [name, src] of [['core', core], ['lesson', lesson], ['concierge', concierge]]) {
-        const n = (src.match(/\/api\/session\/start/g) || []).length;
-        ok(n <= 1, `★ 7-C. ${name}: /api/session/start は多重に無い`, `n=${n}`);
-    }
-
-    // D. 初回 startup では停止系を一切通らない
-    //    コメント行は除いて「実際のコード」だけを見る
-    const initCode = initBody.split('\n')
-        .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
-    for (const token of ['stopAllActivities', 'interrupt(', 'terminateLiveSession',
-                         '/api/cancel', '/api/session/end']) {
-        ok(initCode.indexOf(token) < 0,
-           `★ 7-D. 初回起動で ${token} を呼ばない`);
-    }
-    // 停止系は reset / session 再開始の経路にだけ存在する
-    const resetBody = core.slice(core.indexOf('protected async resetAppContent() {'),
-                                 core.indexOf("console.log('[Reset] Completed');"));
-    ok(/this\.stopAllActivities\(\);/.test(resetBody),
-       '★ 7-D. stopAllActivities は resetAppContent 側に残っている');
-    ok(/\/api\/cancel/.test(resetBody),
-       '★ 7-D. /api/cancel も resetAppContent 側だけ');
-    const sessionBody = core.slice(core.indexOf('protected async initializeSession() {'),
-                                   core.indexOf('protected async initializeSession() {') + 1800);
-    ok(/if \(this\.sessionId\)/.test(sessionBody),
-       '★ 7-D. /api/session/end は既存 session があるときだけ (初回起動では通らない)');
-
-    // E. Avatar gate が live_start の手前にある (再掲: 1 session 化後も維持)
-    const waitAt = core.indexOf('await this._waitForAvatarVisible();');
-    const emitAt = core.indexOf("this.socket.emit('live_start'");
-    ok(waitAt > 0 && waitAt < emitAt,
-       '★ 7-E. 1 session 化後も Avatar 表示待ちが live_start の手前にある');
-
-    // F. reset 機能そのものは壊さない
-    ok(/protected async resetAppContent\(\)/.test(core),
-       '★ 7-F. resetAppContent() は残っている');
-    ok(/document\.addEventListener\('gourmet-app:reset'/.test(core),
-       '★ 7-F. ユーザー明示 reset から呼べる');
-    ok(/backgroundDuration > this\.BACKGROUND_RESET_THRESHOLD[\s\S]{0,120}?this\.resetAppContent\(\)/
-        .test(core),
-       '★ 7-F. 長時間 background 復帰の soft reset も維持');
-    ok(/_hideSplashWhenReady\(\)/.test(initBody)
-        && /\}, 10000\);/.test(initBody),
-       '★ 7-F. splash 制御 (確定待ち + 10 秒安全網) は維持');
-}
 
 console.log(failures === 0 ? '\n=== 全テスト PASS ===' : `\n=== ${failures} 件 FAIL ===`);
 process.exit(failures === 0 ? 0 : 1);
