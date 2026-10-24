@@ -168,6 +168,24 @@ export class LAMWebSocketManager {
                 }
             );
 
+            // ===== splat の fade-in reveal を無効化する =====
+            // package 側は `addSplatScene(..., { progressiveLoad: true })` を
+            // 使っており、Viewer の `sceneRevealMode` は
+            // `options.sceneRevealMode || SceneRevealMode.Default` で Default。
+            // Default は「progressive load のシーンをゆっくり fade-in させる」
+            // 設定なので、splat が数秒かけて徐々に現れる。
+            // Instant では shaderFadeInComplete が常に 1 になり reveal しない。
+            // package 自身も再 build 経路で同じ代入をしている。
+            // 表示タイミングは LAMAvatar 側が finalBuild まで待って制御する。
+            try {
+                const viewer = (this.renderer as any)?.viewer;
+                if (viewer) {
+                    viewer.sceneRevealMode = GaussianSplats3D.SceneRevealMode.Instant;
+                }
+            } catch (e) {
+                console.warn('[LAMWebSocketManager] sceneRevealMode の設定に失敗:', e);
+            }
+
             if (uikaMode) {
                 // ===== UIKA Native 133K hidden PoC =====
                 // 通常の avatar-config camera / orbit-limits / 初期6° polar 補正は
@@ -763,6 +781,38 @@ export class LAMWebSocketManager {
      */
     isLoaded(): boolean {
         return this.isModelLoaded;
+    }
+
+    /**
+     * splat が **最後まで** build され終わったか。
+     *
+     * `isLoaded()` では足りない。package の `addSplatScene()` は
+     * `progressiveLoad: true` のとき `progressiveLoadFirstSectionBuildPromise`
+     * を返す = **最初の section が build された時点で resolve** するため、
+     * `getInstance()` が返った時点ではまだ splat が全部揃っていない。
+     * 最終 build だけが `splatMesh.finalBuild = true` にする。
+     */
+    isSplatLoadComplete(): boolean {
+        try {
+            const mesh = (this.renderer as any)?.viewer?.splatMesh;
+            if (!mesh) return false;
+            if (mesh.finalBuild !== true) return false;
+            const count = typeof mesh.getSplatCount === 'function'
+                ? mesh.getSplatCount() : 0;
+            return count > 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /** 【read-only】現在 build 済みの splat 数 (診断ログ用)。 */
+    getLoadedSplatCount(): number {
+        try {
+            const mesh = (this.renderer as any)?.viewer?.splatMesh;
+            return typeof mesh?.getSplatCount === 'function' ? mesh.getSplatCount() : 0;
+        } catch (e) {
+            return 0;
+        }
     }
 
     /**

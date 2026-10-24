@@ -14,8 +14,7 @@ const CSS = `
 .avatar-install-overlay{position:absolute;inset:0;display:flex;align-items:center;
  justify-content:center;z-index:30;background:#000;overflow:hidden}
 .avatar-install-poster{position:absolute;inset:0;width:100%;height:100%;
- object-fit:cover;opacity:1;transition:opacity .45s ease}
-.avatar-install-poster.is-hidden{opacity:0}
+ object-fit:cover}
 .avatar-install-poster-fallback{position:absolute;inset:0;
  background:linear-gradient(180deg,#dff3e4 0%,#bfe6cc 100%)}
 .avatar-install-card{position:relative;z-index:1;max-width:19rem;margin:0 1rem;
@@ -101,9 +100,9 @@ export function mountPoster(container: HTMLElement, opts: PosterOptions): Instal
     return {
         root,
         revealRenderer() {
-            root.style.transition = 'opacity .45s ease';
-            root.style.opacity = '0';
-            setTimeout(destroy, 480);
+            // フェードさせない。呼び出し側は splat が最後まで build された
+            // 後にだけ呼ぶので、ここで即座に overlay を外す。
+            destroy();
         },
         destroy,
     };

@@ -88,6 +88,9 @@ const {
 }
 
 .lam-loading {
+  /* アバターが完全に表示されるまで出し続ける待機アニメ。
+     install poster overlay (z-index 30) より前面に置く。 */
+  z-index: 31;
   position: absolute;
   top: 50%;
   left: 50%;
@@ -173,6 +176,13 @@ const {
     private retryInitialize: (() => void) | null = null;
     /** renderer へ渡した blob URL。所有権はこちらが持ち、作り直し / 破棄時に revoke する。 */
     private readonly objectUrls = new ObjectUrlOwner();
+    /** initialize() が一度でも始まったか (初期挨拶 gate が参照する)。 */
+    public initializeStarted: boolean = false;
+    /** アバターが表示されたら resolve する gate (初期挨拶を待たせる)。 */
+    private avatarVisibleResolve: () => void = () => {};
+    private avatarVisibleResolved: boolean = false;
+    private readonly avatarVisible: Promise<void> =
+      new Promise<void>((resolve) => { this.avatarVisibleResolve = resolve; });
 
     constructor() {
       this.lamManager = new LAMWebSocketManager();
@@ -188,6 +198,10 @@ const {
      */
     async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
       if (this.isInitialized) return;
+      // 初期挨拶 gate 側が「アバターが来るのか」を判断するための印。
+      // これが false のまま待つと挨拶が永久に始まらないので、
+      // gate は必ずこのフラグを見る。
+      this.initializeStarted = true;
       // install / recovery の完了後に同じ引数でやり直せるようにしておく。
       // やり直す前に前回の blob URL を必ず解放する (所有権はこちら側)。
       this.retryInitialize = () => {
@@ -301,12 +315,15 @@ const {
         }
 
         if (this.lamManager.isLoaded()) {
+          // splat が最後まで build されるまで待つ。それまでは待機アニメのまま。
+          await this._waitForSplatLoadComplete();
           this.loadingEl.classList.add('hidden');
-          // 3D の First Frame が出たので Poster をフェードアウトする (指示書 §17)。
+          // 完成した状態で overlay を一括で外す (フェードしない)。
           this.poster?.revealRenderer();
           this.poster = null;
           this.syncPlayer.start();
           this.isInitialized = true;
+          this._markAvatarVisible();
           void this._checkUpdateInBackground();
           console.log('[LAMAvatar] 3Dアバター初期化完了');
         } else {
@@ -316,6 +333,53 @@ const {
         console.error('[LAMAvatar] 初期化エラー:', error);
         this._showFallback();
       }
+    }
+
+    /**
+     * splat が最後まで build されるのを待つ。
+     *
+     * `lamManager.isLoaded()` では足りない。package の `addSplatScene()` は
+     * `progressiveLoad: true` のとき最初の section build で resolve するため、
+     * `getInstance()` が返った時点ではまだ splat が全部揃っていない。
+     * 判定の Source of Truth は `splatMesh.finalBuild` だけ。
+     * 新しい状態管理は作らず、固定時間 sleep も使わず rAF でポーリングする。
+     */
+    private async _waitForSplatLoadComplete(): Promise<void> {
+      if (this.lamManager.isSplatLoadComplete()) return;
+      console.log('[LAMAvatar] splat の最終 build を待機中'
+                  + ` (現在 ${this.lamManager.getLoadedSplatCount()} splats)`);
+      await new Promise<void>((resolve) => {
+        const tick = () => {
+          if (this.lamManager.isSplatLoadComplete()) {
+            // 完成した同じ描画フレーム内で表示に進ませない
+            requestAnimationFrame(() => resolve());
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+      console.log('[LAMAvatar] splat 最終 build 完了'
+                  + ` (${this.lamManager.getLoadedSplatCount()} splats)`);
+    }
+
+    /**
+     * アバターが表示されるまで初期挨拶を待たせるための gate。
+     *
+     * resolve する条件は 2 つだけ:
+     *   - 3D が最後まで build され、実際に表示された
+     *   - 3D を諦めて 2D フォールバックを表示した
+     * install / recovery / 再読み込み案内を出して待っている間は resolve しない
+     * (案内カードの上で挨拶を鳴らさない)。timeout では resolve しない。
+     */
+    waitUntilVisible(): Promise<void> {
+      return this.avatarVisible;
+    }
+
+    private _markAvatarVisible(): void {
+      if (this.avatarVisibleResolved) return;
+      this.avatarVisibleResolved = true;
+      this.avatarVisibleResolve();
     }
 
     /**
@@ -510,7 +574,7 @@ const {
       this.poster?.destroy();
       this.poster = mountPoster(this.containerEl,
                                 { posterUrl: posterUrl ?? undefined });
-      this.loadingEl.classList.add('hidden');
+      // 待機アニメはここで消さない。splat が最後まで build されるまで出し続ける。
     }
 
     /** blob URL の所有権を持つ。前のものがあれば revoke してから差し替える。 */
@@ -629,6 +693,8 @@ const {
       this.containerEl.style.display = 'none';
       this.loadingEl.classList.add('hidden');
       this.fallbackEl.classList.remove('hidden');
+      // 2D フォールバックも「表示された」状態なので gate を開ける。
+      this._markAvatarVisible();
       console.log('[LAMAvatar] フォールバック表示に切り替え');
     }
 
