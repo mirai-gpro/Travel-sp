@@ -319,6 +319,7 @@ class LiveAPISession:
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
+        self._greeting_pcm_buffer = bytearray()  # 初期あいさつ用PCM蓄積（A2E先行方式）
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -625,13 +626,16 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # 残存バッファを強制フラッシュ（最終チャンク）。
-                        # 初期あいさつも通常ターンと同じ扱いにする。
-                        # 初期あいさつ専用の一括 A2E (_send_a2e_ahead) は撤去した。
-                        # _send_a2e_ahead() 自体はショップ説明 / キャッシュ音声で
-                        # 引き続き使うため残している。
-                        await self._flush_a2e_buffer(force=True, is_final=True)
-                        await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
+                        # ★ 初期あいさつ: A2E先行方式で一括処理
+                        if self._is_initial_greeting_phase and self._greeting_pcm_buffer:
+                            greeting_pcm = bytes(self._greeting_pcm_buffer)
+                            self._greeting_pcm_buffer = bytearray()
+                            logger.info(f"[A2E] 初期あいさつA2E先行送信: {len(greeting_pcm)} bytes")
+                            await self._send_a2e_ahead(greeting_pcm)
+                        else:
+                            # 通常ターン: 残存バッファを強制フラッシュ（最終チャンク）
+                            await self._flush_a2e_buffer(force=True, is_final=True)
+                            await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
@@ -695,14 +699,11 @@ class LiveAPISession:
                                                        {'data': audio_b64},
                                                        room=self.client_sid)
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
-                                    # 初期あいさつも通常ターンと同じ streaming 経路を通す。
-                                    # 以前は初期あいさつだけ _greeting_pcm_buffer へ全量
-                                    # 貯めて turn_complete で一括 POST していた
-                                    # (be0d9ce5 / 7ff62a79 の旧 workaround)。その結果
-                                    # 初期あいさつでは expression が turn 終了まで 1 件も
-                                    # 出ず、クライアントの coordinated scheduler が音声を
-                                    # 保持し続けて挨拶が 20 秒以上遅れていた。
-                                    self._buffer_for_a2e(part.inline_data.data)
+                                    if self._is_initial_greeting_phase:
+                                        # 初期あいさつ: A2E先行方式用に別バッファに蓄積
+                                        self._greeting_pcm_buffer.extend(part.inline_data.data)
+                                    else:
+                                        self._buffer_for_a2e(part.inline_data.data)
 
     async def _handle_tool_call(self, tool_call, session):
         """
