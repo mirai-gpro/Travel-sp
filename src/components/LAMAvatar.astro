@@ -51,6 +51,11 @@ const {
 }
 
 /* ライブラリが生成するcanvasをコンテナ内に収める（:globalで動的要素に適用） */
+/* UIKA Native 133K hidden PoC のときだけ等倍表示にする */
+.lam-avatar-container.uika-133k :global(canvas) {
+  transform: none !important;
+}
+
 .lam-avatar-container :global(canvas) {
   width: 100% !important;
   height: 100% !important;
@@ -123,6 +128,8 @@ const {
   import { LAMWebSocketManager } from '../scripts/chat/lam-websocket-manager';
   import { AudioSyncPlayer } from '../scripts/chat/audio-sync-player';
   import type { LiveAudioManager, ExpressionFrame } from '../scripts/chat/live-audio-manager';
+  import { getUikaExprPath } from '../scripts/chat/uika-133k-mode';
+  import { isA2ETraceMode } from '../scripts/chat/a2e-replay';
 
   /**
    * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
@@ -166,11 +173,72 @@ const {
 
       // Gaussian Splat レンダラーを初期化（公式API: getInstance）
       const config = (window as any).__lamAvatarConfig || {};
+      // UIKA Native 133K hidden PoC: ?uika133k=1 のときだけ UIKA ZIP を使う。
+      // avatar-config には載せないので、通常利用者はこの ZIP を取得しない。
+      let uika133k = false;
+      try {
+        uika133k = new URLSearchParams(location.search).get('uika133k') === '1';
+      } catch (e) { /* noop */ }
+      if (uika133k) {
+        // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
+        // meta.json の camera ではない。UIKA mode では等倍にする。
+        this.containerEl.classList.add('uika-133k');
+        // ===== 診断用 A/B: expression frame の取得経路だけを切り替える =====
+        //   exprPath=provider (既定 / 現状維持):
+        //     renderer の getExpressionData() から
+        //     liveAudioManager.getCurrentExpressionFrame() を直接呼ぶ
+        //   exprPath=cache:
+        //     provider を設定せず、通常 LAM と同じ
+        //     AudioSyncPlayer rAF → updateExpression() → currentExpression 経路にする
+        // モデル / 描画条件 / A2E 値 / 口形補正は一切変えていない。
+        const exprPath = getUikaExprPath();
+        if (exprPath === 'provider') {
+          this.lamManager.setExpressionProvider(
+            () => liveAudioManager.getCurrentExpressionFrame()
+          );
+        } else {
+          this.lamManager.setExpressionProvider(null);
+        }
+        // 診断ログを有効化 (UIKA のときだけ。通常 LAM では設定しない)
+        this.lamManager.setExpressionTrace(
+          exprPath,
+          () => liveAudioManager.getExpressionSyncDebugState()
+        );
+        console.log(
+          `[TRACE] UIKA exprPath=${exprPath}`
+          + (exprPath === 'provider'
+              ? ' (renderer 直接取得 = 現状維持)'
+              : ' (AudioSyncPlayer cache = 通常 LAM と同じ timeline)')
+        );
+      } else if (isA2ETraceMode()) {
+        // ===== 診断専用 (?a2eTrace=1) =====
+        // 通常 avatar 経路 (avatar-config 経由の B80 / FULL133 など) のまま
+        // setExpressionTrace() だけを有効にする。
+        //   - uika133k mode には入れない (ZIP / camera / localStorage を触らない)
+        //   - setExpressionProvider() は呼ばない
+        //     => _getExpressionData() は従来どおり currentExpression cache を読む
+        // つまり本番の cache path の挙動は変えず、trace だけが増える。
+        this.lamManager.setExpressionTrace(
+          'cache',
+          () => liveAudioManager.getExpressionSyncDebugState()
+        );
+        console.log(
+          '[TRACE] a2eTrace=1 (通常 avatar 経路のまま trace のみ有効 / cache path は本番と同一)'
+        );
+      }
       try {
         await this.lamManager.initialize({
           containerElement: this.containerEl,
-          modelUrl: config.modelUrl || '/avatar/meruru.zip',
+          modelUrl: uika133k
+            ? '/avatar/uika-gakki-133k.zip'
+            : (config.modelUrl || '/avatar/meruru.zip'),
         });
+
+        // UIKA 133K のときだけ、renderer と初期 morph warm-up の完了を待つ。
+        // 通常 LAM はこの wait を通らない。
+        if (uika133k && this.lamManager.isLoaded()) {
+          await this.waitForUikaReadyForLive();
+        }
 
         if (this.lamManager.isLoaded()) {
           this.loadingEl.classList.add('hidden');
@@ -184,6 +252,47 @@ const {
         console.error('[LAMAvatar] 初期化エラー:', error);
         this._showFallback();
       }
+    }
+
+    /**
+     * UIKA 133K の実 READY を待つ (UIKA mode 専用)。
+     *
+     * READY 判定の Source of Truth は `window.__uikaStatus` だけ。
+     * 新しい状態管理は作らない。固定時間 sleep も使わず rAF でポーリングする。
+     *
+     *   必須: ready === true / splatCount === 133541 / bsCount === 51
+     *   morphFast === true のときは morphFastFrames > 0 まで待つ
+     *     (初回 full runMorphUpdate → skin/texture/centers 初期化 →
+     *      fast path へ実際に移行したことの証明)
+     *   morphFast === false (?morphFast=off の診断モード) は上記必須条件まで
+     */
+    private async waitForUikaReadyForLive(): Promise<void> {
+      console.log('[UIKA INIT] waiting for renderer warm-up');
+      const isReady = () => {
+        const st = (window as any).__uikaStatus;
+        if (!st) return null;
+        if (st.ready !== true) return null;
+        if (st.splatCount !== 133541) return null;
+        if (st.bsCount !== 51) return null;
+        if (st.morphFast === true && !(st.morphFastFrames > 0)) return null;
+        return st;
+      };
+      const st = await new Promise<any>((resolve) => {
+        const tick = () => {
+          const s = isReady();
+          if (s) {
+            // READY になった同じ描画フレーム内で Live 開始まで進ませない
+            requestAnimationFrame(() => resolve(s));
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+      console.log(
+        `[UIKA INIT] READY splatCount=${st.splatCount} bsCount=${st.bsCount} `
+        + `fullRuns=${st.morphFullRuns} fastFrames=${st.morphFastFrames}`
+      );
     }
 
     /**

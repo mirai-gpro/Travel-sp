@@ -1,0 +1,144 @@
+---
+// UIKA Native Runtime Architecture Correction v1.1 — Gate 3B.
+// Project-owned Gaussian renderer. Completely isolated from LAMAvatar /
+// LAMWebSocketManager / LiveAudioManager / GaussianSplatRenderer.
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UIKA Native v1 — Gate 3B</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #111;
+      color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    #viewer {
+      width: min(720px, calc(100vw - 32px));
+      aspect-ratio: 1 / 1;
+      position: relative;
+      overflow: hidden;
+      background: #000;
+      border: 1px solid #444;
+    }
+    #viewer :global(canvas) {
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+    }
+    #controls {
+      width: min(720px, calc(100vw - 32px));
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 8px 10px;
+      border: 1px solid #555;
+      background: #222;
+      color: #eee;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #status {
+      width: min(720px, calc(100vw - 32px));
+      min-height: 180px;
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      padding: 12px;
+      border: 1px solid #444;
+      background: #181818;
+    }
+  </style>
+</head>
+<body>
+  <h1>UIKA Native v1 — Gate 3B project-owned renderer</h1>
+  <div id="viewer"></div>
+  <div id="controls">
+    <button data-neutral disabled>neutral</button>
+    <button data-morph="jawOpen" disabled>jawOpen 1.0</button>
+    <button data-morph="mouthSmileLeft" disabled>smile L 1.0</button>
+    <button data-morph="mouthSmileRight" disabled>smile R 1.0</button>
+    <button data-morph="eyeBlinkLeft" disabled>blink L 1.0</button>
+    <button data-morph="eyeBlinkRight" disabled>blink R 1.0</button>
+  </div>
+  <pre id="status">initializing...</pre>
+
+  <script>
+    import { UikaNativeRuntime } from '../scripts/chat/uika-native/uika-native-runtime';
+
+    const container = document.getElementById('viewer');
+    const statusEl = document.getElementById('status');
+    if (!(container instanceof HTMLElement) || !(statusEl instanceof HTMLElement)) {
+      throw new Error('UIKA Native Gate 3B: page elements missing');
+    }
+
+    const runtime = new UikaNativeRuntime(container);
+    (window as any).__uikaNativeV1 = runtime;
+
+    const renderStatus = () => {
+      statusEl.textContent = JSON.stringify({
+        runtime: runtime.report,
+        asset: (() => {
+          const a = runtime.getAsset();
+          if (!a) return null;
+          return {
+            sourceUrl: a.sourceUrl,
+            sourceByteLength: a.sourceByteLength,
+            sourceSha256: a.sourceSha256,
+            gaussianCount: a.gaussianCount,
+            canonicalBounds: a.canonicalBounds,
+            basisCount: a.basis.names.length,
+            ignoredCompatibilityEntries: a.ignoredCompatibilityEntries,
+          };
+        })(),
+      }, null, 2);
+    };
+
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('#controls button'));
+    const syncControls = () => {
+      for (const button of buttons) button.disabled = !runtime.report.ready;
+    };
+    for (const button of buttons) {
+      const morph = button.dataset.morph;
+      button.addEventListener('click', () => {
+        try {
+          if (morph) runtime.setSingleBasis(morph, 1.0);
+          else runtime.setNeutral();
+        } catch (error) {
+          console.error('[UIKA NATIVE V1 GATE2-GPU]', error);
+        }
+        renderStatus();
+      });
+    }
+
+    renderStatus();
+    const timer = window.setInterval(() => { renderStatus(); syncControls(); }, 250);
+
+    runtime.initializeNeutral()
+      .then(renderStatus)
+      .catch((error) => {
+        renderStatus();
+        console.error('[UIKA NATIVE V1 PAGE]', error);
+      });
+
+    window.addEventListener('beforeunload', () => {
+      window.clearInterval(timer);
+      runtime.dispose();
+    }, { once: true });
+  </script>
+</body>
+</html>

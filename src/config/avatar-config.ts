@@ -6,16 +6,36 @@ export interface CameraParams {
   posY: number;
   posZ: number;
   targetY: number;
+  /** 横位置の平行移動 (pan)。camera.position.x と controls.target.x を同量ずらすので
+   *  見る角度は変わらず、画面内で左右にスライドするだけ。
+   *  + で被写体が画面左へ、- で右へ。未指定なら 0 (従来どおり)。 */
+  offsetX?: number;
 }
 
 export interface AvatarDef {
   id: string;
   name: string;       // メニュー表示名
+  teacherName?: string; // AI講師の呼び名（プロンプト内の{teacher_name}に使用）
   modelUrl: string;   // public/avatar/ 配下のzipパス
   thumbnail?: string; // サムネイル画像パス（なければファイル名表示）
   voiceModel: string; // REST TTS用音声モデル名（例: ja-JP-Chirp3-HD-Leda）
   liveVoice?: string; // LiveAPI用音声名（例: Leda）
   camera?: CameraParams; // カメラパラメータ
+  /** splat sort policy の既定値 (PoC)。
+   *  未指定 = 出荷版 ('stock')。`?sortPolicy=` で上書きできる。
+   *  `src/scripts/chat/poc/adaptive-sort.ts` が読む。 */
+  sortPolicy?: 'stock' | 'adaptive-gpu' | 'adaptive-cpu';
+  /** morph path の既定値。未指定 = 出荷版 ('stock')。
+   *  'steady-state' は FULL133 専用の毎フレーム経路 (centers 再構築をしない)。
+   *  `?morphPath=` で上書きできる。
+   *  `src/scripts/chat/full133-runtime.ts` が読む。 */
+  morphPath?: 'stock' | 'steady-state';
+  /** splat skinning モードの既定値。未指定 = 出荷版 ('head' = head ボーン 1 本)。
+   *  'aligned' は splatIndex 基準の 4 influence LBS。`?skinMode=` で上書きできる。
+   *  `src/scripts/chat/poc/multibone-skinning.ts` が読む。 */
+  skinMode?: 'head' | 'multi' | 'aligned';
+  /** @deprecated `morphPath` を使う。旧 PoC フラグの互換のためだけに読む。 */
+  morphFast?: boolean;
 }
 
 /** デフォルトのアバター一覧（JSONロード失敗時のフォールバック） */
@@ -62,8 +82,20 @@ export function setSelectedAvatar(mode: string, avatar: AvatarDef): void {
   localStorage.setItem(`selectedAvatarUrl_${mode}`, avatar.modelUrl);
   localStorage.setItem(`selectedVoiceModel_${mode}`, avatar.voiceModel);
   localStorage.setItem(`selectedLiveVoice_${mode}`, avatar.liveVoice || '');
+  localStorage.setItem(`selectedTeacherName_${mode}`, avatar.teacherName || '');
   if (avatar.camera) {
     localStorage.setItem(`selectedCamera_${mode}`, JSON.stringify(avatar.camera));
+  }
+}
+
+/** 新規ユーザー時: モードのデフォルトアバターのlocalStorageを初期化 */
+export async function ensureDefaultAvatarInStorage(mode: string): Promise<void> {
+  if (localStorage.getItem(`selectedCamera_${mode}`)) return; // 既に設定済み
+  const avatars = await loadAvatarConfig();
+  const defaultId = MODE_DEFAULT_AVATAR[mode] || 'meruru';
+  const avatar = getAvatarById(avatars, defaultId);
+  if (avatar) {
+    setSelectedAvatar(mode, avatar);
   }
 }
 

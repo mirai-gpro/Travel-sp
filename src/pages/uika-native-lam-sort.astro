@@ -1,0 +1,521 @@
+---
+// UIKA Native Runtime v1.1 — LAM reference runtime sort PoC.
+//
+// Correctness first (§8): every real-A2E fixture frame is rendered twice — once with the
+// existing exact animated-centre sort, once with the LAM-reference canonical-centre
+// Worker/WASM sort — and the two framebuffers are compared. Only then is anything
+// measured (§10).
+//
+// Isolated PoC route. No Live, no Socket.IO, no AudioContext, no LAMAvatar,
+// no LAMWebSocketManager, no LiveAudioManager, no GaussianSplatRenderer.
+// /uika-native-replay, /uika-native-benchmark, /uika-native-draw-isolation and
+// /uika-native-predeform-benchmark are untouched.
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UIKA Native v1 — LAM reference sort PoC</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: #111; color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    .col { width: min(880px, calc(100vw - 32px)); }
+    #viewer {
+      width: min(880px, calc(100vw - 32px)); aspect-ratio: 1 / 1; position: relative;
+      overflow: hidden; background: #000; border: 1px solid #444;
+    }
+    #viewer :global(canvas) { width: 100% !important; height: 100% !important; display: block; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { padding: 10px 14px; border: 1px solid #555; background: #222; color: #eee; cursor: pointer; font: inherit; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.primary { background: #1d4ed8; border-color: #2563eb; }
+    #live {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px;
+      padding: 12px; border: 1px solid #444; background: #181818;
+    }
+    #live div { display: flex; flex-direction: column; gap: 2px; }
+    #live .k { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    #live .v { font-size: 15px; }
+    .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; }
+    pre {
+      margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px;
+      border: 1px solid #444; background: #181818; max-height: 50vh; overflow-y: auto;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 10px; }
+    th, td { border: 1px solid #333; padding: 4px 6px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: #888; font-weight: normal; }
+    .note { color: #999; font-size: 12px; line-height: 1.6; }
+    .captures { display: flex; flex-direction: column; gap: 14px; }
+    .capture h3 { margin: 0 0 6px; font-size: 13px; font-weight: normal; color: #bbb; }
+    .capture .imgs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .capture figure { margin: 0; }
+    .capture figcaption { font-size: 11px; color: #888; padding-top: 2px; }
+    .capture img { width: 100%; display: block; background: #000; border: 1px solid #333; image-rendering: pixelated; }
+    #tiles { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; width: 240px; }
+    #tiles span { aspect-ratio: 1/1; background: #222; font-size: 9px; display: flex;
+                  align-items: center; justify-content: center; color: #ddd; }
+  </style>
+</head>
+<body>
+  <h1>UIKA Native v1 — LAM reference sort PoC</h1>
+  <div id="viewer"></div>
+
+  <div class="col row">
+    <button id="run" class="primary" disabled>Run LAM Sort PoC</button>
+    <button id="correctness" disabled>Correctness Only</button>
+    <button id="performance" disabled>Performance Only</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="export" disabled>Export JSON</button>
+    <button id="copy" disabled>Copy Results</button>
+  </div>
+
+  <div class="col" id="live"></div>
+  <div class="col" id="tables"></div>
+  <div class="col captures" id="captures"></div>
+
+  <p class="col note">
+    Keep this tab visible and in the foreground for the whole run, and keep DevTools
+    closed. The sort worker and its four WebAssembly payloads are vendored verbatim from
+    <code>gaussian-splat-renderer-for-lam@0.0.9-alpha.1</code>; no sort algorithm is
+    written by this project. The worker sorts by the <strong>canonical</strong> Gaussian
+    centres while the draw keeps placing each Gaussian at
+    <code>canonical + D_UIKA × weights</code>, so the two orders genuinely differ — the
+    comparison below is therefore an alpha-compositing comparison, not a rounding one, and
+    the Gate 4B-2A tolerances do not apply. There is no cadence gate, no timer and no
+    deadline: the only back-pressure is one sort in flight at a time. The visual dimension
+    has no automatic verdict; inspect the captures for mouth interior, lips, teeth, nose,
+    eyes and face silhouette yourself.
+    Four runs, round-robin: <strong>A</strong> no sort · <strong>B</strong> animated-centre
+    GPU distance + readback, main-thread counting sort · <strong>D</strong> the same keys
+    handed to the LAM worker with <code>usePrecomputedDistances = true</code> ·
+    <strong>C</strong> canonical centres, keys computed inside the worker, no readback.
+    B→D isolates the Worker/WASM migration, D→C isolates the GPU→CPU distance/readback
+    cost, A→C is what the canonical worker sort still costs.
+    Query parameters: <code>?lamFrames=20,63,132</code>, <code>?lamRepeats=3</code>,
+    <code>?lamMeasureMs=8000</code>, <code>?lamCaptures=6</code>,
+    <code>?lamIntSort=1</code>, <code>?lamIdleTimeoutMs=30000</code>,
+    <code>?allowSoftware=1</code>.
+  </p>
+
+  <pre class="col" id="status">initializing…</pre>
+
+  <script>
+    import { UikaNativeRuntime } from '../scripts/chat/uika-native/uika-native-runtime';
+    import { UikaNativeReplay } from '../scripts/chat/uika-native/uika-native-replay';
+    import { collectGpuInfo } from '../scripts/chat/uika-native/uika-native-benchmark';
+    import { UikaLamSortPoC, lamSortOptionsFromUrl }
+      from '../scripts/chat/uika-native/uika-lam-sort-poc';
+
+    const container = document.getElementById('viewer');
+    const statusEl = document.getElementById('status');
+    const liveEl = document.getElementById('live');
+    const tablesEl = document.getElementById('tables');
+    const capturesEl = document.getElementById('captures');
+    if (!(container instanceof HTMLElement) || !(statusEl instanceof HTMLElement)
+        || !(liveEl instanceof HTMLElement) || !(tablesEl instanceof HTMLElement)
+        || !(capturesEl instanceof HTMLElement)) {
+      throw new Error('UIKA Native LAM sort PoC: page elements missing');
+    }
+
+    const btn = {
+      run: document.getElementById('run') as HTMLButtonElement,
+      correctness: document.getElementById('correctness') as HTMLButtonElement,
+      performance: document.getElementById('performance') as HTMLButtonElement,
+      stop: document.getElementById('stop') as HTMLButtonElement,
+      export: document.getElementById('export') as HTMLButtonElement,
+      copy: document.getElementById('copy') as HTMLButtonElement,
+    };
+
+    const runtime = new UikaNativeRuntime(container);
+    const replay = new UikaNativeReplay((w) => runtime.applyWeights(w));
+    const poc = new UikaLamSortPoC(runtime, replay);
+    (window as any).__uikaNativeV1 = runtime;
+    (window as any).__uikaNativeReplay = replay;
+    (window as any).__uikaLamSort = poc;
+
+    let lastError: string | null = null;
+    let ready = false;
+    let report: any = null;
+
+    const cell = (k: string, v: string, cls = '') =>
+      `<div><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
+    const num = (v: any, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—');
+    const sci = (v: any) => (typeof v === 'number' && Number.isFinite(v) ? v.toExponential(3) : '—');
+
+    const renderLive = () => {
+      const l: any = poc.getLive();
+      const v: any = runtime.getViewer();
+      const gpu = collectGpuInfo(v?.renderer?.domElement ?? null);
+      const r = runtime.report;
+      const safe = (fn: () => any) => { try { return fn(); } catch { return null; } };
+      const buffer = v?.getDrawingBufferInfo ? safe(() => v.getDrawingBufferInfo()) : null;
+      const s = report?.correctness?.summary;
+      const a = report?.performance?.analysis;
+      liveEl.innerHTML = [
+        cell('tab visible', document.visibilityState, document.visibilityState === 'visible' ? 'ok' : 'bad'),
+        cell('hardware GPU', gpu.isSoftware ? 'NO (software)' : (gpu.unmaskedAvailable ? 'YES' : 'UNKNOWN'),
+             gpu.isSoftware ? 'bad' : (gpu.unmaskedAvailable ? 'ok' : 'warn')),
+        cell('GPU', (gpu.renderer || '—').slice(0, 44)),
+        cell('step', poc.isRunning() ? `${l.step} · ${l.phase}` : (report ? 'finished' : 'idle'),
+             poc.isRunning() ? 'warn' : ''),
+        cell('drawing buffer', buffer ? `${buffer.drawingBufferWidth}×${buffer.drawingBufferHeight}` : '—'),
+        cell('pixelRatio', buffer ? num(buffer.rendererPixelRatio) : '—'),
+        cell('splats', String(r.viewerSplatCount ?? 0)),
+        cell('GL errors', String(r.glErrorCount), r.glErrorCount === 0 ? 'ok' : 'bad'),
+        cell('effective FPS', l.fps ? l.fps.toFixed(2) : '—'),
+        cell('exact p95', l.exactP95 ? `${l.exactP95.toFixed(2)} ms` : '—'),
+        cell('frames identical', s ? `${s.framesPixelIdentical} / ${s.framesCompared}` : '—'),
+        cell('worst diff pixels', s ? String(s.worstDifferentPixels.value) : '—'),
+        cell('worst byte delta', s ? String(s.worstMaxRgbaByteDelta.value) : '—'),
+        cell('structural', report?.correctness?.structural?.verdict ?? '—',
+             report?.correctness?.structural
+               ? (report.correctness.structural.verdict === 'PASS' ? 'ok' : 'bad') : ''),
+        cell('visual', report?.correctness?.visualVerdict ?? '—', 'warn'),
+        cell('B vs D', report?.correctness?.bVsD?.verdict ?? '—',
+             report?.correctness?.bVsD
+               ? (report.correctness.bVsD.verdict === 'IDENTICAL' ? 'ok'
+                  : (report.correctness.bVsD.verdict === 'NOT_RUN' ? '' : 'warn')) : ''),
+        cell('readback in C', a ? (a.readbackPathExercisedInC ? 'YES' : 'no') : '—',
+             a ? (a.readbackPathExercisedInC ? 'bad' : 'ok') : ''),
+        cell('readback in D', a ? (a.readbackPathExercisedInD ? 'yes' : 'NO') : '—',
+             a ? (a.readbackPathExercisedInD ? 'ok' : 'bad') : ''),
+        cell('C meets target', a ? (a.cMeetsTarget ? 'YES' : 'no') : '—',
+             a ? (a.cMeetsTarget ? 'ok' : 'bad') : ''),
+      ].join('');
+    };
+
+    const stage = (x: any) => (x ? `${num(x.p50)} / ${num(x.p95)}` : '—');
+
+    const renderTables = () => {
+      if (!report) { tablesEl.innerHTML = ''; capturesEl.innerHTML = ''; return; }
+      let html = '';
+
+      if (report.sortConfiguration) {
+        const c = report.sortConfiguration;
+        html += `<table>
+          <tr><th>sort configuration</th><th>value</th></tr>
+          <tr><td>source</td><td>${c.source}</td></tr>
+          <tr><td>integerBasedSort</td><td>${c.integerBasedSort}</td></tr>
+          <tr><td>enableSIMDInSort</td><td>${c.enableSIMDInSort}</td></tr>
+          <tr><td>distance map</td><td>1 &lt;&lt; ${c.splatSortDistanceMapPrecision} = ${c.distanceMapRange}</td></tr>
+          <tr><td>useSharedMemory</td><td>${c.useSharedMemory}</td></tr>
+          <tr><td>usePrecomputedDistances</td><td>${c.usePrecomputedDistances}</td></tr>
+        </table>`;
+      }
+
+      if (report.centres) {
+        const z = report.centres;
+        html += `<table>
+          <tr><th>canonical centres uploaded to the worker</th><th>value</th></tr>
+          <tr><td>splats</td><td>${z.splatCount}</td></tr>
+          <tr><td>array</td><td>${z.centreArrayType} (${z.centreBytes} bytes)</td></tr>
+          <tr><td>min xyz</td><td>${z.min.map((n: number) => n.toFixed(5)).join(', ')}</td></tr>
+          <tr><td>max xyz</td><td>${z.max.map((n: number) => n.toFixed(5)).join(', ')}</td></tr>
+          ${z.integerMin ? `<tr><td>integer min / max</td><td>${z.integerMin.join(', ')} / ${z.integerMax.join(', ')}</td></tr>` : ''}
+        </table>`;
+      }
+
+      if (report.orderProbe) {
+        const o = report.orderProbe;
+        html += `<table>
+          <tr><th>emitted order probe</th><th>first</th><th>last</th></tr>
+          <tr><td>splat index</td><td>${o.firstEmittedIndex}</td><td>${o.lastEmittedIndex}</td></tr>
+          <tr><td>clip-space z</td><td>${num(o.firstEmittedDepth, 5)}</td><td>${num(o.lastEmittedDepth, 5)}</td></tr>
+          <tr><td>farthest first</td><td colspan="2" class="${o.farthestFirst ? 'ok' : 'bad'}">${o.farthestFirst ? 'yes (back to front)' : 'NO'}</td></tr>
+        </table>`;
+      }
+
+      const s = report.correctness?.summary;
+      if (s) {
+        html += `<table>
+          <tr><th>correctness (exact sort vs LAM canonical sort)</th><th>value</th></tr>
+          <tr><td>frames compared</td><td>${s.framesCompared} / ${report.correctness.framesRequested}</td></tr>
+          <tr><td>pixel-identical frames</td><td>${s.framesPixelIdentical}</td></tr>
+          <tr><td>frames with a difference</td><td>${s.framesWithDifference}</td></tr>
+          <tr><td>worst different pixels</td><td>${s.worstDifferentPixels.value} (frame ${s.worstDifferentPixels.frame})</td></tr>
+          <tr><td>worst different pixel ratio</td><td>${sci(s.worstDifferentPixelRatio.value)} (frame ${s.worstDifferentPixelRatio.frame})</td></tr>
+          <tr><td>worst max RGBA byte delta</td><td>${s.worstMaxRgbaByteDelta.value} (frame ${s.worstMaxRgbaByteDelta.frame})</td></tr>
+          <tr><td>worst max alpha byte delta</td><td>${s.worstMaxAlphaByteDelta.value} (frame ${s.worstMaxAlphaByteDelta.frame})</td></tr>
+          <tr><td>frames with an alpha difference</td><td>${s.framesWithAlphaDifference}</td></tr>
+          <tr><td>mean different pixel ratio</td><td>${sci(s.meanDifferentPixelRatio)}</td></tr>
+        </table>`;
+        const t = s.tileDifferentPixelsTotal;
+        const peak = Math.max(1, ...t);
+        html += `<p class="note">Differing pixels by 8×8 tile, summed over every compared
+          frame, in top-down image space — tile (0,0) is the top-left of the captures below.
+          The harness localises the difference; it does not label face parts.</p>
+          <div id="tiles">${t.map((n: number) => {
+            const k = n / peak;
+            const bg = `rgba(248,113,113,${(k * 0.85).toFixed(3)})`;
+            return `<span style="background:${bg}" title="${n}">${n > 0 ? n : ''}</span>`;
+          }).join('')}</div>`;
+      }
+
+      const bd = report.correctness?.bVsD;
+      if (bd && bd.framesCompared > 0) {
+        html += `<table>
+          <tr><th>B vs D — same depth keys, two sorts</th><th>value</th></tr>
+          <tr><td>verdict</td>
+              <td class="${bd.verdict === 'IDENTICAL' ? 'ok' : 'warn'}">${bd.verdict}</td></tr>
+          <tr><td>frames compared</td><td>${bd.framesCompared}</td></tr>
+          <tr><td>frames with an identical index order</td>
+              <td>${bd.framesWithIdenticalIndexOrder} / ${bd.framesCompared}</td></tr>
+          <tr><td>pixel-identical frames</td>
+              <td>${bd.framesPixelIdentical} / ${bd.framesCompared}</td></tr>
+          <tr><td>key sequences identical in every frame</td>
+              <td class="${bd.allKeySequencesIdentical ? 'ok' : 'warn'}">${bd.allKeySequencesIdentical ? 'yes — only tie order differs' : 'NO'}</td></tr>
+          <tr><td>frames where both orders are monotonic in the key</td>
+              <td>${bd.framesWithBothOrdersMonotonic} / ${bd.framesCompared}</td></tr>
+          <tr><td>depth keys identical in every frame</td>
+              <td class="${bd.allDepthKeysIdentical ? 'ok' : 'bad'}">${bd.allDepthKeysIdentical ? 'yes' : 'NO'}</td></tr>
+          <tr><td>worst differing index positions</td>
+              <td>${bd.worstDifferingIndexPositions ? `${bd.worstDifferingIndexPositions.value} (frame ${bd.worstDifferingIndexPositions.frame})` : '—'}</td></tr>
+          <tr><td>worst different pixels</td>
+              <td>${bd.worstDifferentPixels ? `${bd.worstDifferentPixels.value} (frame ${bd.worstDifferentPixels.frame})` : '—'}</td></tr>
+          <tr><td>worst max RGBA byte delta</td>
+              <td>${bd.worstMaxRgbaByteDelta ? `${bd.worstMaxRgbaByteDelta.value} (frame ${bd.worstMaxRgbaByteDelta.frame})` : '—'}</td></tr>
+        </table>`;
+        html += `<table>
+          <tr><th>B vs D frame</th><th>index order identical</th><th>differing positions</th>
+              <th>first differing (pos: B→D)</th><th>same splat set</th>
+              <th>max |key B − key D|</th><th>key seq identical</th>
+              <th>monotonic B / D</th><th>worst inversion / key range, B / D</th>
+              <th>distinct keys</th>
+              <th>different px</th><th>max RGBA delta</th></tr>
+          ${bd.frames.map((f: any) => `<tr>
+            <td>${f.frame}</td>
+            <td class="${f.identicalIndexOrder ? 'ok' : 'warn'}">${f.identicalIndexOrder ? 'yes' : 'no'}</td>
+            <td>${f.differingIndexPositions} / ${f.indexPositionsCompared}</td>
+            <td>${f.firstDifferingIndexPosition === null ? '—' : `${f.firstDifferingIndexPosition}: ${f.firstDifferingPair.exact}→${f.firstDifferingPair.lam}`}</td>
+            <td class="${f.sameIndexMultiset ? 'ok' : 'bad'}">${f.sameIndexMultiset ? 'yes' : 'NO'}</td>
+            <td>${sci(f.maxDepthKeyAbsDifference)}</td>
+            <td class="${f.identicalKeySequence ? 'ok' : 'warn'}">${f.identicalKeySequence ? 'yes' : `no (pos ${f.firstDifferingKeyPosition}, max ${sci(f.maxKeySequenceAbsDifference)})`}</td>
+            <td class="${f.exactOrderMonotonic && f.lamOrderMonotonic ? 'ok' : 'warn'}">${f.exactOrderMonotonic ? 'yes' : sci(f.exactMaxInversion)} / ${f.lamOrderMonotonic ? 'yes' : sci(f.lamMaxInversion)}</td>
+            <td>${sci(f.exactMaxInversionRelative)} / ${sci(f.lamMaxInversionRelative)}</td>
+            <td>${f.distinctKeys} <span style="color:#888">of ${f.indexPositionsCompared}</span></td>
+            <td>${f.differentPixels}</td><td>${f.maxRgbaByteDelta}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
+      const st = report.correctness?.structural;
+      if (st) {
+        html += `<table>
+          <tr><th>structural check</th><th>detail</th><th>ok</th></tr>
+          ${st.checks.map((c: any) => `<tr><td>${c.name}</td><td>${c.detail}</td>
+            <td class="${c.ok ? 'ok' : 'bad'}">${c.ok ? 'yes' : 'NO'}</td></tr>`).join('')}
+        </table>`;
+      }
+
+      if ((report.performance?.samples || []).length > 0) {
+        html += `<table>
+          <tr><th>run</th><th>rep</th><th>FPS</th><th>frames (drain)</th><th>exact p50/p95 ms</th>
+              <th>GPU draw p50/p95</th><th>predeform p50/p95</th>
+              <th>worker sort p50/p95</th><th>index update p50/p95</th>
+              <th>distance stage p50/p95</th><th>GPU dist / readback</th><th>sort Hz</th>
+              <th>drains ok</th></tr>
+          ${report.performance.samples.map((x: any) => `<tr>
+            <td>${x.name}</td><td>${x.repeat}</td><td>${num(x.effectiveFPS)}</td>
+            <td>${x.renderedFrames} (${x.framesDuringDrain})</td>
+            <td>${stage(x.exactFrameInterval)}</td>
+            <td>${stage(x.gpuDraw)}</td>
+            <td>${stage(x.predeform)}</td>
+            <td>${x.worker ? stage(x.worker.workerSortMs) : '—'}</td>
+            <td>${x.worker ? stage(x.worker.indexUpdateMs) : '—'}</td>
+            <td>${x.worker && x.worker.distanceStageMs.count > 0 ? stage(x.worker.distanceStageMs) : '—'}</td>
+            <td>${x.gpuDistance.submitted} / ${x.gpuDistance.readbacks}</td>
+            <td>${x.worker ? num(x.worker.effectiveSortHz) : (x.exactPath ? num(x.exactPath.effectiveSortHz) : '—')}</td>
+            <td class="${x.idleBeforeMeasurement && x.drainedAfterMeasurement && x.submittedEqualsCompleted ? 'ok' : 'bad'}">${x.idleBeforeMeasurement ? 'y' : 'N'}/${x.drainedAfterMeasurement ? 'y' : 'N'}/${x.submittedEqualsCompleted ? 'y' : 'N'}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
+      if ((report.performance?.samples || []).some((x: any) => x.worker)) {
+        html += `<table>
+          <tr><th>worker counters (§6)</th><th>precomputed</th><th>requested</th><th>submitted</th>
+              <th>completed</th><th>skipped while running</th><th>skipped before ready</th>
+              <th>worker errors</th><th>distance errors</th></tr>
+          ${report.performance.samples.filter((x: any) => x.worker).map((x: any) => `<tr>
+            <td>${x.name} r${x.repeat}</td>
+            <td>${x.worker.usePrecomputedDistances ? 'true' : 'false'}</td>
+            <td>${x.worker.sortRequested}</td><td>${x.worker.sortSubmitted}</td>
+            <td>${x.worker.sortCompleted}</td><td>${x.worker.sortSkippedWhileRunning}</td>
+            <td>${x.worker.sortSkippedBeforeReady}</td>
+            <td class="${x.worker.workerErrors === 0 ? 'ok' : 'bad'}">${x.worker.workerErrors}</td>
+            <td class="${x.worker.distanceErrors === 0 ? 'ok' : 'bad'}">${x.worker.distanceErrors}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
+      if ((report.performance?.rollUps || []).length > 0) {
+        html += `<table>
+          <tr><th>roll-up (means over repeats)</th><th>reps</th><th>intervals</th><th>FPS</th>
+              <th>exact p95 ms</th><th>p95 spread</th><th>GPU draw p50</th>
+              <th>worker sort p50</th><th>index update p50</th><th>distance stage p50</th></tr>
+          ${report.performance.rollUps.map((x: any) => `<tr>
+            <td>${x.name}</td><td>${x.repeats}</td>
+            <td class="${x.intervalSamples >= 30 ? '' : 'bad'}">${x.intervalSamples}</td>
+            <td>${num(x.meanEffectiveFPS)}</td>
+            <td>${num(x.meanExactP95Ms)}</td><td>${num(x.spreadExactP95Ms)}</td>
+            <td>${num(x.meanGpuDrawP50Ms)}</td>
+            <td>${x.meanWorkerSortP50Ms === null ? '—' : num(x.meanWorkerSortP50Ms)}</td>
+            <td>${x.meanIndexUpdateP50Ms === null ? '—' : num(x.meanIndexUpdateP50Ms)}</td>
+            <td>${x.meanDistanceStageP50Ms === null ? '—' : num(x.meanDistanceStageP50Ms)}</td>
+          </tr>`).join('')}
+        </table>`;
+      }
+
+      const a = report.performance?.analysis;
+      if (a) {
+        html += `<table>
+          <tr><th>analysis (§10)</th><th>value</th></tr>
+          <tr><td>comparison valid</td>
+              <td class="${a.valid ? 'ok' : 'bad'}">${a.valid ? 'yes' : 'NO — see status below'}</td></tr>
+          <tr><td>B → D: LAM Worker/WASM migration, p95</td><td>${num(a.workerMigrationP95DeltaMs)} ms</td></tr>
+          <tr><td>B → D: migration, FPS</td><td>${num(a.workerMigrationFpsDelta)}</td></tr>
+          <tr><td>D → C: GPU distance + readback cost, p95</td><td>${num(a.distanceReadbackP95DeltaMs)} ms</td></tr>
+          <tr><td>D → C: readback cost, FPS</td><td>${num(a.distanceReadbackFpsDelta)}</td></tr>
+          <tr><td>A → C: canonical worker-sort residual, p95</td><td>${num(a.canonicalSortResidualP95Ms)} ms</td></tr>
+          <tr><td>A → C: residual, FPS lost</td><td>${num(a.canonicalSortResidualFps)}</td></tr>
+          <tr><td>exact p95 C − B</td><td>${num(a.exactP95DeltaMs)} ms</td></tr>
+          <tr><td>effective FPS C − B</td><td>${num(a.effectiveFpsDelta)}</td></tr>
+          <tr><td>tail above no-sort, B</td><td>${num(a.tailGapAboveNoSortB)} ms</td></tr>
+          <tr><td>tail above no-sort, D</td><td>${num(a.tailGapAboveNoSortD)} ms</td></tr>
+          <tr><td>tail above no-sort, C</td><td>${num(a.tailGapAboveNoSortC)} ms</td></tr>
+          <tr><td>share of that tail closed by C</td><td>${a.tailGapClosedShare === null ? '—' : `${(a.tailGapClosedShare * 100).toFixed(1)} %`}</td></tr>
+          <tr><td>GPU distance/readback exercised in C</td>
+              <td class="${a.readbackPathExercisedInC ? 'bad' : 'ok'}">${a.readbackPathExercisedInC ? 'YES — run C is contaminated' : 'no'}</td></tr>
+          <tr><td>GPU distance/readback exercised in D</td>
+              <td class="${a.readbackPathExercisedInD ? 'ok' : 'bad'}">${a.readbackPathExercisedInD ? 'yes' : 'NO — run D is not the exact-distance variant'}</td></tr>
+          <tr><td>D submitted with usePrecomputedDistances</td>
+              <td class="${a.dUsedPrecomputedDistances ? 'ok' : 'bad'}">${a.dUsedPrecomputedDistances ? 'true' : 'FALSE'}</td></tr>
+          <tr><td>B meets 30 fps / 33.3 ms p95</td><td class="${a.bMeetsTarget === null ? '' : (a.bMeetsTarget ? 'ok' : 'bad')}">${a.bMeetsTarget === null ? '—' : (a.bMeetsTarget ? 'yes' : 'no')}</td></tr>
+          <tr><td>D meets 30 fps / 33.3 ms p95</td><td class="${a.dMeetsTarget === null ? '' : (a.dMeetsTarget ? 'ok' : 'bad')}">${a.dMeetsTarget === null ? '—' : (a.dMeetsTarget ? 'yes' : 'no')}</td></tr>
+          <tr><td>C meets 30 fps / 33.3 ms p95</td><td class="${a.cMeetsTarget === null ? '' : (a.cMeetsTarget ? 'ok' : 'bad')}">${a.cMeetsTarget === null ? '—' : (a.cMeetsTarget ? 'yes' : 'no')}</td></tr>
+        </table>`;
+      }
+
+      tablesEl.innerHTML = html;
+
+      const caps = report.correctness?.captures || [];
+      capturesEl.innerHTML = caps.length === 0 ? '' : caps.map((c: any) => `
+        <div class="capture">
+          <h3>frame ${c.frame} — ${c.differentPixels} differing pixels
+            (§9: inspect mouth interior, lips, teeth, nose, eyes, face silhouette)</h3>
+          <div class="imgs">
+            <figure><img src="${c.exactPng}" alt="exact sort frame ${c.frame}">
+              <figcaption>exact animated-centre sort</figcaption></figure>
+            <figure><img src="${c.lamPng}" alt="LAM sort frame ${c.frame}">
+              <figcaption>LAM canonical-centre worker sort</figcaption></figure>
+            <figure><img src="${c.diffPng}" alt="difference mask frame ${c.frame}">
+              <figcaption>difference mask (white = any channel differs)</figcaption></figure>
+          </div>
+        </div>`).join('');
+    };
+
+    const renderStatus = () => {
+      const running = poc.isRunning();
+      btn.run.disabled = !ready || running;
+      btn.correctness.disabled = !ready || running;
+      btn.performance.disabled = !ready || running;
+      btn.stop.disabled = !running;
+      btn.export.disabled = report === null;
+      btn.copy.disabled = report === null;
+      renderLive();
+      renderTables();
+      const r = runtime.report;
+      statusEl.textContent = [
+        lastError ? `ERROR: ${lastError}` : null,
+        `asset: ${r.assetLoaded ? 'loaded' : 'not loaded'} · splats ${r.viewerSplatCount ?? 0}`
+          + ` · basis ${r.viewerBasisCount ?? 0}`,
+        report ? `spec: ${report.spec}` : null,
+        report ? `acceptance: ${report.acceptanceVersion}` : null,
+        report ? `notes:\n  - ${(report.notes || []).join('\n  - ')}` : null,
+        report?.correctness?.visualNotes
+          ? `visual:\n  - ${report.correctness.visualNotes.join('\n  - ')}` : null,
+        report?.sortConfiguration?.deviationsFromLamDefaults
+          ? `deviations from LAM defaults:\n  - `
+            + report.sortConfiguration.deviationsFromLamDefaults.join('\n  - ') : null,
+        report?.correctness?.structural?.failures?.length
+          ? `structural failures:\n  - ${report.correctness.structural.failures.join('\n  - ')}` : null,
+        report?.performance?.analysis && !report.performance.analysis.valid
+          ? `performance comparison REFUSED:\n  - `
+            + report.performance.analysis.invalidReasons.join('\n  - ') : null,
+      ].filter(Boolean).join('\n\n');
+    };
+
+    const start = async (overrides: Record<string, unknown>) => {
+      report = null;
+      lastError = null;
+      renderStatus();
+      try {
+        report = await poc.run({ ...lamSortOptionsFromUrl(), ...overrides } as any);
+      } catch (error: any) {
+        lastError = error?.message || String(error);
+        console.error('[UIKA LAM SORT POC]', error);
+        report = poc.getReport();
+      }
+      renderStatus();
+    };
+
+    btn.run.addEventListener('click', () => start({}));
+    btn.correctness.addEventListener('click', () => start({ skipPerformance: true }));
+    btn.performance.addEventListener('click', () => start({ skipCorrectness: true }));
+    btn.stop.addEventListener('click', () => poc.stop());
+
+    btn.export.addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `uika-lam-sort-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    });
+
+    btn.copy.addEventListener('click', async () => {
+      try {
+        // The PNG data URLs make the clipboard payload very large, so they are dropped
+        // from the copied text. Use Export JSON when the captures are wanted.
+        const slim = report
+          ? { ...report, correctness: { ...report.correctness, captures: `${(report.correctness.captures || []).length} captures omitted; use Export JSON` } }
+          : null;
+        await navigator.clipboard.writeText(JSON.stringify(slim, null, 2));
+        btn.copy.textContent = 'Copied';
+        setTimeout(() => { btn.copy.textContent = 'Copy Results'; }, 1500);
+      } catch (error: any) {
+        lastError = `clipboard: ${error?.message || error}`;
+        renderStatus();
+      }
+    });
+
+    renderStatus();
+    const timer = window.setInterval(renderStatus, 500);
+
+    runtime.initializeNeutral()
+      .then(async () => {
+        await replay.loadBundled();
+        replay.bindBasis(runtime.getAsset()!.basis.names);
+        ready = true;
+        renderStatus();
+      })
+      .catch((error: any) => {
+        lastError = error?.message || String(error);
+        console.error('[UIKA LAM SORT PAGE]', error);
+        renderStatus();
+      });
+
+    window.addEventListener('beforeunload', () => {
+      window.clearInterval(timer);
+      runtime.dispose();
+    }, { once: true });
+  </script>
+</body>
+</html>
