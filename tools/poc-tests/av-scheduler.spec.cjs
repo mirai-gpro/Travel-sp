@@ -88,8 +88,8 @@ function frames(n, jawFn) {
            '★ 18-3. clamp-to-last-frame 実装 (Math.min(frameIndex, length-1)) が無い');
         ok(!/A2E_WAIT_TIMEOUT/.test(src) && !/stalled/.test(src),
            '★ 11. timeout bypass (A2E_WAIT_TIMEOUT_SEC / stalled) が復活していない');
-        ok(typeof A2E_LEAD_SEC === 'number' && A2E_LEAD_SEC === 0.20,
-           '★ pre-roll 定数 A2E_LEAD_SEC が PR #48 の値', String(A2E_LEAD_SEC));
+        ok(typeof A2E_LEAD_SEC === 'number' && A2E_LEAD_SEC >= 0.334,
+           '★ pre-roll は実測の必要量 0.334s 以上', String(A2E_LEAD_SEC));
     }
 
     // ---- 18-2. Expression 未到着では AudioContext へ schedule しない ----
@@ -272,6 +272,41 @@ function frames(n, jawFn) {
            '★ 10. 再生済み末尾より後は null (最後の口形を保持しない)');
         ok(m.getCurrentPlaybackOffset() === 0,
            '★ 10. playhead も進まない');
+    }
+
+    // ---- N. 実測シナリオ: 先頭 0.87s 解放 / 次の expression が 1.204s 後 ----
+    // 2026/10/24 の実機ログの再現。0.20 の pre-roll では再生位置 795ms で
+    // 音声が途切れた (playhead null)。pre-roll がこれを吸収することを固定する。
+    {
+        const RELEASED = 0.87;      // 先頭 pump で解放された音声長 [s]
+        const NEXT_EXPR = 1.204;    // 次の live_expression 到着までの実測 [s]
+        ok(A2E_LEAD_SEC + RELEASED > NEXT_EXPR,
+           '★ pre-roll + 先頭解放分が次の expression 到着を越える (枯渇しない)',
+           `${A2E_LEAD_SEC} + ${RELEASED} = ${(A2E_LEAD_SEC + RELEASED).toFixed(3)} > ${NEXT_EXPR}`);
+
+        const { m, ctx } = build();
+        m.onAiResponseStarted();
+        for (let i = 0; i < 4; i++) m.playPcmAudio(pcmBase64(0.29));   // 0.29 x 3 = 0.87
+        sendExpr(m, 31, 0);          // coverage 1.033s -> 3 本だけ解放できる
+        ok(ctx.started.length === 3 && m.getAvDebugState().pendingChunks === 1,
+           '前提: 先頭で 0.87s ぶんだけ解放し 1 本は pending',
+           `started=${ctx.started.length} pending=${m.getAvDebugState().pendingChunks}`);
+
+        // 次の expression が届く瞬間まで音声が切れないこと
+        ctx.currentTime = NEXT_EXPR;
+        ok(m.getCurrentPlaybackOffset() > 0,
+           '★ 次の expression 到着時点でも playhead が生きている (無音にならない)',
+           `playbackMs=${m.getCurrentPlaybackOffset().toFixed(0)}`);
+        ok(m.getCurrentExpressionFrame() !== null,
+           '★ その時点で expression も返る (口が止まらない)');
+        ok(m.getAvDebugState().underrunCount === 0,
+           '★ underrun 0');
+
+        // coverage が伸びれば pending も解放され、以降は連続する
+        sendExpr(m, 90, 1);
+        ok(ctx.started.length === 4 && m.getAvDebugState().pendingChunks === 0,
+           '★ coverage 到着で残りが解放され連続再生に戻る',
+           `started=${ctx.started.length}`);
     }
 
     console.log(failures === 0 ? '\n=== 全テスト PASS ===' : `\n=== ${failures} 件 FAIL ===`);
