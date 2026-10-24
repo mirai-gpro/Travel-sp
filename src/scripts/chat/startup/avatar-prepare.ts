@@ -48,7 +48,12 @@ export function startAvatarPrepare(liveAudioManager: any): Promise<void> {
     preparePromise = waitForAvatarController()
         .then((controller) => controller.initialize(liveAudioManager))
         .catch((e) => {
+            // 失敗を resolve 扱いにしない。呼び出し側が「連携完了」と
+            // 誤認しないよう上位へ伝える (指示書 修正 2)。
+            // LAMAvatarController.doInitialize() 内の 2D fallback 処理は
+            // 従来どおりで、ここでは何も変えない。
             console.error('[Startup] Avatar prepare エラー:', e);
+            throw e;
         });
     return preparePromise;
 }

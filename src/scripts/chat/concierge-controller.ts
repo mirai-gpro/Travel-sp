@@ -72,14 +72,16 @@ export class ConciergeController extends CoreController {
   private async prepareUikaAvatarBeforeLive(): Promise<void> {
     if (!isUika133kMode()) return;
 
-    const controller = (window as any).__lamAvatarController;
+    // Avatar prepare の所有者は 1 つだけ (指示書 §5)。ここから新しく
+    // controller.initialize() を開始しない。controller 生成前 race を作らない
+    // ため、window.__lamAvatarController を直接見る旧経路も使わない。
+    console.log('[UIKA INIT] avatar preparation before Live start');
+    await (getAvatarPreparePromise() ?? startAvatarPrepare(this.liveAudioManager));
+    const controller = getAvatarController();
     if (!controller) {
       throw new Error('UIKA: LAMAvatarController が見つかりません');
     }
     this.lamAvatarController = controller;
-
-    console.log('[UIKA INIT] avatar preparation before Live start');
-    await controller.initialize(this.liveAudioManager);
     console.log('[UIKA INIT] avatar READY; Live start permitted');
   }
 

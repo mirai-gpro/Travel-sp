@@ -37,6 +37,24 @@ export class CoreController {
   protected liveAudioManager: LiveAudioManager = new LiveAudioManager();
   /** 起動時 reset の回数。計測の区別にだけ使う (挙動には影響させない)。 */
   private startupResetCount: number = 0;
+
+  /**
+   * 起動時 Live event の初出を計測する (計測のみ / 挙動は変えない)。
+   *
+   * 二重 reset を維持するため、reset #1 と reset #2 の最初の Audio /
+   * Expression を区別する。B-3 で reset #1 の Greeting は MUTE 対象になり、
+   * ユーザーが実際に聞くのは reset #2 の Greeting なので、5 秒評価には
+   * `APP_START -> RESET2_FIRST_AUDIO` を使う。
+   */
+  private markFirstLiveEvent(kind: 'AUDIO' | 'EXPRESSION'): void {
+    if (this.startupResetCount === 1) {
+      mark(kind === 'AUDIO' ? 'RESET1_FIRST_AUDIO' : 'RESET1_FIRST_EXPRESSION');
+    } else if (this.startupResetCount === 2) {
+      mark(kind === 'AUDIO' ? 'RESET2_FIRST_AUDIO' : 'RESET2_FIRST_EXPRESSION');
+    }
+    // 起動全体で最初の 1 回 (どちらの reset かに関わらず) も残す
+    mark(kind === 'AUDIO' ? 'FIRST_AUDIO' : 'FIRST_EXPRESSION');
+  }
   protected userTranscriptBuffer = '';
   protected aiTranscriptBuffer = '';
 
@@ -351,9 +369,13 @@ export class CoreController {
         );
       }
 
-      mark('FIRST_AUDIO');
-
       if (!this.isLiveMode) return;
+
+      // 計測のみ。reset 切替中の stale event を拾わないよう isLiveMode の後で
+      // 記録し、reset #1 / #2 を区別する (指示書 修正 3 / 4)。
+      // 5 秒評価に使うのは APP_START -> RESET2_FIRST_AUDIO。
+      this.markFirstLiveEvent('AUDIO');
+
       this.liveAudioManager.onAiResponseStarted();
       this.liveAudioManager.playPcmAudio(data.data);
     });
@@ -372,9 +394,10 @@ export class CoreController {
         );
       }
 
-      mark('FIRST_EXPRESSION');
-
       if (!this.isLiveMode) return;
+
+      this.markFirstLiveEvent('EXPRESSION');
+
       console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
       this.liveAudioManager.onExpressionReceived(data);
 

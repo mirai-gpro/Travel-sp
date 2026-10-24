@@ -23,7 +23,11 @@ export type StartupMarkName =
     | 'RESET2_LIVE_START'
     | 'RESET2_END'
     | 'FIRST_AUDIO'
-    | 'FIRST_EXPRESSION';
+    | 'FIRST_EXPRESSION'
+    | 'RESET1_FIRST_AUDIO'
+    | 'RESET1_FIRST_EXPRESSION'
+    | 'RESET2_FIRST_AUDIO'
+    | 'RESET2_FIRST_EXPRESSION';
 
 const marks = new Map<string, number>();
 let reported = false;
@@ -52,18 +56,27 @@ function delta(a: StartupMarkName, b: StartupMarkName): string {
     return `${(y - x).toFixed(0)}ms`;
 }
 
-/** 主要な所要時間を 1 行で出す。FIRST_AUDIO と FIRST_EXPRESSION が揃ったら 1 回だけ。 */
+/**
+ * 主要な所要時間を 1 行で出す。
+ *
+ * 5 秒評価に使うのは **APP_START -> RESET2_FIRST_AUDIO**。
+ * reset #1 の Greeting は B-3 で MUTE 対象になり、ユーザーが実際に聞くのは
+ * reset #2 の Greeting だから。reset #2 の Audio / Expression が揃ったら
+ * 1 回だけ出す。
+ */
 function maybeReport(): void {
     if (reported) return;
-    if (getMark('FIRST_AUDIO') === null || getMark('FIRST_EXPRESSION') === null) return;
+    if (getMark('RESET2_FIRST_AUDIO') === null) return;
+    if (getMark('RESET2_FIRST_EXPRESSION') === null) return;
     reported = true;
     const visible = getMark('AVATAR_VISIBLE') !== null ? 'AVATAR_VISIBLE' : 'AVATAR_READY';
     console.log(
         '[Startup] SUMMARY '
         + `avatar(${visible})=${delta('APP_START', visible as StartupMarkName)} `
-        + `firstAudio=${delta('APP_START', 'FIRST_AUDIO')} `
-        + `firstExpression=${delta('APP_START', 'FIRST_EXPRESSION')} `
-        + `| reset1=${delta('RESET1_START', 'RESET1_END')} `
+        + `reset2FirstAudio=${delta('APP_START', 'RESET2_FIRST_AUDIO')} `
+        + `reset2FirstExpression=${delta('APP_START', 'RESET2_FIRST_EXPRESSION')} `
+        + `| reset1FirstAudio=${delta('APP_START', 'RESET1_FIRST_AUDIO')} `
+        + `reset1=${delta('RESET1_START', 'RESET1_END')} `
         + `reset2start=${delta('APP_START', 'RESET2_START')}`
     );
 }
