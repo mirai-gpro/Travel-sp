@@ -2,8 +2,6 @@
 
 // src/scripts/chat/concierge-controller.ts
 import { CoreController } from './core-controller';
-import { getAvatarPreparePromise, startAvatarPrepare, getAvatarController }
-  from './startup/avatar-prepare';
 import { AudioManager } from './audio-manager';
 import { isUika133kMode } from './uika-133k-mode';
 
@@ -48,20 +46,17 @@ export class ConciergeController extends CoreController {
 
   // ★ LAMAvatarにLiveAudioManagerをバインド（仕様書08 セクション7.1）
   private async linkLamAvatar(): Promise<void> {
-    // Avatar prepare の所有者は StartupCoordinator 側 (core-controller.init) で、
-    // ここでは **新しく initialize せず同じ Promise を待つだけ** にする
-    // (指示書 §5)。未開始なら single-flight な開始関数を呼ぶ。
-    try {
-      await (getAvatarPreparePromise() ?? startAvatarPrepare(this.liveAudioManager));
-      const controller = getAvatarController();
-      if (controller) {
-        this.lamAvatarController = controller;
+    const controller = (window as any).__lamAvatarController;
+    if (controller) {
+      this.lamAvatarController = controller;
+      try {
+        await controller.initialize(this.liveAudioManager);
         console.log('[ConciergeController] LAMAvatar連携完了');
-      } else {
-        console.warn('[ConciergeController] LAMAvatarController が見つかりません');
+      } catch (e) {
+        console.error('[ConciergeController] LAMAvatar連携エラー:', e);
       }
-    } catch (e) {
-      console.error('[ConciergeController] LAMAvatar連携エラー:', e);
+    } else {
+      console.warn('[ConciergeController] LAMAvatarController が見つかりません');
     }
   }
 
@@ -72,16 +67,14 @@ export class ConciergeController extends CoreController {
   private async prepareUikaAvatarBeforeLive(): Promise<void> {
     if (!isUika133kMode()) return;
 
-    // Avatar prepare の所有者は 1 つだけ (指示書 §5)。ここから新しく
-    // controller.initialize() を開始しない。controller 生成前 race を作らない
-    // ため、window.__lamAvatarController を直接見る旧経路も使わない。
-    console.log('[UIKA INIT] avatar preparation before Live start');
-    await (getAvatarPreparePromise() ?? startAvatarPrepare(this.liveAudioManager));
-    const controller = getAvatarController();
+    const controller = (window as any).__lamAvatarController;
     if (!controller) {
       throw new Error('UIKA: LAMAvatarController が見つかりません');
     }
     this.lamAvatarController = controller;
+
+    console.log('[UIKA INIT] avatar preparation before Live start');
+    await controller.initialize(this.liveAudioManager);
     console.log('[UIKA INIT] avatar READY; Live start permitted');
   }
 
