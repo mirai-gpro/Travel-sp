@@ -24,6 +24,13 @@ export class ConciergeController extends CoreController {
 
   // 初期化プロセスをオーバーライド
   protected async init() {
+    // ★ アバターの起動を session 初期化より前に始める。
+    //    初期挨拶はアバター表示後まで待つので、ここで始めないと
+    //    「挨拶待ち ⇄ アバター未開始」で止まる。
+    //    await しない: 25MB の splat build と REST / socket / マイク取得を
+    //    並行させて起動時間を詰めるため。
+    void this.linkLamAvatar();
+
     // 親クラスの初期化を実行
     await super.init();
 
@@ -40,13 +47,13 @@ export class ConciergeController extends CoreController {
       });
     }
 
-    // ★ LAMAvatar連携初期化（仕様書08 セクション7.1）
-    this.linkLamAvatar();
   }
 
   // ★ LAMAvatarにLiveAudioManagerをバインド（仕様書08 セクション7.1）
   private async linkLamAvatar(): Promise<void> {
-    const controller = (window as any).__lamAvatarController;
+    // init() の早い段階で呼ぶため、component 側の global 公開を少し待つ。
+    // 固定 sleep ではなく出現をポーリングする。
+    const controller = await this.waitForLamAvatarController();
     if (controller) {
       this.lamAvatarController = controller;
       try {
