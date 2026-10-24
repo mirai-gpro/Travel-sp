@@ -58,6 +58,42 @@ export function startAvatarPrepare(liveAudioManager: any): Promise<void> {
     return preparePromise;
 }
 
+// ===== Avatar の状態通知 (指示書 §7) =====
+// renderer 初期化完了 (READY) か 2D フォールバック (FALLBACK) のどちらかで
+// 必ず settle する。StartupCoordinator はこれを待ってから実描画 frame を見る。
+
+export type AvatarSettleKind = 'READY' | 'FALLBACK';
+
+let settled: AvatarSettleKind | null = null;
+let resolveSettled: ((k: AvatarSettleKind) => void) | null = null;
+const avatarSettled: Promise<AvatarSettleKind> = new Promise<AvatarSettleKind>((r) => {
+    resolveSettled = r;
+});
+
+/** renderer 初期化が完了した (3D が出せる状態)。LAMAvatar から 1 度だけ呼ぶ。 */
+export function notifyAvatarReady(): void {
+    if (settled) return;
+    settled = 'READY';
+    resolveSettled?.('READY');
+}
+
+/** 3D を諦めて 2D フォールバックに切り替えた。LAMAvatar から 1 度だけ呼ぶ。 */
+export function notifyAvatarFallback(): void {
+    if (settled) return;
+    settled = 'FALLBACK';
+    resolveSettled?.('FALLBACK');
+}
+
+/** READY / FALLBACK のどちらかで settle する Promise。 */
+export function waitAvatarSettled(): Promise<AvatarSettleKind> {
+    return avatarSettled;
+}
+
+/** 同期取得 (未 settle なら null)。 */
+export function getAvatarSettleKind(): AvatarSettleKind | null {
+    return settled;
+}
+
 /** 既に開始済みの prepare Promise (未開始なら null)。 */
 export function getAvatarPreparePromise(): Promise<void> | null {
     return preparePromise;

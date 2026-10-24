@@ -5,7 +5,7 @@ import { AudioManager } from './audio-manager';
 import { LiveAudioManager } from './live-audio-manager';
 import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
 import { mark } from './startup/startup-metrics';
-import { startAvatarPrepare } from './startup/avatar-prepare';
+import { startupCoordinator } from './startup/startup-coordinator';
 import { captureLiveExpression } from './a2e-replay';
 
 declare const io: any;
@@ -102,14 +102,16 @@ export class CoreController {
 
   protected async init() {
     console.log('[Core] Starting initialization...');
-    mark('APP_START');
 
-    // ===== Avatar prepare だけ先行並列化する (指示書 §2 / §3 / §5) =====
-    // 並列化するのは Avatar の download / renderer 初期化だけ。
-    // reset 同士 / session 同士 / LiveAPI 同士は並列化しない。
-    // prepare の所有者はここ 1 箇所だけにする (single-flight)。
-    // await しない: reset #1 と並行して進めるため。
-    void startAvatarPrepare(this.liveAudioManager);
+    // ===== 起動状態の所有者は StartupCoordinator だけ (指示書 §9 / §14.3) =====
+    // Waiting ON / APP_START 計測 / Avatar prepare の先行開始 (§2 / §3 / §5) を
+    // ここで 1 度だけ行う。並列化するのは Avatar の download / renderer
+    // 初期化だけで、reset 同士 / session 同士 / LiveAPI 同士は並列化しない。
+    const startupGeneration = startupCoordinator.begin({
+      splashOverlay: this.els.splashOverlay ?? null,
+      splashVideo: this.els.splashVideo ?? null,
+      avatarLoading: document.getElementById('lamAvatarLoading'),
+    }, this.liveAudioManager);
 
     // ===== 一時診断: main thread の停止時間を見る (UIKA mode のみ) =====
     // 100ms 間隔の heartbeat が 250ms 超遅れたら、その差分だけ main thread が
@@ -138,27 +140,27 @@ export class CoreController {
     this.bindEvents();
     this.initSocket();
 
-    setTimeout(() => {
-        if (this.els.splashVideo) this.els.splashVideo.loop = false;
-        if (this.els.splashOverlay) {
-             this.els.splashOverlay.classList.add('fade-out');
-             setTimeout(() => this.els.splashOverlay.classList.add('hidden'), 800);
-        }
-    }, 10000);
+    // 何があっても Waiting を残さないための安全網 (従来の 10 秒相当)。
+    startupCoordinator.armSafetyTimeout(startupGeneration, 10000);
 
+    // ===== reset #1 (従来どおり / 省略も簡略化もしない / 指示書 §0 §10) =====
+    startupCoordinator.enterWarmup();
     await this.resetAppContent();
 
-    setTimeout(() => {
-      if (this.els.splashOverlay) {
-        this.els.splashOverlay.classList.add('fade-out');
-        setTimeout(() => this.els.splashOverlay.classList.add('hidden'), 800);
-      }
-    }, 2000);
+    // ===== Avatar が実際に表示されるまで Waiting を出し続ける (§7 / §8) =====
+    // reset #1 と Avatar prepare は並行して進んでいる。ここで合流する。
+    await startupCoordinator.awaitAvatarVisible(startupGeneration);
+    startupCoordinator.hideWaiting(startupGeneration);
 
     console.log('[Core] Initialization completed');
 
     // ★ 初期起動完了後にソフトリセットを自動実行（リップシンク正常化）
+    //   Avatar 表示後に実行するので、ユーザーが見る初期挨拶は reset #2 のもの。
+    //   reset #1 / #2 は従来どおり直列 (並列化しない / 指示書 §14.2)。
+    startupCoordinator.enterFinalReset();
     await this.resetAppContent();
+
+    startupCoordinator.enterRunning();
   }
 
   protected getUserId(): string {
