@@ -129,6 +129,8 @@ const {
   import { AudioSyncPlayer } from '../scripts/chat/audio-sync-player';
   import type { LiveAudioManager, ExpressionFrame } from '../scripts/chat/live-audio-manager';
   import { getUikaExprPath } from '../scripts/chat/uika-133k-mode';
+  import { registerAvatarController } from '../scripts/chat/startup/avatar-prepare';
+  import { mark } from '../scripts/chat/startup/startup-metrics';
   import { isA2ETraceMode } from '../scripts/chat/a2e-replay';
 
   /**
@@ -146,6 +148,8 @@ const {
     private fallbackEl: HTMLImageElement;
     private loadingEl: HTMLElement;
     private isInitialized: boolean = false;
+    /** initialize() の single-flight 用。初回の Promise を保持する。 */
+    private initializationPromise: Promise<void> | null = null;
     private useFallback: boolean = false;
 
     constructor() {
@@ -160,7 +164,20 @@ const {
      * LiveAudioManager をバインドして初期化
      * ConciergeController.linkLamAvatar() から呼ばれる
      */
-    async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
+    /**
+     * Avatar 初期化の入口 (single-flight / 指示書 §4)。
+     *
+     * `isInitialized` のチェックだけでは、ほぼ同時に 2 回呼ばれたときに
+     * 両方が false を通過して二重初期化になり得る。初回呼び出しの Promise を
+     * 保持し、以降は同じ Promise を返す。
+     */
+    initialize(liveAudioManager: LiveAudioManager): Promise<void> {
+      if (this.initializationPromise) return this.initializationPromise;
+      this.initializationPromise = this.doInitialize(liveAudioManager);
+      return this.initializationPromise;
+    }
+
+    private async doInitialize(liveAudioManager: LiveAudioManager): Promise<void> {
       if (this.isInitialized) return;
 
       // AudioSyncPlayer に LiveAudioManager をバインド
@@ -244,6 +261,7 @@ const {
           this.loadingEl.classList.add('hidden');
           this.syncPlayer.start();
           this.isInitialized = true;
+          mark('AVATAR_READY');
           console.log('[LAMAvatar] 3Dアバター初期化完了');
         } else {
           this._showFallback();
@@ -303,6 +321,7 @@ const {
       this.containerEl.style.display = 'none';
       this.loadingEl.classList.add('hidden');
       this.fallbackEl.classList.remove('hidden');
+      mark('AVATAR_FALLBACK');
       console.log('[LAMAvatar] フォールバック表示に切り替え');
     }
 
@@ -353,5 +372,8 @@ const {
   }
 
   // グローバルにインスタンスを公開（ConciergeController からアクセス用）
-  (window as any).__lamAvatarController = new LAMAvatarController();
+  const __lamAvatarControllerInstance = new LAMAvatarController();
+  (window as any).__lamAvatarController = __lamAvatarControllerInstance;
+  // 生成を Startup 側へ通知する (固定 sleep / ポーリングで待たせない / 指示書 §6)
+  registerAvatarController(__lamAvatarControllerInstance);
 </script>

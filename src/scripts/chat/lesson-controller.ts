@@ -4,6 +4,8 @@
 // 会話レッスン・モード用コントローラ（concierge-controller.tsベースに移植）
 // アバター + A2Eリップシンク搭載、ショップ検索・予約機能を除外
 import { CoreController } from './core-controller';
+import { getAvatarPreparePromise, startAvatarPrepare, getAvatarController }
+  from './startup/avatar-prepare';
 import { AudioManager } from './audio-manager';
 import { isUika133kMode } from './uika-133k-mode';
 
@@ -54,17 +56,20 @@ export class LessonController extends CoreController {
 
   // ★ LAMAvatarにLiveAudioManagerをバインド（仕様書08 セクション7.1）
   private async linkLamAvatar(): Promise<void> {
-    const controller = (window as any).__lamAvatarController;
-    if (controller) {
-      this.lamAvatarController = controller;
-      try {
-        await controller.initialize(this.liveAudioManager);
+    // Avatar prepare の所有者は StartupCoordinator 側 (core-controller.init) で、
+    // ここでは **新しく initialize せず同じ Promise を待つだけ** にする
+    // (指示書 §5)。未開始なら single-flight な開始関数を呼ぶ。
+    try {
+      await (getAvatarPreparePromise() ?? startAvatarPrepare(this.liveAudioManager));
+      const controller = getAvatarController();
+      if (controller) {
+        this.lamAvatarController = controller;
         console.log('[LessonController] LAMAvatar連携完了');
-      } catch (e) {
-        console.error('[LessonController] LAMAvatar連携エラー:', e);
+      } else {
+        console.warn('[LessonController] LAMAvatarController が見つかりません');
       }
-    } else {
-      console.warn('[LessonController] LAMAvatarController が見つかりません');
+    } catch (e) {
+      console.error('[LessonController] LAMAvatar連携エラー:', e);
     }
   }
 

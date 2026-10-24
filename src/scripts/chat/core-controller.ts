@@ -4,6 +4,8 @@ import { i18n } from '../../constants/i18n';
 import { AudioManager } from './audio-manager';
 import { LiveAudioManager } from './live-audio-manager';
 import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
+import { mark } from './startup/startup-metrics';
+import { startAvatarPrepare } from './startup/avatar-prepare';
 import { captureLiveExpression } from './a2e-replay';
 
 declare const io: any;
@@ -33,6 +35,8 @@ export class CoreController {
   // ★ LiveAPI状態変数（仕様書02 セクション4.4.2）
   protected isLiveMode = false;
   protected liveAudioManager: LiveAudioManager = new LiveAudioManager();
+  /** 起動時 reset の回数。計測の区別にだけ使う (挙動には影響させない)。 */
+  private startupResetCount: number = 0;
   protected userTranscriptBuffer = '';
   protected aiTranscriptBuffer = '';
 
@@ -80,6 +84,14 @@ export class CoreController {
 
   protected async init() {
     console.log('[Core] Starting initialization...');
+    mark('APP_START');
+
+    // ===== Avatar prepare だけ先行並列化する (指示書 §2 / §3 / §5) =====
+    // 並列化するのは Avatar の download / renderer 初期化だけ。
+    // reset 同士 / session 同士 / LiveAPI 同士は並列化しない。
+    // prepare の所有者はここ 1 箇所だけにする (single-flight)。
+    // await しない: reset #1 と並行して進めるため。
+    void startAvatarPrepare(this.liveAudioManager);
 
     // ===== 一時診断: main thread の停止時間を見る (UIKA mode のみ) =====
     // 100ms 間隔の heartbeat が 250ms 超遅れたら、その差分だけ main thread が
@@ -143,6 +155,11 @@ export class CoreController {
   }
 
   protected async resetAppContent() {
+    // 起動時の 2 回だけ計測する。以降 (手動 reset / background 復帰) は記録しない。
+    // 挙動は一切変えない (指示書 §15 / §16)。
+    this.startupResetCount++;
+    if (this.startupResetCount === 1) mark('RESET1_START');
+    else if (this.startupResetCount === 2) mark('RESET2_START');
     console.log('[Reset] Starting soft reset...');
     const oldSessionId = this.sessionId;
     this.stopAllActivities();
@@ -186,6 +203,8 @@ export class CoreController {
     this.container.scrollIntoView({ behavior: 'smooth', block: 'start' });
     window.scrollTo({ top: 0, behavior: 'smooth' });
 
+    if (this.startupResetCount === 1) mark('RESET1_END');
+    else if (this.startupResetCount === 2) mark('RESET2_END');
     console.log('[Reset] Completed');
   }
 
@@ -332,6 +351,8 @@ export class CoreController {
         );
       }
 
+      mark('FIRST_AUDIO');
+
       if (!this.isLiveMode) return;
       this.liveAudioManager.onAiResponseStarted();
       this.liveAudioManager.playPcmAudio(data.data);
@@ -350,6 +371,8 @@ export class CoreController {
           `chunk=${data.chunk_index} frames=${frames} fps=${fps}`
         );
       }
+
+      mark('FIRST_EXPRESSION');
 
       if (!this.isLiveMode) return;
       console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
@@ -646,6 +669,8 @@ export class CoreController {
       const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
       const liveVoice = localStorage.getItem(`selectedLiveVoice_${this.currentMode}`) || '';
       const teacherName = localStorage.getItem(`selectedTeacherName_${this.currentMode}`) || '';
+      if (this.startupResetCount === 1) mark('RESET1_LIVE_START');
+      else if (this.startupResetCount === 2) mark('RESET2_LIVE_START');
       this.socket.emit('live_start', {
         session_id: this.sessionId,
         mode: this.currentMode,
