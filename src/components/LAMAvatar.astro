@@ -198,10 +198,24 @@ const {
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
 
-      // expression 更新コールバックを設定
+      // expression 更新コールバックを設定 (exprPath=cache のときだけ使われる)
       this.syncPlayer.setExpressionCallback((frame: ExpressionFrame | null) => {
         this.lamManager.updateExpression(frame);
       });
+
+      // ===== Render fps と LipSync fps を分離する (PR #48) =====
+      // renderer が描画するたびに、実 AudioContext playhead から
+      // fractional A2E frame position を計算して expression を取る。
+      // 別 rAF のキャッシュ経由にしない (renderer の fps を A2E timeline にしない)。
+      // 通常 LAM / UIKA / FULL133 の区別なく同じ経路。`?exprPath=cache` で旧経路へ。
+      const exprPath = getUikaExprPath();
+      if (exprPath === 'provider') {
+        this.lamManager.setExpressionProvider(
+          () => liveAudioManager.getCurrentExpressionFrame()
+        );
+      } else {
+        this.lamManager.setExpressionProvider(null);
+      }
 
       // Gaussian Splat レンダラーを初期化（公式API: getInstance）
       const config = (window as any).__lamAvatarConfig || {};
@@ -215,23 +229,8 @@ const {
         // canvas の transform: scale(1.4) は Travel-sp の表示上の寄せであって
         // meta.json の camera ではない。UIKA mode では等倍にする。
         this.containerEl.classList.add('uika-133k');
-        // ===== 診断用 A/B: expression frame の取得経路だけを切り替える =====
-        //   exprPath=provider (既定 / 現状維持):
-        //     renderer の getExpressionData() から
-        //     liveAudioManager.getCurrentExpressionFrame() を直接呼ぶ
-        //   exprPath=cache:
-        //     provider を設定せず、通常 LAM と同じ
-        //     AudioSyncPlayer rAF → updateExpression() → currentExpression 経路にする
-        // モデル / 描画条件 / A2E 値 / 口形補正は一切変えていない。
-        const exprPath = getUikaExprPath();
-        if (exprPath === 'provider') {
-          this.lamManager.setExpressionProvider(
-            () => liveAudioManager.getCurrentExpressionFrame()
-          );
-        } else {
-          this.lamManager.setExpressionProvider(null);
-        }
-        // 診断ログを有効化 (UIKA のときだけ。通常 LAM では設定しない)
+        // expression 取得経路は上の共通処理で設定済み (PR #48)。
+        // ここでは診断ログを有効化するだけ (UIKA のときだけ)。
         this.lamManager.setExpressionTrace(
           exprPath,
           () => liveAudioManager.getExpressionSyncDebugState()
@@ -247,15 +246,14 @@ const {
         // 通常 avatar 経路 (avatar-config 経由の B80 / FULL133 など) のまま
         // setExpressionTrace() だけを有効にする。
         //   - uika133k mode には入れない (ZIP / camera / localStorage を触らない)
-        //   - setExpressionProvider() は呼ばない
-        //     => _getExpressionData() は従来どおり currentExpression cache を読む
-        // つまり本番の cache path の挙動は変えず、trace だけが増える。
+        //   - expression 取得経路は上の共通処理のまま (ここでは変更しない)
+        // つまり本番経路の挙動は変えず、trace だけが増える。
         this.lamManager.setExpressionTrace(
-          'cache',
+          exprPath,
           () => liveAudioManager.getExpressionSyncDebugState()
         );
         console.log(
-          '[TRACE] a2eTrace=1 (通常 avatar 経路のまま trace のみ有効 / cache path は本番と同一)'
+          `[TRACE] a2eTrace=1 (通常 avatar 経路のまま trace のみ有効 / exprPath=${exprPath})`
         );
       }
       // ===== asset resolution (指示書 §26) =====
