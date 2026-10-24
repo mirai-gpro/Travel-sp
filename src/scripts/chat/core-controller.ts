@@ -108,20 +108,22 @@ export class CoreController {
     this.bindEvents();
     this.initSocket();
 
-    // 安全網: 何があっても 10 秒で splash を外す (従来どおり)
     setTimeout(() => {
         if (this.els.splashVideo) this.els.splashVideo.loop = false;
-        this._hideSplash();
+        if (this.els.splashOverlay) {
+             this.els.splashOverlay.classList.add('fade-out');
+             setTimeout(() => this.els.splashOverlay.classList.add('hidden'), 800);
+        }
     }, 10000);
 
-    // ===== splash の解除を初期挨拶 gate から切り離す =====
-    // `resetAppContent()` は initializeSession -> startLiveMode を通り、
-    // startLiveMode はアバター表示まで待つ。splash の解除タイマーを
-    // この await の後に登録すると、splash がアバター表示後まで残る。
-    // await しないで先に開始し、アバターが落ち着いた時点で外す。
-    void this._hideSplashWhenReady();
-
     await this.resetAppContent();
+
+    setTimeout(() => {
+      if (this.els.splashOverlay) {
+        this.els.splashOverlay.classList.add('fade-out');
+        setTimeout(() => this.els.splashOverlay.classList.add('hidden'), 800);
+      }
+    }, 2000);
 
     console.log('[Core] Initialization completed');
 
@@ -606,102 +608,6 @@ export class CoreController {
   // ★ LiveAPI制御メソッド（仕様書02 セクション4.4.2）
   // ========================================
 
-  /** splash overlay を外す (多重呼び出し可)。 */
-  private _hideSplash(): void {
-    const el = this.els.splashOverlay;
-    if (!el || el.classList.contains('hidden')) return;
-    el.classList.add('fade-out');
-    setTimeout(() => el.classList.add('hidden'), 800);
-  }
-
-  /**
-   * splash をいつ外すか。
-   *
-   * アバターの状態が確定した時点で外す。「確定」は
-   *   - 3D が最後まで build されて表示された
-   *   - 2D フォールバック表示
-   *   - install / recovery / 再読み込みの案内を出して待機している
-   * の 3 つ。案内カードを splash で隠さないよう、表示待ち
-   * (`waitUntilVisible`) ではなく確定待ち (`waitUntilSettled`) を使う。
-   *
-   * アバターを持たない画面 / 初期化が始まらない場合は従来どおり時間で外す。
-   */
-  private async _hideSplashWhenReady(): Promise<void> {
-    try {
-      const c = await this.waitForLamAvatarController();
-      if (c && typeof c.waitUntilSettled === 'function'
-          && await this._avatarInitializeStarted(c)) {
-        await c.waitUntilSettled();
-      } else {
-        await new Promise<void>((r) => setTimeout(r, 2000));
-      }
-    } catch (e) {
-      /* 何があっても splash は外す */
-    }
-    this._hideSplash();
-  }
-
-  /**
-   * `initialize()` が始まるのを少しだけ待つ。
-   * `linkLamAvatar()` は await せずに開始しているので、ここに来た時点では
-   * まだ始まっていないことがある。始まらなければ false。
-   */
-  private async _avatarInitializeStarted(c: any,
-                                         budgetMs: number = 3000): Promise<boolean> {
-    const deadline = Date.now() + budgetMs;
-    while (c.initializeStarted !== true && Date.now() < deadline) {
-      await new Promise<void>((r) => setTimeout(r, 30));
-    }
-    return c.initializeStarted === true;
-  }
-
-  /**
-   * `window.__lamAvatarController` が公開されるのを待つ。
-   *
-   * アバター起動を session 初期化より前に始めるため、component script と
-   * controller script の評価順に依存できない。固定 sleep ではなく出現を
-   * ポーリングする。`timeoutMs` は「アバターを持たない画面」を判定するための
-   * 打ち切り予算 (計測値ではない)。出現しなければ null。
-   */
-  protected waitForLamAvatarController(timeoutMs: number = 3000): Promise<any> {
-    const existing = (window as any).__lamAvatarController;
-    if (existing) return Promise.resolve(existing);
-    return new Promise<any>((resolve) => {
-      const deadline = Date.now() + timeoutMs;
-      const tick = () => {
-        const c = (window as any).__lamAvatarController;
-        if (c) { resolve(c); return; }
-        if (Date.now() >= deadline) { resolve(null); return; }
-        setTimeout(tick, 30);
-      };
-      setTimeout(tick, 30);
-    });
-  }
-
-  /**
-   * アバターが表示されるまで待つ。
-   *
-   * resolve 条件は LAMAvatarController 側に 1 本化してある
-   * (3D が最後まで build されて表示された / 2D フォールバック表示)。
-   * アバターを持たない画面、あるいはアバター初期化がまだ始まっていない場合は
-   * 待たない (待つと初期挨拶が永久に始まらないため)。
-   */
-  private async _waitForAvatarVisible(): Promise<void> {
-    try {
-      const c = (window as any).__lamAvatarController;
-      if (!c || typeof c.waitUntilVisible !== 'function') return;
-      if (!(await this._avatarInitializeStarted(c))) {
-        console.warn('[LiveAPI] アバター初期化が未開始のため表示待ちをスキップ');
-        return;
-      }
-      console.log('[LiveAPI] アバター表示待ち → 完了後に初期挨拶を開始');
-      await c.waitUntilVisible();
-      console.log('[LiveAPI] アバター表示完了 → 初期挨拶を開始');
-    } catch (e) {
-      console.warn('[LiveAPI] アバター表示待ちに失敗 (挨拶は続行):', e);
-    }
-  }
-
   protected async startLiveMode(): Promise<void> {
     if (!this.socket) {
       console.warn('[LiveAPI] Socket未初期化、startLiveMode中止');
@@ -735,12 +641,6 @@ export class CoreController {
 
       // ★ 新規ユーザー対応: デフォルトアバター情報をlocalStorageに確実に設定
       await ensureDefaultAvatarInStorage(this.currentMode);
-
-      // ===== アバターが表示されるまで初期挨拶を始めない =====
-      // `live_start` が server 側の初期挨拶の起点なので、ここで待つ。
-      // マイク取得 / AudioWorklet の初期化は上で済ませているため、
-      // splat の最終 build とこれらは並行して進む。
-      await this._waitForAvatarVisible();
 
       // サーバーにLiveAPIセッション開始を通知
       const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
