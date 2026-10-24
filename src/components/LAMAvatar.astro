@@ -183,6 +183,11 @@ const {
     private avatarVisibleResolved: boolean = false;
     private readonly avatarVisible: Promise<void> =
       new Promise<void>((resolve) => { this.avatarVisibleResolve = resolve; });
+    /** 表示 / フォールバック / 案内表示のいずれかで resolve する gate (splash 解除用)。 */
+    private avatarSettledResolve: () => void = () => {};
+    private avatarSettledResolved: boolean = false;
+    private readonly avatarSettled: Promise<void> =
+      new Promise<void>((resolve) => { this.avatarSettledResolve = resolve; });
 
     constructor() {
       this.lamManager = new LAMWebSocketManager();
@@ -202,6 +207,7 @@ const {
       // これが false のまま待つと挨拶が永久に始まらないので、
       // gate は必ずこのフラグを見る。
       this.initializeStarted = true;
+      this._showWaitingAnimation();
       // install / recovery の完了後に同じ引数でやり直せるようにしておく。
       // やり直す前に前回の blob URL を必ず解放する (所有権はこちら側)。
       this.retryInitialize = () => {
@@ -376,10 +382,47 @@ const {
       return this.avatarVisible;
     }
 
+    /**
+     * アバターの状態が確定したら resolve する gate (splash 解除用)。
+     *
+     * 表示完了 / 2D フォールバックに加えて、**install / recovery /
+     * 再読み込み案内を出して待機している状態**でも resolve する。
+     * これを待たずに splash を外すと案内カードが splash で隠れる。
+     */
+    waitUntilSettled(): Promise<void> {
+      return this.avatarSettled;
+    }
+
     private _markAvatarVisible(): void {
+      this._markAvatarSettled();
       if (this.avatarVisibleResolved) return;
       this.avatarVisibleResolved = true;
       this.avatarVisibleResolve();
+    }
+
+    private _markAvatarSettled(): void {
+      if (this.avatarSettledResolved) return;
+      this.avatarSettledResolved = true;
+      this.avatarSettledResolve();
+    }
+
+    /**
+     * 待機アニメの表示制御。
+     *
+     * splash overlay (`#splashOverlay`) は透過で、中央の video 以外からは
+     * 下のアバターコンテナが見える。そのため splash の "Loading..." と
+     * アバターの "Loading 3D Avatar..." が同時に見え、待機アニメが 2 つに
+     * 見える。splash が出ている間はこちらを出さない。
+     * splash はアバターの状態が確定した時点で外れるので、取り残しは起きない。
+     */
+    private _showWaitingAnimation(): void {
+      const splash = document.getElementById('splashOverlay');
+      const splashVisible = !!splash && !splash.classList.contains('hidden');
+      if (splashVisible) {
+        this.loadingEl.classList.add('hidden');
+        return;
+      }
+      this.loadingEl.classList.remove('hidden');
     }
 
     /**
@@ -500,6 +543,7 @@ const {
       if (shouldDeferInstallToHomeScreen(env)) {
         renderHomeScreenGuide(host, env, {});
         console.log('[AvatarInstall] iOS Safari のためホーム画面追加を案内');
+        this._markAvatarSettled();
         return null;
       }
 
@@ -510,6 +554,7 @@ const {
           reason: 'アバターの配布情報を取得できませんでした。通信状況をご確認ください。',
           onRetry: () => this.retryInitialize?.(),
         });
+        this._markAvatarSettled();
         return null;
       }
 
@@ -519,6 +564,7 @@ const {
           sizeBytes: entry.size, reason: resolution.reason,
           onRetry: () => void this._runInstall(host, entry, false),
         });
+        this._markAvatarSettled();
         return null;
       }
 
@@ -529,6 +575,7 @@ const {
           ? '端末の空き容量が不足している可能性があります。' : null,
         onStart: () => void this._runInstall(host, entry, false),
       });
+      this._markAvatarSettled();
       return null;
     }
 
@@ -554,6 +601,7 @@ const {
                    + ' local package を渡せません。再読み込みを案内します');
       if (host) {
         renderReloadRequiredPrompt(host, { onReload: () => location.reload() });
+        this._markAvatarSettled();
       } else {
         this._showFallback();
       }
@@ -574,7 +622,9 @@ const {
       this.poster?.destroy();
       this.poster = mountPoster(this.containerEl,
                                 { posterUrl: posterUrl ?? undefined });
-      // 待機アニメはここで消さない。splat が最後まで build されるまで出し続ける。
+      // 待機アニメはここで消さない。splat が最後まで build されるまで出し続ける
+      // (splash が出ている間は二重に見せないため _showWaitingAnimation に従う)。
+      this._showWaitingAnimation();
     }
 
     /** blob URL の所有権を持つ。前のものがあれば revoke してから差し替える。 */
