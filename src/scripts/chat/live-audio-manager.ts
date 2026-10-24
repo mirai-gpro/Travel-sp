@@ -61,7 +61,18 @@ export interface ExpressionFrame {
  * この値そのものが重要なのではなく、「Audio が Expression buffer を
  * 追い越した状態で再生されない」ことが重要。0 にすると pre-roll 無しになる。
  */
-export const A2E_LEAD_SEC = 0.20;
+/**
+ * 値の根拠 (実機実測 2026/10/24):
+ *   先頭で解放した音声            0.87s
+ *   次の live_expression の到着   1.204s 後
+ *   必要な pre-roll              1.204 - 0.87 = 0.334s
+ * 0.20 では 0.134s 足りず、再生位置 795ms で音声が約 330ms 途切れた
+ * (playhead が null = 無音)。0.60 は上記必要量に 0.266s の余裕を持たせた値。
+ * A2E の到着は burst なので、ここは「最大の到着間隔を吸収する余裕」であり
+ * 計測済みの物理量ではない。途切れが再発したら増やす、挨拶の鳴り始めを
+ * 詰めたいなら減らす (0.334s 未満にすると今回の症状が戻る)。
+ */
+export const A2E_LEAD_SEC = 0.60;
 
 /** AudioContext へ渡す前の、まだ schedule していない音声チャンク。 */
 interface PendingAudioChunk {
