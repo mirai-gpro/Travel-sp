@@ -1,0 +1,50 @@
+---
+// UIKA Native Runtime Architecture Correction v1.0 — Gate 0 only.
+// Hidden diagnostic page. It does not initialize an avatar or alter existing routes.
+---
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UIKA Native Gate 0 — Renderer API Audit</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #111;
+      color: #eee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    h1 { font-size: 18px; }
+    p { line-height: 1.6; color: #bbb; }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      padding: 16px;
+      border: 1px solid #444;
+      background: #181818;
+    }
+  </style>
+</head>
+<body>
+  <h1>UIKA Native Runtime — Gate 0 Renderer API Audit</h1>
+  <p>
+    Read-only diagnostic. No avatar, ZIP, skeleton, animation or Live session is initialized.
+  </p>
+  <pre id="auditResult">loading...</pre>
+
+  <script>
+    import { auditRendererApi } from '../scripts/chat/uika-native/renderer-api-audit';
+
+    const result = auditRendererApi();
+    (window as any).__uikaRendererApiAudit = result;
+
+    const target = document.getElementById('auditResult');
+    if (target) target.textContent = JSON.stringify(result, null, 2);
+
+    console.log('[UIKA NATIVE GATE0] renderer API audit', result);
+  </script>
+</body>
+</html>

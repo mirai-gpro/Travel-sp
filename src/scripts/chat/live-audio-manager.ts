@@ -240,6 +240,37 @@ export class LiveAudioManager {
     }
 
     /**
+     * 【診断専用・read-only】同期状態のスナップショットを返す。
+     *
+     * `getCurrentExpressionFrame()` の判定式 (下記) をそのまま再計算するだけで、
+     * 状態は一切変更しない (`_a2eDebugCounter` も進めない)。
+     * 同期アルゴリズム / `firstChunkStartTime` / `expressionFrameBuffer` /
+     * fps / clamp 方式には手を付けていない。
+     */
+    getExpressionSyncDebugState(): {
+        playbackMs: number;
+        bufferFrames: number;
+        fps: number;
+        requestedFrame: number;
+        selectedFrame: number;
+        clamped: boolean;
+    } {
+        const playbackMs = this.getCurrentPlaybackOffset();
+        const bufferFrames = this.expressionFrameBuffer.length;
+        const fps = this.expressionFrameRate;
+        const requestedFrame = Math.floor((playbackMs / 1000) * fps);
+        const selectedFrame = Math.min(requestedFrame, bufferFrames - 1);
+        return {
+            playbackMs,
+            bufferFrames,
+            fps,
+            requestedFrame,
+            selectedFrame,
+            clamped: requestedFrame >= bufferFrames,
+        };
+    }
+
+    /**
      * 現在のフレームインデックスからexpressionフレームを取得
      */
     getCurrentExpressionFrame(): ExpressionFrame | null {

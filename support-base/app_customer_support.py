@@ -755,6 +755,7 @@ def handle_live_start(data):
     language = data.get('language', 'ja')
     voice_model = data.get('voice_model', '')
     live_voice = data.get('live_voice', '')
+    teacher_name = data.get('teacher_name', '')
 
     # 既存のLiveAPIセッションがあれば停止
     if client_sid in active_live_sessions:
@@ -779,7 +780,10 @@ def handle_live_start(data):
                     'preferred_name': profile.get('preferred_name', ''),
                     'name_honorific': profile.get('name_honorific', ''),
                 }
-                logger.info(f"[LiveAPI] ユーザープロファイル取得: first_visit={is_first_visit}, name={profile.get('preferred_name', '')}")
+                # ★ アバター毎の講師名（フロントエンドから受信）
+                if teacher_name:
+                    user_profile['lesson_teacher_name'] = teacher_name
+                logger.info(f"[LiveAPI] ユーザープロファイル取得: first_visit={is_first_visit}, name={profile.get('preferred_name', '')}, teacher={teacher_name}")
         except Exception as e:
             logger.warning(f"[LiveAPI] プロファイル取得エラー: {e}")
 

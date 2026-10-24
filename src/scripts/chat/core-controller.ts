@@ -3,6 +3,8 @@
 import { i18n } from '../../constants/i18n';
 import { AudioManager } from './audio-manager';
 import { LiveAudioManager } from './live-audio-manager';
+import { ensureDefaultAvatarInStorage } from '../../config/avatar-config';
+import { captureLiveExpression } from './a2e-replay';
 
 declare const io: any;
 
@@ -79,6 +81,30 @@ export class CoreController {
   protected async init() {
     console.log('[Core] Starting initialization...');
 
+    // ===== 一時診断: main thread の停止時間を見る (UIKA mode のみ) =====
+    // 100ms 間隔の heartbeat が 250ms 超遅れたら、その差分だけ main thread が
+    // 止まっていたことになる。Socket.IO の callback も止まるので、
+    // この直後に live_expression が複数 chunk まとまって届くかを見る。
+    try {
+      if (new URLSearchParams(location.search).get('uika133k') === '1') {
+        let last = performance.now();
+        setInterval(() => {
+          const now = performance.now();
+          const gap = now - last;
+          last = now;
+          if (gap > 250) {
+            console.warn(`[TRACE MAIN GAP] ${gap.toFixed(1)}ms`);
+            // 画面表示用に集計 (DevTools を開かずに読めるようにする)
+            const w = window as any;
+            const g = w.__uikaMainGap || (w.__uikaMainGap = { count: 0, maxMs: 0 });
+            g.count++;
+            if (gap > g.maxMs) g.maxMs = gap;
+          }
+        }, 100);
+        console.log('[TRACE] UIKA mode: main thread heartbeat 開始 (100ms, >250ms で警告)');
+      }
+    } catch (e) { /* noop */ }
+
     this.bindEvents();
     this.initSocket();
 
@@ -90,8 +116,7 @@ export class CoreController {
         }
     }, 10000);
 
-    await this.initializeSession();
-    this.updateUILanguage();
+    await this.resetAppContent();
 
     setTimeout(() => {
       if (this.els.splashOverlay) {
@@ -101,6 +126,9 @@ export class CoreController {
     }, 2000);
 
     console.log('[Core] Initialization completed');
+
+    // ★ 初期起動完了後にソフトリセットを自動実行（リップシンク正常化）
+    await this.resetAppContent();
   }
 
   protected getUserId(): string {
@@ -293,6 +321,17 @@ export class CoreController {
     });
 
     this.socket.on('live_audio', (data: any) => {
+      // ===== 一時診断ログ (TRACE) =====
+      // live_audio / live_expression のコールバック到達時刻を同じ形式で出し、
+      // 通常 LAM と UIKA で比較する。既存ロジックは変更しない。
+      {
+        const now = performance.now();
+        const audioNow = this.liveAudioManager.getCurrentPlaybackOffset();
+        console.log(
+          `[TRACE AUDIO] perf=${now.toFixed(1)}ms playback=${audioNow.toFixed(1)}ms`
+        );
+      }
+
       if (!this.isLiveMode) return;
       this.liveAudioManager.onAiResponseStarted();
       this.liveAudioManager.playPcmAudio(data.data);
@@ -300,9 +339,25 @@ export class CoreController {
 
     // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
     this.socket.on('live_expression', (data: any) => {
+      // ===== 一時診断ログ (TRACE) =====
+      {
+        const now = performance.now();
+        const audioNow = this.liveAudioManager.getCurrentPlaybackOffset();
+        const frames = data.expressions?.length ?? 0;
+        const fps = data.frame_rate ?? 30;
+        console.log(
+          `[TRACE EXPR] perf=${now.toFixed(1)}ms playback=${audioNow.toFixed(1)}ms ` +
+          `chunk=${data.chunk_index} frames=${frames} fps=${fps}`
+        );
+      }
+
       if (!this.isLiveMode) return;
       console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
       this.liveAudioManager.onExpressionReceived(data);
+
+      // ===== 診断専用: ?a2eCapture=1 のときだけ受信データをそのまま保存 =====
+      // 既存の処理には一切介入しない (保存するだけ)。
+      captureLiveExpression(data);
 
       // ★ A2Eのブレンドシェイプ名順序をLAMレンダラーに反映（名前インデックス同期）
       if (data.expression_names && data.expression_names.length > 0) {
@@ -584,15 +639,20 @@ export class CoreController {
       // LiveAudioManager初期化（マイク取得 + AudioWorklet設定）
       await this.liveAudioManager.initialize(this.socket);
 
+      // ★ 新規ユーザー対応: デフォルトアバター情報をlocalStorageに確実に設定
+      await ensureDefaultAvatarInStorage(this.currentMode);
+
       // サーバーにLiveAPIセッション開始を通知
       const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
       const liveVoice = localStorage.getItem(`selectedLiveVoice_${this.currentMode}`) || '';
+      const teacherName = localStorage.getItem(`selectedTeacherName_${this.currentMode}`) || '';
       this.socket.emit('live_start', {
         session_id: this.sessionId,
         mode: this.currentMode,
         language: this.currentLanguage,
         voice_model: voiceModel,
-        live_voice: liveVoice
+        live_voice: liveVoice,
+        teacher_name: teacherName
       });
 
       this.isLiveMode = true;
