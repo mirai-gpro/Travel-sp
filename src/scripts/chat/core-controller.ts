@@ -121,27 +121,12 @@ export class CoreController {
     // await しないで先に開始し、アバターが落ち着いた時点で外す。
     void this._hideSplashWhenReady();
 
-    // ===== 初回起動は soft reset を経由しない =====
-    // 2026/4/4 の a5fdcbef で「初期起動をソフトリセット経由にする」
-    // workaround が入っていた。当時の前提は
-    //   初期起動では Avatar 初期化より先に A2E が始まるので lip-sync が壊れる
-    //   -> 1 回目の reset の裏で Avatar を初期化し、2 回目で Live を再開始する
-    // だった。
-    //
-    // 現在は 1522e894 以降、
-    //   linkLamAvatar() を session より先に開始し、
-    //   startLiveMode() が splat finalBuild + Avatar 完全表示まで待ってから
-    //   live_start を出す
-    // 設計になっているので、この前提自体が存在しない。
-    // 二重 reset を残すと、起動直後に stopAllActivities() -> interrupt() ->
-    // セッション終了 -> もう一度 session/live_start という不自然なフローになる。
-    //
-    // resetAppContent() 自体は残す (ユーザー操作 / background 復帰などの
-    // 明示的な再セッション化で引き続き使う)。初回起動から外すだけ。
-    await this.initializeSession();
-    this.updateUILanguage();
+    await this.resetAppContent();
 
     console.log('[Core] Initialization completed');
+
+    // ★ 初期起動完了後にソフトリセットを自動実行（リップシンク正常化）
+    await this.resetAppContent();
   }
 
   protected getUserId(): string {
