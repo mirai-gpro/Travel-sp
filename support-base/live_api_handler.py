@@ -11,6 +11,7 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import threading
 import os
 import logging
 import struct
@@ -323,6 +324,19 @@ class LiveAPISession:
         self._generation_id = generation_id
         self._startup_role = startup_role
 
+        # ★ final startup lifecycle（Phase 4）
+        #   startup_role == 'final' のときだけ、Gemini 接続後に
+        #   FINAL_WAITING_FOR_GREETING で待機し、greeting_trigger を待つ。
+        #   one-shot は connection attempt ではなく final startup lifecycle に属する
+        #   （再接続しても再発火しない）。
+        self._greeting_state = None            # None / 'FINAL_WAITING_FOR_GREETING' / 'GREETING_TRIGGERED'
+        self._greeting_triggered = False
+        self._greeting_lock = threading.Lock()  # Socket handler thread からの受理判定を直列化
+        self._greeting_event: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # warmup 抑止ログの重複抑制（event 名ごとに 1 回）
+        self._warmup_suppress_logged = set()
+
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
@@ -365,6 +379,94 @@ class LiveAPISession:
         """起動ロール（live_start で固定。以後変更不可）。Phase 1では保持のみ"""
         return self._startup_role
 
+    # warmup 世代でもクライアントへ通す event。
+    # lifecycle 確認用の live_connected だけ。これ以外は UI / audio / Avatar 状態を
+    # 汚染しうるので全て抑止する（将来追加される event も既定で抑止される）。
+    WARMUP_ALLOWED_EVENTS = frozenset({'live_connected'})
+
+    def request_greeting(self, generation_id):
+        """greeting_trigger の受理判定。Socket handler thread から呼ばれる。
+
+        受理条件:
+          - startup_role == 'final'
+          - state == FINAL_WAITING_FOR_GREETING
+          - greeting_triggered == False
+          - received generation == この session の generation
+
+        受理したら「送信処理より先に」one-shot state を確定し、その後で
+        asyncio loop へ安全に通知する（loop.call_soon_threadsafe）。
+        Socket handler thread から asyncio object を直接 await したり
+        新しい loop / thread を作ったりはしない。
+
+        戻り値: (accepted: bool, reason: str)
+        """
+        with self._greeting_lock:
+            if self._startup_role != 'final':
+                return False, f'startup_role={self._startup_role}'
+            if self._greeting_state != 'FINAL_WAITING_FOR_GREETING':
+                return False, f'state={self._greeting_state}'
+            if self._greeting_triggered:
+                return False, 'already triggered'
+            if generation_id != self._generation_id:
+                return False, (f'generation mismatch '
+                               f'(received={generation_id} session={self._generation_id})')
+            loop = self._loop
+            event = self._greeting_event
+            if loop is None or event is None:
+                return False, 'event loop not ready'
+            # ★ 送信処理より先に one-shot state を確定する
+            self._greeting_triggered = True
+            self._greeting_state = 'GREETING_TRIGGERED'
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError as e:
+            logger.error(f"[GREETING] loop 通知に失敗: {e}")
+            return False, 'loop closed'
+        return True, 'accepted'
+
+    def _release_greeting_wait(self):
+        """待機中の greeting を解除する（stop 時）。timeout は使わない。"""
+        loop = self._loop
+        event = self._greeting_event
+        if loop is None or event is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+    async def _send_initial_greeting_trigger(self, session):
+        """INITIAL_GREETING_TRIGGER を Gemini へ 1 回送る（既存のダミーメッセージ）。"""
+        trigger_msgs = self.INITIAL_GREETING_TRIGGERS
+        mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
+        dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
+        await session.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(text=dummy_text)]),
+            turn_complete=True
+        )
+        logger.info(f"[LiveAPI] INITIAL_GREETING_TRIGGER_SENT_TO_GEMINI "
+                    f"generation={self._generation_id} role={self._startup_role} "
+                    f"text='{dummy_text}'")
+
+    async def _send_greeting_when_triggered(self, session):
+        """FINAL_WAITING_FOR_GREETING から greeting_trigger を待って 1 回だけ送る。
+
+        _session_loop と並行に動かすので、待機中も Gemini からの受信は止まらない。
+        stop() されたときは _release_greeting_wait() で解除され、送信せずに終了する。
+        """
+        try:
+            await self._greeting_event.wait()
+        except asyncio.CancelledError:
+            return
+        if not self.is_running or not self._greeting_triggered:
+            logger.info(f"[GREETING] waiting 解除（停止）: 初期挨拶は送らない "
+                        f"generation={self._generation_id}")
+            return
+        try:
+            await self._send_initial_greeting_trigger(session)
+        except Exception as e:
+            logger.error(f"[GREETING] INITIAL_GREETING_TRIGGER 送信失敗: {e}")
+
     def _emit(self, event, data=None):
         """Live session に属する全イベントの唯一の送信口。
 
@@ -380,6 +482,15 @@ class LiveAPISession:
         if not self.is_running:
             logger.debug(f"[Generation] outbound DROP event={event} "
                          f"generation={self._generation_id} (session stopped)")
+            return
+        # ★ warmup 世代の user-facing output は抑止する（Phase 4 §13）。
+        #   内部処理（Gemini 生成 / A2E 等）は従来どおり動かし、emit だけ止める。
+        #   診断 / lifecycle 確認用の live_connected だけ通す。
+        if self._startup_role == 'warmup' and event not in self.WARMUP_ALLOWED_EVENTS:
+            if event not in self._warmup_suppress_logged:
+                self._warmup_suppress_logged.add(event)
+                logger.info(f"[WARMUP_SUPPRESS] event={event} "
+                            f"generation={self._generation_id} (以後同 event は抑止ログを省略)")
             return
         payload = dict(data) if data else {}
         payload['generation_id'] = self._generation_id
@@ -481,6 +592,9 @@ class LiveAPISession:
         """セッションを停止"""
         self.is_running = False
         self.needs_reconnect = False
+        # ★ FINAL_WAITING_FOR_GREETING で待機中なら解除する。
+        #   待機が残って run() が終わらない状態を作らない（timeout は使わない）。
+        self._release_greeting_wait()
 
     async def run(self):
         """
@@ -489,6 +603,11 @@ class LiveAPISession:
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
         self.is_running = True
+        # ★ このセッション専用の event loop を保持する。
+        #   greeting_trigger（Socket handler thread）からはこの loop へ
+        #   call_soon_threadsafe で通知する。
+        self._loop = asyncio.get_running_loop()
+        self._greeting_event = asyncio.Event()
         self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
 
         try:
@@ -503,6 +622,7 @@ class LiveAPISession:
 
                 config = self._build_config(with_context=context)
 
+                greeting_task = None
                 try:
                     logger.info(
                         f"[LiveAPI] Gemini connect開始 generation={self._generation_id} "
@@ -523,21 +643,24 @@ class LiveAPISession:
                             'session_count': self.session_count,
                         })
 
-                        if self.session_count == 1:
-                            # 初回接続: ダミーメッセージで初期あいさつを発火
+                        # ★ 判定優先順位: explicit startup_role -> legacy session_count
+                        #   final startup lifecycle は greeted_client_sids /
+                        #   session_count の既存挙動より優先する。
+                        #   （double reset により同一 client_sid の 2 回目となり
+                        #     session_count が 1 に固定されても final として扱う）
+                        if self._startup_role == 'final' and not self._greeting_triggered:
+                            # final lifecycle: ここでは送らず greeting_trigger を待つ
                             self._is_initial_greeting_phase = True
-                            trigger_msgs = self.INITIAL_GREETING_TRIGGERS
-                            mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
-                            dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
-
-                            await session.send_client_content(
-                                turns=types.Content(
-                                    role="user",
-                                    parts=[types.Part(text=dummy_text)]
-                                ),
-                                turn_complete=True
-                            )
-                            logger.info(f"[LiveAPI] 初期あいさつトリガー送信: '{dummy_text}'")
+                            self._greeting_state = 'FINAL_WAITING_FOR_GREETING'
+                            logger.info(f"[GREETING] FINAL_WAITING_FOR_GREETING "
+                                        f"generation={self._generation_id} "
+                                        f"session_count={self.session_count}")
+                            greeting_task = asyncio.ensure_future(
+                                self._send_greeting_when_triggered(session))
+                        elif self.session_count == 1:
+                            # legacy / warmup: 従来どおり接続と同時に送る
+                            self._is_initial_greeting_phase = True
+                            await self._send_initial_greeting_trigger(session)
                         else:
                             # 再接続時（v5 §7.1: 履歴再送 → トリガーの2段階送信）
                             self._is_initial_greeting_phase = False
@@ -565,10 +688,18 @@ class LiveAPISession:
 
                         await self._session_loop(session)
 
+                        if greeting_task is not None:
+                            self._release_greeting_wait()
+                            greeting_task.cancel()
+                            greeting_task = None
+
                         if not self.needs_reconnect:
                             break
 
                 except Exception as e:
+                    if greeting_task is not None:
+                        greeting_task.cancel()
+                        greeting_task = None
                     error_msg = str(e).lower()
                     if any(kw in error_msg for kw in
                            ["1011", "internal error", "disconnected",

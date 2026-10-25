@@ -1023,6 +1023,30 @@ def handle_live_start(data):
     #   実際のGreeting完了時の greeting_done（live_api_handler.py の turn_complete）は残す。
 
 
+@socketio.on('greeting_trigger')
+def handle_greeting_trigger(data=None):
+    """正式初期挨拶の開始要求（Frontend の AND gate 成立時のみ 1 回送られる）"""
+    client_sid = request.sid
+    received_generation = data.get('generation_id') if isinstance(data, dict) else None
+
+    if not _check_generation('greeting_trigger', client_sid, received_generation):
+        return
+
+    live_session = active_live_sessions.get(client_sid)
+    if not live_session:
+        logger.info(f"[GREETING] greeting_trigger DROP sid={client_sid} "
+                    f"received={received_generation} (session なし)")
+        return
+
+    accepted, reason = live_session.request_greeting(received_generation)
+    if accepted:
+        logger.info(f"[GREETING] GREETING_TRIGGER_ACCEPTED sid={client_sid} "
+                    f"generation={received_generation}")
+    else:
+        logger.info(f"[GREETING] greeting_trigger DROP sid={client_sid} "
+                    f"received={received_generation} reason={reason}")
+
+
 @socketio.on('live_audio_in')
 def handle_live_audio_in(data):
     """ブラウザ → LiveAPI 音声データ"""
