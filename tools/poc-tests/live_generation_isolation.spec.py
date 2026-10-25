@@ -506,7 +506,10 @@ reset_state()
 c4 = new_client()
 sid4 = sid_of(c4)
 
-live_start(c4, 'G1', 'warmup')
+# Phase 4 で warmup 世代の user-facing emit は抑止されるようになったため、
+# 「旧世代の emit が G1 のまま」を見る H-3 は warmup 以外の role で検証する。
+# warmup suppression 自体は Phase 4 の spec が担当する。
+live_start(c4, 'G1', 'startup-test')
 g1 = SESSIONS[-1]
 recv = c4.get_received()
 ready = [r for r in recv if r['name'] == 'live_ready']
@@ -518,7 +521,7 @@ ok(connected and connected[0]['args'][0].get('generation_id') == 'G1',
    'H-2 LiveAPISession の emit に generation_id が付いている（live_connected）',
    f"payload={connected[0]['args'][0] if connected else None}")
 
-live_start(c4, 'G2', 'final')
+live_start(c4, 'G2', 'startup-test')
 g2 = SESSIONS[-1]
 c4.get_received()
 

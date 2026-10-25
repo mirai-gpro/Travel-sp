@@ -339,8 +339,13 @@ console.log('\n=== Test F/G/H: generation 独立 / Greeting 非干渉 ===');
         sceneCount: 1, delayFromRenderMs: 5.5,
     };
     document.dispatchEvent(new CustomEvent('avatar:first-valid-frame', { detail }));
+    ok(c.avatarVisible === false,
+       'G-2a FIRST_VALID_FRAME_RENDERED だけでは avatarVisible にしない（Phase 4 で再定義）');
+    // AVATAR_VISIBLE は presentation barrier 通過後に別 event として届く
+    const vdetail = { ...detail, visibleAt: 1250.0, barrierMs: 10.0, rendersSinceFirstValidFrame: 1 };
+    document.dispatchEvent(new CustomEvent('avatar:visible', { detail: vdetail }));
 
-    ok(c.avatarVisible === true, 'G-2 signal を受けて avatarVisible = true');
+    ok(c.avatarVisible === true, 'G-2 AVATAR_VISIBLE を受けて avatarVisible = true');
     ok(c.avatarFirstValidFrame && c.avatarFirstValidFrame.firstRenderTime === 1234.5,
        'G-3 診断値を保持している');
     ok(socket.emitted.length === 0,
@@ -357,7 +362,7 @@ console.log('\n=== Test F/G/H: generation 独立 / Greeting 非干渉 ===');
        `active=${c.activeGenerationId}`);
 
     // 同じ Avatar instance を共有しているので generation ごとに再発火しない
-    document.dispatchEvent(new CustomEvent('avatar:first-valid-frame', { detail }));
+    document.dispatchEvent(new CustomEvent('avatar:visible', { detail: vdetail }));
     ok(c.avatarFirstValidFrame.firstRenderTime === 1234.5,
        'F-3 2 回目の通知が来ても状態は 1 回目のまま（generation 再発火なし）');
 
