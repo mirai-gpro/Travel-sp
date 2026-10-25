@@ -163,6 +163,18 @@ const {
     async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
       if (this.isInitialized) return;
 
+      console.log(`[AVATAR] initialization_start t=${performance.now().toFixed(1)}ms`);
+
+      // ★ FIRST_VALID_FRAME_RENDERED を上位 controller へ中継する（Phase 3）。
+      //   signal の判定責務は Avatar subsystem（LAMWebSocketManager）側にあり、
+      //   ここは受け取って通知するだけ。Greeting / live_connected / A2E とは
+      //   結合しない（結合は Phase 4）。
+      this.lamManager.onFirstValidFrame((info) => {
+        document.dispatchEvent(new CustomEvent('avatar:first-valid-frame', {
+          detail: info,
+        }));
+      });
+
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
 

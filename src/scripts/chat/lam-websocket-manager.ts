@@ -58,9 +58,35 @@ export const ARKIT_BLENDSHAPE_NAMES = [
     'tongueOut'
 ];
 
+/**
+ * FIRST_VALID_FRAME_RENDERED の診断値。
+ * Architecture 上の AVATAR_VISIBLE の Source of Truth。
+ */
+export interface FirstValidFrameInfo {
+    /** splatMesh.firstRenderTime（renderer が記録した performance.now()） */
+    firstRenderTime: number;
+    /** アプリ側が観測した performance.now() */
+    observedAt: number;
+    /** 観測時点の描画対象 splat 数（geometry.instanceCount） */
+    renderSplatCount: number;
+    /** 観測時点の splat scene 数 */
+    sceneCount: number;
+    /** firstRenderTime から観測までの遅れ（ms） */
+    delayFromRenderMs: number;
+}
+
 export class LAMWebSocketManager {
     private renderer: GaussianSplats3D.GaussianSplatRenderer | null = null;
     private isModelLoaded: boolean = false;
+
+    // ★ FIRST_VALID_FRAME_RENDERED（Phase 3）
+    //   「Avatar がロードされた」ではなく「最初の有効描画が実際に成立した」ことを
+    //   検知する。Avatar lifecycle ごとに 1 回だけ発火する。
+    //   Live generation / Greeting / A2E とは独立した lifecycle なので、
+    //   generation では reset しない（reset するのは dispose / initialize のみ）。
+    private firstValidFrameReported: boolean = false;
+    private firstValidFrameInfo: FirstValidFrameInfo | null = null;
+    private firstValidFrameListener: ((info: FirstValidFrameInfo) => void) | null = null;
     private _exprDebugCounter: number = 0;  // デバッグログ間引き用
     private _prevMouthValues: Record<string, number> = {};  // スムージング用前フレーム値
 
@@ -157,6 +183,10 @@ export class LAMWebSocketManager {
                 await ensureDefaultAvatarInStorage(mode);
             }
 
+            // ★ Avatar lifecycle の開始。FIRST_VALID_FRAME_RENDERED を未発火に戻す。
+            this.firstValidFrameReported = false;
+            this.firstValidFrameInfo = null;
+
             this.renderer = await GaussianSplats3D.GaussianSplatRenderer.getInstance(
                 config.containerElement,
                 config.modelUrl,
@@ -168,6 +198,12 @@ export class LAMWebSocketManager {
                 }
             );
 
+            // renderer と viewer.splatMesh へ到達できるようになった時点。
+            // これは「表示準備完了」であって実描画ではない（signal にはしない）。
+            console.log('[AVATAR] renderer_ready'
+                + ` t=${performance.now().toFixed(1)}ms`
+                + ` splatMesh=${!!(this.renderer as any)?.viewer?.splatMesh}`);
+
             if (uikaMode) {
                 // ===== UIKA Native 133K hidden PoC =====
                 // 通常の avatar-config camera / orbit-limits / 初期6° polar 補正は
@@ -176,7 +212,7 @@ export class LAMWebSocketManager {
                 applyUika133kMode(this.renderer, { getChatState: () => this.chatState });
                 console.log('[LAMWebSocketManager][UIKA133K] mode 適用開始 '
                             + '(gate 判定は window.__uikaStatus を参照)');
-                this.isModelLoaded = true;
+                this._markModelReady('UIKA133K');
                 console.log('[LAMWebSocketManager] モデルロード完了 (UIKA133K)');
                 return;
             }
@@ -333,7 +369,7 @@ export class LAMWebSocketManager {
                 .then(() => logRunConfig(this.renderer, getDiagMode()))
                 .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e));
 
-            this.isModelLoaded = true;
+            this._markModelReady('LAM');
             console.log('[LAMWebSocketManager] モデルロード完了');
         } catch (error) {
             console.error('[LAMWebSocketManager] 初期化エラー:', error);
@@ -452,7 +488,90 @@ export class LAMWebSocketManager {
     /**
      * コールバック: 現在のexpressionデータをブレンドシェイプmapとして返す
      */
+    /**
+     * モデルのロード完了をマークする。
+     * これも「表示準備完了」であって実描画ではない（signal にはしない）。
+     */
+    private _markModelReady(label: string): void {
+        this.isModelLoaded = true;
+        console.log(`[AVATAR] model_ready t=${performance.now().toFixed(1)}ms (${label})`);
+    }
+
+    /**
+     * FIRST_VALID_FRAME_RENDERED のリスナ登録。
+     * 登録順に依存しないよう、既に成立していれば即座に通知する。
+     */
+    onFirstValidFrame(listener: (info: FirstValidFrameInfo) => void): void {
+        this.firstValidFrameListener = listener;
+        if (this.firstValidFrameReported && this.firstValidFrameInfo) {
+            try { listener(this.firstValidFrameInfo); }
+            catch (e) { console.warn('[AVATAR] first_valid_frame listener エラー:', e); }
+        }
+    }
+
+    /** FIRST_VALID_FRAME_RENDERED が既に成立しているか（診断用） */
+    hasRenderedFirstValidFrame(): boolean {
+        return this.firstValidFrameReported;
+    }
+
+    /**
+     * FIRST_VALID_FRAME_RENDERED の観測。
+     *
+     * 判定条件（すべて成立して初めて発火する）:
+     *   1. Avatar model が scene に存在する      … viewer.splatMesh があり scenes.length > 0
+     *   2. 描画対象 splat が存在する              … geometry.instanceCount > 0
+     *   3. 描画処理へ有効な geometry が渡った      … geometry.drawRange.count > 0
+     *   4. firstRenderTime が未設定値から有効値へ  … splatMesh.firstRenderTime >= 0（初期値 -1）
+     *
+     * renderer が render loop から毎フレーム呼ぶ getExpressionData() の中で
+     * 観測するので、新しい loop / setInterval / 固定待機 / monkey patch を作らない。
+     * node_modules は読むだけで一切変更しない。
+     */
+    private _observeFirstValidFrame(): void {
+        if (this.firstValidFrameReported) return;
+
+        const splatMesh = (this.renderer as any)?.viewer?.splatMesh;
+        if (!splatMesh) return;                                   // 1
+        const scenes = splatMesh.scenes;
+        if (!scenes || scenes.length === 0) return;               // 1
+        const geometry = splatMesh.geometry;
+        if (!geometry) return;
+        const renderSplatCount = geometry.instanceCount;
+        if (!(renderSplatCount > 0)) return;                      // 2
+        const drawRange = geometry.drawRange;
+        if (!drawRange || !(drawRange.count > 0)) return;         // 3
+        const firstRenderTime = splatMesh.firstRenderTime;
+        if (typeof firstRenderTime !== 'number' || firstRenderTime < 0) return;  // 4
+
+        const observedAt = performance.now();
+        const info: FirstValidFrameInfo = {
+            firstRenderTime,
+            observedAt,
+            renderSplatCount,
+            sceneCount: scenes.length,
+            delayFromRenderMs: observedAt - firstRenderTime,
+        };
+        this.firstValidFrameReported = true;
+        this.firstValidFrameInfo = info;
+
+        console.log('[AVATAR] first_valid_frame_rendered'
+            + ` t=${observedAt.toFixed(1)}ms`
+            + ` firstRenderTime=${firstRenderTime.toFixed(1)}ms`
+            + ` delay=${info.delayFromRenderMs.toFixed(1)}ms`
+            + ` splats=${renderSplatCount}`
+            + ` scenes=${info.sceneCount}`);
+
+        if (this.firstValidFrameListener) {
+            try { this.firstValidFrameListener(info); }
+            catch (e) { console.warn('[AVATAR] first_valid_frame listener エラー:', e); }
+        }
+    }
+
     private _getExpressionData(): Record<string, number> {
+        // ★ 既存の per-frame callback 内で観測する（Phase 3）。
+        //   morphProbe の early return より前に置くので全モードで観測される。
+        this._observeFirstValidFrame();
+
         const result: Record<string, number> = {};
 
         // ===== 診断専用: 人工 morph プローブ =====
@@ -779,6 +898,9 @@ export class LAMWebSocketManager {
     dispose(): void {
         this.renderer = null;
         this.isModelLoaded = false;
+        // ★ Avatar lifecycle の終端。次の lifecycle で再び 1 回だけ発火できるようにする。
+        this.firstValidFrameReported = false;
+        this.firstValidFrameInfo = null;
         this.currentExpression = null;
         this.expressionProvider = null;
         this.exprTrace = null;

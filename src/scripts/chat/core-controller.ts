@@ -45,6 +45,14 @@ export class CoreController {
   protected activeStartupRole: string | null = null;
   private _generationLogSeen = new Set<string>();
 
+  // ★ AVATAR_VISIBLE（Startup Architecture Phase 3）
+  //   Source of Truth は Avatar subsystem が出す FIRST_VALID_FRAME_RENDERED。
+  //   「initialize から N ms 経った」「load promise が終わった」で推定しない。
+  //   Live generation とは別 lifecycle なので generation では reset しない。
+  //   Phase 3 では診断状態として保持するだけで、Greeting には使わない。
+  protected avatarVisible = false;
+  protected avatarFirstValidFrame: any = null;
+
   // ★追加: バックグラウンド状態の追跡
   protected isInBackground = false;
   protected backgroundStartTime = 0;
@@ -313,6 +321,16 @@ export class CoreController {
     });
     this.els.userInput?.addEventListener('blur', () => {
       if (floatingButtons) floatingButtons.classList.remove('keyboard-active');
+    });
+
+    // ★ Avatar subsystem からの FIRST_VALID_FRAME_RENDERED を受け取る（Phase 3）。
+    //   live_connected との AND も greeting_trigger もここでは行わない（Phase 4）。
+    document.addEventListener('avatar:first-valid-frame', (e: any) => {
+      if (this.avatarVisible) return;
+      this.avatarVisible = true;
+      this.avatarFirstValidFrame = (e && e.detail) || null;
+      console.log('[AVATAR] avatarVisible=true (FIRST_VALID_FRAME_RENDERED) '
+        + JSON.stringify(this.avatarFirstValidFrame));
     });
 
     const resetHandler = async () => { await this.resetAppContent(); };
