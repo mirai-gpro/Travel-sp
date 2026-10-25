@@ -34,6 +34,7 @@ import { installAdaptiveSort } from './poc/adaptive-sort';
 import { installFrameCost } from './poc/frame-cost';
 import { installFull133Runtime } from './full133-runtime';
 import { installFull133Predeform } from './full133-predeform';
+import { installFull133RenderBudget } from './full133-render-budget';
 
 export interface LAMConfig {
     containerElement: HTMLDivElement;   // レンダラーを埋め込むdiv要素
@@ -325,6 +326,11 @@ export class LAMWebSocketManager {
                 .then(p => console.log('[FULL133 predeform]', JSON.stringify(p)))
                 .then(() => installAdaptiveSort(this.renderer))
                 .then(p => console.log('[PoC adaptiveSort]', JSON.stringify(p)))
+                // FULL133 + スマホのときだけ drawing buffer の DPR を 1.0 に制限する。
+                // sort / morph / predeform / skinning / shader には触らないので
+                // 既存 install の順序は変えず、後ろへ独立 1 段として足す。
+                .then(() => installFull133RenderBudget(this.renderer))
+                .then(p => { if (p.applied || p.mobile) console.log('[FULL133 RenderBudget]', JSON.stringify(p)); return p; })
                 // frame cost は **最後**。morph / sort の wrapper を外側から
                 // 包んで「実際に掛かった時間」を測るので、全部入った後でないと
                 // 出荷版の関数を直接包んでしまう (指示書 §13)。
