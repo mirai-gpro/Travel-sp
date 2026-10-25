@@ -45,13 +45,25 @@ export class CoreController {
   protected activeStartupRole: string | null = null;
   private _generationLogSeen = new Set<string>();
 
-  // ★ AVATAR_VISIBLE（Startup Architecture Phase 3）
-  //   Source of Truth は Avatar subsystem が出す FIRST_VALID_FRAME_RENDERED。
-  //   「initialize から N ms 経った」「load promise が終わった」で推定しない。
+  // ★ Avatar readiness（Phase 3 / Phase 4-A）
+  //   FIRST_VALID_FRAME_RENDERED … renderer へ有効 geometry が入った技術 signal
+  //   AVATAR_VISIBLE            … その frame が実際の render/presentation を通過した
+  //   Greeting gate の Avatar 側条件になるのは AVATAR_VISIBLE だけ。
+  //   「initialize から N ms 経った」「load promise が終わった」では推定しない。
   //   Live generation とは別 lifecycle なので generation では reset しない。
-  //   Phase 3 では診断状態として保持するだけで、Greeting には使わない。
-  protected avatarVisible = false;
+  protected avatarFirstValidFrameSeen = false;
   protected avatarFirstValidFrame: any = null;
+  protected avatarVisible = false;
+  protected avatarVisibleInfo: any = null;
+
+  // ★ Final Greeting Gate（Phase 4）
+  //   正式 Greeting は avatarVisible AND live_connected(final generation) の
+  //   両方が成立したときだけ、exactly once で greeting_trigger を送る。
+  //   live_ready / greeting_done は gate に使わない。
+  protected liveConnectedGeneration: number | null = null;
+  protected greetingTriggeredGeneration: number | null = null;
+  protected firstFormalAudioAt: number | null = null;
+  protected firstFormalExpressionAt: number | null = null;
 
   // ★追加: バックグラウンド状態の追跡
   protected isInBackground = false;
@@ -122,6 +134,8 @@ export class CoreController {
       }
     } catch (e) { /* noop */ }
 
+    console.log(`[STARTUP] APP_START t=${performance.now().toFixed(1)}ms`);
+
     this.bindEvents();
     this.initSocket();
 
@@ -173,6 +187,9 @@ export class CoreController {
     const retired = this.activeGenerationId;
     this.activeGenerationId = null;
     this.activeStartupRole = null;
+    // live_connected は generation に属する状態なので退役させる。
+    // greetingTriggeredGeneration は generation id で比較するので reset しない。
+    this.liveConnectedGeneration = null;
     this._generationLogSeen.clear();
     console.log(`[Generation] retire gen=${retired} -> active=null`);
   }
@@ -188,6 +205,8 @@ export class CoreController {
     this.activeStartupRole = startupRole ?? null;
     this._generationLogSeen.clear();
     console.log(`[Generation] allocate gen=${this.activeGenerationId} role=${this.activeStartupRole}`);
+    console.log(`[STARTUP] G${this.activeGenerationId}_START`
+      + ` role=${this.activeStartupRole} t=${performance.now().toFixed(1)}ms`);
     return this.activeGenerationId;
   }
 
@@ -228,6 +247,41 @@ export class CoreController {
       console.log(`[Generation] event=${eventName} received=${received} active=${active} -> ${decision}`);
     }
     return accepted;
+  }
+
+  /**
+   * 正式 Greeting の AND gate。
+   * avatar_visible と live_connected の到着順に依存しないよう、
+   * 両方の受け口からこの 1 箇所を呼ぶ。
+   *   avatarVisible == true
+   *   AND activeStartupRole == 'final'
+   *   AND liveConnectedGeneration == activeGenerationId
+   *   AND greetingTriggeredGeneration != activeGenerationId
+   * live_ready / greeting_done は条件に使わない。
+   */
+  protected tryTriggerFinalGreeting(): void {
+    const gen = this.activeGenerationId;
+    const ready = this.avatarVisible
+      && this.activeStartupRole === 'final'
+      && gen !== null
+      && this.liveConnectedGeneration === gen
+      && this.greetingTriggeredGeneration !== gen;
+
+    console.log(`[STARTUP] GREETING_GATE_CHECK gen=${gen} role=${this.activeStartupRole}`
+      + ` avatarVisible=${this.avatarVisible}`
+      + ` liveConnected=${this.liveConnectedGeneration}`
+      + ` triggered=${this.greetingTriggeredGeneration}`
+      + ` -> ${ready ? 'SEND' : 'WAIT'} t=${performance.now().toFixed(1)}ms`);
+
+    if (!ready) return;
+    if (!this.socket || !this.socket.connected) {
+      console.warn('[STARTUP] greeting_trigger を送れません（socket 未接続）');
+      return;
+    }
+    // ★ emit より先に one-shot を確定する（同一 tick の重複呼び出しでも 1 回）
+    this.greetingTriggeredGeneration = gen;
+    console.log(`[STARTUP] GREETING_TRIGGER_SENT gen=${gen} t=${performance.now().toFixed(1)}ms`);
+    this.socket.emit('greeting_trigger', { generation_id: gen });
   }
 
   protected async resetAppContent(startupRole?: string) {
@@ -323,14 +377,24 @@ export class CoreController {
       if (floatingButtons) floatingButtons.classList.remove('keyboard-active');
     });
 
-    // ★ Avatar subsystem からの FIRST_VALID_FRAME_RENDERED を受け取る（Phase 3）。
-    //   live_connected との AND も greeting_trigger もここでは行わない（Phase 4）。
+    // ★ Avatar subsystem からの FIRST_VALID_FRAME_RENDERED（技術 signal）。
+    //   これは Greeting gate には使わない。診断として保持するだけ。
     document.addEventListener('avatar:first-valid-frame', (e: any) => {
+      if (this.avatarFirstValidFrameSeen) return;
+      this.avatarFirstValidFrameSeen = true;
+      this.avatarFirstValidFrame = (e && e.detail) || null;
+      console.log('[AVATAR] first_valid_frame_rendered received '
+        + JSON.stringify(this.avatarFirstValidFrame));
+    });
+
+    // ★ AVATAR_VISIBLE（Phase 4-A）。Greeting gate の Avatar 側条件。
+    document.addEventListener('avatar:visible', (e: any) => {
       if (this.avatarVisible) return;
       this.avatarVisible = true;
-      this.avatarFirstValidFrame = (e && e.detail) || null;
-      console.log('[AVATAR] avatarVisible=true (FIRST_VALID_FRAME_RENDERED) '
-        + JSON.stringify(this.avatarFirstValidFrame));
+      this.avatarVisibleInfo = (e && e.detail) || null;
+      console.log('[AVATAR] avatarVisible=true (AVATAR_VISIBLE) '
+        + JSON.stringify(this.avatarVisibleInfo));
+      this.tryTriggerFinalGreeting();
     });
 
     const resetHandler = async () => { await this.resetAppContent(); };
@@ -422,7 +486,12 @@ export class CoreController {
     //   Phase 2では診断ログのみ。Greeting開始やAvatarとのAND gateには使わない。
     this.socket.on('live_connected', (data: any) => {
       if (!this.acceptGeneration('live_connected', data)) return;
-      console.log(`[STARTUP] live_connected gen=${data?.generation_id} session_count=${data?.session_count}`);
+      const gen = data?.generation_id ?? null;
+      console.log(`[STARTUP] G${gen}_LIVE_CONNECTED gen=${gen}`
+        + ` role=${this.activeStartupRole} session_count=${data?.session_count}`
+        + ` t=${performance.now().toFixed(1)}ms`);
+      this.liveConnectedGeneration = gen;
+      this.tryTriggerFinalGreeting();
     });
 
     this.socket.on('greeting_done', (data: any) => {
@@ -435,6 +504,12 @@ export class CoreController {
 
     this.socket.on('live_audio', (data: any) => {
       if (!this.acceptGeneration('live_audio', data)) return;
+      if (this.firstFormalAudioAt === null
+          && this.greetingTriggeredGeneration === this.activeGenerationId) {
+        this.firstFormalAudioAt = performance.now();
+        console.log(`[STARTUP] FIRST_FORMAL_AUDIO gen=${this.activeGenerationId}`
+          + ` t=${this.firstFormalAudioAt.toFixed(1)}ms`);
+      }
       // ===== 一時診断ログ (TRACE) =====
       // live_audio / live_expression のコールバック到達時刻を同じ形式で出し、
       // 通常 LAM と UIKA で比較する。既存ロジックは変更しない。
@@ -454,6 +529,12 @@ export class CoreController {
     // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
     this.socket.on('live_expression', (data: any) => {
       if (!this.acceptGeneration('live_expression', data)) return;
+      if (this.firstFormalExpressionAt === null
+          && this.greetingTriggeredGeneration === this.activeGenerationId) {
+        this.firstFormalExpressionAt = performance.now();
+        console.log(`[STARTUP] FIRST_FORMAL_EXPRESSION gen=${this.activeGenerationId}`
+          + ` t=${this.firstFormalExpressionAt.toFixed(1)}ms`);
+      }
       // ===== 一時診断ログ (TRACE) =====
       {
         const now = performance.now();
