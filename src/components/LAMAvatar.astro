@@ -175,6 +175,18 @@ const {
         }));
       });
 
+      // ★ AVATAR_VISIBLE（Phase 4-A）。
+      //   FIRST_VALID_FRAME_RENDERED が実際の render/presentation を通過した後に届く。
+      //   AVATAR_VISIBLE だけが Greeting gate の Avatar 側条件になる。
+      this.lamManager.onAvatarVisible((info) => {
+        // ★ Avatar 用の loading indicator は AVATAR_VISIBLE まで消さない（Phase 4 §20）。
+        //   model load 完了では消さない。splash の既存タイマーとは別物なので触らない。
+        this.loadingEl.classList.add('hidden');
+        document.dispatchEvent(new CustomEvent('avatar:visible', {
+          detail: info,
+        }));
+      });
+
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
 
@@ -253,7 +265,8 @@ const {
         }
 
         if (this.lamManager.isLoaded()) {
-          this.loadingEl.classList.add('hidden');
+          // ★ ここでは loading indicator を消さない。
+          //   AVATAR_VISIBLE（onAvatarVisible）まで出し続ける。
           this.syncPlayer.start();
           this.isInitialized = true;
           console.log('[LAMAvatar] 3Dアバター初期化完了');
