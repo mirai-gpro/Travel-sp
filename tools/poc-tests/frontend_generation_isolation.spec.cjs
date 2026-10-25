@@ -408,8 +408,11 @@ ok(/if self\.session_count == 1:/.test(handlerSrc)
 ok(/A2E_FIRST_FLUSH_BYTES = 4800/.test(handlerSrc)
    && /A2E_AUTO_FLUSH_BYTES = 240000/.test(handlerSrc),
    'L-5 A2E 閾値が変更されていない');
-ok(/_greeting_pcm_buffer/.test(handlerSrc) && /_buffer_for_a2e/.test(handlerSrc),
-   'L-6 _greeting_pcm_buffer / _buffer_for_a2e が残っている');
+// Phase 5 で初期あいさつ専用の一括PCMバッファは撤去され、
+// 初期あいさつも通常会話と同じ _buffer_for_a2e() の streaming 経路になった。
+// ここで固定するのは「通常会話の A2E 経路が残っていること」。
+ok(/_buffer_for_a2e/.test(handlerSrc) && /_flush_a2e_buffer/.test(handlerSrc),
+   'L-6 通常会話の A2E streaming 経路が残っている');
 
 // ---------- Test E: audio stream への generation bind ----------
 console.log('\n=== Test E: audio stream の generation binding ===');

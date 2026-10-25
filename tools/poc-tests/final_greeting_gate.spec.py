@@ -260,10 +260,12 @@ _has_notify = 'call_soon_threadsafe' in req_code
 ok(_has_set and _has_notify
    and req_code.index('_greeting_triggered = True') < req_code.index('call_soon_threadsafe'),
    '静的-6 one-shot state を loop への通知より先に確定している')
-ok('_greeting_pcm_buffer' in handler_src and '_buffer_for_a2e' in handler_src
+# Phase 5 で初期あいさつ専用の一括PCMバッファは撤去された。
+# 固定するのは通常会話の A2E 経路と閾値が不変であること。
+ok('_buffer_for_a2e' in handler_src
    and 'A2E_FIRST_FLUSH_BYTES = 4800' in handler_src
    and 'A2E_AUTO_FLUSH_BYTES = 240000' in handler_src,
-   '静的-7 A2E 経路 / 閾値を変更していない（Phase 5 の範囲）')
+   '静的-7 通常会話の A2E 経路 / 閾値を変更していない')
 ok('greeted_client_sids' in app_src and 'session_count' in handler_src,
    '静的-8 legacy の greeted_client_sids / session_count を撤去していない')
 ok("WARMUP_ALLOWED_EVENTS = frozenset({'live_connected'})" in handler_src,
