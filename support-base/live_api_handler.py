@@ -340,7 +340,11 @@ class LiveAPISession:
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
-        self._greeting_pcm_buffer = bytearray()  # 初期あいさつ用PCM蓄積（A2E先行方式）
+        # 初期あいさつ専用のPCM一括バッファは撤去した。
+        # 初期あいさつも通常会話と同じ _buffer_for_a2e() の streaming 経路を通る。
+
+        # A2E 処理順の計測点（turn ごとに最初の 1 回だけ INFO で出す）
+        self._turn_marks = set()
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -467,6 +471,18 @@ class LiveAPISession:
         except Exception as e:
             logger.error(f"[GREETING] INITIAL_GREETING_TRIGGER 送信失敗: {e}")
 
+    def _mark(self, name, detail=''):
+        """A2E 処理順の計測点。turn 内で最初の 1 回だけ INFO を出す。
+        PCM chunk ごとのログ洪水を避けるため 2 回目以降は何も出さない。"""
+        if name in self._turn_marks:
+            return
+        self._turn_marks.add(name)
+        logger.info(f"[A2E_SEQ] {name}"
+                    f" generation={self._generation_id}"
+                    f" role={self._startup_role}"
+                    f" initial_greeting={self._is_initial_greeting_phase}"
+                    + (f" {detail}" if detail else ''))
+
     def _emit(self, event, data=None):
         """Live session に属する全イベントの唯一の送信口。
 
@@ -492,6 +508,9 @@ class LiveAPISession:
                 logger.info(f"[WARMUP_SUPPRESS] event={event} "
                             f"generation={self._generation_id} (以後同 event は抑止ログを省略)")
             return
+        if event == 'live_expression':
+            self._mark('FIRST_LIVE_EXPRESSION',
+                       f"chunk_index={(data or {}).get('chunk_index')}")
         payload = dict(data) if data else {}
         payload['generation_id'] = self._generation_id
         self.socketio.emit(event, payload, room=self.client_sid)
@@ -806,17 +825,13 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # ★ 初期あいさつ: A2E先行方式で一括処理
-                        if self._is_initial_greeting_phase and self._greeting_pcm_buffer:
-                            greeting_pcm = bytes(self._greeting_pcm_buffer)
-                            self._greeting_pcm_buffer = bytearray()
-                            logger.info(f"[A2E] 初期あいさつA2E先行送信: {len(greeting_pcm)} bytes")
-                            await self._send_a2e_ahead(greeting_pcm)
-                        else:
-                            # 通常ターン: 残存バッファを強制フラッシュ（最終チャンク）
-                            await self._flush_a2e_buffer(force=True, is_final=True)
-                            await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
+                        # 初期あいさつも通常ターンと同じ最終フラッシュを通す。
+                        # （初期あいさつ専用の _send_a2e_ahead 一括送信は撤去した）
+                        await self._flush_a2e_buffer(force=True, is_final=True)
+                        await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
+                        self._mark('TURN_COMPLETE')
+                        self._turn_marks = set()      # 次ターンの計測点を再び取る
                         self._process_turn_complete()
                         self._emit('turn_complete', {})
 
@@ -867,17 +882,19 @@ class LiveAPISession:
                             if (hasattr(part, 'inline_data')
                                     and part.inline_data):
                                 if isinstance(part.inline_data.data, bytes):
+                                    self._mark('FIRST_GEMINI_AUDIO_CHUNK',
+                                               f"bytes={len(part.inline_data.data)}")
                                     audio_b64 = base64.b64encode(
                                         part.inline_data.data
                                     ).decode('utf-8')
                                     self._emit('live_audio',
                                                {'data': audio_b64})
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
-                                    if self._is_initial_greeting_phase:
-                                        # 初期あいさつ: A2E先行方式用に別バッファに蓄積
-                                        self._greeting_pcm_buffer.extend(part.inline_data.data)
-                                    else:
-                                        self._buffer_for_a2e(part.inline_data.data)
+                                    #   初期あいさつも通常会話も同じ streaming 経路。
+                                    #   初期あいさつ専用の一括バッファ分岐は撤去した。
+                                    self._mark('FIRST_A2E_BUFFER_APPEND',
+                                               f"bytes={len(part.inline_data.data)}")
+                                    self._buffer_for_a2e(part.inline_data.data)
 
     async def _handle_tool_call(self, tool_call, session):
         """
@@ -1661,7 +1678,13 @@ class LiveAPISession:
         chunk_index = self._a2e_chunk_index
         self._a2e_chunk_index += 1
 
+        self._mark('FIRST_A2E_FLUSH',
+                   f"chunk_index={chunk_index} bytes={len(pcm_data)} "
+                   f"force={force} is_final={is_final}")
+
         # キューに投入（ワーカーが直列で送信）
+        self._mark('FIRST_A2E_REQUEST',
+                   f"chunk_index={chunk_index} bytes={len(pcm_data)} (queued)")
         await self._a2e_send_queue.put((pcm_data, chunk_index, is_final))
 
     async def _send_to_a2e(self, pcm_data: bytes, chunk_index: int, is_final: bool = False):
