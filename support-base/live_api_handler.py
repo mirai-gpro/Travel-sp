@@ -304,7 +304,8 @@ class LiveAPISession:
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
                  shop_search_callback=None, user_id: str = None,
-                 voice_model: str = '', live_voice: str = ''):
+                 voice_model: str = '', live_voice: str = '',
+                 generation_id: str = None, startup_role: str = None):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -315,6 +316,12 @@ class LiveAPISession:
         self.voice_model = voice_model  # REST TTS用音声モデル名（例: ja-JP-Chirp3-HD-Leda）
         self.live_voice = live_voice    # LiveAPI用音声名（例: Leda）
         self.user_id = user_id  # 長期記憶のプロファイル更新に使用
+
+        # ★ 世代識別（live_start で固定。生成後は変更不可 = read-only property）
+        #   None の場合は legacy request（generation を送らないFrontend）。
+        #   Phase 1では保持と通知のみ。roleによる挙動分岐は行わない。
+        self._generation_id = generation_id
+        self._startup_role = startup_role
 
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
@@ -347,6 +354,16 @@ class LiveAPISession:
         # 非同期キュー
         self.audio_queue_to_gemini = None
         self.is_running = False
+
+    @property
+    def generation_id(self):
+        """世代ID（live_start で固定。以後変更不可）"""
+        return self._generation_id
+
+    @property
+    def startup_role(self):
+        """起動ロール（live_start で固定。以後変更不可）。Phase 1では保持のみ"""
+        return self._startup_role
 
     def _build_config(self, with_context=None):
         """
@@ -467,10 +484,25 @@ class LiveAPISession:
                 config = self._build_config(with_context=context)
 
                 try:
+                    logger.info(
+                        f"[LiveAPI] Gemini connect開始 generation={self._generation_id} "
+                        f"role={self._startup_role} session_count={self.session_count}"
+                    )
                     async with self.client.aio.live.connect(
                         model=LIVE_API_MODEL,
                         config=config
                     ) as session:
+                        # ★ Gemini Live の connect() が実際に成功した時点の通知。
+                        #   live_ready（Socketハンドラ側の起動通知）とは別物。
+                        #   Phase 1ではGreeting制御には使用しない（通知のみ）。
+                        logger.info(
+                            f"[LiveAPI] Gemini connect成功 generation={self._generation_id} "
+                            f"session_count={self.session_count}"
+                        )
+                        self.socketio.emit('live_connected', {
+                            'generation_id': self._generation_id,
+                            'session_count': self.session_count,
+                        }, room=self.client_sid)
 
                         if self.session_count == 1:
                             # 初回接続: ダミーメッセージで初期あいさつを発火

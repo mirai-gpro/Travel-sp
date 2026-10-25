@@ -746,6 +746,48 @@ def health_check():
 active_live_sessions = {}  # {client_sid: LiveAPISession}
 greeted_client_sids = set()  # 挨拶済みのclient_sid
 
+# ★ Socket SIDごとの現在のactive generation（世代所有権）
+#   最後に受理した live_start の generation_id を保持する。
+#   値が None の場合は legacy request（generation を送らないFrontend）。
+active_generation_by_sid = {}  # {client_sid: generation_id}
+
+# 世代判定ログの重複抑止（live_audio_in は毎フレーム到着するため）
+_generation_log_seen = set()  # {(client_sid, event, received, active, decision)}
+
+
+def _check_generation(event_name, client_sid, received_generation):
+    """
+    受信イベントの generation が現在のactive generationと一致するか判定する。
+
+    後方互換性: received / active のどちらかが None（legacy request、
+    または generation を伴わずに開始されたセッション）の場合は世代分離を
+    適用せず ACCEPT する。仮の generation を推測生成はしない。
+
+    戻り値: True = 処理を続行 / False = Drop
+    """
+    active_generation = active_generation_by_sid.get(client_sid)
+    if received_generation is None or active_generation is None:
+        decision = 'ACCEPT (legacy: no generation)'
+        accepted = True
+    elif received_generation == active_generation:
+        decision = 'ACCEPT'
+        accepted = True
+    else:
+        decision = 'DROP (stale generation)'
+        accepted = False
+
+    message = (f"[Generation] event={event_name} sid={client_sid} "
+               f"received={received_generation} active={active_generation} "
+               f"-> {decision}")
+    key = (client_sid, event_name, received_generation, active_generation, decision)
+    if key in _generation_log_seen:
+        logger.debug(message)
+    else:
+        _generation_log_seen.add(key)
+        logger.info(message)
+    return accepted
+
+
 @socketio.on('live_start')
 def handle_live_start(data):
     """LiveAPIセッション開始"""
@@ -756,6 +798,9 @@ def handle_live_start(data):
     voice_model = data.get('voice_model', '')
     live_voice = data.get('live_voice', '')
     teacher_name = data.get('teacher_name', '')
+    # ★ 世代識別。legacy request では None のまま（推測生成しない）
+    generation_id = data.get('generation_id')
+    startup_role = data.get('startup_role')
 
     # 既存のLiveAPIセッションがあれば停止
     if client_sid in active_live_sessions:
@@ -934,7 +979,9 @@ def handle_live_start(data):
         shop_search_callback=shop_search_callback,
         user_id=user_id,
         voice_model=voice_model,
-        live_voice=live_voice
+        live_voice=live_voice,
+        generation_id=generation_id,
+        startup_role=startup_role
     )
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
@@ -944,6 +991,11 @@ def handle_live_start(data):
         greeted_client_sids.add(client_sid)
 
     active_live_sessions[client_sid] = live_session
+    # ★ この sid の active generation を更新（最後の live_start が所有権を持つ）
+    active_generation_by_sid[client_sid] = generation_id
+    logger.info(f"[Generation] event=live_start sid={client_sid} "
+                f"received={generation_id} active={generation_id} "
+                f"-> ACCEPT (active generation updated, role={startup_role})")
 
     # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
     def start_live_session_thread(session):
@@ -965,15 +1017,21 @@ def handle_live_start(data):
 
     emit('live_ready', {'status': 'connected'})
 
-    # ★ 挨拶済みの場合、greeting_doneも即座にemit（§5.3 ソフトリロード対応）
-    if client_sid in greeted_client_sids:
-        emit('greeting_done', {})
+    # ★ ここにあった greeting_done の即時emitは削除した。
+    #   greeted_client_sids.add() の直後に同じ集合を判定していたため初回でも必ず発火し、
+    #   実際のGreeting完了を表していなかった（二重emitの原因）。
+    #   実際のGreeting完了時の greeting_done（live_api_handler.py の turn_complete）は残す。
 
 
 @socketio.on('live_audio_in')
 def handle_live_audio_in(data):
     """ブラウザ → LiveAPI 音声データ"""
     client_sid = request.sid
+
+    # ★ 旧世代からの音声入力は現行セッションへ渡さない
+    if not _check_generation('live_audio_in', client_sid, data.get('generation_id')):
+        return
+
     live_session = active_live_sessions.get(client_sid)
 
     if not live_session or not live_session.is_running:
@@ -991,13 +1049,20 @@ def handle_live_audio_in(data):
 
 
 @socketio.on('live_stop')
-def handle_live_stop():
+def handle_live_stop(data=None):
     """LiveAPIセッション終了"""
     client_sid = request.sid
+    received_generation = data.get('generation_id') if isinstance(data, dict) else None
+
+    # ★ 遅延した live_stop(G1) が現行の G2 を停止しないようにする
+    if not _check_generation('live_stop', client_sid, received_generation):
+        return
+
     if client_sid in active_live_sessions:
         live_session = active_live_sessions[client_sid]
         live_session.stop()
         del active_live_sessions[client_sid]
+    active_generation_by_sid.pop(client_sid, None)
     emit('live_stopped', {'status': 'disconnected'})
 
 
@@ -1023,6 +1088,10 @@ def handle_disconnect():
         logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
     # 挨拶済みフラグのクリーンアップ
     greeted_client_sids.discard(request.sid)
+    # ★ 世代所有権のクリーンアップ
+    active_generation_by_sid.pop(request.sid, None)
+    for _key in [k for k in _generation_log_seen if k[0] == request.sid]:
+        _generation_log_seen.discard(_key)
     # STTストリームのクリーンアップ
     if request.sid in active_streams:
         stream_data = active_streams[request.sid]
