@@ -282,11 +282,16 @@ input:checked + .slider:before { transform: translateX(20px); }
 
 <script>
   import { ConciergeController } from '../scripts/chat/concierge-controller';
+  import { runLegacyAvatarInstallCleanupIfNeeded }
+    from '../scripts/legacy-avatar-install-cleanup';
   
-  document.addEventListener('DOMContentLoaded', () => {
+  document.addEventListener('DOMContentLoaded', async () => {
     const container = document.querySelector('.gourmet-chat-container') as HTMLElement;
     if (container) {
       const apiBase = container.dataset.apiBase || '';
+      // PR #85-#87 が端末へ残した avatar install 状態だけを 1 回掃除する。
+      // chat controller の初期化より前。失敗しても起動は止めない。
+      await runLegacyAvatarInstallCleanupIfNeeded();
       new ConciergeController(container, apiBase);
     }
   });
