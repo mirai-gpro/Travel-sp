@@ -11,7 +11,6 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
-import threading
 import os
 import logging
 import struct
@@ -305,8 +304,7 @@ class LiveAPISession:
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
                  shop_search_callback=None, user_id: str = None,
-                 voice_model: str = '', live_voice: str = '',
-                 generation_id: str = None, startup_role: str = None):
+                 voice_model: str = '', live_voice: str = ''):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -318,33 +316,10 @@ class LiveAPISession:
         self.live_voice = live_voice    # LiveAPI用音声名（例: Leda）
         self.user_id = user_id  # 長期記憶のプロファイル更新に使用
 
-        # ★ 世代識別（live_start で固定。生成後は変更不可 = read-only property）
-        #   None の場合は legacy request（generation を送らないFrontend）。
-        #   Phase 1では保持と通知のみ。roleによる挙動分岐は行わない。
-        self._generation_id = generation_id
-        self._startup_role = startup_role
-
-        # ★ final startup lifecycle（Phase 4）
-        #   startup_role == 'final' のときだけ、Gemini 接続後に
-        #   FINAL_WAITING_FOR_GREETING で待機し、greeting_trigger を待つ。
-        #   one-shot は connection attempt ではなく final startup lifecycle に属する
-        #   （再接続しても再発火しない）。
-        self._greeting_state = None            # None / 'FINAL_WAITING_FOR_GREETING' / 'GREETING_TRIGGERED'
-        self._greeting_triggered = False
-        self._greeting_lock = threading.Lock()  # Socket handler thread からの受理判定を直列化
-        self._greeting_event: asyncio.Event | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        # warmup 抑止ログの重複抑制（event 名ごとに 1 回）
-        self._warmup_suppress_logged = set()
-
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
-        # 初期あいさつ専用のPCM一括バッファは撤去した。
-        # 初期あいさつも通常会話と同じ _buffer_for_a2e() の streaming 経路を通る。
-
-        # A2E 処理順の計測点（turn ごとに最初の 1 回だけ INFO で出す）
-        self._turn_marks = set()
+        self._greeting_pcm_buffer = bytearray()  # 初期あいさつ用PCM蓄積（A2E先行方式）
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -372,148 +347,6 @@ class LiveAPISession:
         # 非同期キュー
         self.audio_queue_to_gemini = None
         self.is_running = False
-
-    @property
-    def generation_id(self):
-        """世代ID（live_start で固定。以後変更不可）"""
-        return self._generation_id
-
-    @property
-    def startup_role(self):
-        """起動ロール（live_start で固定。以後変更不可）。Phase 1では保持のみ"""
-        return self._startup_role
-
-    # warmup 世代でもクライアントへ通す event。
-    # lifecycle 確認用の live_connected だけ。これ以外は UI / audio / Avatar 状態を
-    # 汚染しうるので全て抑止する（将来追加される event も既定で抑止される）。
-    WARMUP_ALLOWED_EVENTS = frozenset({'live_connected'})
-
-    def request_greeting(self, generation_id):
-        """greeting_trigger の受理判定。Socket handler thread から呼ばれる。
-
-        受理条件:
-          - startup_role == 'final'
-          - state == FINAL_WAITING_FOR_GREETING
-          - greeting_triggered == False
-          - received generation == この session の generation
-
-        受理したら「送信処理より先に」one-shot state を確定し、その後で
-        asyncio loop へ安全に通知する（loop.call_soon_threadsafe）。
-        Socket handler thread から asyncio object を直接 await したり
-        新しい loop / thread を作ったりはしない。
-
-        戻り値: (accepted: bool, reason: str)
-        """
-        with self._greeting_lock:
-            if self._startup_role != 'final':
-                return False, f'startup_role={self._startup_role}'
-            if self._greeting_state != 'FINAL_WAITING_FOR_GREETING':
-                return False, f'state={self._greeting_state}'
-            if self._greeting_triggered:
-                return False, 'already triggered'
-            if generation_id != self._generation_id:
-                return False, (f'generation mismatch '
-                               f'(received={generation_id} session={self._generation_id})')
-            loop = self._loop
-            event = self._greeting_event
-            if loop is None or event is None:
-                return False, 'event loop not ready'
-            # ★ 送信処理より先に one-shot state を確定する
-            self._greeting_triggered = True
-            self._greeting_state = 'GREETING_TRIGGERED'
-        try:
-            loop.call_soon_threadsafe(event.set)
-        except RuntimeError as e:
-            logger.error(f"[GREETING] loop 通知に失敗: {e}")
-            return False, 'loop closed'
-        return True, 'accepted'
-
-    def _release_greeting_wait(self):
-        """待機中の greeting を解除する（stop 時）。timeout は使わない。"""
-        loop = self._loop
-        event = self._greeting_event
-        if loop is None or event is None:
-            return
-        try:
-            loop.call_soon_threadsafe(event.set)
-        except RuntimeError:
-            pass
-
-    async def _send_initial_greeting_trigger(self, session):
-        """INITIAL_GREETING_TRIGGER を Gemini へ 1 回送る（既存のダミーメッセージ）。"""
-        trigger_msgs = self.INITIAL_GREETING_TRIGGERS
-        mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
-        dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
-        await session.send_client_content(
-            turns=types.Content(role="user", parts=[types.Part(text=dummy_text)]),
-            turn_complete=True
-        )
-        logger.info(f"[LiveAPI] INITIAL_GREETING_TRIGGER_SENT_TO_GEMINI "
-                    f"generation={self._generation_id} role={self._startup_role} "
-                    f"text='{dummy_text}'")
-
-    async def _send_greeting_when_triggered(self, session):
-        """FINAL_WAITING_FOR_GREETING から greeting_trigger を待って 1 回だけ送る。
-
-        _session_loop と並行に動かすので、待機中も Gemini からの受信は止まらない。
-        stop() されたときは _release_greeting_wait() で解除され、送信せずに終了する。
-        """
-        try:
-            await self._greeting_event.wait()
-        except asyncio.CancelledError:
-            return
-        if not self.is_running or not self._greeting_triggered:
-            logger.info(f"[GREETING] waiting 解除（停止）: 初期挨拶は送らない "
-                        f"generation={self._generation_id}")
-            return
-        try:
-            await self._send_initial_greeting_trigger(session)
-        except Exception as e:
-            logger.error(f"[GREETING] INITIAL_GREETING_TRIGGER 送信失敗: {e}")
-
-    def _mark(self, name, detail=''):
-        """A2E 処理順の計測点。turn 内で最初の 1 回だけ INFO を出す。
-        PCM chunk ごとのログ洪水を避けるため 2 回目以降は何も出さない。"""
-        if name in self._turn_marks:
-            return
-        self._turn_marks.add(name)
-        logger.info(f"[A2E_SEQ] {name}"
-                    f" generation={self._generation_id}"
-                    f" role={self._startup_role}"
-                    f" initial_greeting={self._is_initial_greeting_phase}"
-                    + (f" {detail}" if detail else ''))
-
-    def _emit(self, event, data=None):
-        """Live session に属する全イベントの唯一の送信口。
-
-        - generation_id は必ず self._generation_id（この session 固有の値）を
-          付与する。送信時点の active generation をコピーしてはいけない。
-          旧世代 session が遅れて emit した場合も generation_id は旧世代のまま
-          になる（G2 へ付け替えない）。
-        - stop() 済みの session からの user-facing event は送信しない。
-          handle_live_start() は新しい session を作る前に必ず旧 session を
-          stop() するため、is_running が False の session は退役した旧世代。
-          （app_customer_support の global state は import しない＝循環依存回避）
-        """
-        if not self.is_running:
-            logger.debug(f"[Generation] outbound DROP event={event} "
-                         f"generation={self._generation_id} (session stopped)")
-            return
-        # ★ warmup 世代の user-facing output は抑止する（Phase 4 §13）。
-        #   内部処理（Gemini 生成 / A2E 等）は従来どおり動かし、emit だけ止める。
-        #   診断 / lifecycle 確認用の live_connected だけ通す。
-        if self._startup_role == 'warmup' and event not in self.WARMUP_ALLOWED_EVENTS:
-            if event not in self._warmup_suppress_logged:
-                self._warmup_suppress_logged.add(event)
-                logger.info(f"[WARMUP_SUPPRESS] event={event} "
-                            f"generation={self._generation_id} (以後同 event は抑止ログを省略)")
-            return
-        if event == 'live_expression':
-            self._mark('FIRST_LIVE_EXPRESSION',
-                       f"chunk_index={(data or {}).get('chunk_index')}")
-        payload = dict(data) if data else {}
-        payload['generation_id'] = self._generation_id
-        self.socketio.emit(event, payload, room=self.client_sid)
 
     def _build_config(self, with_context=None):
         """
@@ -611,9 +444,6 @@ class LiveAPISession:
         """セッションを停止"""
         self.is_running = False
         self.needs_reconnect = False
-        # ★ FINAL_WAITING_FOR_GREETING で待機中なら解除する。
-        #   待機が残って run() が終わらない状態を作らない（timeout は使わない）。
-        self._release_greeting_wait()
 
     async def run(self):
         """
@@ -622,11 +452,6 @@ class LiveAPISession:
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
         self.is_running = True
-        # ★ このセッション専用の event loop を保持する。
-        #   greeting_trigger（Socket handler thread）からはこの loop へ
-        #   call_soon_threadsafe で通知する。
-        self._loop = asyncio.get_running_loop()
-        self._greeting_event = asyncio.Event()
         self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
 
         try:
@@ -641,49 +466,32 @@ class LiveAPISession:
 
                 config = self._build_config(with_context=context)
 
-                greeting_task = None
                 try:
-                    logger.info(
-                        f"[LiveAPI] Gemini connect開始 generation={self._generation_id} "
-                        f"role={self._startup_role} session_count={self.session_count}"
-                    )
                     async with self.client.aio.live.connect(
                         model=LIVE_API_MODEL,
                         config=config
                     ) as session:
-                        # ★ Gemini Live の connect() が実際に成功した時点の通知。
-                        #   live_ready（Socketハンドラ側の起動通知）とは別物。
-                        #   Phase 1ではGreeting制御には使用しない（通知のみ）。
-                        logger.info(
-                            f"[LiveAPI] Gemini connect成功 generation={self._generation_id} "
-                            f"session_count={self.session_count}"
-                        )
-                        self._emit('live_connected', {
-                            'session_count': self.session_count,
-                        })
 
-                        # ★ 判定優先順位: explicit startup_role -> legacy session_count
-                        #   final startup lifecycle は greeted_client_sids /
-                        #   session_count の既存挙動より優先する。
-                        #   （double reset により同一 client_sid の 2 回目となり
-                        #     session_count が 1 に固定されても final として扱う）
-                        if self._startup_role == 'final' and not self._greeting_triggered:
-                            # final lifecycle: ここでは送らず greeting_trigger を待つ
+                        if self.session_count == 1:
+                            # 初回接続: ダミーメッセージで初期あいさつを発火
                             self._is_initial_greeting_phase = True
-                            self._greeting_state = 'FINAL_WAITING_FOR_GREETING'
-                            logger.info(f"[GREETING] FINAL_WAITING_FOR_GREETING "
-                                        f"generation={self._generation_id} "
-                                        f"session_count={self.session_count}")
-                            greeting_task = asyncio.ensure_future(
-                                self._send_greeting_when_triggered(session))
-                        elif self.session_count == 1:
-                            # legacy / warmup: 従来どおり接続と同時に送る
-                            self._is_initial_greeting_phase = True
-                            await self._send_initial_greeting_trigger(session)
+                            trigger_msgs = self.INITIAL_GREETING_TRIGGERS
+                            mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
+                            dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
+
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text=dummy_text)]
+                                ),
+                                turn_complete=True
+                            )
+                            logger.info(f"[LiveAPI] 初期あいさつトリガー送信: '{dummy_text}'")
                         else:
                             # 再接続時（v5 §7.1: 履歴再送 → トリガーの2段階送信）
                             self._is_initial_greeting_phase = False
-                            self._emit('live_reconnecting', {})
+                            self.socketio.emit('live_reconnecting', {},
+                                               room=self.client_sid)
 
                             # ★ 1008で中断された未処理のユーザー発話を履歴に救済
                             if self.user_transcript_buffer.strip():
@@ -703,22 +511,15 @@ class LiveAPISession:
                             self._resume_message = None
                             await session.send_realtime_input(text=resume_text)
                             logger.info("[LiveAPI] 再接続: 履歴再送+トリガー送信完了")
-                            self._emit('live_reconnected', {})
+                            self.socketio.emit('live_reconnected', {},
+                                               room=self.client_sid)
 
                         await self._session_loop(session)
-
-                        if greeting_task is not None:
-                            self._release_greeting_wait()
-                            greeting_task.cancel()
-                            greeting_task = None
 
                         if not self.needs_reconnect:
                             break
 
                 except Exception as e:
-                    if greeting_task is not None:
-                        greeting_task.cancel()
-                        greeting_task = None
                     error_msg = str(e).lower()
                     if any(kw in error_msg for kw in
                            ["1011", "internal error", "disconnected",
@@ -825,20 +626,26 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # 初期あいさつも通常ターンと同じ最終フラッシュを通す。
-                        # （初期あいさつ専用の _send_a2e_ahead 一括送信は撤去した）
-                        await self._flush_a2e_buffer(force=True, is_final=True)
-                        await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
+                        # ★ 初期あいさつ: A2E先行方式で一括処理
+                        if self._is_initial_greeting_phase and self._greeting_pcm_buffer:
+                            greeting_pcm = bytes(self._greeting_pcm_buffer)
+                            self._greeting_pcm_buffer = bytearray()
+                            logger.info(f"[A2E] 初期あいさつA2E先行送信: {len(greeting_pcm)} bytes")
+                            await self._send_a2e_ahead(greeting_pcm)
+                        else:
+                            # 通常ターン: 残存バッファを強制フラッシュ（最終チャンク）
+                            await self._flush_a2e_buffer(force=True, is_final=True)
+                            await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
-                        self._mark('TURN_COMPLETE')
-                        self._turn_marks = set()      # 次ターンの計測点を再び取る
                         self._process_turn_complete()
-                        self._emit('turn_complete', {})
+                        self.socketio.emit('turn_complete', {},
+                                           room=self.client_sid)
 
                         # 初期あいさつフェーズ終了（仕様書02 セクション4.5.5）
                         if self._is_initial_greeting_phase:
                             self._is_initial_greeting_phase = False
-                            self._emit('greeting_done', {})
+                            self.socketio.emit('greeting_done', {},
+                                               room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
                             # 注: 旧モデル(2.5)では 1008 予防の keep-alive 空ターンを
                             #     送っていたが、Gemini 3.1 Live では send_client_content
@@ -851,7 +658,8 @@ class LiveAPISession:
                         self._clear_a2e_queue()
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self.ai_transcript_buffer = ""
-                        self._emit('interrupted', {})
+                        self.socketio.emit('interrupted', {},
+                                           room=self.client_sid)
                         continue
 
                     # 4. 入力トランスクリプション
@@ -862,8 +670,9 @@ class LiveAPISession:
                         text = sc.input_transcription.text
                         if text and not self._is_initial_greeting_phase:
                             self.user_transcript_buffer += text
-                            self._emit('user_transcript',
-                                       {'text': text})
+                            self.socketio.emit('user_transcript',
+                                               {'text': text},
+                                               room=self.client_sid)
 
                     # 5. 出力トランスクリプション
                     if (hasattr(sc, 'output_transcription')
@@ -871,8 +680,9 @@ class LiveAPISession:
                         text = sc.output_transcription.text
                         if text:
                             self.ai_transcript_buffer += text
-                            self._emit('ai_transcript',
-                                       {'text': text})
+                            self.socketio.emit('ai_transcript',
+                                               {'text': text},
+                                               room=self.client_sid)
                             # ★ A2E: 句読点検出フラッシュ（キュー直列化で順序保証済み）
                             self._on_output_transcription(text)
 
@@ -882,19 +692,18 @@ class LiveAPISession:
                             if (hasattr(part, 'inline_data')
                                     and part.inline_data):
                                 if isinstance(part.inline_data.data, bytes):
-                                    self._mark('FIRST_GEMINI_AUDIO_CHUNK',
-                                               f"bytes={len(part.inline_data.data)}")
                                     audio_b64 = base64.b64encode(
                                         part.inline_data.data
                                     ).decode('utf-8')
-                                    self._emit('live_audio',
-                                               {'data': audio_b64})
+                                    self.socketio.emit('live_audio',
+                                                       {'data': audio_b64},
+                                                       room=self.client_sid)
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
-                                    #   初期あいさつも通常会話も同じ streaming 経路。
-                                    #   初期あいさつ専用の一括バッファ分岐は撤去した。
-                                    self._mark('FIRST_A2E_BUFFER_APPEND',
-                                               f"bytes={len(part.inline_data.data)}")
-                                    self._buffer_for_a2e(part.inline_data.data)
+                                    if self._is_initial_greeting_phase:
+                                        # 初期あいさつ: A2E先行方式用に別バッファに蓄積
+                                        self._greeting_pcm_buffer.extend(part.inline_data.data)
+                                    else:
+                                        self._buffer_for_a2e(part.inline_data.data)
 
     async def _handle_tool_call(self, tool_call, session):
         """
@@ -907,7 +716,8 @@ class LiveAPISession:
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
-                self._emit('shop_search_start', {})
+                self.socketio.emit('shop_search_start', {},
+                                   room=self.client_sid)
 
                 # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
                 # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
@@ -976,9 +786,9 @@ class LiveAPISession:
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
-            self._emit('shop_search_result', {
+            self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
-            })
+            }, room=self.client_sid)
             return
 
         try:
@@ -992,9 +802,9 @@ class LiveAPISession:
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
-                self._emit('shop_search_result', {
+                self.socketio.emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
-                })
+                }, room=self.client_sid)
                 return
 
             raw_shops = shop_data['shops']
@@ -1010,10 +820,10 @@ class LiveAPISession:
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
 
             # 3. ショップカードデータをブラウザに送信
-            self._emit('shop_search_result', {
+            self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
-            })
+            }, room=self.client_sid)
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
             await asyncio.sleep(0.3)
 
@@ -1022,9 +832,9 @@ class LiveAPISession:
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
-            self._emit('shop_search_result', {
+            self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
-            })
+            }, room=self.client_sid)
 
     def _process_turn_complete(self):
         """
@@ -1111,7 +921,7 @@ class LiveAPISession:
         logger.info(f"[ShopDesc] 1軒目冒頭TTS先行開始: '{head_text}'")
 
         # ── A2Eリセット ──
-        self._emit('live_expression_reset')
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
         self._clear_a2e_queue()
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
@@ -1264,12 +1074,13 @@ class LiveAPISession:
             self._add_to_history("ai", transcript)
 
         # expressionリセット（前セグメントの残留防止）
-        self._emit('live_expression_reset')
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
 
         # 音声送信
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
-            self._emit('live_audio', {'data': audio_b64})
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
 
     async def _stream_single_shop(self, shop, shop_number: int, total: int):
         """1軒目用: 音声を直接ブラウザにストリーミング"""
@@ -1404,17 +1215,17 @@ class LiveAPISession:
         all_pcm = b''.join(audio_chunks)
 
         # 1. expressionリセット → フロントのバッファクリア
-        self._emit('live_expression_reset')
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
 
         # 2. A2E先行: Expressionをフロントに先着させる
         if a2e_result:
             # 事前計算済み: emitのみ（HTTP待ちなし）
-            self._emit('live_expression', {
+            self.socketio.emit('live_expression', {
                 'expressions': a2e_result['expressions'],
                 'expression_names': a2e_result['expression_names'],
                 'frame_rate': a2e_result['frame_rate'],
                 'chunk_index': 0,
-            })
+            }, room=self.client_sid)
             logger.info(f"[A2E] ショップ{shop_number}: 事前計算済みexpression emit ({len(a2e_result['expressions'])} frames)")
         else:
             # 事前計算失敗時: 従来通りHTTP呼び出し
@@ -1426,7 +1237,8 @@ class LiveAPISession:
         # 4. 音声送信: Expressionが既にバッファにある状態で再生開始
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
-            self._emit('live_audio', {'data': audio_b64})
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
 
     async def _receive_shop_description(self, session, shop_number: int):
         """
@@ -1462,8 +1274,9 @@ class LiveAPISession:
                     text = sc.output_transcription.text
                     if text:
                         self.ai_transcript_buffer += text
-                        self._emit('ai_transcript',
-                                   {'text': text, 'type': 'shop_description'})
+                        self.socketio.emit('ai_transcript',
+                                           {'text': text, 'type': 'shop_description'},
+                                           room=self.client_sid)
 
                 # 出力トランスクリプション（ショップ説明 - A2E句読点検出）
                 if (hasattr(sc, 'output_transcription')
@@ -1481,8 +1294,9 @@ class LiveAPISession:
                                 audio_b64 = base64.b64encode(
                                     part.inline_data.data
                                 ).decode('utf-8')
-                                self._emit('live_audio',
-                                           {'data': audio_b64})
+                                self.socketio.emit('live_audio',
+                                                   {'data': audio_b64},
+                                                   room=self.client_sid)
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
                                 # ★ ストリーミング送信バイト数累計（動的sleep用）
@@ -1508,7 +1322,7 @@ class LiveAPISession:
             return
 
         # 1. expressionリセット → フロントのバッファクリア
-        self._emit('live_expression_reset')
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
 
         # 2. A2E先行: 全音声を一括でA2Eに送信し、Expressionを先にフロントへ届ける
         await self._send_a2e_ahead(pcm_data)
@@ -1521,7 +1335,8 @@ class LiveAPISession:
         for i in range(0, len(pcm_data), CHUNK_SIZE):
             chunk = pcm_data[i:i + CHUNK_SIZE]
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
-            self._emit('live_audio', {'data': audio_b64})
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
 
         logger.info(f"[CachedAudio] A2E先行+再生完了: {len(pcm_data)} bytes")
 
@@ -1678,13 +1493,7 @@ class LiveAPISession:
         chunk_index = self._a2e_chunk_index
         self._a2e_chunk_index += 1
 
-        self._mark('FIRST_A2E_FLUSH',
-                   f"chunk_index={chunk_index} bytes={len(pcm_data)} "
-                   f"force={force} is_final={is_final}")
-
         # キューに投入（ワーカーが直列で送信）
-        self._mark('FIRST_A2E_REQUEST',
-                   f"chunk_index={chunk_index} bytes={len(pcm_data)} (queued)")
         await self._a2e_send_queue.put((pcm_data, chunk_index, is_final))
 
     async def _send_to_a2e(self, pcm_data: bytes, chunk_index: int, is_final: bool = False):
@@ -1729,12 +1538,12 @@ class LiveAPISession:
                     # A2Eレスポンス frames: [{weights: [float]}] →
                     # フロントエンド expressions: [[float]] に変換
                     expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
-                    self._emit('live_expression', {
+                    self.socketio.emit('live_expression', {
                         'expressions': expressions,
                         'expression_names': names,
                         'frame_rate': frame_rate,
                         'chunk_index': chunk_index,
-                    })
+                    }, room=self.client_sid)
                     logger.info(f"[A2E] chunk {chunk_index}: {len(frames)} frames送信")
             else:
                 logger.warning(f"[A2E] サービスエラー: {response.status_code}")

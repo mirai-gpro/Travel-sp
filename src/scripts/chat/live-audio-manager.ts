@@ -56,13 +56,6 @@ export class LiveAudioManager {
     public isAiSpeaking: boolean = false;
     private isStreaming: boolean = false;
 
-    // ★ Generation Isolation（Phase 2）
-    //   このaudio streamが属するLive sessionのgeneration。
-    //   emit時点のglobal stateを読むのではなく、stream開始時に固定した値を使う。
-    //   そうしないと、G1のcallbackがG2 activeになった後に発火した場合に
-    //   G1の音声をG2として誤送信してしまう。
-    private streamGenerationId: number | string | null = null;
-
     // PCM再生（24kHz）- 即時スケジューリング方式
     private nextPlayTime: number = 0;
     private scheduledSources: AudioBufferSourceNode[] = [];  // interrupt時にstop()用
@@ -157,31 +150,12 @@ export class LiveAudioManager {
             if (!this.isStreaming) return;
             if (this.isAiSpeaking) return; // 半二重: AI応答中は送信しない
 
-            // ★ このstreamにbindされたgenerationを送る（遅延callbackもG1のまま）
-            if (this.streamGenerationId === null) {
-                console.warn('[LiveAudioManager] generation未bind: live_audio_in を送信しません');
-                return;
-            }
             const audioChunk: Int16Array = e.data.audioChunk;
             const base64 = arrayBufferToBase64(audioChunk.buffer);
-            this.socket.emit('live_audio_in', {
-                data: base64,
-                generation_id: this.streamGenerationId,
-            });
+            this.socket.emit('live_audio_in', { data: base64 });
         };
 
         console.log('[LiveAudioManager] 初期化完了');
-    }
-
-    // ========================================
-    // ★ Generation bind（Phase 2）
-    //   Live session開始時（live_start送信時）に、そのsessionのgenerationを
-    //   このaudio streamへ固定する。セッション終了時は null を渡して解除する。
-    //   generationはstream/sessionに属し、emit時点のglobal stateではない。
-    // ========================================
-    bindGeneration(generationId: number | string | null): void {
-        this.streamGenerationId = generationId;
-        console.log(`[LiveAudioManager] generation bind: ${generationId}`);
     }
 
     // ========================================
