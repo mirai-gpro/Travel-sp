@@ -163,30 +163,6 @@ const {
     async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
       if (this.isInitialized) return;
 
-      console.log(`[AVATAR] initialization_start t=${performance.now().toFixed(1)}ms`);
-
-      // ★ FIRST_VALID_FRAME_RENDERED を上位 controller へ中継する（Phase 3）。
-      //   signal の判定責務は Avatar subsystem（LAMWebSocketManager）側にあり、
-      //   ここは受け取って通知するだけ。Greeting / live_connected / A2E とは
-      //   結合しない（結合は Phase 4）。
-      this.lamManager.onFirstValidFrame((info) => {
-        document.dispatchEvent(new CustomEvent('avatar:first-valid-frame', {
-          detail: info,
-        }));
-      });
-
-      // ★ AVATAR_VISIBLE（Phase 4-A）。
-      //   FIRST_VALID_FRAME_RENDERED が実際の render/presentation を通過した後に届く。
-      //   AVATAR_VISIBLE だけが Greeting gate の Avatar 側条件になる。
-      this.lamManager.onAvatarVisible((info) => {
-        // ★ Avatar 用の loading indicator は AVATAR_VISIBLE まで消さない（Phase 4 §20）。
-        //   model load 完了では消さない。splash の既存タイマーとは別物なので触らない。
-        this.loadingEl.classList.add('hidden');
-        document.dispatchEvent(new CustomEvent('avatar:visible', {
-          detail: info,
-        }));
-      });
-
       // AudioSyncPlayer に LiveAudioManager をバインド
       this.syncPlayer.bindLiveAudioManager(liveAudioManager);
 
@@ -265,8 +241,7 @@ const {
         }
 
         if (this.lamManager.isLoaded()) {
-          // ★ ここでは loading indicator を消さない。
-          //   AVATAR_VISIBLE（onAvatarVisible）まで出し続ける。
+          this.loadingEl.classList.add('hidden');
           this.syncPlayer.start();
           this.isInitialized = true;
           console.log('[LAMAvatar] 3Dアバター初期化完了');
