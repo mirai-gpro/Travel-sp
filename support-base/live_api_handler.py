@@ -365,6 +365,26 @@ class LiveAPISession:
         """起動ロール（live_start で固定。以後変更不可）。Phase 1では保持のみ"""
         return self._startup_role
 
+    def _emit(self, event, data=None):
+        """Live session に属する全イベントの唯一の送信口。
+
+        - generation_id は必ず self._generation_id（この session 固有の値）を
+          付与する。送信時点の active generation をコピーしてはいけない。
+          旧世代 session が遅れて emit した場合も generation_id は旧世代のまま
+          になる（G2 へ付け替えない）。
+        - stop() 済みの session からの user-facing event は送信しない。
+          handle_live_start() は新しい session を作る前に必ず旧 session を
+          stop() するため、is_running が False の session は退役した旧世代。
+          （app_customer_support の global state は import しない＝循環依存回避）
+        """
+        if not self.is_running:
+            logger.debug(f"[Generation] outbound DROP event={event} "
+                         f"generation={self._generation_id} (session stopped)")
+            return
+        payload = dict(data) if data else {}
+        payload['generation_id'] = self._generation_id
+        self.socketio.emit(event, payload, room=self.client_sid)
+
     def _build_config(self, with_context=None):
         """
         Live API接続設定を構築
@@ -499,10 +519,9 @@ class LiveAPISession:
                             f"[LiveAPI] Gemini connect成功 generation={self._generation_id} "
                             f"session_count={self.session_count}"
                         )
-                        self.socketio.emit('live_connected', {
-                            'generation_id': self._generation_id,
+                        self._emit('live_connected', {
                             'session_count': self.session_count,
-                        }, room=self.client_sid)
+                        })
 
                         if self.session_count == 1:
                             # 初回接続: ダミーメッセージで初期あいさつを発火
@@ -522,8 +541,7 @@ class LiveAPISession:
                         else:
                             # 再接続時（v5 §7.1: 履歴再送 → トリガーの2段階送信）
                             self._is_initial_greeting_phase = False
-                            self.socketio.emit('live_reconnecting', {},
-                                               room=self.client_sid)
+                            self._emit('live_reconnecting', {})
 
                             # ★ 1008で中断された未処理のユーザー発話を履歴に救済
                             if self.user_transcript_buffer.strip():
@@ -543,8 +561,7 @@ class LiveAPISession:
                             self._resume_message = None
                             await session.send_realtime_input(text=resume_text)
                             logger.info("[LiveAPI] 再接続: 履歴再送+トリガー送信完了")
-                            self.socketio.emit('live_reconnected', {},
-                                               room=self.client_sid)
+                            self._emit('live_reconnected', {})
 
                         await self._session_loop(session)
 
@@ -670,14 +687,12 @@ class LiveAPISession:
                             await self._a2e_send_queue.join()  # 全チャンク送信完了を待つ
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self._process_turn_complete()
-                        self.socketio.emit('turn_complete', {},
-                                           room=self.client_sid)
+                        self._emit('turn_complete', {})
 
                         # 初期あいさつフェーズ終了（仕様書02 セクション4.5.5）
                         if self._is_initial_greeting_phase:
                             self._is_initial_greeting_phase = False
-                            self.socketio.emit('greeting_done', {},
-                                               room=self.client_sid)
+                            self._emit('greeting_done', {})
                             logger.info("[LiveAPI] greeting_done送信")
                             # 注: 旧モデル(2.5)では 1008 予防の keep-alive 空ターンを
                             #     送っていたが、Gemini 3.1 Live では send_client_content
@@ -690,8 +705,7 @@ class LiveAPISession:
                         self._clear_a2e_queue()
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self.ai_transcript_buffer = ""
-                        self.socketio.emit('interrupted', {},
-                                           room=self.client_sid)
+                        self._emit('interrupted', {})
                         continue
 
                     # 4. 入力トランスクリプション
@@ -702,9 +716,8 @@ class LiveAPISession:
                         text = sc.input_transcription.text
                         if text and not self._is_initial_greeting_phase:
                             self.user_transcript_buffer += text
-                            self.socketio.emit('user_transcript',
-                                               {'text': text},
-                                               room=self.client_sid)
+                            self._emit('user_transcript',
+                                       {'text': text})
 
                     # 5. 出力トランスクリプション
                     if (hasattr(sc, 'output_transcription')
@@ -712,9 +725,8 @@ class LiveAPISession:
                         text = sc.output_transcription.text
                         if text:
                             self.ai_transcript_buffer += text
-                            self.socketio.emit('ai_transcript',
-                                               {'text': text},
-                                               room=self.client_sid)
+                            self._emit('ai_transcript',
+                                       {'text': text})
                             # ★ A2E: 句読点検出フラッシュ（キュー直列化で順序保証済み）
                             self._on_output_transcription(text)
 
@@ -727,9 +739,8 @@ class LiveAPISession:
                                     audio_b64 = base64.b64encode(
                                         part.inline_data.data
                                     ).decode('utf-8')
-                                    self.socketio.emit('live_audio',
-                                                       {'data': audio_b64},
-                                                       room=self.client_sid)
+                                    self._emit('live_audio',
+                                               {'data': audio_b64})
                                     # ★ A2E: PCMバッファ蓄積（仕様書08 セクション3.2）
                                     if self._is_initial_greeting_phase:
                                         # 初期あいさつ: A2E先行方式用に別バッファに蓄積
@@ -748,8 +759,7 @@ class LiveAPISession:
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
-                self.socketio.emit('shop_search_start', {},
-                                   room=self.client_sid)
+                self._emit('shop_search_start', {})
 
                 # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
                 # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
@@ -818,9 +828,9 @@ class LiveAPISession:
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
-            self.socketio.emit('shop_search_result', {
+            self._emit('shop_search_result', {
                 'shops': [], 'response': '',
-            }, room=self.client_sid)
+            })
             return
 
         try:
@@ -834,9 +844,9 @@ class LiveAPISession:
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
-                self.socketio.emit('shop_search_result', {
+                self._emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
-                }, room=self.client_sid)
+                })
                 return
 
             raw_shops = shop_data['shops']
@@ -852,10 +862,10 @@ class LiveAPISession:
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
 
             # 3. ショップカードデータをブラウザに送信
-            self.socketio.emit('shop_search_result', {
+            self._emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
-            }, room=self.client_sid)
+            })
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
             await asyncio.sleep(0.3)
 
@@ -864,9 +874,9 @@ class LiveAPISession:
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
-            self.socketio.emit('shop_search_result', {
+            self._emit('shop_search_result', {
                 'shops': [], 'response': '',
-            }, room=self.client_sid)
+            })
 
     def _process_turn_complete(self):
         """
@@ -953,7 +963,7 @@ class LiveAPISession:
         logger.info(f"[ShopDesc] 1軒目冒頭TTS先行開始: '{head_text}'")
 
         # ── A2Eリセット ──
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
+        self._emit('live_expression_reset')
         self._clear_a2e_queue()
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
@@ -1106,13 +1116,12 @@ class LiveAPISession:
             self._add_to_history("ai", transcript)
 
         # expressionリセット（前セグメントの残留防止）
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
+        self._emit('live_expression_reset')
 
         # 音声送信
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
-            self.socketio.emit('live_audio', {'data': audio_b64},
-                               room=self.client_sid)
+            self._emit('live_audio', {'data': audio_b64})
 
     async def _stream_single_shop(self, shop, shop_number: int, total: int):
         """1軒目用: 音声を直接ブラウザにストリーミング"""
@@ -1247,17 +1256,17 @@ class LiveAPISession:
         all_pcm = b''.join(audio_chunks)
 
         # 1. expressionリセット → フロントのバッファクリア
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
+        self._emit('live_expression_reset')
 
         # 2. A2E先行: Expressionをフロントに先着させる
         if a2e_result:
             # 事前計算済み: emitのみ（HTTP待ちなし）
-            self.socketio.emit('live_expression', {
+            self._emit('live_expression', {
                 'expressions': a2e_result['expressions'],
                 'expression_names': a2e_result['expression_names'],
                 'frame_rate': a2e_result['frame_rate'],
                 'chunk_index': 0,
-            }, room=self.client_sid)
+            })
             logger.info(f"[A2E] ショップ{shop_number}: 事前計算済みexpression emit ({len(a2e_result['expressions'])} frames)")
         else:
             # 事前計算失敗時: 従来通りHTTP呼び出し
@@ -1269,8 +1278,7 @@ class LiveAPISession:
         # 4. 音声送信: Expressionが既にバッファにある状態で再生開始
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
-            self.socketio.emit('live_audio', {'data': audio_b64},
-                               room=self.client_sid)
+            self._emit('live_audio', {'data': audio_b64})
 
     async def _receive_shop_description(self, session, shop_number: int):
         """
@@ -1306,9 +1314,8 @@ class LiveAPISession:
                     text = sc.output_transcription.text
                     if text:
                         self.ai_transcript_buffer += text
-                        self.socketio.emit('ai_transcript',
-                                           {'text': text, 'type': 'shop_description'},
-                                           room=self.client_sid)
+                        self._emit('ai_transcript',
+                                   {'text': text, 'type': 'shop_description'})
 
                 # 出力トランスクリプション（ショップ説明 - A2E句読点検出）
                 if (hasattr(sc, 'output_transcription')
@@ -1326,9 +1333,8 @@ class LiveAPISession:
                                 audio_b64 = base64.b64encode(
                                     part.inline_data.data
                                 ).decode('utf-8')
-                                self.socketio.emit('live_audio',
-                                                   {'data': audio_b64},
-                                                   room=self.client_sid)
+                                self._emit('live_audio',
+                                           {'data': audio_b64})
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
                                 # ★ ストリーミング送信バイト数累計（動的sleep用）
@@ -1354,7 +1360,7 @@ class LiveAPISession:
             return
 
         # 1. expressionリセット → フロントのバッファクリア
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
+        self._emit('live_expression_reset')
 
         # 2. A2E先行: 全音声を一括でA2Eに送信し、Expressionを先にフロントへ届ける
         await self._send_a2e_ahead(pcm_data)
@@ -1367,8 +1373,7 @@ class LiveAPISession:
         for i in range(0, len(pcm_data), CHUNK_SIZE):
             chunk = pcm_data[i:i + CHUNK_SIZE]
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
-            self.socketio.emit('live_audio', {'data': audio_b64},
-                               room=self.client_sid)
+            self._emit('live_audio', {'data': audio_b64})
 
         logger.info(f"[CachedAudio] A2E先行+再生完了: {len(pcm_data)} bytes")
 
@@ -1570,12 +1575,12 @@ class LiveAPISession:
                     # A2Eレスポンス frames: [{weights: [float]}] →
                     # フロントエンド expressions: [[float]] に変換
                     expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
-                    self.socketio.emit('live_expression', {
+                    self._emit('live_expression', {
                         'expressions': expressions,
                         'expression_names': names,
                         'frame_rate': frame_rate,
                         'chunk_index': chunk_index,
-                    }, room=self.client_sid)
+                    })
                     logger.info(f"[A2E] chunk {chunk_index}: {len(frames)} frames送信")
             else:
                 logger.warning(f"[A2E] サービスエラー: {response.status_code}")

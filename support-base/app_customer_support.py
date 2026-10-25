@@ -1015,7 +1015,7 @@ def handle_live_start(data):
     )
     thread.start()
 
-    emit('live_ready', {'status': 'connected'})
+    emit('live_ready', {'status': 'connected', 'generation_id': generation_id})
 
     # ★ ここにあった greeting_done の即時emitは削除した。
     #   greeted_client_sids.add() の直後に同じ集合を判定していたため初回でも必ず発火し、
@@ -1058,12 +1058,16 @@ def handle_live_stop(data=None):
     if not _check_generation('live_stop', client_sid, received_generation):
         return
 
+    stopped_generation = received_generation
     if client_sid in active_live_sessions:
         live_session = active_live_sessions[client_sid]
+        # 停止した session 固有の generation を Source of Truth にする
+        stopped_generation = live_session.generation_id
         live_session.stop()
         del active_live_sessions[client_sid]
     active_generation_by_sid.pop(client_sid, None)
-    emit('live_stopped', {'status': 'disconnected'})
+    emit('live_stopped', {'status': 'disconnected',
+                          'generation_id': stopped_generation})
 
 
 # ========================================

@@ -36,6 +36,15 @@ export class CoreController {
   protected userTranscriptBuffer = '';
   protected aiTranscriptBuffer = '';
 
+  // ★ Generation Isolation（Startup Architecture Phase 2）
+  //   同一Socket lifecycle内で単調増加する世代カウンタ。
+  //   目的は「G1で発生したものは最後までG1」を成立させること。
+  //   遅れて届いたG1を、現在activeだからという理由でG2に付け替えない。
+  protected generationCounter = 0;
+  protected activeGenerationId: number | null = null;
+  protected activeStartupRole: string | null = null;
+  private _generationLogSeen = new Set<string>();
+
   // ★追加: バックグラウンド状態の追跡
   protected isInBackground = false;
   protected backgroundStartTime = 0;
@@ -116,7 +125,8 @@ export class CoreController {
         }
     }, 10000);
 
-    await this.resetAppContent();
+    // ★ reset #1 = warmup 世代
+    await this.resetAppContent('warmup');
 
     setTimeout(() => {
       if (this.els.splashOverlay) {
@@ -128,7 +138,8 @@ export class CoreController {
     console.log('[Core] Initialization completed');
 
     // ★ 初期起動完了後にソフトリセットを自動実行（リップシンク正常化）
-    await this.resetAppContent();
+    // ★ reset #2 = final 世代
+    await this.resetAppContent('final');
   }
 
   protected getUserId(): string {
@@ -142,10 +153,83 @@ export class CoreController {
     return userId;
   }
 
-  protected async resetAppContent() {
+  // ========================================
+  // ★ Generation Isolation（Phase 2）
+  // ========================================
+
+  /**
+   * 旧世代を退役させ active generation を null にする。
+   * この null 期間に遅れて届いた旧世代イベントは全てDROPされる。
+   */
+  protected retireGeneration(): void {
+    const retired = this.activeGenerationId;
+    this.activeGenerationId = null;
+    this.activeStartupRole = null;
+    this._generationLogSeen.clear();
+    console.log(`[Generation] retire gen=${retired} -> active=null`);
+  }
+
+  /**
+   * 新しい世代を発行して active にする。
+   * startupRole は startup 経路（init()のreset #1/#2）のみが指定する。
+   * それ以外の reset には既定roleを与えない。
+   */
+  protected allocateGeneration(startupRole?: string): number {
+    this.generationCounter += 1;
+    this.activeGenerationId = this.generationCounter;
+    this.activeStartupRole = startupRole ?? null;
+    this._generationLogSeen.clear();
+    console.log(`[Generation] allocate gen=${this.activeGenerationId} role=${this.activeStartupRole}`);
+    return this.activeGenerationId;
+  }
+
+  /**
+   * generation-scoped な Server event のフィルタ。
+   * handlerの最初（queue投入・UI変更・flag変更より前）に呼ぶ。
+   *   received=G2 / active=G2    -> ACCEPT
+   *   received=G1 / active=G2    -> DROP
+   *   received=G1 / active=null  -> DROP
+   *   received=なし / active=G2  -> DROP
+   *   received=なし / active=null -> ACCEPT（legacy）
+   */
+  protected acceptGeneration(eventName: string, data?: any): boolean {
+    const received = (data && typeof data === 'object') ? data.generation_id : undefined;
+    const active = this.activeGenerationId;
+    let accepted: boolean;
+    let decision: string;
+    if (received === undefined || received === null) {
+      if (active === null) {
+        // 新Generation lifecycleが動いていない状態のみ現行挙動を維持する
+        accepted = true;
+        decision = 'ACCEPT (legacy: no generation)';
+      } else {
+        accepted = false;
+        decision = 'DROP (missing generation)';
+      }
+    } else if (received === active) {
+      accepted = true;
+      decision = 'ACCEPT';
+    } else {
+      accepted = false;
+      decision = 'DROP (stale generation)';
+    }
+    // live_audio / live_expression は高頻度なので同一組み合わせは1回だけ出す
+    const key = `${eventName}|${received}|${active}|${decision}`;
+    if (!this._generationLogSeen.has(key)) {
+      this._generationLogSeen.add(key);
+      console.log(`[Generation] event=${eventName} received=${received} active=${active} -> ${decision}`);
+    }
+    return accepted;
+  }
+
+  protected async resetAppContent(startupRole?: string) {
     console.log('[Reset] Starting soft reset...');
     const oldSessionId = this.sessionId;
     this.stopAllActivities();
+    // ★ 旧世代の live_stop は stopAllActivities() -> terminateLiveSession() で
+    //   送信済み。新世代を発行する前に必ず旧世代を退役させ、
+    //   activeGenerationId = null の gap 期間を作る。
+    this.retireGeneration();
     
     if (oldSessionId) {
       try {
@@ -180,6 +264,8 @@ export class CoreController {
     this.isAISpeaking = false;
     this.isFromVoiceInput = false;
     await new Promise(resolve => setTimeout(resolve, 300));
+    // ★ 既存300ms待機のあとに新世代を発行する（待機時間は変更しない）
+    this.allocateGeneration(startupRole);
     await this.initializeSession();
 
     // ★追加: スクロール位置をリセット（ヘッダーが隠れないように）
@@ -306,14 +392,23 @@ export class CoreController {
     });
 
     // ★ LiveAPIリスナー（仕様書02 セクション4.4.2）
-    this.socket.on('live_ready', () => {
+    this.socket.on('live_ready', (data: any) => {
+      if (!this.acceptGeneration('live_ready', data)) return;
       console.log('[LiveAPI] live_ready受信 → greeting_done待機');
       // ★ startStreaming()は呼ばない。greeting_done を待つ。
       //   理由: send_client_content（挨拶）と send_realtime_input（マイク音声）の
       //         混在はLiveAPI SDK非推奨（ChatGPT/Gemini助言）
     });
 
-    this.socket.on('greeting_done', () => {
+    // ★ Gemini Live の connect() 成功通知（live_ready とは別物）。
+    //   Phase 2では診断ログのみ。Greeting開始やAvatarとのAND gateには使わない。
+    this.socket.on('live_connected', (data: any) => {
+      if (!this.acceptGeneration('live_connected', data)) return;
+      console.log(`[STARTUP] live_connected gen=${data?.generation_id} session_count=${data?.session_count}`);
+    });
+
+    this.socket.on('greeting_done', (data: any) => {
+      if (!this.acceptGeneration('greeting_done', data)) return;
       console.log('[LiveAPI] greeting_done受信 → マイクOFF状態で待機（ユーザータップ待ち）');
       // ★ startStreaming()は呼ばない。ユーザーがマイクボタンを押すまでOFF状態。
       //   理由: iOSではユーザージェスチャーなしのマイク有効化がセキュリティ制約に抵触する。
@@ -321,6 +416,7 @@ export class CoreController {
     });
 
     this.socket.on('live_audio', (data: any) => {
+      if (!this.acceptGeneration('live_audio', data)) return;
       // ===== 一時診断ログ (TRACE) =====
       // live_audio / live_expression のコールバック到達時刻を同じ形式で出し、
       // 通常 LAM と UIKA で比較する。既存ロジックは変更しない。
@@ -339,6 +435,7 @@ export class CoreController {
 
     // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
     this.socket.on('live_expression', (data: any) => {
+      if (!this.acceptGeneration('live_expression', data)) return;
       // ===== 一時診断ログ (TRACE) =====
       {
         const now = performance.now();
@@ -369,13 +466,15 @@ export class CoreController {
     });
 
     // ★ A2E expressionリセット（仕様書12 §6.2: A2E先行方式対応）
-    this.socket.on('live_expression_reset', () => {
+    this.socket.on('live_expression_reset', (data: any) => {
+      if (!this.acceptGeneration('live_expression_reset', data)) return;
       if (!this.isLiveMode) return;
       console.log('[A2E] live_expression_reset受信');
       this.liveAudioManager.resetForNewSegment();
     });
 
     this.socket.on('user_transcript', (data: any) => {
+      if (!this.acceptGeneration('user_transcript', data)) return;
       if (!this.isLiveMode) return;
       const text = data.text;
       if (text) {
@@ -385,6 +484,7 @@ export class CoreController {
     });
 
     this.socket.on('ai_transcript', (data: any) => {
+      if (!this.acceptGeneration('ai_transcript', data)) return;
       if (!this.isLiveMode) return;
       const text = data.text;
       if (text) {
@@ -404,7 +504,8 @@ export class CoreController {
       }
     });
 
-    this.socket.on('turn_complete', () => {
+    this.socket.on('turn_complete', (data: any) => {
+      if (!this.acceptGeneration('turn_complete', data)) return;
       if (!this.isLiveMode) return;
       console.log('[LiveAPI] turn_complete');
       this.liveAudioManager.onAiResponseEnded();
@@ -424,7 +525,8 @@ export class CoreController {
       this.aiTranscriptBuffer = '';
     });
 
-    this.socket.on('interrupted', () => {
+    this.socket.on('interrupted', (data: any) => {
+      if (!this.acceptGeneration('interrupted', data)) return;
       if (!this.isLiveMode) return;
       console.log('[LiveAPI] interrupted');
       this.liveAudioManager.clearPlaybackQueue();
@@ -435,29 +537,34 @@ export class CoreController {
       if (streaming) streaming.remove();
     });
 
-    this.socket.on('live_reconnecting', () => {
+    this.socket.on('live_reconnecting', (data: any) => {
+      if (!this.acceptGeneration('live_reconnecting', data)) return;
       if (!this.isLiveMode) return;
       console.log('[LiveAPI] 再接続中...');
     });
 
-    this.socket.on('live_reconnected', () => {
+    this.socket.on('live_reconnected', (data: any) => {
+      if (!this.acceptGeneration('live_reconnected', data)) return;
       if (!this.isLiveMode) return;
       console.log('[LiveAPI] 再接続完了');
     });
 
-    this.socket.on('live_stopped', () => {
+    this.socket.on('live_stopped', (data: any) => {
+      if (!this.acceptGeneration('live_stopped', data)) return;
       console.log('[LiveAPI] live_stopped');
       this.isLiveMode = false;
     });
 
     // ★ ショップ検索開始（§3.6: 待機アニメーション表示）
-    this.socket.on('shop_search_start', () => {
+    this.socket.on('shop_search_start', (data: any) => {
+      if (!this.acceptGeneration('shop_search_start', data)) return;
       console.log('[LiveAPI] shop_search_start: 待機アニメーション表示');
       this.showWaitOverlay();
     });
 
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
+      if (!this.acceptGeneration('shop_search_result', data)) return;
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
       this.hideWaitOverlay();
       const shops = data?.shops || [];
@@ -646,14 +753,25 @@ export class CoreController {
       const voiceModel = localStorage.getItem(`selectedVoiceModel_${this.currentMode}`) || '';
       const liveVoice = localStorage.getItem(`selectedLiveVoice_${this.currentMode}`) || '';
       const teacherName = localStorage.getItem(`selectedTeacherName_${this.currentMode}`) || '';
-      this.socket.emit('live_start', {
+      // ★ このLive sessionのgenerationを確定し、audio streamへbindする。
+      //   以後このstreamから出る live_audio_in は最後までこのgenerationを送る。
+      const generationId = this.activeGenerationId;
+      this.liveAudioManager.bindGeneration(generationId);
+
+      const livePayload: any = {
         session_id: this.sessionId,
         mode: this.currentMode,
         language: this.currentLanguage,
         voice_model: voiceModel,
         live_voice: liveVoice,
-        teacher_name: teacherName
-      });
+        teacher_name: teacherName,
+        generation_id: generationId
+      };
+      // startup以外の経路では role を付けない（既定roleを勝手に作らない）
+      if (this.activeStartupRole !== null) {
+        livePayload.startup_role = this.activeStartupRole;
+      }
+      this.socket.emit('live_start', livePayload);
 
       this.isLiveMode = true;
       this.userTranscriptBuffer = '';
@@ -666,8 +784,10 @@ export class CoreController {
   }
 
   protected terminateLiveSession(): void {
+    // ★ 停止開始時点のgenerationをcaptureしてから live_stop を送る
+    const stoppingGeneration = this.activeGenerationId;
     if (this.isLiveMode && this.socket && this.socket.connected) {
-      this.socket.emit('live_stop');
+      this.socket.emit('live_stop', { generation_id: stoppingGeneration });
     }
     this.isLiveMode = false;
     this.isRecording = false;
@@ -677,6 +797,7 @@ export class CoreController {
     this.liveAudioManager.onAiResponseEnded();
     this.userTranscriptBuffer = '';
     this.aiTranscriptBuffer = '';
+    this.liveAudioManager.bindGeneration(null);
     console.log('[LiveAPI] セッション終了');
   }
 
