@@ -48,10 +48,19 @@ export default defineConfig({
         ]
       },
       workbox: {
-        // ★★★ 修正箇所: '/404' から '/index.html' に変更 ★★★
-        // これでファイル未検出エラーがなくなり、SWが正常起動します
-        navigateFallback: '/index.html',
-        globPatterns: ['**/*.{css,js,html,svg,png,ico,txt}']
+        // navigateFallback は **precache manifest に実在する URL** でなければ
+        // ならない。生成 manifest の index entry は clean URL の '/' であり
+        // '/index.html' は存在しないため、'/index.html' を指定すると install 時に
+        //   non-precached-url :: [{"url":"/index.html"}]
+        // で SW が activate できず、端末に古い SW が残り続ける
+        // (PR #87 で実機確認済み)。
+        navigateFallback: '/',
+        globPatterns: ['**/*.{css,js,html,svg,png,ico,txt}'],
+        // 404.html は clean URL の '/404' として登録され、実際に GET すると
+        // Vercel が status 404 を返すため
+        //   bad-precaching-response :: [{"url":".../404","status":404}]
+        // で SW の install が失敗する (PR #87 で実機確認済み)。
+        globIgnores: ['**/node_modules/**/*', '404.html']
       }
     })
   ]
