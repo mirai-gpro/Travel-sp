@@ -16,6 +16,9 @@
 #   8. handle_live_start に即時 greeting_done emit が存在しない
 #   9. 実際の Greeting 完了時の greeting_done（turn_complete 側）は残っている
 #  10. disconnect で generation ownership がクリーンアップされる
+#  11. Server -> Client の Live event に generation_id が付く（Phase 2）
+#  12. 旧世代 session の emit は G1 のまま（G2 に付け替えない）（Phase 2）
+#  13. 停止済み session からの outbound は送信されない（Phase 2）
 #
 # ------------------------------------------------------------------
 # 実行方法
@@ -495,6 +498,74 @@ ok(async_with_at != -1 and live_connected_at > async_with_at,
 
 
 # ============================================================
+# Test H — Server -> Client への generation 付与と
+#          停止済み session の outbound 抑止（Phase 2）
+# ============================================================
+print("\n=== Test H: server -> client の generation 付与 / outbound 抑止 ===")
+reset_state()
+c4 = new_client()
+sid4 = sid_of(c4)
+
+live_start(c4, 'G1', 'warmup')
+g1 = SESSIONS[-1]
+recv = c4.get_received()
+ready = [r for r in recv if r['name'] == 'live_ready']
+connected = [r for r in recv if r['name'] == 'live_connected']
+ok(ready and ready[0]['args'][0].get('generation_id') == 'G1',
+   'H-1 live_ready に generation_id が付いている',
+   f"payload={ready[0]['args'][0] if ready else None}")
+ok(connected and connected[0]['args'][0].get('generation_id') == 'G1',
+   'H-2 LiveAPISession の emit に generation_id が付いている（live_connected）',
+   f"payload={connected[0]['args'][0] if connected else None}")
+
+live_start(c4, 'G2', 'final')
+g2 = SESSIONS[-1]
+c4.get_received()
+
+# 旧世代 session が遅れて emit した場合、generation_id は G1 のままでなければならない。
+# （停止済みなので通常は抑止されるが、「G2 へ付け替えない」ことを直接確認する）
+g1_was_running = g1.is_running
+g1.is_running = True
+g1._emit('live_audio', {'data': 'AAAA'})
+g1.is_running = g1_was_running
+recv = c4.get_received()
+stale = [r for r in recv if r['name'] == 'live_audio']
+ok(stale and stale[0]['args'][0].get('generation_id') == 'G1',
+   'H-3 旧世代 session の emit は G1 のまま（G2 に付け替えない）',
+   f"payload={stale[0]['args'][0] if stale else None}")
+
+# 停止済み（退役した）session からの user-facing event は送信されない
+ok(g1.is_running is False, 'H-4 旧世代 session は停止している',
+   f"is_running={g1.is_running}")
+c4.get_received()
+g1._emit('live_audio', {'data': 'AAAA'})
+g1._emit('turn_complete', {})
+recv = c4.get_received()
+ok(len(recv) == 0,
+   'H-5 停止済み session からの outbound は送信されない（server側 stale Drop）',
+   f"received={[r['name'] for r in recv]}")
+
+# 現行世代の emit は通る
+c4.get_received()
+g2._emit('live_audio', {'data': 'AAAA'})
+recv = c4.get_received()
+ok(len(recv) == 1 and recv[0]['args'][0].get('generation_id') == 'G2',
+   'H-6 現行世代 session の emit は通り generation_id = G2',
+   f"received={[(r['name'], r['args'][0].get('generation_id')) for r in recv]}")
+
+c4.get_received()
+c4.emit('live_stop', {'generation_id': 'G2'})
+time.sleep(0.2)
+recv = c4.get_received()
+stopped = [r for r in recv if r['name'] == 'live_stopped']
+ok(stopped and stopped[0]['args'][0].get('generation_id') == 'G2',
+   'H-7 live_stopped に停止した session の generation_id が付いている',
+   f"payload={stopped[0]['args'][0] if stopped else None}")
+LOG_H = list(LOG_LINES)
+c4.disconnect()
+
+
+# ============================================================
 # サマリ
 # ============================================================
 print("\n" + "=" * 64)
@@ -507,7 +578,8 @@ print(f"TOTAL {len(RESULTS)}  PASS {len(RESULTS) - len(failures)}  FAIL {len(fai
 if '--dump-logs' in sys.argv:
     print("\n" + "=" * 64)
     for label, lines in [('TEST A', LOG_A), ('TEST B', LOG_B), ('TEST C', LOG_C),
-                         ('TEST D', LOG_D), ('TEST E', LOG_E), ('TEST F', LOG_F)]:
+                         ('TEST D', LOG_D), ('TEST E', LOG_E), ('TEST F', LOG_F),
+                         ('TEST H', LOG_H)]:
         print(f"\n########## {label} ##########")
         for line in lines:
             print(line)
