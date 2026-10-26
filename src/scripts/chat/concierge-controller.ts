@@ -5,6 +5,10 @@ import { CoreController } from './core-controller';
 import { AudioManager } from './audio-manager';
 import { isUika133kMode } from './uika-133k-mode';
 
+// 正式選択アバター FULL133 のモデル URL (public/avatar/avatar-config.json の
+// id=uika-full133-skin)。?uika133k=1 の診断経路 (uika-gakki-133k.zip) とは別物。
+const OFFICIAL_FULL133_MODEL_URL = '/avatar/uika-full133-skin.zip';
+
 declare const io: any;
 
 export class ConciergeController extends CoreController {
@@ -64,8 +68,49 @@ export class ConciergeController extends CoreController {
   // 🎯 セッション初期化をオーバーライド（LiveAPI統一）
   // （仕様書02 セクション4.4.3）
   // ========================================
+  /**
+   * 正式選択アバター uika-full133-skin のときだけ、最初の startLiveMode() より前に
+   * 既存の LAMAvatarController.initialize() を完了させ、Avatar の表示機会を
+   * 確保してから Waiting を外す (最終実装仕様 v2.0 §3)。
+   * 通常 LAM はここで即 return し、Golden と同じ経路のまま。
+   *
+   * this.lamAvatarController はここでは代入しない。
+   *   代入すると reset #2 の stopAllActivities() が resetExpression() と
+   *   stopAvatarAnimation() → onSpeakingEnd() を実行し、初期 Greeting 中は
+   *   onSpeakingStart() も走るようになり、double reset の実行内容が Golden と
+   *   変わる。代入は従来どおり super.init() 後の linkLamAvatar() に任せる。
+   *
+   * initializeSession() の try 内で await されるので、ここで例外を投げると
+   * session / Live 開始ごと中断される。どんな失敗でも Waiting を外して
+   * 通常フローへ戻す。
+   */
+  private async prepareOfficialFull133BeforeLive(): Promise<void> {
+    if ((window as any).__lamAvatarConfig?.modelUrl !== OFFICIAL_FULL133_MODEL_URL) return;
+    const controller = (window as any).__lamAvatarController;
+    try {
+      if (!controller) return;
+      // reset #1 で既に fallback になっていたら reset #2 で再ロードしない。
+      if (controller.hasFallenBack()) return;
+      // 成功済みなら既存の isInitialized guard で即 return する (reset #2)。
+      await controller.initialize(this.liveAudioManager);
+      await controller.releaseFull133Waiting();
+    } catch (e) {
+      console.error('[ConciergeController] FULL133 pre-Live 準備エラー:', e);
+    } finally {
+      // どの経路で抜けても Waiting を残さない (controller 不在 / 例外を含む)。
+      document.getElementById('lamFull133Waiting')?.classList.add('hidden');
+      // 既存 splash は Avatar を覆っている。Avatar 表示後に Greeting を始めるため
+      // ここで外す。core-controller の 10s / 2s タイマーは変更しない
+      // (後から同じ class を付けても no-op)。
+      this.els.splashOverlay?.classList.add('hidden');
+    }
+  }
+
   private async prepareUikaAvatarBeforeLive(): Promise<void> {
-    if (!isUika133kMode()) return;
+    if (!isUika133kMode()) {
+      await this.prepareOfficialFull133BeforeLive();
+      return;
+    }
 
     const controller = (window as any).__lamAvatarController;
     if (!controller) {
