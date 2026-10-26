@@ -32,6 +32,14 @@ const {
   </div>
 </div>
 
+<!-- 正式 FULL133 (uika-full133-skin) の初期 Avatar 準備中だけ出す全画面 Waiting。
+     既存の lam-spinner をそのまま使う。表示判定は下の inline script、
+     解除は LAMAvatarController.releaseFull133Waiting() (最終実装仕様 v2.0 §3.3)。 -->
+<div id="lamFull133Waiting" class="lam-full133-waiting hidden" aria-hidden="true">
+  <div class="lam-spinner"></div>
+  <p>Loading 3D Avatar...</p>
+</div>
+
 <style>
 .lam-avatar-wrapper {
   position: relative;
@@ -115,6 +123,26 @@ const {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
 }
+
+/* 正式 FULL133 の全画面 Waiting。
+   document.body 直下へ移すので祖先の stacking context (.avatar-container z-index:10)
+   の影響を受けない。既存 splash (z-index:9999) より下、アプリ本体より上に置く。 */
+.lam-full133-waiting {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #ffffff;
+  color: #666;
+  font-size: 12px;
+}
+
+.lam-full133-waiting.hidden {
+  display: none;
+}
 </style>
 
 <script define:vars={{ modelUrl }}>
@@ -122,6 +150,19 @@ const {
   const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
   const storedUrl = localStorage.getItem('selectedAvatarUrl_' + mode);
   window.__lamAvatarConfig = { modelUrl: storedUrl || modelUrl };
+
+  // 正式選択アバター FULL133 のときだけ、初回描画まで全画面 Waiting を出す。
+  // ?uika133k=1 の診断経路 (uika-gakki-133k.zip) は対象外で従来どおり。
+  try {
+    const isUikaDiag = new URLSearchParams(location.search).get('uika133k') === '1';
+    if (!isUikaDiag && window.__lamAvatarConfig.modelUrl === '/avatar/uika-full133-skin.zip') {
+      const waiting = document.getElementById('lamFull133Waiting');
+      if (waiting) {
+        document.body.appendChild(waiting);
+        waiting.classList.remove('hidden');
+      }
+    }
+  } catch (e) { /* noop: 表示しないだけで従来どおり */ }
 </script>
 
 <script>
@@ -333,6 +374,46 @@ const {
      */
     resetExpression(): void {
       this.lamManager.resetExpression();
+    }
+
+    /**
+     * 既存 initialize() が fallback 表示で終わったか (読み取りのみ)。
+     * 正式 FULL133 の reset #2 で再ロードしないために controller が参照する。
+     */
+    hasFallenBack(): boolean {
+      return this.useFallback;
+    }
+
+    /**
+     * 正式 FULL133 の全画面 Waiting を外す。既存 initialize() の完了後にだけ呼ぶ。
+     *
+     * 判定に使うのは既存の公開情報だけ: initialize() の成功 (isInitialized かつ
+     * fallback でない)、既存ローダー (#lamAvatarLoading) が外れたこと、canvas の
+     * DOM 可視、そして描画機会としての rAF 2 回 (この状態で 1 フレーム描かれ、
+     * それが表示へ出るまで)。renderer 内部の状態は読まない。
+     * これで WebGL の first frame present を厳密に証明できるわけではない。
+     *
+     * 固定時間の待機は使わない。fallback / 未初期化なら待たずに外し、
+     * Waiting を無期限に残さない。2 回目以降の呼び出しは何もしない。
+     */
+    async releaseFull133Waiting(): Promise<void> {
+      const waiting = document.getElementById('lamFull133Waiting');
+      if (!waiting || waiting.classList.contains('hidden')) return;
+      if (this.useFallback || !this.isInitialized) {
+        waiting.classList.add('hidden');
+        return;
+      }
+      const canvas = this.containerEl.querySelector('canvas');
+      const loaderHidden = this.loadingEl.classList.contains('hidden');
+      const canvasVisible = !!canvas && canvas.getClientRects().length > 0
+        && this.containerEl.style.display !== 'none';
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+      waiting.classList.add('hidden');
+      console.log(
+        `[LAMAvatar] FULL133 Waiting 解除 loader=${loaderHidden} canvas=${canvasVisible}`
+      );
     }
 
     /**
