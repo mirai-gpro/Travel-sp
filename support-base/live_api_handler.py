@@ -14,7 +14,6 @@ import base64
 import os
 import logging
 import struct
-import threading
 import time
 import httpx
 from scipy.signal import resample_poly
@@ -305,8 +304,7 @@ class LiveAPISession:
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
                  shop_search_callback=None, user_id: str = None,
-                 voice_model: str = '', live_voice: str = '',
-                 resume_gate: bool = False):
+                 voice_model: str = '', live_voice: str = ''):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -337,14 +335,6 @@ class LiveAPISession:
 
         # 再接続時のトリガーメッセージ（§7.1）
         self._resume_message = None
-
-        # ★ 実験 (exp/resume-gate): 最初の接続で再接続トリガーの送信を
-        #   フロントの合図まで保留する。会話中の再接続では保留しない。
-        self._resume_gate = resume_gate
-        self._resume_gate_lock = threading.Lock()
-        self._resume_gate_released = False
-        self._resume_gate_loop = None
-        self._resume_gate_event = None
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -454,34 +444,6 @@ class LiveAPISession:
         """セッションを停止"""
         self.is_running = False
         self.needs_reconnect = False
-        self._wake_resume_gate()
-
-    def release_resume_gate(self):
-        """フロントの合図で保留を解除する（Socket.IO のスレッドから呼ばれる）"""
-        with self._resume_gate_lock:
-            self._resume_gate_released = True
-        self._wake_resume_gate()
-
-    def _wake_resume_gate(self):
-        with self._resume_gate_lock:
-            loop, event = self._resume_gate_loop, self._resume_gate_event
-        if loop is not None and event is not None:
-            try:
-                loop.call_soon_threadsafe(event.set)
-            except RuntimeError:
-                pass  # イベントループ終了済み
-
-    async def _wait_resume_gate(self):
-        with self._resume_gate_lock:
-            self._resume_gate_loop = asyncio.get_running_loop()
-            self._resume_gate_event = asyncio.Event()
-            if self._resume_gate_released or not self.is_running:
-                self._resume_gate_event.set()
-        logger.info("[ResumeGate] 再接続トリガー送信を保留（フロントの合図待ち）")
-        started = time.monotonic()
-        await self._resume_gate_event.wait()
-        logger.info(f"[ResumeGate] 保留解除 waited={(time.monotonic() - started) * 1000:.0f}ms "
-                    f"running={self.is_running}")
 
     async def run(self):
         """
@@ -491,7 +453,6 @@ class LiveAPISession:
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
         self.is_running = True
         self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
-        first_connect = True
 
         try:
             while self.is_running:
@@ -546,10 +507,6 @@ class LiveAPISession:
                             # Gemini 3.1 Live: send_client_content は initial seeding 専用。
                             # 会話途中（再接続後の resume を含む）の user content は
                             # send_realtime_input(text=...) を使う必要がある。
-                            if self._resume_gate and first_connect:
-                                await self._wait_resume_gate()
-                                if not self.is_running:
-                                    break
                             resume_text = self._resume_message or "続きをお願いします"
                             self._resume_message = None
                             await session.send_realtime_input(text=resume_text)
@@ -557,7 +514,6 @@ class LiveAPISession:
                             self.socketio.emit('live_reconnected', {},
                                                room=self.client_sid)
 
-                        first_connect = False
                         await self._session_loop(session)
 
                         if not self.needs_reconnect:

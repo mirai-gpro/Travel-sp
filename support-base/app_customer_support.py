@@ -81,10 +81,7 @@ allowed_origins = [
     "https://gourmet-sp.vercel.app",
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
-    "http://localhost:4321",
-    # ★ 実験 (exp/resume-gate*): Vercel Preview のブランチ固定 URL。本番ブランチには入れない
-    "https://travel-sp-git-exp-resume-gate-mirais-projects-87257550.vercel.app",
-    "https://travel-sp-git-exp-resume-gate-t1-mirais-projects-87257550.vercel.app",
+    "http://localhost:4321"
 ]
 
 # SocketIO初期化 (cors_allowed_originsを明示的に指定)
@@ -749,13 +746,6 @@ def health_check():
 active_live_sessions = {}  # {client_sid: LiveAPISession}
 greeted_client_sids = set()  # 挨拶済みのclient_sid
 
-# ★ 実験 (exp/resume-gate): 本番ブランチには入れない。
-#   同一ソケットで 2 回目の live_start（二重リセットの 2 回目）で作るセッションだけ、
-#   最初の接続の再接続トリガー送信をフロントの resume_gate_release まで保留する。
-RESUME_GATE_ENABLED = True
-live_start_counts = {}            # {client_sid: このソケットでの live_start 回数}
-resume_gate_released_sids = set() # resume_gate_release を受信済みの client_sid
-
 @socketio.on('live_start')
 def handle_live_start(data):
     """LiveAPIセッション開始"""
@@ -933,9 +923,6 @@ def handle_live_start(data):
             logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)
             return None
 
-    live_start_counts[client_sid] = live_start_counts.get(client_sid, 0) + 1
-    resume_gate = RESUME_GATE_ENABLED and live_start_counts[client_sid] == 2
-
     # LiveAPIセッション作成
     live_session = LiveAPISession(
         session_id=session_id,
@@ -947,14 +934,8 @@ def handle_live_start(data):
         shop_search_callback=shop_search_callback,
         user_id=user_id,
         voice_model=voice_model,
-        live_voice=live_voice,
-        resume_gate=resume_gate
+        live_voice=live_voice
     )
-    if resume_gate:
-        logger.info(f"[ResumeGate] 対象セッション作成 sid={client_sid} "
-                    f"release済み={client_sid in resume_gate_released_sids}")
-        if client_sid in resume_gate_released_sids:
-            live_session.release_resume_gate()
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
     if client_sid in greeted_client_sids:
@@ -1020,17 +1001,6 @@ def handle_live_stop():
     emit('live_stopped', {'status': 'disconnected'})
 
 
-@socketio.on('resume_gate_release')
-def handle_resume_gate_release(data=None):
-    """実験 (exp/resume-gate): フロントの合図で再接続トリガー送信の保留を解除"""
-    client_sid = request.sid
-    resume_gate_released_sids.add(client_sid)
-    live_session = active_live_sessions.get(client_sid)
-    logger.info(f"[ResumeGate] 合図受信 sid={client_sid} session={'あり' if live_session else 'なし'}")
-    if live_session:
-        live_session.release_resume_gate()
-
-
 # ========================================
 # WebSocket Streaming STT
 # ========================================
@@ -1053,8 +1023,6 @@ def handle_disconnect():
         logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
     # 挨拶済みフラグのクリーンアップ
     greeted_client_sids.discard(request.sid)
-    live_start_counts.pop(request.sid, None)
-    resume_gate_released_sids.discard(request.sid)
     # STTストリームのクリーンアップ
     if request.sid in active_streams:
         stream_data = active_streams[request.sid]
