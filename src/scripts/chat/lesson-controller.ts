@@ -60,11 +60,6 @@ export class LessonController extends CoreController {
       try {
         await controller.initialize(this.liveAudioManager);
         console.log('[LessonController] LAMAvatar連携完了');
-        // ★ 実験 (exp/resume-gate): ?resumeGate=1 のときだけ保留解除の合図を送る
-        if (new URLSearchParams(window.location.search).get('resumeGate') === '1') {
-          this.socket?.emit('resume_gate_release', {});
-          console.log('[ResumeGate] release emit');
-        }
       } catch (e) {
         console.error('[LessonController] LAMAvatar連携エラー:', e);
       }
