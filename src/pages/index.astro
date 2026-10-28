@@ -4,7 +4,8 @@
 import LessonChat from '../components/LessonChat.astro';
 
 // APIベースURL（Cloud Runのエンドポイント）
-const apiBaseUrl = import.meta.env.PUBLIC_API_URL || '';
+// ★ 実験 (exp/resume-gate*): 検証用 Cloud Run revision (tag rgt1) を直接指す。本番ブランチには入れない
+const apiBaseUrl = 'https://rgt1---travel-sp-base-fmfxldo6kq-uc.a.run.app';
 ---
 
 <!DOCTYPE html>
