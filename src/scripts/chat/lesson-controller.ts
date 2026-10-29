@@ -60,17 +60,26 @@ export class LessonController extends CoreController {
       try {
         await controller.initialize(this.liveAudioManager);
         console.log('[LessonController] LAMAvatar連携完了');
-        // ★ 実験 (exp/resume-gate): ?resumeGate=1 のときだけ保留解除の合図を送る
-        if (new URLSearchParams(window.location.search).get('resumeGate') === '1') {
-          this.socket?.emit('resume_gate_release', {});
-          console.log('[ResumeGate] release emit');
-        }
       } catch (e) {
         console.error('[LessonController] LAMAvatar連携エラー:', e);
       }
     } else {
       console.warn('[LessonController] LAMAvatarController が見つかりません');
     }
+    this.releaseResumeGate();
+  }
+
+  // ★ アバター連携の処理が終わったら、成否を問わずバックエンドへ挨拶開始の保留解除を送る。
+  //   バックエンドは二重リセットの 2 回目のセッションで、この合図まで挨拶の送信を保留する。
+  //   Socket.IO が再接続して接続 ID が変わった場合も送り直す（新しい接続でも保留されうるため）。
+  private releaseResumeGate(): void {
+    if (!this.socket) return;
+    this.socket.emit('resume_gate_release', {});
+    console.log('[ResumeGate] release emit');
+    this.socket.on('connect', () => {
+      this.socket.emit('resume_gate_release', {});
+      console.log('[ResumeGate] release emit (reconnect)');
+    });
   }
 
   /**
