@@ -85,6 +85,7 @@ allowed_origins = [
     # ★ 実験 (exp/resume-gate*): Vercel Preview のブランチ固定 URL。本番ブランチには入れない
     "https://travel-sp-git-exp-resume-gate-mirais-projects-87257550.vercel.app",
     "https://travel-sp-git-exp-resume-gate-t1-mirais-projects-87257550.vercel.app",
+    "https://travel-sp-git-exp-connect-gate-mirais-projects-87257550.vercel.app",
 ]
 
 # SocketIO初期化 (cors_allowed_originsを明示的に指定)
@@ -749,9 +750,9 @@ def health_check():
 active_live_sessions = {}  # {client_sid: LiveAPISession}
 greeted_client_sids = set()  # 挨拶済みのclient_sid
 
-# ★ 実験 (exp/resume-gate): 本番ブランチには入れない。
+# ★ 実験 (exp/connect-gate, 案1): 本番ブランチには入れない。
 #   同一ソケットで 2 回目の live_start（二重リセットの 2 回目）で作るセッションだけ、
-#   最初の接続の再接続トリガー送信をフロントの resume_gate_release まで保留する。
+#   最初の Gemini 接続をフロントの resume_gate_release まで保留する。
 RESUME_GATE_ENABLED = True
 live_start_counts = {}            # {client_sid: このソケットでの live_start 回数}
 resume_gate_released_sids = set() # resume_gate_release を受信済みの client_sid
@@ -1022,7 +1023,7 @@ def handle_live_stop():
 
 @socketio.on('resume_gate_release')
 def handle_resume_gate_release(data=None):
-    """実験 (exp/resume-gate): フロントの合図で再接続トリガー送信の保留を解除"""
+    """実験 (exp/connect-gate, 案1): フロントの合図で Gemini 接続の保留を解除"""
     client_sid = request.sid
     resume_gate_released_sids.add(client_sid)
     live_session = active_live_sessions.get(client_sid)

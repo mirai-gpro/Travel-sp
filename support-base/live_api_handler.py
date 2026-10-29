@@ -338,7 +338,7 @@ class LiveAPISession:
         # 再接続時のトリガーメッセージ（§7.1）
         self._resume_message = None
 
-        # ★ 実験 (exp/resume-gate): 最初の接続で再接続トリガーの送信を
+        # ★ 実験 (exp/connect-gate, 案1): 最初の Gemini 接続を
         #   フロントの合図まで保留する。会話中の再接続では保留しない。
         self._resume_gate = resume_gate
         self._resume_gate_lock = threading.Lock()
@@ -477,7 +477,7 @@ class LiveAPISession:
             self._resume_gate_event = asyncio.Event()
             if self._resume_gate_released or not self.is_running:
                 self._resume_gate_event.set()
-        logger.info("[ResumeGate] 再接続トリガー送信を保留（フロントの合図待ち）")
+        logger.info("[ResumeGate] Gemini 接続を保留（フロントの合図待ち）")
         started = time.monotonic()
         await self._resume_gate_event.wait()
         logger.info(f"[ResumeGate] 保留解除 waited={(time.monotonic() - started) * 1000:.0f}ms "
@@ -504,6 +504,13 @@ class LiveAPISession:
                     context = self._get_context_summary()
 
                 config = self._build_config(with_context=context)
+
+                # ★ 実験 (exp/connect-gate, 案1): Gemini への接続そのものを合図まで保留する。
+                #   接続後は Golden と同じく、間を空けずに最初の入力を送る。
+                if self._resume_gate and first_connect:
+                    await self._wait_resume_gate()
+                    if not self.is_running:
+                        break
 
                 try:
                     async with self.client.aio.live.connect(
@@ -546,10 +553,6 @@ class LiveAPISession:
                             # Gemini 3.1 Live: send_client_content は initial seeding 専用。
                             # 会話途中（再接続後の resume を含む）の user content は
                             # send_realtime_input(text=...) を使う必要がある。
-                            if self._resume_gate and first_connect:
-                                await self._wait_resume_gate()
-                                if not self.is_running:
-                                    break
                             resume_text = self._resume_message or "続きをお願いします"
                             self._resume_message = None
                             await session.send_realtime_input(text=resume_text)
