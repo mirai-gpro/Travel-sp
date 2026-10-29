@@ -42,6 +42,12 @@ export class CoreController {
   //   releaseStartupPlaybackHold() で同じ順に流す。解除は 1 回だけで、会話中は保留しない。
   protected startupPlaybackHold = true;
   private heldStartupEvents: Array<() => void> = [];
+  // ★ 実験 (exp/playback-hold): ソフトリセット後の保留。アバターは表示済みなので、
+  //   AVATAR_VISIBLE ではなく「最初の 0.1 秒分（chunk 0）の次の表情データ（chunk 1 以降）が届いた時点」で解除する。
+  //   それより先に turn_complete / interrupted が来た場合はその時点で解除する。
+  //   この解除条件は二重リセットが終わってから有効にする（1 回目のセッションの残りで解除しないため）。
+  private softResetHold = false;
+  private releaseHoldOnExpression = false;
 
   // ★追加: バックグラウンド状態の追跡
   protected isInBackground = false;
@@ -238,8 +244,10 @@ export class CoreController {
 
     // ★ 実験 (exp/playback-hold): ソフトリセットも初期起動と同じ二重リセットにする
     const resetHandler = async () => {
+      this.beginSoftResetPlaybackHold();
       await this.resetAppContent();
       await this.resetAppContent();
+      this.armSoftResetPlaybackRelease();
     };
     const resetWrapper = async () => {
       await resetHandler();
@@ -261,8 +269,10 @@ export class CoreController {
         if (backgroundDuration > this.BACKGROUND_RESET_THRESHOLD) {
           console.log('[Foreground] Long background duration - triggering soft reset...');
           // ★ 実験 (exp/playback-hold): 初期起動と同じ二重リセットにする
+          this.beginSoftResetPlaybackHold();
           await this.resetAppContent();
           await this.resetAppContent();
+          this.armSoftResetPlaybackRelease();
           return;
         }
 
@@ -385,7 +395,10 @@ export class CoreController {
           }
         }
       };
-      if (this.holdStartupEvent(run)) return;
+      if (this.holdStartupEvent(run)) {
+        if (this.releaseHoldOnExpression && data.chunk_index >= 1) this.releaseStartupPlaybackHold();
+        return;
+      }
       run();
     });
 
@@ -417,7 +430,10 @@ export class CoreController {
 
     this.socket.on('turn_complete', () => {
       if (!this.isLiveMode) return;
-      if (this.holdStartupEvent(() => this.handleTurnComplete())) return;
+      if (this.holdStartupEvent(() => this.handleTurnComplete())) {
+        if (this.releaseHoldOnExpression) this.releaseStartupPlaybackHold();
+        return;
+      }
       this.handleTurnComplete();
     });
 
@@ -432,7 +448,10 @@ export class CoreController {
         const streaming = this.els.chatArea.querySelector('.message.assistant.live-streaming');
         if (streaming) streaming.remove();
       };
-      if (this.holdStartupEvent(run)) return;
+      if (this.holdStartupEvent(run)) {
+        if (this.releaseHoldOnExpression) this.releaseStartupPlaybackHold();
+        return;
+      }
       run();
     });
 
@@ -726,6 +745,24 @@ export class CoreController {
     console.log('[LiveAPI] セッション終了');
   }
 
+  // ★ 実験 (exp/playback-hold): ソフトリセットの前に保留を再開する。
+  //   起動時の保留がまだ解除されていない（アバター表示前）なら、そちらの解除条件のまま何もしない。
+  private beginSoftResetPlaybackHold(): void {
+    if (this.startupPlaybackHold) return;
+    this.startupPlaybackHold = true;
+    this.softResetHold = true;
+    this.releaseHoldOnExpression = false;
+    this.heldStartupEvents = [];
+    console.log(`[PlaybackHold] ソフトリセットで保留を再開 t=${performance.now().toFixed(1)}ms`);
+  }
+
+  // ★ 実験 (exp/playback-hold): 二重リセットが終わったら、ソフトリセット後の解除条件を有効にする
+  private armSoftResetPlaybackRelease(): void {
+    if (!this.startupPlaybackHold || !this.softResetHold) return;
+    this.releaseHoldOnExpression = true;
+    console.log(`[PlaybackHold] ソフトリセット後の解除条件を有効化 t=${performance.now().toFixed(1)}ms`);
+  }
+
   // ★ 実験 (exp/playback-hold): 保留中なら処理を溜めて true を返す
   private holdStartupEvent(run: () => void): boolean {
     if (!this.startupPlaybackHold) return false;
@@ -740,6 +777,8 @@ export class CoreController {
   protected releaseStartupPlaybackHold(): void {
     if (!this.startupPlaybackHold) return;
     this.startupPlaybackHold = false;
+    this.softResetHold = false;
+    this.releaseHoldOnExpression = false;
     const events = this.heldStartupEvents;
     this.heldStartupEvents = [];
     console.log(`[PlaybackHold] release t=${performance.now().toFixed(1)}ms events=${events.length}`);
