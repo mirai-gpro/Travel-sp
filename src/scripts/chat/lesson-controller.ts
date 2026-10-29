@@ -57,9 +57,20 @@ export class LessonController extends CoreController {
     const controller = (window as any).__lamAvatarController;
     if (controller) {
       this.lamAvatarController = controller;
+      // ★ 実験 (exp/visible-gate, 案3): アバターが実際に画面へ描画された時点（AVATAR_VISIBLE）で合図を送る。
+      //   initialize() より前に購読するので、描画が先に成立しても取りこぼさない。
+      const avatarVisible = new Promise<void>((resolve) => {
+        if (controller.lamManager?.isAvatarVisible?.()) { resolve(); return; }
+        document.addEventListener('avatar:visible', () => resolve(), { once: true });
+      });
       try {
         await controller.initialize(this.liveAudioManager);
         console.log('[LessonController] LAMAvatar連携完了');
+        // 3D アバターの初期化に失敗した場合（静止画表示）は待たない。
+        if (controller.isInitialized) {
+          await avatarVisible;
+          console.log('[LessonController] AVATAR_VISIBLE 受信');
+        }
       } catch (e) {
         console.error('[LessonController] LAMAvatar連携エラー:', e);
       }
@@ -69,7 +80,7 @@ export class LessonController extends CoreController {
     this.releaseResumeGate();
   }
 
-  // ★ アバター連携の処理が終わったら、成否を問わずバックエンドへ挨拶開始の保留解除を送る。
+  // ★ アバターが画面に表示されたら（連携に失敗した場合はその時点で）、バックエンドへ挨拶開始の保留解除を送る。
   //   バックエンドは二重リセットの 2 回目のセッションで、この合図まで挨拶の送信を保留する。
   //   Socket.IO が再接続して接続 ID が変わった場合も送り直す（新しい接続でも保留されうるため）。
   private releaseResumeGate(): void {

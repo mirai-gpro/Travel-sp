@@ -86,6 +86,7 @@ allowed_origins = [
     "https://travel-sp-git-exp-resume-gate-mirais-projects-87257550.vercel.app",
     "https://travel-sp-git-exp-resume-gate-t1-mirais-projects-87257550.vercel.app",
     "https://travel-sp-git-exp-connect-gate-mirais-projects-87257550.vercel.app",
+    "https://travel-sp-git-exp-visible-gate-mirais-projects-87257550.vercel.app",
 ]
 
 # SocketIO初期化 (cors_allowed_originsを明示的に指定)
