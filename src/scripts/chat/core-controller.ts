@@ -236,7 +236,11 @@ export class CoreController {
       if (floatingButtons) floatingButtons.classList.remove('keyboard-active');
     });
 
-    const resetHandler = async () => { await this.resetAppContent(); };
+    // ★ 実験 (exp/playback-hold): ソフトリセットも初期起動と同じ二重リセットにする
+    const resetHandler = async () => {
+      await this.resetAppContent();
+      await this.resetAppContent();
+    };
     const resetWrapper = async () => {
       await resetHandler();
       document.addEventListener('gourmet-app:reset', resetWrapper, { once: true });
@@ -256,6 +260,8 @@ export class CoreController {
         // ★120秒以上バックグラウンドにいた場合はソフトリセット
         if (backgroundDuration > this.BACKGROUND_RESET_THRESHOLD) {
           console.log('[Foreground] Long background duration - triggering soft reset...');
+          // ★ 実験 (exp/playback-hold): 初期起動と同じ二重リセットにする
+          await this.resetAppContent();
           await this.resetAppContent();
           return;
         }
