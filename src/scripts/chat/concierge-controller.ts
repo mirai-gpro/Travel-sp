@@ -49,15 +49,28 @@ export class ConciergeController extends CoreController {
     const controller = (window as any).__lamAvatarController;
     if (controller) {
       this.lamAvatarController = controller;
+      // ★ 実験 (exp/playback-hold): アバターが実際に画面へ描画された時点（AVATAR_VISIBLE）で再生の保留を解除する。
+      //   initialize() より前に購読するので、描画が先に成立しても取りこぼさない。
+      const avatarVisible = new Promise<void>((resolve) => {
+        if (controller.lamManager?.isAvatarVisible?.()) { resolve(); return; }
+        document.addEventListener('avatar:visible', () => resolve(), { once: true });
+      });
       try {
         await controller.initialize(this.liveAudioManager);
         console.log('[ConciergeController] LAMAvatar連携完了');
+        // 3D アバターの初期化に失敗した場合（静止画表示）は待たない。
+        if (controller.isInitialized) {
+          await avatarVisible;
+          console.log('[ConciergeController] AVATAR_VISIBLE 受信');
+        }
       } catch (e) {
         console.error('[ConciergeController] LAMAvatar連携エラー:', e);
       }
     } else {
       console.warn('[ConciergeController] LAMAvatarController が見つかりません');
     }
+    // ★ 実験 (exp/playback-hold): 連携の成否を問わず、ここで保留を解除する。
+    this.releaseStartupPlaybackHold();
   }
 
   // ========================================

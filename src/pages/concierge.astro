@@ -3,7 +3,8 @@
 import ConciergeComponent from '../components/Concierge.astro';
 import ShopCardList from '../components/ShopCardList.astro';
 
-const apiBaseUrl = import.meta.env.PUBLIC_API_URL || '';
+// ★ 実験 (exp/playback-hold): 検証用 Cloud Run revision (tag rgt5) を直接指す。本番ブランチには入れない
+const apiBaseUrl = 'https://rgt5---travel-sp-base-fmfxldo6kq-uc.a.run.app';
 ---
 
 <!DOCTYPE html>
