@@ -36,6 +36,13 @@ export class CoreController {
   protected userTranscriptBuffer = '';
   protected aiTranscriptBuffer = '';
 
+  // ★ 起動直後だけ、音声・表情データなどの処理をアバター表示まで保留する。
+  //   Gemini 側の流れ（二重リセット・G1/G2・挨拶の生成）は Golden のまま変えない。
+  //   受け付けの判定（isLiveMode）は到着時に行い、受け付けたイベントの処理だけを到着順に溜め、
+  //   releaseStartupPlaybackHold() で同じ順に流す。解除は 1 回だけで、会話中は保留しない。
+  protected startupPlaybackHold = true;
+  private heldStartupEvents: Array<() => void> = [];
+
   // ★追加: バックグラウンド状態の追跡
   protected isInBackground = false;
   protected backgroundStartTime = 0;
@@ -229,7 +236,11 @@ export class CoreController {
       if (floatingButtons) floatingButtons.classList.remove('keyboard-active');
     });
 
-    const resetHandler = async () => { await this.resetAppContent(); };
+    // ★ ソフトリセットも初期起動と同じ二重リセットにする
+    const resetHandler = async () => {
+      await this.resetAppContent();
+      await this.resetAppContent();
+    };
     const resetWrapper = async () => {
       await resetHandler();
       document.addEventListener('gourmet-app:reset', resetWrapper, { once: true });
@@ -249,6 +260,8 @@ export class CoreController {
         // ★120秒以上バックグラウンドにいた場合はソフトリセット
         if (backgroundDuration > this.BACKGROUND_RESET_THRESHOLD) {
           console.log('[Foreground] Long background duration - triggering soft reset...');
+          // ★ 初期起動と同じ二重リセットにする
+          await this.resetAppContent();
           await this.resetAppContent();
           return;
         }
@@ -333,8 +346,12 @@ export class CoreController {
       }
 
       if (!this.isLiveMode) return;
-      this.liveAudioManager.onAiResponseStarted();
-      this.liveAudioManager.playPcmAudio(data.data);
+      const run = () => {
+        this.liveAudioManager.onAiResponseStarted();
+        this.liveAudioManager.playPcmAudio(data.data);
+      };
+      if (this.holdStartupEvent(run)) return;
+      run();
     });
 
     // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
@@ -352,27 +369,35 @@ export class CoreController {
       }
 
       if (!this.isLiveMode) return;
-      console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
-      this.liveAudioManager.onExpressionReceived(data);
+      const run = () => {
+        console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
+        this.liveAudioManager.onExpressionReceived(data);
 
-      // ===== 診断専用: ?a2eCapture=1 のときだけ受信データをそのまま保存 =====
-      // 既存の処理には一切介入しない (保存するだけ)。
-      captureLiveExpression(data);
+        // ===== 診断専用: ?a2eCapture=1 のときだけ受信データをそのまま保存 =====
+        // 既存の処理には一切介入しない (保存するだけ)。
+        captureLiveExpression(data);
 
-      // ★ A2Eのブレンドシェイプ名順序をLAMレンダラーに反映（名前インデックス同期）
-      if (data.expression_names && data.expression_names.length > 0) {
-        const lamController = (window as any).__lamAvatarController;
-        if (lamController && typeof lamController.setExpressionNames === 'function') {
-          lamController.setExpressionNames(data.expression_names);
+        // ★ A2Eのブレンドシェイプ名順序をLAMレンダラーに反映（名前インデックス同期）
+        if (data.expression_names && data.expression_names.length > 0) {
+          const lamController = (window as any).__lamAvatarController;
+          if (lamController && typeof lamController.setExpressionNames === 'function') {
+            lamController.setExpressionNames(data.expression_names);
+          }
         }
-      }
+      };
+      if (this.holdStartupEvent(run)) return;
+      run();
     });
 
     // ★ A2E expressionリセット（仕様書12 §6.2: A2E先行方式対応）
     this.socket.on('live_expression_reset', () => {
       if (!this.isLiveMode) return;
-      console.log('[A2E] live_expression_reset受信');
-      this.liveAudioManager.resetForNewSegment();
+      const run = () => {
+        console.log('[A2E] live_expression_reset受信');
+        this.liveAudioManager.resetForNewSegment();
+      };
+      if (this.holdStartupEvent(run)) return;
+      run();
     });
 
     this.socket.on('user_transcript', (data: any) => {
@@ -386,53 +411,29 @@ export class CoreController {
 
     this.socket.on('ai_transcript', (data: any) => {
       if (!this.isLiveMode) return;
-      const text = data.text;
-      if (text) {
-        this.aiTranscriptBuffer += text;
-        // AI発話をリアルタイムでチャット欄に表示
-        const existing = this.els.chatArea.querySelector('.message.assistant.live-streaming');
-        if (existing) {
-          const msgText = existing.querySelector('.message-text');
-          if (msgText) msgText.textContent = this.aiTranscriptBuffer;
-        } else {
-          const div = document.createElement('div');
-          div.className = 'message assistant live-streaming';
-          div.innerHTML = `<div class="message-avatar">🍽</div><div class="message-content"><span class="message-text">${this.aiTranscriptBuffer}</span></div>`;
-          this.els.chatArea.appendChild(div);
-          this.els.chatArea.scrollTop = this.els.chatArea.scrollHeight;
-        }
-      }
+      if (this.holdStartupEvent(() => this.showAiTranscript(data))) return;
+      this.showAiTranscript(data);
     });
 
     this.socket.on('turn_complete', () => {
       if (!this.isLiveMode) return;
-      console.log('[LiveAPI] turn_complete');
-      this.liveAudioManager.onAiResponseEnded();
-
-      // ユーザー発話をチャット欄に確定表示（lessonモードでは非表示）
-      if (this.userTranscriptBuffer.trim() && this.currentMode !== 'lesson') {
-        this.addMessage('user', this.userTranscriptBuffer.trim());
-      }
-      this.userTranscriptBuffer = '';
-      this.els.userInput.value = '';
-
-      // AI発話のストリーミング表示を確定
-      const streaming = this.els.chatArea.querySelector('.message.assistant.live-streaming');
-      if (streaming) {
-        streaming.classList.remove('live-streaming');
-      }
-      this.aiTranscriptBuffer = '';
+      if (this.holdStartupEvent(() => this.handleTurnComplete())) return;
+      this.handleTurnComplete();
     });
 
     this.socket.on('interrupted', () => {
       if (!this.isLiveMode) return;
-      console.log('[LiveAPI] interrupted');
-      this.liveAudioManager.clearPlaybackQueue();
-      this.liveAudioManager.onAiResponseEnded();
-      this.aiTranscriptBuffer = '';
-      // ストリーミング中のメッセージを削除
-      const streaming = this.els.chatArea.querySelector('.message.assistant.live-streaming');
-      if (streaming) streaming.remove();
+      const run = () => {
+        console.log('[LiveAPI] interrupted');
+        this.liveAudioManager.clearPlaybackQueue();
+        this.liveAudioManager.onAiResponseEnded();
+        this.aiTranscriptBuffer = '';
+        // ストリーミング中のメッセージを削除
+        const streaming = this.els.chatArea.querySelector('.message.assistant.live-streaming');
+        if (streaming) streaming.remove();
+      };
+      if (this.holdStartupEvent(run)) return;
+      run();
     });
 
     this.socket.on('live_reconnecting', () => {
@@ -665,6 +666,46 @@ export class CoreController {
     }
   }
 
+  // ★ AI発話をリアルタイムでチャット欄に表示（ai_transcript の処理。起動時の再生保留で使うためメソッド化）
+  private showAiTranscript(data: any): void {
+    const text = data.text;
+    if (text) {
+      this.aiTranscriptBuffer += text;
+      // AI発話をリアルタイムでチャット欄に表示
+      const existing = this.els.chatArea.querySelector('.message.assistant.live-streaming');
+      if (existing) {
+        const msgText = existing.querySelector('.message-text');
+        if (msgText) msgText.textContent = this.aiTranscriptBuffer;
+      } else {
+        const div = document.createElement('div');
+        div.className = 'message assistant live-streaming';
+        div.innerHTML = `<div class="message-avatar">🍽</div><div class="message-content"><span class="message-text">${this.aiTranscriptBuffer}</span></div>`;
+        this.els.chatArea.appendChild(div);
+        this.els.chatArea.scrollTop = this.els.chatArea.scrollHeight;
+      }
+    }
+  }
+
+  // ★ turn_complete の処理（起動時の再生保留で使うためメソッド化）
+  private handleTurnComplete(): void {
+    console.log('[LiveAPI] turn_complete');
+    this.liveAudioManager.onAiResponseEnded();
+
+    // ユーザー発話をチャット欄に確定表示（lessonモードでは非表示）
+    if (this.userTranscriptBuffer.trim() && this.currentMode !== 'lesson') {
+      this.addMessage('user', this.userTranscriptBuffer.trim());
+    }
+    this.userTranscriptBuffer = '';
+    this.els.userInput.value = '';
+
+    // AI発話のストリーミング表示を確定
+    const streaming = this.els.chatArea.querySelector('.message.assistant.live-streaming');
+    if (streaming) {
+      streaming.classList.remove('live-streaming');
+    }
+    this.aiTranscriptBuffer = '';
+  }
+
   protected terminateLiveSession(): void {
     if (this.isLiveMode && this.socket && this.socket.connected) {
       this.socket.emit('live_stop');
@@ -677,7 +718,34 @@ export class CoreController {
     this.liveAudioManager.onAiResponseEnded();
     this.userTranscriptBuffer = '';
     this.aiTranscriptBuffer = '';
+    // ★ ここまでに溜めた処理は、Golden ではこの時点で再生ごと消えていたものなので捨てる
+    if (this.heldStartupEvents.length > 0) {
+      console.log(`[PlaybackHold] セッション終了で保留分を破棄 events=${this.heldStartupEvents.length}`);
+      this.heldStartupEvents = [];
+    }
     console.log('[LiveAPI] セッション終了');
+  }
+
+  // ★ 保留中なら処理を溜めて true を返す
+  private holdStartupEvent(run: () => void): boolean {
+    if (!this.startupPlaybackHold) return false;
+    if (this.heldStartupEvents.length === 0) {
+      console.log(`[PlaybackHold] hold 開始 t=${performance.now().toFixed(1)}ms`);
+    }
+    this.heldStartupEvents.push(run);
+    return true;
+  }
+
+  // ★ 保留を解除し、溜めた処理を到着順に流す（1 回だけ）
+  protected releaseStartupPlaybackHold(): void {
+    if (!this.startupPlaybackHold) return;
+    this.startupPlaybackHold = false;
+    const events = this.heldStartupEvents;
+    this.heldStartupEvents = [];
+    console.log(`[PlaybackHold] release t=${performance.now().toFixed(1)}ms events=${events.length}`);
+    for (const run of events) {
+      try { run(); } catch (e) { console.error('[PlaybackHold] 処理エラー:', e); }
+    }
   }
 
   protected stopStreamingSTT() {
