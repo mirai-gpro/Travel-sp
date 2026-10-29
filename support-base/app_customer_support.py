@@ -81,10 +81,7 @@ allowed_origins = [
     "https://gourmet-sp.vercel.app",
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
-    "http://localhost:4321",
-    # ★ 実験 (exp/resume-gate*): Vercel Preview のブランチ固定 URL。本番ブランチには入れない
-    "https://travel-sp-git-exp-resume-gate-mirais-projects-87257550.vercel.app",
-    "https://travel-sp-git-exp-resume-gate-t1-mirais-projects-87257550.vercel.app",
+    "http://localhost:4321"
 ]
 
 # SocketIO初期化 (cors_allowed_originsを明示的に指定)
