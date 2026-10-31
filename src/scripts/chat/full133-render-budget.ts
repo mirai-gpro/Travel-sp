@@ -49,9 +49,9 @@
  */
 
 import { getAvatarIdForDiag } from './poc/render-perf';
+import { isFull133AvatarId } from './full133-avatars';
 
-/** この最適化を適用する唯一の avatar。 */
-export const FULL133_AVATAR_ID = 'uika-full133-skin';
+/** この最適化を適用する avatar は full133-avatars.ts の一覧。 */
 
 /** 落とし先の pixel density。今回の変数はこれ 1 つだけ。 */
 export const FULL133_MOBILE_DPR = 1;
@@ -131,7 +131,7 @@ function apply(renderer: any, stats: Full133RenderBudgetStats, w?: any): void {
         stats.reason = '?uika133k=1 の hidden PoC 経路は対象外';
         return;
     }
-    if (stats.avatarId !== FULL133_AVATAR_ID) {
+    if (!isFull133AvatarId(stats.avatarId)) {
         stats.reason = `FULL133 専用。avatarId=${stats.avatarId} のため適用しない`;
         return;
     }
@@ -179,7 +179,7 @@ export async function installFull133RenderBudget(
     if (win) win.__full133RenderBudget = stats;
 
     // FULL133 でない / desktop のときは待たずに抜ける (他経路を遅らせない)。
-    if (getAvatarIdForDiag() !== FULL133_AVATAR_ID
+    if (!isFull133AvatarId(getAvatarIdForDiag())
         || !isMobileClassDevice(win)
         || isUika133kHiddenRoute(win)) {
         apply(renderer, stats, win);
