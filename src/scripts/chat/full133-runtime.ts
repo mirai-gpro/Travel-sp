@@ -113,9 +113,9 @@
 import { loadAvatarConfig } from '../../config/avatar-config';
 import { getAvatarIdForDiag } from './poc/render-perf';
 import { updateFull133Predeform } from './full133-predeform';
+import { isFull133AvatarId } from './full133-avatars';
 
-/** 適用対象。これ以外では何もしない。 */
-const FULL133_AVATAR_ID = 'uika-full133-skin';
+/** 適用対象は full133-avatars.ts の一覧。これ以外では何もしない。 */
 const FULL133_SPLAT_COUNT = 133541;
 
 /** 初期化が揃うまで完全実行する最小フレーム数 (起動時のみのコスト)。
@@ -281,7 +281,7 @@ function apply(renderer: any, stats: Full133RuntimeStats): void {
         return;
     }
     // FULL133 以外には絶対に適用しない。
-    if (stats.avatarId !== FULL133_AVATAR_ID) {
+    if (!isFull133AvatarId(stats.avatarId)) {
         stats.reason = `FULL133 専用。avatarId=${stats.avatarId} のため適用しない`;
         return;
     }

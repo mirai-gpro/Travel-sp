@@ -79,11 +79,11 @@
 
 import { getAvatarIdForDiag, getSortModeFlag } from './render-perf';
 import { loadAvatarConfig } from '../../../config/avatar-config';
+import { isFull133AvatarId } from '../full133-avatars';
 
 export type SortPolicy = 'stock' | 'adaptive-gpu' | 'adaptive-cpu';
 
-/** 適用対象。これ以外の avatar では何もしない (指示書 §4 / §28)。 */
-const FULL133_AVATAR_ID = 'uika-full133-skin';
+/** 適用対象は full133-avatars.ts の一覧。これ以外の avatar では何もしない (指示書 §4 / §28)。 */
 const FULL133_SPLAT_COUNT = 133541;
 
 /** camera signature の一致判定に使う epsilon (指示書 §7)。 */
@@ -293,7 +293,7 @@ function apply(renderer: any, s: AdaptiveSortStats): void {
     }
 
     // FULL133 だけに適用する (指示書 §4 / §28)。
-    if (s.avatarId !== FULL133_AVATAR_ID || s.splatCount !== FULL133_SPLAT_COUNT) {
+    if (!isFull133AvatarId(s.avatarId) || s.splatCount !== FULL133_SPLAT_COUNT) {
         s.reason = `FULL133 専用。avatarId=${s.avatarId} splatCount=${s.splatCount} のため適用しない`;
         return;
     }

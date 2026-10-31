@@ -92,8 +92,8 @@
  */
 
 import { getAvatarIdForDiag } from './poc/render-perf';
+import { isFull133AvatarId } from './full133-avatars';
 
-const FULL133_AVATAR_ID = 'uika-full133-skin';
 const FULL133_SPLAT_COUNT = 133541;
 
 /** main shader の morph accumulation ループの開始行 (`SplatMaterial.js:222`)。 */
@@ -350,7 +350,7 @@ function apply(renderer: any, stats: Full133PredeformStats): void {
     stats.splatCount = Number(sm?.getSplatCount?.() ?? 0);
 
     // ---- FULL133 以外には絶対に適用しない (指示書 §28) ----
-    if (stats.avatarId !== FULL133_AVATAR_ID) {
+    if (!isFull133AvatarId(stats.avatarId)) {
         stats.reason = `FULL133 専用。avatarId=${stats.avatarId} のため適用しない`;
         return;
     }

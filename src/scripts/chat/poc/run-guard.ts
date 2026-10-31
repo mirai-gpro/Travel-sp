@@ -19,12 +19,12 @@ import { getSkinMode, type SkinMode } from './multibone-skinning';
 import { getSortModeFlag, getAvatarIdForDiag } from './render-perf';
 import { getMorphPath, type Full133MorphPath } from '../full133-runtime';
 import { getSortPolicy, type SortPolicy } from './adaptive-sort';
+import { isFull133AvatarId } from '../full133-avatars';
 
 /** FULL133 の Gaussian 数。`tools/uika_to_lam/build_full133.py` の出力と一致する値。 */
 const EXPECTED_SPLATS_FULL133 = 133541;
 
-/** splat 数の検証を掛ける avatarId。これ以外では件数を記録するだけで判定しない。 */
-const FULL133_AVATAR_ID = 'uika-full133-skin';
+/** splat 数の検証を掛ける avatarId は full133-avatars.ts の一覧。これ以外では件数を記録するだけで判定しない。 */
 
 export interface RunConfig {
     avatarId: string;
@@ -103,7 +103,7 @@ export function buildRunConfig(renderer: any, diagMode: string): RunConfig {
     const full133 = (window as any).__full133Runtime ?? {};
     const avatarId = getAvatarIdForDiag();
     const splatCount = Number(v?.splatMesh?.getSplatCount?.() ?? 0);
-    const expectedSplatCount = avatarId === FULL133_AVATAR_ID ? EXPECTED_SPLATS_FULL133 : null;
+    const expectedSplatCount = isFull133AvatarId(avatarId) ? EXPECTED_SPLATS_FULL133 : null;
 
     const cfg: RunConfig = {
         avatarId,
