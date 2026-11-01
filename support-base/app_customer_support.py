@@ -736,7 +736,8 @@ def health_check():
             'stt': 'ok',
             'places_api': 'ok' if GOOGLE_PLACES_API_KEY else 'not configured',
             'audio2exp': 'ok' if AUDIO2EXP_SERVICE_URL else 'not configured'
-        }
+        },
+        'models': model_info(),
     })
 
 
