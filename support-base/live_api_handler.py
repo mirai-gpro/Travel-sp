@@ -34,10 +34,11 @@ A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 480
 A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）
 A2E_EXPRESSION_FPS = 30
 
-# stt_stream.py から転記（変更禁止）
-LIVE_API_MODEL = "gemini-3.1-flash-live-preview"
-MAX_AI_CHARS_BEFORE_RECONNECT = 800
-LONG_SPEECH_THRESHOLD = 500
+# モデル ID と再接続の閾値は live_model_config.py に集約（値は stt_stream.py から転記、変更禁止）
+from live_model_config import LIVE_API_MODEL, LIVE_MODEL_PROFILE, model_info
+MAX_AI_CHARS_BEFORE_RECONNECT = LIVE_MODEL_PROFILE.max_ai_chars_before_reconnect
+LONG_SPEECH_THRESHOLD = LIVE_MODEL_PROFILE.long_speech_threshold
+logger.info(f"[LiveAPI] モデル設定: {model_info()}")
 
 # ============================================================
 # ショップ検索UX: 事前生成キャッシュ音声（24kHz 16bit mono PCM）
@@ -467,6 +468,7 @@ class LiveAPISession:
                 config = self._build_config(with_context=context)
 
                 try:
+                    logger.info(f"[LiveAPI] 接続開始: model={LIVE_API_MODEL}, session_count={self.session_count}")
                     async with self.client.aio.live.connect(
                         model=LIVE_API_MODEL,
                         config=config
