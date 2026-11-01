@@ -43,7 +43,6 @@ from support_core import (
     gemini_client
 )
 from live_api_handler import LiveAPISession, build_system_instruction
-from live_model_config import TEXT_MODEL, model_info
 
 # ロギング設定
 logging.basicConfig(
@@ -736,8 +735,7 @@ def health_check():
             'stt': 'ok',
             'places_api': 'ok' if GOOGLE_PLACES_API_KEY else 'not configured',
             'audio2exp': 'ok' if AUDIO2EXP_SERVICE_URL else 'not configured'
-        },
-        'models': model_info(),
+        }
     })
 
 
@@ -872,7 +870,7 @@ def handle_live_start(data):
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             )
             response = gemini_client.models.generate_content(
-                model=TEXT_MODEL,
+                model="gemini-2.5-flash",
                 contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
                 config=config
             )

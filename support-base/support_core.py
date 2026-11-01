@@ -17,7 +17,6 @@ import google.generativeai as genai_legacy
 
 # api_integrations から必要な関数をインポート
 from api_integrations import extract_shops_from_response
-from live_model_config import TEXT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +31,7 @@ except Exception as e:
 # Gemini クライアント初期化
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 genai_legacy.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai_legacy.GenerativeModel(TEXT_MODEL)
+model = genai_legacy.GenerativeModel('gemini-2.5-flash')
 
 # ========================================
 # RAMベースのセッション管理 (Firestore完全廃止)
@@ -686,7 +685,7 @@ class SupportAssistant:
             )
 
             response = gemini_client.models.generate_content(
-                model=TEXT_MODEL,
+                model="gemini-2.5-flash",
                 contents=history,
                 config=config
             )
@@ -780,7 +779,7 @@ class SupportAssistant:
         try:
             logger.info("[Assistant] Generating final summary")
             response = gemini_client.models.generate_content(
-                model=TEXT_MODEL,
+                model="gemini-2.5-flash",
                 contents=summary_prompt
             )
             summary = response.text
@@ -902,7 +901,7 @@ class SupportAssistant:
         try:
             logger.info("[Assistant] Generating summary")
             response = gemini_client.models.generate_content(
-                model=TEXT_MODEL,
+                model="gemini-2.5-flash",
                 contents=summary_prompt
             )
             return response.text
