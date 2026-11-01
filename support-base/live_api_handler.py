@@ -35,7 +35,8 @@ A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
-LIVE_API_MODEL = "gemini-3.1-flash-live-preview"
+# 2026-11: gemini-3.8-live へ切替（ユーザー指示）。旧: "gemini-3.1-flash-live-preview"
+LIVE_API_MODEL = "gemini-3.8-live"
 MAX_AI_CHARS_BEFORE_RECONNECT = 800
 LONG_SPEECH_THRESHOLD = 500
 
@@ -227,8 +228,11 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
 # Function Calling 定義（v5 §5.2）
 # ============================================================
 
+# gemini-3.8-live は Function Calling の既定が非同期（NON_BLOCKING）。
+# 3.1 と同じ同期動作（tool_response を返すまでモデルは待つ）にするため BLOCKING を明示する。
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
+    behavior=types.Behavior.BLOCKING,
     description="ユーザーの条件に基づいてレストランを検索する。条件が十分に揃ったと判断した時に呼び出す。user_requestには会話で確認した全条件を必ず含めること。",
     parameters=types.Schema(
         type="OBJECT",
@@ -244,6 +248,7 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
 
 UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
     name="update_user_profile",
+    behavior=types.Behavior.BLOCKING,
     description="ユーザーが名前を教えてくれた時、または名前の変更を依頼された時に呼び出す。初回の名前登録にも、名前変更にも使用する。",
     parameters=types.Schema(
         type="OBJECT",
@@ -335,6 +340,8 @@ class LiveAPISession:
 
         # 再接続時のトリガーメッセージ（§7.1）
         self._resume_message = None
+        # ショップ紹介（LiveAPI 読み上げ）のターン待ち
+        self._shop_intro_turn_pending = False
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -730,8 +737,8 @@ class LiveAPISession:
                 searching_task = asyncio.ensure_future(asyncio.sleep(0))
                 please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
 
-                # ショップ検索を実行
-                await self._handle_shop_search(user_request)
+                # ショップ検索を実行（カード表示まで。読み上げは LiveAPI が行う）
+                shops = await self._handle_shop_search(user_request)
 
                 # 検索完了 → 未再生のタスクをキャンセル
                 for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
@@ -740,13 +747,17 @@ class LiveAPISession:
                         logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
 
                 # function responseを返す（LiveAPI SDK: キーワード引数必須）
+                # 読み上げは REST TTS ではなく LiveAPI のモデル発話で行う
                 await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
-                        response={"result": "検索結果をユーザーに表示しました"}
+                        response=self._build_shop_tool_response(shops)
                     )]
                 )
+                if shops:
+                    self._shop_intro_turn_pending = True
+                    logger.info(f"[ShopDesc] LiveAPI読み上げ: {len(shops)}件をtool_responseで送信")
             elif fc.name == "update_user_profile":
                 # ユーザー名登録・変更をDBに永続化
                 updates = fc.args or {}
@@ -805,7 +816,7 @@ class LiveAPISession:
                 self.socketio.emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
                 }, room=self.client_sid)
-                return
+                return []
 
             raw_shops = shop_data['shops']
             response_text = shop_data.get('response', '')
@@ -825,16 +836,42 @@ class LiveAPISession:
                 'response': response_text,
             }, room=self.client_sid)
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
-            await asyncio.sleep(0.3)
 
-            # 4. TTS再生（ショップカード提示後にTTS生成開始）
-            await self._describe_shops_via_live(shops)
+            # 4. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
+            #    旧方式: await self._describe_shops_via_live(shops)  ※REST TTS
+            return shops
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
             self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
             }, room=self.client_sid)
+            return []
+
+    def _build_shop_tool_response(self, shops: list) -> dict:
+        """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""
+        if not shops:
+            return {"result": "条件に合うお店が見つかりませんでした。条件を変えて探すことを提案してください。"}
+
+        total = len(shops)
+        items = []
+        for i, shop in enumerate(shops, start=1):
+            items.append({
+                "number": i,
+                "name": shop.get('name', ''),
+                "area": shop.get('area', ''),
+                "category": shop.get('category', shop.get('genre', '')),
+                "description": shop.get('description', ''),
+                "price_range": shop.get('priceRange', shop.get('budget', '')),
+            })
+        instruction = (
+            f"検索結果の{total}軒をショップカードとしてユーザーの画面に表示しました。"
+            f"shops の順に1軒目から{total}軒目まで全て、話し言葉で紹介してください。"
+            "各店は「N軒目は、店名です。」から始め、エリア・ジャンル・説明・予算を含めること。"
+            "マークダウン記法や記号は使わないこと。"
+            f"最後は「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めること。"
+        )
+        return {"result": instruction, "shops": items}
 
     def _process_turn_complete(self):
         """
@@ -874,6 +911,14 @@ class LiveAPISession:
             elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
+
+            # ショップ紹介ターンの完了（LiveAPI 読み上げ）
+            if self._shop_intro_turn_pending:
+                self._shop_intro_turn_pending = False
+                logger.info(f"[ShopDesc] LiveAPI読み上げ完了: {char_count}文字")
+                if self.needs_reconnect:
+                    # 旧 REST 方式の読み上げ後と同じ再開メッセージ（「続きをお願いします」で再度読み上げさせない）
+                    self._resume_message = "ありがとうございます。気になるお店について教えてください。"
 
     async def _describe_shops_via_live(self, shops: list):
         """
