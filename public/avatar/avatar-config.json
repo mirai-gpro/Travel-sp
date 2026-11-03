@@ -140,5 +140,41 @@
     "skinMode": "aligned",
     "sortPolicy": "adaptive-cpu",
     "morphPath": "steady-state"
+  },
+  {
+    "id": "uika-fumiya02-full133",
+    "name": "UIKA fumiya02",
+    "thumbnail": "/avatar/thumbs/uika-fumiya02-full133.png",
+    "modelUrl": "/avatar/uika-fumiya02-full133.zip",
+    "voiceModel": "ja-JP-Chirp3-HD-Enceladus",
+    "liveVoice": "Enceladus",
+    "camera": { "posY": 1.704, "posZ": 0.45, "targetY": 1.644, "offsetX": 0.045 },
+    "skinMode": "aligned",
+    "sortPolicy": "adaptive-cpu",
+    "morphPath": "steady-state"
+  },
+  {
+    "id": "uika-hitomi-full133",
+    "name": "UIKA hitomi",
+    "thumbnail": "/avatar/thumbs/uika-hitomi-full133.png",
+    "modelUrl": "/avatar/uika-hitomi-full133.zip",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.704, "posZ": 0.45, "targetY": 1.644, "offsetX": 0.045 },
+    "skinMode": "aligned",
+    "sortPolicy": "adaptive-cpu",
+    "morphPath": "steady-state"
+  },
+  {
+    "id": "uika-sades-full133",
+    "name": "UIKA sades",
+    "thumbnail": "/avatar/thumbs/uika-sades-full133.png",
+    "modelUrl": "/avatar/uika-sades-full133.zip",
+    "voiceModel": "ja-JP-Chirp3-HD-Leda",
+    "liveVoice": "Leda",
+    "camera": { "posY": 1.704, "posZ": 0.45, "targetY": 1.644, "offsetX": 0.045 },
+    "skinMode": "aligned",
+    "sortPolicy": "adaptive-cpu",
+    "morphPath": "steady-state"
   }
 ]
