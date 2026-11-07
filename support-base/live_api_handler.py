@@ -11,6 +11,7 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import json
 import os
 import logging
 import struct
@@ -229,10 +230,12 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
 # ============================================================
 
 # gemini-3.8-live は Function Calling の既定が非同期（NON_BLOCKING）。
-# 3.1 と同じ同期動作（tool_response を返すまでモデルは待つ）にするため BLOCKING を明示する。
+# search_shops は NON_BLOCKING: 検索中もモデルは会話を続け、お店を探していることを自分の言葉で伝える。
+#   結果は検索完了後に scheduling=WHEN_IDLE で返す（_shop_search_in_background）。
+# update_user_profile は 3.1 と同じ同期動作（tool_response を返すまでモデルは待つ）にするため BLOCKING を明示する。
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
-    behavior=types.Behavior.BLOCKING,
+    behavior=types.Behavior.NON_BLOCKING,
     description="ユーザーの条件に基づいてレストランを検索する。条件が十分に揃ったと判断した時に呼び出す。user_requestには会話で確認した全条件を必ず含めること。",
     parameters=types.Schema(
         type="OBJECT",
@@ -244,6 +247,25 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
         },
         required=["user_request"]
     )
+)
+
+# search_shops 呼び出し直後にモデルへ送る指示（決まったセリフではなく、言い回しはモデルに任せる）
+SHOP_SEARCH_STARTED_NUDGE = (
+    "（システムからの連絡）お店の検索を開始しました。結果はまだ届いていません。"
+    "お店を探していることを、ユーザーと話している言語で、自分の言葉で一言だけ伝えてください。"
+    "お店の名前や内容は、検索結果が届くまで話さないでください。"
+)
+
+# 検索中に search_shops がもう一度呼ばれた時に返す結果（scheduling=SILENT）
+SHOP_SEARCH_BUSY_RESULT = (
+    "前のお店の検索がまだ実行中のため、この呼び出しは受け付けていません。"
+    "検索結果が届くまで待ってください。"
+)
+
+# 検索中に再接続が起きた時、新しい接続へ検索結果を渡す際の前置き
+SHOP_SEARCH_RESULT_AFTER_RECONNECT = (
+    "（システムからの連絡）先ほど依頼されたお店の検索結果が届きました。"
+    "以下の内容に従って、ユーザーにお店を紹介してください。\n"
 )
 
 UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
@@ -342,6 +364,10 @@ class LiveAPISession:
         self._resume_message = None
         # ショップ紹介（LiveAPI 読み上げ）のターン待ち
         self._shop_intro_turn_pending = False
+        # search_shops（NON_BLOCKING）をバックグラウンドで実行中のタスク
+        self._shop_search_task: asyncio.Task | None = None
+        # 現在接続中の LiveAPI セッション（再接続で入れ替わる）
+        self._active_session = None
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -478,6 +504,7 @@ class LiveAPISession:
                         model=LIVE_API_MODEL,
                         config=config
                     ) as session:
+                        self._active_session = session
 
                         if self.session_count == 1:
                             # 初回接続: ダミーメッセージで初期あいさつを発火
@@ -546,6 +573,9 @@ class LiveAPISession:
             if self._a2e_worker_task:
                 self._a2e_worker_task.cancel()
                 self._a2e_worker_task = None
+            if self._shop_search_task and not self._shop_search_task.done():
+                self._shop_search_task.cancel()
+            self._shop_search_task = None
             self.is_running = False
             logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
@@ -611,6 +641,10 @@ class LiveAPISession:
                         self.needs_reconnect = True
                     else:
                         logger.error(f"[LiveAPI] タスクエラー: {e}")
+        finally:
+            # このセッションは閉じる（検索結果はこのセッションに送らない）
+            if self._active_session is session:
+                self._active_session = None
 
     async def _receive_and_forward(self, session):
         """
@@ -720,44 +754,39 @@ class LiveAPISession:
         for fc in tool_call.function_calls:
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
-                logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
-                # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
+                # 検索中にもう一度呼ばれた場合は受け付けない（カードの入れ替わりを防ぐ）
+                if self._shop_search_task and not self._shop_search_task.done():
+                    logger.info(f"[LiveAPI] search_shops呼び出し（検索中のため受け付けない）: '{user_request}'")
+                    await session.send_tool_response(
+                        function_responses=[types.FunctionResponse(
+                            name=fc.name,
+                            id=fc.id,
+                            response={"result": SHOP_SEARCH_BUSY_RESULT},
+                            scheduling=types.FunctionResponseScheduling.SILENT,
+                        )]
+                    )
+                    continue
+
+                logger.info(f"[LiveAPI] search_shops呼び出し（NON_BLOCKING）: '{user_request}'")
+
+                # 検索開始をブラウザに通知
                 self.socketio.emit('shop_search_start', {},
                                    room=self.client_sid)
 
-                # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
-                # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
-                # searching_task = asyncio.ensure_future(
-                #     self._delayed_cached_audio(_CACHED_SEARCHING_PCM, delay=0.5)
-                # )
-                # please_wait_task = asyncio.ensure_future(
-                #     self._delayed_cached_audio(_CACHED_PLEASE_WAIT_PCM, delay=6.5)
-                # )
-                searching_task = asyncio.ensure_future(asyncio.sleep(0))
-                please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
-
-                # ショップ検索を実行（カード表示まで。読み上げは LiveAPI が行う）
-                shops = await self._handle_shop_search(user_request)
-
-                # 検索完了 → 未再生のタスクをキャンセル
-                for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
-                    if not task.done():
-                        task.cancel()
-                        logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
-
-                # function responseを返す（LiveAPI SDK: キーワード引数必須）
-                # 読み上げは REST TTS ではなく LiveAPI のモデル発話で行う
-                await session.send_tool_response(
-                    function_responses=[types.FunctionResponse(
-                        name=fc.name,
-                        id=fc.id,
-                        response=self._build_shop_tool_response(shops)
-                    )]
+                # 受信ループを止めないよう、検索はバックグラウンドで実行する
+                self._shop_search_task = asyncio.create_task(
+                    self._shop_search_in_background(session, fc.name, fc.id, user_request)
                 )
-                if shops:
-                    self._shop_intro_turn_pending = True
-                    logger.info(f"[ShopDesc] LiveAPI読み上げ: {len(shops)}件をtool_responseで送信")
+
+                # 検索中の無言を避けるため、モデルに「お店を探していることを自分の言葉で伝える」よう促す。
+                # 決まったセリフは渡さない（言い回しはモデルが決める）。
+                # search_shops は NON_BLOCKING なので、この入力で検索は取り消されない。
+                try:
+                    await session.send_realtime_input(text=SHOP_SEARCH_STARTED_NUDGE)
+                    logger.info("[ShopSearch] 検索開始の発話を促す指示を送信")
+                except Exception as e:
+                    logger.warning(f"[ShopSearch] 検索開始の指示送信失敗: {e}")
             elif fc.name == "update_user_profile":
                 # ユーザー名登録・変更をDBに永続化
                 updates = fc.args or {}
@@ -783,6 +812,47 @@ class LiveAPISession:
                 )
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
+
+    async def _shop_search_in_background(self, session, name: str, call_id: str, user_request: str):
+        """search_shops（NON_BLOCKING）: 検索してカードを表示し、結果を WHEN_IDLE で返す"""
+        t0 = time.time()
+        shops = await self._handle_shop_search(user_request) or []
+        response = self._build_shop_tool_response(shops)
+
+        delivered = False
+        if session is self._active_session:
+            try:
+                await session.send_tool_response(
+                    function_responses=[types.FunctionResponse(
+                        name=name,
+                        id=call_id,
+                        response=response,
+                        scheduling=types.FunctionResponseScheduling.WHEN_IDLE,
+                    )]
+                )
+                delivered = True
+                logger.info(f"[ShopDesc] LiveAPI読み上げ: {len(shops)}件をtool_response（WHEN_IDLE）で送信 {time.time() - t0:.1f}秒")
+            except Exception as e:
+                logger.warning(f"[ShopDesc] tool_response送信失敗: {e}")
+
+        if not delivered:
+            # 検索中に再接続が起きた: 呼び出し元のセッションは閉じているため、
+            # 同じ検索結果を新しい接続にテキストで渡す（接続中なら即送信、再接続中なら再接続時に送る）
+            text = SHOP_SEARCH_RESULT_AFTER_RECONNECT + json.dumps(response, ensure_ascii=False)
+            active = self._active_session
+            if active is not None:
+                try:
+                    await active.send_realtime_input(text=text)
+                    delivered = True
+                    logger.info(f"[ShopDesc] 再接続後のセッションに検索結果を送信: {len(shops)}件")
+                except Exception as e:
+                    logger.warning(f"[ShopDesc] 再接続後のセッションへの送信失敗: {e}")
+            if not delivered:
+                self._resume_message = text
+                logger.info(f"[ShopDesc] 再接続時に検索結果を送信予定: {len(shops)}件")
+
+        if shops:
+            self._shop_intro_turn_pending = True
 
     async def _handle_shop_search(self, user_request: str):
         """
