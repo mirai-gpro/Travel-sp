@@ -487,6 +487,18 @@ export class ConciergeController extends CoreController {
   // 🎯 コンシェルジュモード専用: メッセージ送信処理
   // ========================================
   protected async sendMessage() {
+    // ★ LiveAPI 接続中のテキスト入力は LiveAPI(3.8) に送る（応答も 3.8 が音声で返す）
+    if (this.isLiveMode && this.socket && this.socket.connected) {
+      const liveText = this.els.userInput.value.trim();
+      if (!liveText) return;
+      this.enableAudioPlayback();
+      this.addMessage('user', liveText);
+      this.els.userInput.value = '';
+      this.isFromVoiceInput = false;
+      this.socket.emit('live_text_in', { text: liveText });
+      return;
+    }
+
     let firstAckPromise: Promise<void> | null = null; 
     this.unlockAudioParams();
     const message = this.els.userInput.value.trim();
