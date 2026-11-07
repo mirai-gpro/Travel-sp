@@ -368,6 +368,8 @@ class LiveAPISession:
         self._shop_search_task: asyncio.Task | None = None
         # 現在接続中の LiveAPI セッション（再接続で入れ替わる）
         self._active_session = None
+        # run() を実行しているイベントループ（テキスト入力を Flask スレッドから渡すため）
+        self._loop = None
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -473,6 +475,26 @@ class LiveAPISession:
             except asyncio.QueueFull:
                 pass  # キューが満杯の場合はドロップ
 
+    def enqueue_text(self, text: str):
+        """ブラウザから受信したテキスト入力を LiveAPI に送る（Flask スレッドから呼ばれる）"""
+        if not self.is_running or self._loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._send_text_input(text), self._loop)
+
+    async def _send_text_input(self, text: str):
+        """テキスト入力をユーザー発話として LiveAPI に送る（応答は通常どおり音声で返る）"""
+        session = self._active_session
+        if session is None:
+            logger.warning(f"[LiveAPI] テキスト入力: 接続中のセッションがないため送信できません: '{text}'")
+            return
+        # 音声入力の文字起こしと同じく、ターン完了時にユーザー発話として履歴に残す
+        self.user_transcript_buffer += text
+        try:
+            await session.send_realtime_input(text=text)
+            logger.info(f"[LiveAPI] テキスト入力を送信: '{text}'")
+        except Exception as e:
+            logger.warning(f"[LiveAPI] テキスト入力の送信失敗: {e}")
+
     def stop(self):
         """セッションを停止"""
         self.is_running = False
@@ -484,6 +506,7 @@ class LiveAPISession:
         仕様書 セクション6.1 の run() を移植
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
+        self._loop = asyncio.get_running_loop()
         self.is_running = True
         self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
 
