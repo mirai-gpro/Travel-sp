@@ -489,9 +489,8 @@ export class CoreController {
         const section = document.getElementById('shopListSection');
         if (section) section.classList.add('has-shops');
 
-        if (data.response) {
-          this.addMessage('assistant', data.response);
-        }
+        // ショップ紹介は LiveAPI(3.8) が話し、その文字起こしがチャット欄に出る。
+        // 検索用モデルが書いた紹介文（data.response）は表示しない。
 
         if (window.innerWidth < 1024) {
           setTimeout(() => {
