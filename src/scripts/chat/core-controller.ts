@@ -470,10 +470,9 @@ export class CoreController {
       this.isLiveMode = false;
     });
 
-    // ★ ショップ検索開始（§3.6: 待機アニメーション表示）
+    // ★ ショップ検索開始: 検索中は LiveAPI(3.8) が話すため、アバターを隠す待機画面は出さない
     this.socket.on('shop_search_start', () => {
-      console.log('[LiveAPI] shop_search_start: 待機アニメーション表示');
-      this.showWaitOverlay();
+      console.log('[LiveAPI] shop_search_start: 検索中（待機画面は表示しない）');
     });
 
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
