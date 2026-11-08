@@ -107,6 +107,7 @@ def run(client, places_key, pocs, q_idx, runs, gap_s):
                                shops=[{"name": s["name"], "source": s["source_type"],
                                        "recent": (s.get("recent") or {}).get("event_type"),
                                        "rating": s["rating"], "price": s["priceRange"]} for s in res["shops"]],
+                               matched=res.get("matched", []),
                                rejected=res.get("rejected_detail", []))
                 except v2.ShopSearchError as e:
                     row.update(ok=False, error_stage=e.stage, error=e.reason,

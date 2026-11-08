@@ -525,7 +525,7 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
     ranked = timed("rank_ms", rank_candidates, gemini_client, user_request, merged, language)
     results, rejected = timed("places_ms", verify_candidates, ranked, area, geo_info, language)
 
-    shops, seen = [], set()
+    shops, seen, matched = [], set(), []
     # 照合で外れた候補（PoC の確認用。ログには出さない）
     rejected_detail = [{"name": c["name"], "area": c["area"], "source_type": c.get("source_type"),
                         "reason": r["reason"]} for c, r in zip(ranked, results) if not r["ok"]]
@@ -534,6 +534,9 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
             continue
         seen.add(r["place"]["place_id"])
         shops.append(build_shop(cand, r["place"]))
+        # 候補名 → Places の名前・住所（今までのロジックは最初の営業中の 1 件を採るため、別店への置き換えを PoC で確認する）
+        matched.append({"cand": cand["name"], "cand_area": cand["area"], "genre": cand.get("genre", ""),
+                        "place": r["place"].get("name"), "address": (r["place"].get("formatted_address") or "")[:40]})
         if len(shops) >= MAX_SHOPS:
             break
     # 写真は Phase D で place_id から後取得する
@@ -545,7 +548,8 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
     logger.info(f"[ShopSearchV2] search_id={search_id} status={status} recent={recent['status']} "
                 f"stats={stats} timings={timings}")
     return {"search_id": search_id, "status": status, "shops": shops, "photo_refs": photo_refs,
-            "recent_check": recent, "timings": timings, "stats": stats, "rejected_detail": rejected_detail}
+            "recent_check": recent, "timings": timings, "stats": stats, "rejected_detail": rejected_detail,
+            "matched": matched}
 
 
 # ------------------------------------------------------------

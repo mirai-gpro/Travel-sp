@@ -165,6 +165,7 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(res["shops"][0]["recent"]["event_type"], "opened")
         self.assertEqual(res["stats"]["rejected"], {"not_found": 2})
         self.assertEqual({d["name"] for d in res["rejected_detail"]}, {"幻の店", "鳥しき"})
+        self.assertEqual([(m["cand"], m["place"]) for m in res["matched"]], [("新店X", "新店X"), ("鳥幸", "鳥幸 恵比寿店")])
         for k in ("a_ms", "b_ms", "area_ms", "rank_ms", "places_ms", "total_ms"):
             self.assertIn(k, res["timings"])
 
