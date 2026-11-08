@@ -5,8 +5,9 @@ shop_search_v2 の PoC 計測（Cloud Shell 等で手動実行。本番コード
           504 などの原因切り分け用。各呼び出しの時間・トークン数・エラーを表示する。
   A     : PoC A = A（知識候補）→ 順位づけ → Places 照合（今までの search_place）
   diag  : 置き換わりの原因調査。今までの search_place をそのまま呼び、Text Search が返した全件
-          （順位・店名・営業状態・住所）と、採用された 1 件を表示する
+          （順位・店名・営業状態・住所）・件数と、採用された 1 件とその Places (New) 店舗タイプを表示する
   B     : PoC B = A ∥ B（2.5-flash + Google 検索）→ 統合・順位づけ → Places 照合
+  run の --gates observe（既定）で、照合できた店ごとに採否判定（①ジャンル ②すり替わり）を記録する
 
 使い方（キーは環境変数で渡す。表示もログ出力もしない）:
   python tools/poc_shop_search_v2.py probe
@@ -116,10 +117,15 @@ def diag(items, language):
                 requests.get = orig_get
             data = captured[0] if captured else {}
             region = (geo or {}).get("region", "") if label == "legacy" else ""
+            types = (v2.fetch_place_types(os.environ.get("GOOGLE_PLACES_API_KEY", ""), place["place_id"])
+                     if place and place.get("place_id") else None)
             out = {"cand": name, "variant": label,
                    "query": " ".join(x for x in (name, area if label == "legacy" else "", region) if x),
                    "status": data.get("status"),
                    "adopted": (place or {}).get("name"),
+                   "adopted_types": types,
+                   "result_count": len(data.get("results") or []),
+                   "name_match": v2.name_overlaps(name, (place or {}).get("name") or "", (area,)),
                    "results": [{"rank": i + 1, "name": r.get("name"),
                                 "business_status": r.get("business_status", "(なし)"),
                                 "address": (r.get("formatted_address") or "")[:40],
@@ -135,7 +141,7 @@ def pct(values, q):
     return s[max(0, min(len(s) - 1, round(q * (len(s) - 1))))]
 
 
-def run(client, places_key, pocs, q_idx, runs, gap_s):
+def run(client, places_key, pocs, q_idx, runs, gap_s, gates="observe"):
     results = {p: [] for p in pocs}
     for r in range(runs):
         for qi in q_idx:
@@ -145,7 +151,7 @@ def run(client, places_key, pocs, q_idx, runs, gap_s):
                 t0 = time.monotonic()
                 try:
                     res = v2.search_shops(query, lang, client, places_key, today=date.today(),
-                                          use_recent=(poc == "B"))
+                                          use_recent=(poc == "B"), gates=gates)
                     rc = res["recent_check"]
                     row.update(ok=True, status=res["status"], timings=res["timings"], stats=res["stats"],
                                recent={"status": rc["status"], "reason": rc.get("reason", ""),
@@ -172,6 +178,14 @@ def run(client, places_key, pocs, q_idx, runs, gap_s):
             vals = [x["timings"][key] for x in rows if key in x["timings"]]
             if vals:
                 print(f"  {key:9} n={len(vals):3} p50={statistics.median(vals)} p95={pct(vals, 0.95)}")
+        verdicts = {}
+        for x in rows:
+            for m in x.get("matched", []) + x.get("rejected", []):
+                v = (m.get("gate") or {}).get("verdict")
+                if v:
+                    verdicts[v] = verdicts.get(v, 0) + 1
+        if verdicts:
+            print(f"  採否判定 {verdicts}")
         cards = [len(x["shops"]) for x in rows]
         if cards:
             print(f"  カード件数 平均={round(statistics.mean(cards), 2)} / 0件={cards.count(0)}")
@@ -195,6 +209,8 @@ def main():
     p2.add_argument("--llm-timeout", type=int, default=None, help="LLM のタイムアウト（秒）。既定は v2 の値")
     p2.add_argument("--knowledge-model", default=None, help="A と順位づけのモデル（比較用。本番の設定は変えない）")
     p2.add_argument("--recent-model", default=None, help="B のモデル（比較用。本番の設定は変えない）")
+    p2.add_argument("--gates", choices=("off", "observe", "enforce"), default="observe",
+                    help="採否判定。observe=判定して記録のみ（既定） / enforce=判定で不採用にする / off")
     args = ap.parse_args()
 
     places_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
@@ -224,7 +240,7 @@ def main():
                       "recent_model": v2.RECENT_MODEL, "llm_timeout_ms": v2.LLM_TIMEOUT_MS}), flush=True)
     q_idx = range(len(QUERIES)) if args.queries == "all" else [int(x) for x in args.queries.split(",")]
     pocs = [p for p in args.pocs.split(",") if p in ("A", "B")]
-    run(client, places_key, pocs, q_idx, args.runs, args.gap)
+    run(client, places_key, pocs, q_idx, args.runs, args.gap, args.gates)
 
 
 if __name__ == "__main__":
