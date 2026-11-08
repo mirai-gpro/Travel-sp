@@ -81,6 +81,7 @@ allowed_origins = [
     "https://gourmet-sp.vercel.app",
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
+    "https://travel-sp-git-preview-shop-v2-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（本番に merge しない）
     "http://localhost:4321"
 ]
 
@@ -927,7 +928,8 @@ def handle_live_start(data):
     # LLM の知識候補 → Google Places 照合（今までの search_place）→ カード 2 段表示（最新情報は後から追加）。
     # 新方式の失敗時に案C へ自動で切り替えることはしない。
     shop_search_v2_start = None
-    if os.getenv('SHOP_SEARCH_V2') == '1' and mode != 'lesson':
+    # 検証用プレビュー専用（本番に merge しない）: 環境変数を変えずに新方式を既定で有効にする
+    if os.getenv('SHOP_SEARCH_V2', '1') == '1' and mode != 'lesson':
         import shop_search_v2
 
         def _start_progressive_search(user_request, lang):
