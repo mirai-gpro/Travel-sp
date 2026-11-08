@@ -41,6 +41,11 @@ class TestRecent(unittest.TestCase):
         g = FakeGemini({"gemini-2.5-flash+search": route})
         return v2.recent_updates(g, "恵比寿 焼き鳥", "ja", TODAY), g
 
+    def test_renamed_is_accepted_and_requested(self):
+        res, g = self.run_b(FakeResponse(updates_text([item("酒場くし亭 恵比寿本店", "renamed", "2026-09-01")])))
+        self.assertEqual([(u["name"], u["event_type"]) for u in res["updates"]], [("酒場くし亭 恵比寿本店", "renamed")])
+        self.assertIn("店名変更", g.models.calls[0]["config"].system_instruction)
+
     def test_normal_with_grounding_and_fenced_json(self):
         res, g = self.run_b(FakeResponse(updates_text([item("新店A"), item("改装B", "renovated", "2026-10-01")]),
                                          grounding=grounding()))

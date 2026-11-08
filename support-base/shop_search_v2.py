@@ -212,15 +212,16 @@ def knowledge_call(client, user_request: str, language: str) -> tuple:
 RECENT_MODEL = "gemini-2.5-flash"
 RECENT_MAX = 5
 RECENT_WINDOW_DAYS = 365
-RECENT_EVENT_TYPES = ("opened", "renovated", "moved", "concept_change")
+RECENT_EVENT_TYPES = ("opened", "renovated", "moved", "concept_change", "renamed")
 
 RECENT_INSTRUCTION = """あなたはレストランの最新情報の調査担当です。
 Google 検索で、ユーザーの希望条件（エリア・料理ジャンル・利用シーン）に合う店のうち、
-{start} から {today} までの間に「新規開店・改装（リニューアル）・移転・業態変更」があった店を調べてください。
+{start} から {today} までの間に「新規開店・改装（リニューアル）・移転・業態変更・店名変更」があった店を調べてください。
 
 【ルール】
 1. 検索で根拠が見つかった店だけを挙げる。最大{max_n}件。見つからなければ空配列。
-2. event_type は opened / renovated / moved / concept_change のいずれか。
+2. event_type は opened / renovated / moved / concept_change / renamed（店名変更）のいずれか。
+   name は現在の店名（店名変更の場合は変更後の店名）。
 3. event_date は実際の開店・改装等の日付（YYYY-MM-DD または YYYY-MM）。記事の公開日ではない。分からなければ空文字。
 4. source_url は根拠にしたページの URL。reason は{language}で1文。
 5. 価格・評価などの数値は書かない。
@@ -485,9 +486,10 @@ def area_context(user_request: str, language: str):
 
 # ---- 採否判定（PoC 検証中）-------------------------------------------------
 # ① ジャンル: 採用店の Places (New) 店舗タイプが、A が選んだ genre_types と重なるか
-# ② すり替わり: 店名が一致するか。一致しなければ Text Search の結果件数を見て、
-#    狙い撃ちの少数件なら店名変更とみなし採用、似た店の一覧が返っていれば存在しない店のすり替わりとみなす
-PINPOINT_MAX_RESULTS = 2   # 暫定値。diag の実測（実在 1〜2 件 / 存在しない店 8 件以上）から。PoC で確定する
+# ② すり替わり: 候補名と Places の店名が一致しなければ採用しない。
+#    Text Search は店が無いと近所の似た店を返し、今までの search_place はそれを無条件に採るため。
+#    店名変更（例: 串亭 → 酒場くし亭）もここで外れる。直近 12 か月の店名変更は B（Google 検索）で拾う。
+#    （結果件数で店名変更を見分ける案は、10 クエリ計測で無関係な店 2 件を通したため採らない）
 GATE_MODES = ("off", "observe", "enforce")
 
 
@@ -512,34 +514,6 @@ def name_overlaps(cand_name: str, place_name: str, areas) -> bool:
     return cand in place or place in cand
 
 
-def legacy_text_search_results(name: str, area: str, geo_info, language: str) -> list | None:
-    """search_place と同じ条件の Text Search を呼び、結果の全件を返す（件数を見るため）。失敗時は None。"""
-    key = legacy.GOOGLE_PLACES_API_KEY
-    if not key:
-        return None
-    region = geo_info.get("region", "") if geo_info else ""
-    expected_country = geo_info.get("country_code", "JP") if geo_info else "JP"
-    query = (f"{name} {area} {region}" if region else f"{name} {area}").strip()
-    params = {"query": query, "key": key, "language": language, "type": "restaurant"}
-    if geo_info and geo_info.get("lat") and geo_info.get("lng"):
-        params["location"] = f"{geo_info['lat']},{geo_info['lng']}"
-        if expected_country == "JP":
-            params["radius"] = 3000
-            params["region"] = "jp"
-        else:
-            params["radius"] = 50000
-    try:
-        data = requests.get("https://maps.googleapis.com/maps/api/place/textsearch/json",
-                            params=params, timeout=PLACES_TIMEOUT_SEC).json()
-    except Exception as e:
-        logger.warning(f"[ShopSearchV2] 件数確認の検索失敗 ({type(e).__name__})")
-        return None
-    if data.get("status") not in ("OK", "ZERO_RESULTS"):
-        logger.warning(f"[ShopSearchV2] 件数確認の検索失敗 status={data.get('status')}")
-        return None
-    return data.get("results") or []
-
-
 def fetch_place_types(api_key: str, place_id: str, session=None) -> list | None:
     """Places (New) Place Details で types だけ取る（Essentials SKU）。失敗時は None。キーはヘッダーで送り、ログに出さない。"""
     if not api_key or not place_id:
@@ -562,16 +536,7 @@ def evaluate_gates(cand: dict, place: dict, area: str, geo_info, language: str, 
     """照合できた 1 件について ①ジャンル ②すり替わり を判定する。"""
     cand_area = cand.get("area") or area
     out = {"name_match": name_overlaps(cand["name"], place.get("name") or "", (cand_area, area))}
-    results = legacy_text_search_results(cand["name"], cand_area, geo_info, language)
-    out["result_count"] = None if results is None else len(results)
-    if out["name_match"]:
-        out["identity"] = "name_match"
-    elif results is None:
-        out["identity"] = "unknown"
-    elif len(results) <= PINPOINT_MAX_RESULTS:
-        out["identity"] = "pinpoint"
-    else:
-        out["identity"] = "broad"
+    out["identity"] = "name_match" if out["name_match"] else "mismatch"
 
     types = fetch_place_types(ctx.get("places_api_key", ""), place["place_id"], ctx.get("session"))
     specific = [t for t in (types or []) if t in FOOD_TYPES and t not in GENERIC_TYPES]
@@ -584,7 +549,7 @@ def evaluate_gates(cand: dict, place: dict, area: str, geo_info, language: str, 
 
     if out["genre"] == "ng":
         out["verdict"] = "reject_genre"
-    elif out["identity"] == "broad":
+    elif out["identity"] == "mismatch":
         out["verdict"] = "reject_substituted"
     else:
         out["verdict"] = "adopt"

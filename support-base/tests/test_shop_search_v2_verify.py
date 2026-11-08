@@ -146,24 +146,25 @@ class TestGates(unittest.TestCase):
         for c, p_, a in ng:
             self.assertFalse(v2.name_overlaps(c, p_, (a,)), (c, p_))
 
-    def run_gate(self, cand_name, place_name, n_results, types, genre_types):
+    def run_gate(self, cand_name, place_name, types, genre_types):
         ctx = {"mode": "observe", "genre_types": genre_types, "places_api_key": API_KEY}
-        with patch.object(v2, "legacy_text_search_results", lambda *a: None if n_results is None else [{}] * n_results), \
-             patch.object(v2, "fetch_place_types", lambda *a: types):
+        with patch.object(v2, "fetch_place_types", lambda *a: types):
             return v2.evaluate_gates(cand(cand_name), legacy_place("P", place_name), "恵比寿", None, "ja", ctx)
 
-    def test_cases_from_diag(self):
-        yaki = ["yakitori_restaurant", "chicken_restaurant", "japanese_izakaya_restaurant"]
-        g = self.run_gate("恵比寿 串亭", "酒場くし亭 恵比寿本店", 1, ["japanese_izakaya_restaurant", "restaurant"], yaki)
-        self.assertEqual((g["identity"], g["genre"], g["verdict"]), ("pinpoint", "ok", "adopt"))      # 店名変更は採用
-        g = self.run_gate("地鶏やおまへん 恵比寿店", "食鶏 しまや 恵比寿", 8, ["yakitori_restaurant"], yaki)
-        self.assertEqual((g["identity"], g["verdict"]), ("broad", "reject_substituted"))
-        g = self.run_gate("魚まみれ", "魚まみれ眞吉 恵比寿店", 1, ["seafood_restaurant", "restaurant", "food"], yaki)
-        self.assertEqual((g["genre"], g["verdict"]), ("ng", "reject_genre"))
-        g = self.run_gate("喜鈴 恵比寿", "喜鈴(キリン)", 20, ["restaurant", "food"], yaki)
-        self.assertEqual((g["identity"], g["genre"], g["verdict"]), ("name_match", "unknown", "adopt"))
-        g = self.run_gate("恵比寿 串亭", "酒場くし亭", None, None, [])                    # 確認できない時は外さない
-        self.assertEqual((g["identity"], g["genre"], g["verdict"]), ("unknown", "unknown", "adopt"))
+    def test_cases_from_poc(self):
+        yaki = ["yakitori_restaurant", "chicken_restaurant"]
+        g = self.run_gate("恵比寿 串亭", "酒場くし亭 恵比寿本店", ["japanese_izakaya_restaurant", "restaurant"], yaki)
+        self.assertEqual((g["identity"], g["genre"], g["verdict"]), ("mismatch", "ng", "reject_genre"))
+        g = self.run_gate("焼鳥 市松", "中目黒 いぐち 恵比寿店", ["yakitori_restaurant"], yaki)   # 結果 1 件でも別店
+        self.assertEqual((g["identity"], g["verdict"]), ("mismatch", "reject_substituted"))
+        g = self.run_gate("地鶏やおまへん 恵比寿店", "食鶏 しまや 恵比寿", ["yakitori_restaurant"], yaki)
+        self.assertEqual(g["verdict"], "reject_substituted")
+        g = self.run_gate("魚まみれ眞吉 恵比寿店", "魚まみれ眞吉 恵比寿店", ["japanese_izakaya_restaurant", "food"], yaki)
+        self.assertEqual((g["identity"], g["genre"], g["verdict"]), ("name_match", "ng", "reject_genre"))
+        g = self.run_gate("喜鈴 恵比寿", "喜鈴(キリン)", ["restaurant", "food"], yaki)
+        self.assertEqual((g["genre"], g["verdict"]), ("unknown", "adopt"))               # 細かいタイプが無い店は外さない
+        g = self.run_gate("喜鈴 恵比寿", "喜鈴(キリン)", None, [])                       # タイプを取れない時も外さない
+        self.assertEqual((g["genre"], g["verdict"]), ("unknown", "adopt"))
 
     def test_fetch_place_types_header_and_failure(self):
         s = PlacesSession({})
@@ -223,9 +224,7 @@ class TestFlow(unittest.TestCase):
                 {"name": n, "area": "恵比寿", "genre": "焼き鳥", "reason": ""} for n in ("鳥幸", "地鶏やおまへん")]},
                 ensure_ascii=False)})
         table = {"鳥幸": legacy_place("A", "鳥幸"), "地鶏やおまへん": legacy_place("B", "食鶏 しまや")}
-        counts = {"鳥幸": 1, "地鶏やおまへん": 8}
         with self.with_places(table), \
-             patch.object(v2, "legacy_text_search_results", lambda name, *a: [{}] * counts[name]), \
              patch.object(v2, "fetch_place_types", lambda *a: ["yakitori_restaurant"]):
             obs = v2.search_shops("q", "ja", gem(), API_KEY, today=TODAY, use_recent=False, gates="observe")
             enf = v2.search_shops("q", "ja", gem(), API_KEY, today=TODAY, use_recent=False, gates="enforce")
