@@ -77,6 +77,18 @@ const { apiBaseUrl = '' } = Astro.props;
     transition: transform 0.3s ease;
   }
 
+  .shop-card-list :global(.photo-attribution) {
+    font-size: 11px;
+    color: #666;
+    text-align: right;
+    padding: 2px 8px 0;
+  }
+
+  .shop-card-list :global(.photo-attribution a) {
+    color: inherit;
+    text-decoration: underline;
+  }
+
   .shop-card-list :global(.hero-image-link:hover img) {
     transform: scale(1.05);
   }
@@ -625,6 +637,8 @@ const { apiBaseUrl = '' } = Astro.props;
     priceRange?: string;
     location?: string;
     image?: string;
+    // 写真の撮影者表記（Google Places の写真を使う時は表示が必要）
+    image_attributions?: { displayName: string; uri?: string }[];
     highlights?: string[];
     tips?: string;
     hotpepper_url?: string;
@@ -737,6 +751,21 @@ const { apiBaseUrl = '' } = Astro.props;
     }
 
     // ショップカードを追加
+    // 写真の撮影者表記（image_attributions がある時だけ。名前と URL は Google から受け取った値をエスケープして出す）
+    private createPhotoAttributionHtml(shop: ShopData): string {
+      const attrs = (shop.image && shop.image_attributions) || [];
+      if (attrs.length === 0) return '';
+      const esc = (t: string) => t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+      const items = attrs.map((a) => {
+        const name = esc(a.displayName || '');
+        const uri = a.uri || '';
+        return /^https:\/\//.test(uri)
+          ? `<a href="${esc(uri)}" target="_blank" rel="noopener noreferrer">${name}</a>`
+          : name;
+      });
+      return `<div class="photo-attribution">Photo: ${items.join(', ')}</div>`;
+    }
+
     addShop(shop: ShopData) {
       const card = this.createShopCard(shop);
       this.container.appendChild(card);
@@ -816,6 +845,7 @@ const { apiBaseUrl = '' } = Astro.props;
             ` : ''}
           </div>
         </a>
+        ${this.createPhotoAttributionHtml(shop)}
         <div class="card-body">
           
           <a href="${mapsUrl}" target="_blank" rel="noopener noreferrer" class="shop-header-link">
