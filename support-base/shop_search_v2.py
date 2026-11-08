@@ -609,7 +609,8 @@ def build_shop(cand: dict, place: dict) -> dict:
         "reviewCount": place.get("user_ratings_total"),
         "priceRange": None,
         "phone": place.get("phone"),
-        "image": None,
+        "image": None,                 # 写真は attach_photos で入れる（キーを含まない photoUri）
+        "image_attributions": [],      # 写真の撮影者表記（Google の規約で表示が必要）
         "tips": None,
         "source_type": cand.get("source_type"),
         "recent": cand.get("recent"),
@@ -788,6 +789,7 @@ class ProgressiveSearch:
         self._knowledge_keys = {(normalize_name(c["name"]), normalize_area(c["area"])) for c in knowledge}
         results = self._verify(knowledge, self._area, self._geo_info, "places_ms")
         shops, matched, rejected = _select_shops(knowledge, results, self._seen_place_ids, MAX_SHOPS)
+        self._timed("photos_ms", attach_photos, self.places_api_key, shops)
         self._shown_keys = {normalize_name(s["name"]) for s in shops}
         self.timings["initial_ms"] = self._elapsed()
         logger.info(f"[ShopSearchV2] search_id={self.search_id} 1段目 {len(shops)}件 "
@@ -814,6 +816,7 @@ class ProgressiveSearch:
                 cands.append(item)
             results = self._verify(cands, self._area, self._geo_info, "places_b_ms") if cands else []
             shops, matched, rejected = _select_shops(cands, results, self._seen_place_ids, ADDITION_MAX)
+            self._timed("photos_b_ms", attach_photos, self.places_api_key, shops)
             self.timings["additions_ms"] = self._elapsed()
             logger.info(f"[ShopSearchV2] search_id={self.search_id} 2段目 {len(shops)}件 "
                         f"recent={recent['status']} (更新情報 {len(recent['updates'])}) timings={self.timings}")
@@ -859,6 +862,42 @@ def fetch_photo(api_key: str, photo: dict, session=None) -> dict | None:
                     for a in (photo.get("authorAttributions") or [])
                     if isinstance(a, dict) and a.get("displayName")]
     return {"image": uri, "attributions": attributions}
+
+
+def fetch_shop_photo(api_key: str, place_id: str, session=None) -> dict | None:
+    """店の 1 枚目の写真（photoUri と撮影者表記）。Place Details (New) の photos だけを取り、写真の URL を得る。"""
+    if not api_key or not place_id:
+        return None
+    http = session or requests
+    try:
+        resp = http.get(f"{PLACES_API_BASE}/places/{place_id}",
+                        headers={"X-Goog-Api-Key": api_key, "X-Goog-FieldMask": "photos"},
+                        timeout=PLACES_TIMEOUT_SEC)
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"[ShopSearchV2] 写真情報の取得失敗 ({type(e).__name__})")
+        return None
+    if resp.status_code != 200:
+        logger.warning(f"[ShopSearchV2] 写真情報の取得失敗 HTTP {resp.status_code}")
+        return None
+    try:
+        photos = (resp.json() or {}).get("photos") or []
+    except ValueError:
+        return None
+    if not photos:
+        return None
+    return fetch_photo(api_key, photos[0], session=session)
+
+
+def attach_photos(api_key: str, shops: list) -> None:
+    """カード用の店に写真を並列で付ける。取れなかった店は image=None のまま（画面側の既定画像）。"""
+    if not api_key or not shops:
+        return
+    with ThreadPoolExecutor(max_workers=min(PLACES_MAX_WORKERS, len(shops))) as ex:
+        photos = list(ex.map(lambda s: fetch_shop_photo(api_key, s["place_id"]), shops))
+    for shop, photo in zip(shops, photos):
+        if photo:
+            shop["image"] = photo["image"]
+            shop["image_attributions"] = photo["attributions"]
 
 
 def fetch_phone(api_key: str, place_id: str, language: str, session=None) -> str | None:
