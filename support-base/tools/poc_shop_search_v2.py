@@ -4,12 +4,15 @@ shop_search_v2 の PoC 計測（Cloud Shell 等で手動実行。本番コード
   probe : gemini-3.8-flash の応答を 3 回だけ試す（短い文 / +thinking low / 実際の候補生成）。
           504 などの原因切り分け用。各呼び出しの時間・トークン数・エラーを表示する。
   A     : PoC A = A（知識候補）→ 順位づけ → Places 照合（今までの search_place）
+  diag  : 置き換わりの原因調査。今までの search_place をそのまま呼び、Text Search が返した全件
+          （順位・店名・営業状態・住所）と、採用された 1 件を表示する
   B     : PoC B = A ∥ B（2.5-flash + Google 検索）→ 統合・順位づけ → Places 照合
 
 使い方（キーは環境変数で渡す。表示もログ出力もしない）:
   python tools/poc_shop_search_v2.py probe
   python tools/poc_shop_search_v2.py run --pocs A,B --runs 1
   python tools/poc_shop_search_v2.py run --pocs B --queries 0,4 --llm-timeout 60
+  python tools/poc_shop_search_v2.py diag "恵比寿 串亭@恵比寿" "鳥貴族 渋谷明治通り店@渋谷"
 
 出力: 1 回ごとに 1 行（JSON）。最後に PoC ごとの p50 / p95。
 """
@@ -80,6 +83,51 @@ def probe(client, timeout_s, gap_s, model):
         print(json.dumps(out, ensure_ascii=False), flush=True)
 
 
+DIAG_DEFAULT = ["恵比寿 串亭@恵比寿", "地鶏やおまへん 恵比寿店@恵比寿", "鳥貴族 渋谷明治通り店@渋谷",
+                "喜鈴 恵比寿@恵比寿", "中目黒いぐち 恵比寿店@恵比寿"]
+
+
+def diag(items, language):
+    """今までの search_place の Text Search 応答を横取りして全件表示する（search_place 自体は変更しない）"""
+    import requests
+    legacy = v2.legacy
+    captured = []
+    orig_get = requests.get
+
+    def spy_get(url, *a, **kw):
+        resp = orig_get(url, *a, **kw)
+        if "textsearch" in url:
+            try:
+                captured.append(resp.json())
+            except ValueError:
+                captured.append({"status": f"HTTP {resp.status_code}"})
+        return resp
+
+    for item in items:
+        name, _, area = item.partition("@")
+        geo = legacy.get_region_from_area(area, language) if area else None
+        # 1) 今までの照合と同じ条件（候補名 + エリア + 都道府県、位置バイアスあり）  2) 候補名だけ
+        for label, args in (("legacy", (name, area, geo, language)), ("name_only", (name, "", None, language))):
+            captured.clear()
+            requests.get = spy_get
+            try:
+                place = legacy.search_place(*args)
+            finally:
+                requests.get = orig_get
+            data = captured[0] if captured else {}
+            region = (geo or {}).get("region", "") if label == "legacy" else ""
+            out = {"cand": name, "variant": label,
+                   "query": " ".join(x for x in (name, area if label == "legacy" else "", region) if x),
+                   "status": data.get("status"),
+                   "adopted": (place or {}).get("name"),
+                   "results": [{"rank": i + 1, "name": r.get("name"),
+                                "business_status": r.get("business_status", "(なし)"),
+                                "address": (r.get("formatted_address") or "")[:40],
+                                "types": (r.get("types") or [])[:3]}
+                               for i, r in enumerate((data.get("results") or [])[:8])]}
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+
+
 def pct(values, q):
     if not values:
         return None
@@ -136,6 +184,9 @@ def main():
     p1.add_argument("--timeout", type=int, default=90)
     p1.add_argument("--gap", type=int, default=10)
     p1.add_argument("--model", default=v2.KNOWLEDGE_MODEL, help="比較用。本番の設定は変えない")
+    p3 = sub.add_parser("diag")
+    p3.add_argument("items", nargs="*", help="「候補名@エリア」を並べる。省略時は前回置き換わった 3 件 + 対照 2 件")
+    p3.add_argument("--lang", default="ja")
     p2 = sub.add_parser("run")
     p2.add_argument("--pocs", default="A,B")
     p2.add_argument("--queries", default="all")
@@ -148,6 +199,12 @@ def main():
 
     places_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if args.cmd == "diag":
+        if not places_key:
+            print("GOOGLE_PLACES_API_KEY を環境変数で渡してください", file=sys.stderr)
+            sys.exit(2)
+        diag(args.items or DIAG_DEFAULT, args.lang)
+        return
     if not gemini_key or (args.cmd == "run" and not places_key):
         print("GEMINI_API_KEY（run では GOOGLE_PLACES_API_KEY も）を環境変数で渡してください", file=sys.stderr)
         sys.exit(2)
