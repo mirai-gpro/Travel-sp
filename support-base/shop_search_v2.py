@@ -535,14 +535,18 @@ def verify_candidate(api_key: str, cand: dict, language: str, session=None) -> d
         places = _places_text_search(api_key, f"{cand['name']} {cand['area']}", language, session)
     except ShopSearchError as e:
         return {"ok": False, "reason": "places_error", "detail": e.reason, "place": None}
+    # 照合結果の確認用（PoC の集計で使う。ログには出さない）
+    top = [{"name": (p.get("displayName") or {}).get("text", ""), "address": p.get("formattedAddress", ""),
+            "status": p.get("businessStatus")}
+           for p in places[:3] if isinstance(p, dict)]
     named = [p for p in places if isinstance(p, dict) and p.get("id")
              and p.get("formattedAddress")
              and name_matches(cand["name"], (p.get("displayName") or {}).get("text", ""))]
     if not named:
-        return {"ok": False, "reason": "no_name_match", "place": None}
+        return {"ok": False, "reason": "no_name_match", "place": None, "places_top": top}
     in_area = [p for p in named if area_matches(cand["area"], p)]
     if not in_area:
-        return {"ok": False, "reason": "area_mismatch", "place": None}
+        return {"ok": False, "reason": "area_mismatch", "place": None, "places_top": top}
     eligible = []
     last_reason = ""
     for p in in_area:
@@ -555,12 +559,12 @@ def verify_candidate(api_key: str, cand: dict, language: str, session=None) -> d
         elif p["id"] not in {e["id"] for e in eligible}:
             eligible.append(p)
     if not eligible:
-        return {"ok": False, "reason": last_reason or "not_eligible", "place": None}
+        return {"ok": False, "reason": last_reason or "not_eligible", "place": None, "places_top": top}
     if len(eligible) > 1:
         exact = [p for p in eligible
                  if normalize_name(p["displayName"]["text"]) == normalize_name(cand["name"])]
         if len(exact) != 1:
-            return {"ok": False, "reason": "ambiguous", "place": None}
+            return {"ok": False, "reason": "ambiguous", "place": None, "places_top": top}
         eligible = exact
     return {"ok": True, "reason": "", "place": eligible[0]}
 
@@ -681,6 +685,10 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
     results, rejected = timed("places_ms", verify_candidates, places_api_key, ranked, language, session)
 
     shops, photo_refs, seen = [], {}, set()
+    # 照合で外れた候補（PoC の確認用。ログには出さない）
+    rejected_detail = [{"name": c["name"], "area": c["area"], "source_type": c.get("source_type"),
+                        "reason": r["reason"], "places_top": r.get("places_top", [])}
+                       for c, r in zip(ranked, results) if not r["ok"]]
     for cand, r in zip(ranked, results):
         if not r["ok"] or r["place"]["id"] in seen:
             continue
@@ -699,7 +707,7 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
     logger.info(f"[ShopSearchV2] search_id={search_id} status={status} recent={recent['status']} "
                 f"stats={stats} timings={timings}")
     return {"search_id": search_id, "status": status, "shops": shops, "photo_refs": photo_refs,
-            "recent_check": recent, "timings": timings, "stats": stats}
+            "recent_check": recent, "timings": timings, "stats": stats, "rejected_detail": rejected_detail}
 
 
 # ------------------------------------------------------------

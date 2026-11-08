@@ -106,7 +106,8 @@ def run(client, places_key, pocs, q_idx, runs, gap_s):
                                        "queries": rc.get("queries", []), "sources": len(rc.get("sources", []))},
                                shops=[{"name": s["name"], "source": s["source_type"],
                                        "recent": (s.get("recent") or {}).get("event_type"),
-                                       "rating": s["rating"], "price": s["priceRange"]} for s in res["shops"]])
+                                       "rating": s["rating"], "price": s["priceRange"]} for s in res["shops"]],
+                               rejected=res.get("rejected_detail", []))
                 except v2.ShopSearchError as e:
                     row.update(ok=False, error_stage=e.stage, error=e.reason,
                                total_ms=round((time.monotonic() - t0) * 1000))
@@ -141,6 +142,7 @@ def main():
     p2.add_argument("--gap", type=int, default=3, help="検索ごとの間隔（秒）。429 回避用")
     p2.add_argument("--llm-timeout", type=int, default=None, help="LLM のタイムアウト（秒）。既定は v2 の値")
     p2.add_argument("--knowledge-model", default=None, help="A と順位づけのモデル（比較用。本番の設定は変えない）")
+    p2.add_argument("--recent-model", default=None, help="B のモデル（比較用。本番の設定は変えない）")
     args = ap.parse_args()
 
     places_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
@@ -158,6 +160,8 @@ def main():
     if args.knowledge_model:
         v2.KNOWLEDGE_MODEL = args.knowledge_model
         v2.RANK_MODEL = args.knowledge_model
+    if args.recent_model:
+        v2.RECENT_MODEL = args.recent_model
     print(json.dumps({"knowledge_model": v2.KNOWLEDGE_MODEL, "rank_model": v2.RANK_MODEL,
                       "recent_model": v2.RECENT_MODEL, "llm_timeout_ms": v2.LLM_TIMEOUT_MS}), flush=True)
     q_idx = range(len(QUERIES)) if args.queries == "all" else [int(x) for x in args.queries.split(",")]
