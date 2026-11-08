@@ -2,13 +2,13 @@
 コンシェルジュ Live 用ショップ検索（LLM の知識ベースが主体）
 
 流れ（仕様書 v1.1 §3）:
-  A: Gemini 3.8 Flash（Google 検索なし）が、LLM の知識から条件に合う候補を短い JSON で列挙
+  A: LLM（Google 検索なし）が、知識から条件に合う候補を短い JSON で列挙
   B: Google 検索で直近 12 か月の開店・改装・移転・業態変更を調べて候補を補う（A と並列）
   → A/B の候補を統合・重複除去し、LLM が順位づけ
-  → Google Places (New) で候補を 1 件ずつ並列に照合（実在・名称・地域・営業状態）
+  → Google Places で候補を並列に照合（照合ロジックは今までの api_integrations.search_place）
   → 照合できた店だけを確定リストにする（最大 5 件。足りなければ少なく、0 件なら 0 件）
 
-推薦するのは LLM。Places は「推薦店を選ぶエンジン」にはせず、実在確認とカードの事実項目にだけ使う。
+推薦するのは LLM。Places は実在確認とカードの事実項目にだけ使う。
 失敗は ShopSearchError として呼び出し元に伝え、照合していない店では穴埋めしない。
 API キー・写真 URL・会話内容はログに出さない。
 """
@@ -407,247 +407,86 @@ def rank_candidates(client, user_request: str, merged: list, language: str) -> l
 
 
 # ------------------------------------------------------------
-# Google Places (New) による実在確認（候補ごとに並列）
+# Google Places による実在確認（今までのロジック。候補ごとに並列）
 # ------------------------------------------------------------
-PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+# 照合は今までと同じ api_integrations.search_place（旧 Places Text Search → Place Details、
+# 営業中の候補を採用・国コード検証）をそのまま使う。api_integrations.py は変更しない。
+import api_integrations as legacy  # noqa: E402
+
 PLACES_API_BASE = "https://places.googleapis.com/v1"
 PLACES_TIMEOUT_SEC = 8
-PLACES_PAGE_SIZE = 5
 PLACES_MAX_WORKERS = 8
 PHOTO_MAX_WIDTH_PX = 800
 
-# 照合とカードの事実項目に使う項目（Text Search Pro + Enterprise の rating / userRatingCount / priceRange）
-VERIFY_FIELDS = ",".join([
-    "places.id", "places.movedPlaceId", "places.displayName", "places.formattedAddress",
-    "places.businessStatus", "places.location", "places.googleMapsUri", "places.primaryType",
-    "places.primaryTypeDisplayName", "places.types", "places.photos",
-    "places.rating", "places.userRatingCount", "places.priceRange",
-])
 
-# 飲食店として扱う型（Places の Table A「Food and Drink」+ Table B の "food"）
-FOOD_TYPES = frozenset("""
-acai_shop afghani_restaurant african_restaurant american_restaurant argentinian_restaurant
-asian_fusion_restaurant asian_restaurant australian_restaurant austrian_restaurant bagel_shop
-bakery bangladeshi_restaurant bar bar_and_grill barbecue_restaurant basque_restaurant
-bavarian_restaurant beer_garden belgian_restaurant bistro brazilian_restaurant
-breakfast_restaurant brewery brewpub british_restaurant brunch_restaurant buffet_restaurant
-burmese_restaurant burrito_restaurant cafe cafeteria cajun_restaurant cake_shop
-californian_restaurant cambodian_restaurant candy_store cantonese_restaurant
-caribbean_restaurant cat_cafe chicken_restaurant chicken_wings_restaurant chilean_restaurant
-chinese_noodle_restaurant chinese_restaurant chocolate_factory chocolate_shop cocktail_bar
-coffee_roastery coffee_shop coffee_stand colombian_restaurant confectionery
-croatian_restaurant cuban_restaurant czech_restaurant danish_restaurant deli
-dessert_restaurant dessert_shop dim_sum_restaurant diner dog_cafe donut_shop
-dumpling_restaurant dutch_restaurant eastern_european_restaurant ethiopian_restaurant
-european_restaurant falafel_restaurant family_restaurant fast_food_restaurant
-filipino_restaurant fine_dining_restaurant fish_and_chips_restaurant fondue_restaurant
-food_court french_restaurant fusion_restaurant gastropub german_restaurant greek_restaurant
-gyro_restaurant halal_restaurant hamburger_restaurant hawaiian_restaurant hookah_bar
-hot_dog_restaurant hot_dog_stand hot_pot_restaurant hungarian_restaurant ice_cream_shop
-indian_restaurant indonesian_restaurant irish_pub irish_restaurant israeli_restaurant
-italian_restaurant japanese_curry_restaurant japanese_izakaya_restaurant japanese_restaurant
-juice_shop kebab_shop korean_barbecue_restaurant korean_restaurant latin_american_restaurant
-lebanese_restaurant lounge_bar malaysian_restaurant meal_delivery meal_takeaway
-mediterranean_restaurant mexican_restaurant middle_eastern_restaurant
-mongolian_barbecue_restaurant moroccan_restaurant noodle_shop north_indian_restaurant
-oyster_bar_restaurant pakistani_restaurant pastry_shop persian_restaurant peruvian_restaurant
-pizza_delivery pizza_restaurant polish_restaurant portuguese_restaurant pub ramen_restaurant
-restaurant romanian_restaurant russian_restaurant salad_shop sandwich_shop
-scandinavian_restaurant seafood_restaurant shawarma_restaurant snack_bar soul_food_restaurant
-soup_restaurant south_american_restaurant south_indian_restaurant southwestern_us_restaurant
-spanish_restaurant sports_bar sri_lankan_restaurant steak_house sushi_restaurant
-swiss_restaurant taco_restaurant taiwanese_restaurant tapas_restaurant tea_house
-tex_mex_restaurant thai_restaurant tibetan_restaurant tonkatsu_restaurant turkish_restaurant
-ukrainian_restaurant vegan_restaurant vegetarian_restaurant vietnamese_restaurant
-western_restaurant wine_bar winery yakiniku_restaurant yakitori_restaurant
-food
-""".split())
+def area_context(user_request: str, language: str):
+    """今までと同じく、検索条件からエリアを取り出し、Geocoding で地域情報を得る。"""
+    area = legacy.extract_area_from_text(user_request, language) or ""
+    geo_info = legacy.get_region_from_area(area, language) if area else None
+    return area, geo_info
 
 
-def name_matches(candidate_name: str, place_name: str) -> bool:
-    """候補名と Places の店名が明確に一致するか（完全一致・前方一致・長さ比 0.5 以上の包含）。"""
-    a = normalize_name(candidate_name)
-    b = normalize_name(place_name)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    if len(short) < 2:
-        return False
-    if long_.startswith(short):
-        return True
-    return short in long_ and len(short) / len(long_) >= 0.5
-
-
-def area_matches(candidate_area: str, place: dict) -> bool:
-    """候補のエリア名が、Places の住所または店名（支店名）に含まれるか。"""
-    area = normalize_area(candidate_area)
-    if not area:
-        return False
-    address = normalize_name(place.get("formattedAddress", ""))
-    name = normalize_name((place.get("displayName") or {}).get("text", ""))
-    return area in address or area in name
-
-
-def _is_food(place: dict) -> bool:
-    types_ = set(place.get("types") or [])
-    if place.get("primaryType"):
-        types_.add(place["primaryType"])
-    return bool(types_ & FOOD_TYPES)
-
-
-def _places_text_search(api_key: str, text_query: str, language: str, session=None) -> list:
-    http = session or requests
+def verify_candidate(cand: dict, area: str, geo_info, language: str) -> dict:
+    """1 候補を今までのロジック（search_place）で照合する。戻り値: {ok, reason, place}"""
     try:
-        resp = http.post(
-            PLACES_TEXT_SEARCH_URL,
-            json={"textQuery": text_query, "languageCode": language, "pageSize": PLACES_PAGE_SIZE},
-            headers={"Content-Type": "application/json", "X-Goog-Api-Key": api_key,
-                     "X-Goog-FieldMask": VERIFY_FIELDS},
-            timeout=PLACES_TIMEOUT_SEC,
-        )
-    except requests.exceptions.Timeout:
-        raise ShopSearchError("places", "Text Search タイムアウト")
-    except requests.exceptions.RequestException as e:
-        # 例外メッセージは URL 等を含み得るので型名だけを残す
-        raise ShopSearchError("places", f"Text Search 通信エラー ({type(e).__name__})")
-    if resp.status_code != 200:
-        status = ""
-        try:
-            status = (resp.json() or {}).get("error", {}).get("status", "")
-        except ValueError:
-            pass
-        raise ShopSearchError("places", f"Text Search HTTP {resp.status_code} {status}".strip())
-    try:
-        places = (resp.json() or {}).get("places", [])
-    except ValueError:
-        raise ShopSearchError("places", "Text Search の応答が JSON ではない")
-    return places if isinstance(places, list) else []
+        place = legacy.search_place(cand["name"], cand.get("area") or area, geo_info, language)
+    except Exception as e:   # search_place は内部で例外を処理するが、念のため
+        return {"ok": False, "reason": f"error_{type(e).__name__}", "place": None}
+    if not place or not place.get("place_id"):
+        return {"ok": False, "reason": "not_found", "place": None}
+    return {"ok": True, "reason": "", "place": place}
 
 
-def verify_candidate(api_key: str, cand: dict, language: str, session=None) -> dict:
-    """
-    1 候補を Places で照合する。戻り値: {ok: bool, reason, place}
-    採用条件: 店名が明確に一致 / エリアが一致 / OPERATIONAL / 飲食店 / 移転なし / 該当が 1 店に絞れる。
-    """
-    try:
-        places = _places_text_search(api_key, f"{cand['name']} {cand['area']}", language, session)
-    except ShopSearchError as e:
-        return {"ok": False, "reason": "places_error", "detail": e.reason, "place": None}
-    # 照合結果の確認用（PoC の集計で使う。ログには出さない）
-    top = [{"name": (p.get("displayName") or {}).get("text", ""), "address": p.get("formattedAddress", ""),
-            "status": p.get("businessStatus")}
-           for p in places[:3] if isinstance(p, dict)]
-    named = [p for p in places if isinstance(p, dict) and p.get("id")
-             and p.get("formattedAddress")
-             and name_matches(cand["name"], (p.get("displayName") or {}).get("text", ""))]
-    if not named:
-        return {"ok": False, "reason": "no_name_match", "place": None, "places_top": top}
-    in_area = [p for p in named if area_matches(cand["area"], p)]
-    if not in_area:
-        return {"ok": False, "reason": "area_mismatch", "place": None, "places_top": top}
-    eligible = []
-    last_reason = ""
-    for p in in_area:
-        if p.get("movedPlaceId"):
-            last_reason = "moved"
-        elif p.get("businessStatus") != "OPERATIONAL":
-            last_reason = f"status_{p.get('businessStatus') or 'missing'}"
-        elif not _is_food(p):
-            last_reason = "not_food"
-        elif p["id"] not in {e["id"] for e in eligible}:
-            eligible.append(p)
-    if not eligible:
-        return {"ok": False, "reason": last_reason or "not_eligible", "place": None, "places_top": top}
-    if len(eligible) > 1:
-        exact = [p for p in eligible
-                 if normalize_name(p["displayName"]["text"]) == normalize_name(cand["name"])]
-        if len(exact) != 1:
-            return {"ok": False, "reason": "ambiguous", "place": None, "places_top": top}
-        eligible = exact
-    return {"ok": True, "reason": "", "place": eligible[0]}
-
-
-def verify_candidates(api_key: str, ranked: list, language: str, session=None) -> tuple:
+def verify_candidates(ranked: list, area: str, geo_info, language: str) -> tuple:
     """順位順の候補を並列に照合する。戻り値: (results: 候補と同じ順の照合結果, rejected 集計)。"""
-    if not api_key:
-        raise ShopSearchError("places", "GOOGLE_PLACES_API_KEY が未設定")
     if not ranked:
         return [], {}
     with ThreadPoolExecutor(max_workers=min(PLACES_MAX_WORKERS, len(ranked))) as ex:
-        results = list(ex.map(lambda c: verify_candidate(api_key, c, language, session), ranked))
+        results = list(ex.map(lambda c: verify_candidate(c, area, geo_info, language), ranked))
     rejected = {}
     for r in results:
         if not r["ok"]:
             rejected[r["reason"]] = rejected.get(r["reason"], 0) + 1
-    if rejected.get("places_error", 0) == len(ranked):
-        raise ShopSearchError("places", "全候補の照合で Places API がエラー")
     return results, rejected
 
 
-def format_price_range(price_range) -> str | None:
-    """Places の priceRange（Money）を表示用文字列にする。無ければ None。"""
-    if not isinstance(price_range, dict):
-        return None
-    start = price_range.get("startPrice") or {}
-    end = price_range.get("endPrice") or {}
-    cur = start.get("currencyCode") or end.get("currencyCode")
-
-    def num(units):
-        try:
-            return f"{int(units):,}"
-        except (TypeError, ValueError):
-            return None
-
-    s = num(start.get("units")) if start.get("units") else None
-    e = num(end.get("units")) if end.get("units") else None
-    if not s and not e:
-        return None
-    if cur == "JPY":
-        if s and e:
-            return f"{s}円〜{e}円"
-        return f"{s}円〜" if s else f"〜{e}円"
-    if s and e:
-        return f"{cur} {s}〜{e}"
-    return f"{cur} {s}〜" if s else f"{cur} 〜{e}"
-
-
 def build_shop(cand: dict, place: dict) -> dict:
-    """カード用（ShopCardList の ShopData 互換）。事実項目は Places、理由は LLM。無い項目は None。"""
-    recent = cand.get("recent")
+    """
+    カード用（ShopCardList の ShopData 互換）。今までと同じく、店名・評価・住所・地図・電話は Places の値。
+    理由は LLM。写真は API キーを含む URL をブラウザに渡さないため、ここでは入れない（Phase D で後取得）。
+    """
     return {
-        "place_id": place["id"],
-        "name": place["displayName"]["text"],
+        "place_id": place["place_id"],
+        "name": place.get("name") or cand["name"],
         "area": cand["area"],
-        "category": (place.get("primaryTypeDisplayName") or {}).get("text") or cand.get("genre") or "",
+        "category": cand.get("genre") or "",
         "description": cand.get("reason") or "",
         "highlights": [],
-        "location": place["formattedAddress"],
-        "maps_url": place.get("googleMapsUri"),
+        "location": place.get("formatted_address"),
+        "maps_url": place.get("maps_url"),
         "rating": place.get("rating"),
-        "reviewCount": place.get("userRatingCount"),
-        "priceRange": format_price_range(place.get("priceRange")),
+        "reviewCount": place.get("user_ratings_total"),
+        "priceRange": None,
+        "phone": place.get("phone"),
         "image": None,
         "tips": None,
         "source_type": cand.get("source_type"),
-        "recent": recent,
+        "recent": cand.get("recent"),
         "verified": True,
-        "verification": {"provider": "google_places_new", "business_status": place.get("businessStatus")},
+        "verification": {"provider": "google_places_legacy", "country_code": place.get("country_code")},
     }
 
 
 # ------------------------------------------------------------
 # 全体の流れ
 # ------------------------------------------------------------
-def search_shops(user_request: str, language: str, gemini_client, places_api_key: str,
-                 today=None, use_recent: bool = True, session=None) -> dict:
+def search_shops(user_request: str, language: str, gemini_client, places_api_key: str = "",
+                 today=None, use_recent: bool = True) -> dict:
     """
-    A ∥ B → 統合・順位づけ → Places 並列照合 → 確定リスト（最大 5 件）。
+    A ∥ B（∥ エリアの Geocoding）→ 統合・順位づけ → Places 並列照合 → 確定リスト（最大 5 件）。
     戻り値: {search_id, status: verified | no_candidates | no_verified, shops, photo_refs,
-             recent_check: {status, reason, updates, sources, queries, search_entry_point},
-             timings: {a_ms, b_ms, rank_ms, places_ms, total_ms}, stats}
-    A・順位づけ・Places 全滅は ShopSearchError。B の失敗は recent_check.status=failed として記録する。
+             recent_check, timings: {a_ms, b_ms, area_ms, rank_ms, places_ms, total_ms}, stats, rejected_detail}
+    A・順位づけの失敗は ShopSearchError。B の失敗は recent_check.status=failed として記録する。
     """
     from datetime import date
     today = today or date.today()
@@ -662,14 +501,16 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
         finally:
             timings[key] = round((time.monotonic() - s) * 1000)
 
-    ex = ThreadPoolExecutor(max_workers=2)
+    ex = ThreadPoolExecutor(max_workers=3)
     try:
         fa = ex.submit(timed, "a_ms", knowledge_candidates, gemini_client, user_request, language)
         fb = (ex.submit(timed, "b_ms", recent_updates, gemini_client, user_request, language, today)
               if use_recent else None)
+        fg = ex.submit(timed, "area_ms", area_context, user_request, language)
         knowledge = fa.result()
         recent = fb.result() if fb else {"status": "skipped", "reason": "", "updates": [],
                                           "queries": [], "sources": [], "search_entry_point": None}
+        area, geo_info = fg.result()
     finally:
         ex.shutdown(wait=False)
 
@@ -679,27 +520,24 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
         timings["total_ms"] = round((time.monotonic() - t0) * 1000)
         logger.info(f"[ShopSearchV2] search_id={search_id} 候補 0 件 recent={recent['status']} timings={timings}")
         return {"search_id": search_id, "status": "no_candidates", "shops": [], "photo_refs": {},
-                "recent_check": recent, "timings": timings, "stats": stats}
+                "recent_check": recent, "timings": timings, "stats": stats, "rejected_detail": []}
 
     ranked = timed("rank_ms", rank_candidates, gemini_client, user_request, merged, language)
-    results, rejected = timed("places_ms", verify_candidates, places_api_key, ranked, language, session)
+    results, rejected = timed("places_ms", verify_candidates, ranked, area, geo_info, language)
 
-    shops, photo_refs, seen = [], {}, set()
+    shops, seen = [], set()
     # 照合で外れた候補（PoC の確認用。ログには出さない）
     rejected_detail = [{"name": c["name"], "area": c["area"], "source_type": c.get("source_type"),
-                        "reason": r["reason"], "places_top": r.get("places_top", [])}
-                       for c, r in zip(ranked, results) if not r["ok"]]
+                        "reason": r["reason"]} for c, r in zip(ranked, results) if not r["ok"]]
     for cand, r in zip(ranked, results):
-        if not r["ok"] or r["place"]["id"] in seen:
+        if not r["ok"] or r["place"]["place_id"] in seen:
             continue
-        seen.add(r["place"]["id"])
-        shop = build_shop(cand, r["place"])
-        shops.append(shop)
-        photos = r["place"].get("photos") or []
-        if photos and isinstance(photos[0], dict) and photos[0].get("name"):
-            photo_refs[shop["place_id"]] = photos[0]
+        seen.add(r["place"]["place_id"])
+        shops.append(build_shop(cand, r["place"]))
         if len(shops) >= MAX_SHOPS:
             break
+    # 写真は Phase D で place_id から後取得する
+    photo_refs = {s["place_id"]: {"place_id": s["place_id"]} for s in shops}
 
     timings["total_ms"] = round((time.monotonic() - t0) * 1000)
     stats.update(ranked=len(ranked), verified=len(shops), rejected=rejected)

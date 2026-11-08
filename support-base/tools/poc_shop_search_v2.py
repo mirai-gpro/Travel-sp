@@ -3,7 +3,7 @@ shop_search_v2 の PoC 計測（Cloud Shell 等で手動実行。本番コード
 
   probe : gemini-3.8-flash の応答を 3 回だけ試す（短い文 / +thinking low / 実際の候補生成）。
           504 などの原因切り分け用。各呼び出しの時間・トークン数・エラーを表示する。
-  A     : PoC A = A（知識候補）→ Places 照合
+  A     : PoC A = A（知識候補）→ 順位づけ → Places 照合（今までの search_place）
   B     : PoC B = A ∥ B（2.5-flash + Google 検索）→ 統合・順位づけ → Places 照合
 
 使い方（キーは環境変数で渡す。表示もログ出力もしない）:
@@ -119,7 +119,7 @@ def run(client, places_key, pocs, q_idx, runs, gap_s):
     for poc in pocs:
         rows = [x for x in results[poc] if x.get("ok")]
         print(f"PoC {poc}: 成功 {len(rows)} / {len(results[poc])}")
-        for key in ("a_ms", "b_ms", "rank_ms", "places_ms", "total_ms"):
+        for key in ("a_ms", "b_ms", "area_ms", "rank_ms", "places_ms", "total_ms"):
             vals = [x["timings"][key] for x in rows if key in x["timings"]]
             if vals:
                 print(f"  {key:9} n={len(vals):3} p50={statistics.median(vals)} p95={pct(vals, 0.95)}")

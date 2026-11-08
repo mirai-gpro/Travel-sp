@@ -1,4 +1,4 @@
-"""統合・順位づけ・Places 照合・全体の流れ・補助情報のテスト"""
+"""統合・順位づけ・Places 照合（今までのロジック）・全体の流れ・補助情報のテスト"""
 import json
 import logging
 import os
@@ -9,26 +9,12 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import requests  # noqa: E402
+from unittest.mock import patch  # noqa: E402
 import shop_search_v2 as v2  # noqa: E402
 from fakes import FakeGemini, FakeHttpResp, knowledge_json  # noqa: E402
 
 API_KEY = "TEST-PLACES-KEY-DO-NOT-LOG"
 TODAY = date(2026, 11, 8)
-
-
-def place(pid, name, address="日本、〒150-0013 東京都渋谷区恵比寿1-1-1", status="OPERATIONAL",
-          types_=("yakitori_restaurant", "restaurant", "food"), **extra):
-    p = {"id": pid, "displayName": {"text": name}, "formattedAddress": address,
-         "businessStatus": status, "types": list(types_), "primaryType": types_[0],
-         "primaryTypeDisplayName": {"text": "焼き鳥店"},
-         "googleMapsUri": f"https://maps.google.com/?cid={pid}",
-         "photos": [{"name": f"places/{pid}/photos/p1",
-                     "authorAttributions": [{"displayName": "撮影者", "uri": "https://maps.google.com/c/1"}]}]}
-    if status is None:
-        del p["businessStatus"]
-    p.update(extra)
-    return p
 
 
 class PlacesSession:
@@ -52,105 +38,55 @@ class PlacesSession:
         return self.get_resp
 
 
+def legacy_place(pid, name, **extra):
+    """api_integrations.search_place の戻り値の形"""
+    p = {"place_id": pid, "name": name, "rating": None, "user_ratings_total": None,
+         "formatted_address": "東京都渋谷区恵比寿1-1-1", "country_code": "JP", "lat": 35.6, "lng": 139.7,
+         "photo_url": f"https://maps.googleapis.com/maps/api/place/photo?photo_reference=x&key={API_KEY}",
+         "maps_url": f"https://www.google.com/maps/place/?q=place_id:{pid}", "phone": None}
+    p.update(extra)
+    return p
+
+
 def cand(name, area="恵比寿", cid="k1", source_type="knowledge", **kw):
     c = {"cand_id": cid, "name": name, "area": area, "genre": "焼き鳥", "reason": "理由", "source_type": source_type}
     c.update(kw)
     return c
 
 
-class TestNameArea(unittest.TestCase):
-    def test_name_matches(self):
-        m = v2.name_matches
-        self.assertTrue(m("鳥幸", "鳥幸"))
-        self.assertTrue(m("ＴＯＲＩ　ＴＯＫＹＯ", "TORI TOKYO"))         # 全角・空白
-        self.assertTrue(m("鳥貴族", "鳥貴族 渋谷店"))                     # 前方一致（支店）
-        self.assertTrue(m("叙々苑", "叙々苑 六本木ヒルズ店"))
-        self.assertTrue(m("焼鳥 鳥しき", "鳥しき"))                       # 包含（長さ比 0.5 以上）
-        self.assertFalse(m("鳥", "鳥幸"))                                 # 1 文字
-        self.assertFalse(m("鳥幸", "やきとり鳥幸本店の別館ビル店"))        # 包含だが長さ比が小さい
-        self.assertFalse(m("鳥幸", "鳥しき"))
-        self.assertFalse(m("", "鳥幸"))
+class TestLegacyVerify(unittest.TestCase):
+    """照合は今までの api_integrations.search_place をそのまま使う"""
 
-    def test_area_matches(self):
-        p = place("A", "鳥幸", address="東京都渋谷区恵比寿西1-2-3")
-        self.assertTrue(v2.area_matches("恵比寿", p))
-        self.assertTrue(v2.area_matches("恵比寿駅", p))
-        self.assertTrue(v2.area_matches("恵比寿駅周辺", p))
-        self.assertFalse(v2.area_matches("梅田", p))
-        self.assertTrue(v2.area_matches("六本木", place("B", "叙々苑 六本木ヒルズ店", address="東京都港区")))
-        self.assertFalse(v2.area_matches("", p))
+    def test_found_and_not_found(self):
+        calls = []
 
+        def fake_search_place(name, area, geo_info, language):
+            calls.append((name, area, geo_info, language))
+            return legacy_place("A", "鳥幸 恵比寿店") if name == "鳥幸" else None
+        with patch.object(v2.legacy, "search_place", fake_search_place):
+            results, rejected = v2.verify_candidates(
+                [cand("鳥幸"), cand("幻の店", cid="k2"), cand("鳥しき", area="", cid="k3")],
+                "恵比寿", {"country_code": "JP"}, "ja")
+        self.assertEqual([r["ok"] for r in results], [True, False, False])
+        self.assertEqual(rejected, {"not_found": 2})
+        self.assertIn(("鳥幸", "恵比寿", {"country_code": "JP"}, "ja"), calls)
+        self.assertIn(("鳥しき", "恵比寿", {"country_code": "JP"}, "ja"), calls)   # 候補のエリアが空なら検索条件のエリア
 
-class TestVerify(unittest.TestCase):
-    def verify(self, c, places):
-        s = PlacesSession({f"{c['name']} {c['area']}": places})
-        return v2.verify_candidate(API_KEY, c, "ja", session=s), s
+    def test_exception_is_rejected_not_raised(self):
+        def boom(*a):
+            raise RuntimeError("x")
+        with patch.object(v2.legacy, "search_place", boom):
+            results, rejected = v2.verify_candidates([cand("鳥幸")], "", None, "ja")
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(rejected, {"error_RuntimeError": 1})
 
-    def test_exact_match(self):
-        r, s = self.verify(cand("鳥幸"), [place("A", "鳥幸")])
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["place"]["id"], "A")
-        req = s.posts[0]
-        self.assertEqual(req["json"], {"textQuery": "鳥幸 恵比寿", "languageCode": "ja", "pageSize": 5})
-        self.assertEqual(req["headers"]["X-Goog-FieldMask"], v2.VERIFY_FIELDS)
-
-    def test_first_operational_is_not_taken_blindly(self):
-        # 検索結果の最初が別の店でも、店名が一致しなければ採用しない
-        r, _ = self.verify(cand("鳥幸"), [place("X", "鳥しき"), place("Y", "やきとん")])
-        self.assertEqual(r["reason"], "no_name_match")
-
-    def test_area_mismatch(self):
-        r, _ = self.verify(cand("鳥幸"), [place("A", "鳥幸", address="大阪府大阪市北区梅田1")])
-        self.assertEqual(r["reason"], "area_mismatch")
-
-    def test_status_and_type(self):
-        for status, reason in (("CLOSED_PERMANENTLY", "status_CLOSED_PERMANENTLY"),
-                               ("CLOSED_TEMPORARILY", "status_CLOSED_TEMPORARILY"),
-                               ("FUTURE_OPENING", "status_FUTURE_OPENING"),
-                               (None, "status_missing")):
-            r, _ = self.verify(cand("鳥幸"), [place("A", "鳥幸", status=status)])
-            self.assertEqual(r["reason"], reason)
-        r, _ = self.verify(cand("鳥幸"), [place("A", "鳥幸", types_=("hotel", "lodging"))])
-        self.assertEqual(r["reason"], "not_food")
-        r, _ = self.verify(cand("鳥幸"), [place("A", "鳥幸", movedPlaceId="A2")])
-        self.assertEqual(r["reason"], "moved")
-
-    def test_ambiguous_same_area_branches(self):
-        r, _ = self.verify(cand("鳥貴族", area="渋谷"),
-                           [place("A", "鳥貴族 渋谷店", address="東京都渋谷区道玄坂1"),
-                            place("B", "鳥貴族 渋谷南口店", address="東京都渋谷区渋谷3")])
-        self.assertEqual(r["reason"], "ambiguous")
-
-    def test_exact_name_resolves_multiple(self):
-        r, _ = self.verify(cand("鳥貴族 渋谷店", area="渋谷"),
-                           [place("A", "鳥貴族 渋谷店", address="東京都渋谷区道玄坂1"),
-                            place("B", "鳥貴族 渋谷南口店", address="東京都渋谷区渋谷3")])
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["place"]["id"], "A")
-
-    def test_same_name_different_area_resolved_by_area(self):
-        r, _ = self.verify(cand("鳥幸"),
-                           [place("O", "鳥幸", address="大阪府大阪市北区梅田1"),
-                            place("E", "鳥幸", address="東京都渋谷区恵比寿1")])
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["place"]["id"], "E")
-
-    def test_no_results_and_http_error(self):
-        r, _ = self.verify(cand("鳥幸"), [])
-        self.assertEqual(r["reason"], "no_name_match")
-        r, _ = self.verify(cand("鳥幸"), FakeHttpResp(403, {"error": {"status": "PERMISSION_DENIED"}}))
-        self.assertEqual(r["reason"], "places_error")
-
-    def test_all_places_errors_raise(self):
-        s = PlacesSession({}, default=requests.exceptions.Timeout("https://x?key=" + API_KEY))
-        with self.assertRaises(v2.ShopSearchError) as cm:
-            v2.verify_candidates(API_KEY, [cand("鳥幸"), cand("鳥しき", cid="k2")], "ja", session=s)
-        self.assertEqual(cm.exception.stage, "places")
-        self.assertNotIn(API_KEY, str(cm.exception))
-
-    def test_missing_key(self):
-        with self.assertRaises(v2.ShopSearchError):
-            v2.verify_candidates("", [cand("鳥幸")], "ja", session=PlacesSession({}))
+    def test_area_context_uses_legacy(self):
+        with patch.object(v2.legacy, "extract_area_from_text", lambda t, l: "恵比寿"), \
+             patch.object(v2.legacy, "get_region_from_area", lambda a, l: {"country_code": "JP", "region": "東京都"}):
+            self.assertEqual(v2.area_context("恵比寿の焼き鳥", "ja"), ("恵比寿", {"country_code": "JP", "region": "東京都"}))
+        with patch.object(v2.legacy, "extract_area_from_text", lambda t, l: ""), \
+             patch.object(v2.legacy, "get_region_from_area", lambda a, l: self.fail("呼ばない")):
+            self.assertEqual(v2.area_context("q", "ja"), ("", None))
 
 
 class TestMergeRank(unittest.TestCase):
@@ -192,6 +128,19 @@ class TestMergeRank(unittest.TestCase):
 
 
 class TestFlow(unittest.TestCase):
+    def setUp(self):
+        self.patches = [patch.object(v2.legacy, "extract_area_from_text", lambda t, l: ""),
+                        patch.object(v2.legacy, "get_region_from_area", lambda a, l: None)]
+        for p_ in self.patches:
+            p_.start()
+
+    def tearDown(self):
+        for p_ in self.patches:
+            p_.stop()
+
+    def with_places(self, table):
+        return patch.object(v2.legacy, "search_place", lambda name, area, g, l: table.get(name))
+
     def test_full_flow(self):
         g = FakeGemini({
             "gemini-3.8-flash": [knowledge_json(("鳥幸", "恵比寿"), ("幻の店", "恵比寿"), ("鳥しき", "恵比寿")),
@@ -204,65 +153,60 @@ class TestFlow(unittest.TestCase):
                  "event_date": "2026-09", "source_url": "https://news.example/x", "reason": "開店"}]},
                 ensure_ascii=False),
         })
-        s = PlacesSession({
-            "鳥幸 恵比寿": [place("A", "鳥幸", rating=4.3, userRatingCount=200,
-                                  priceRange={"startPrice": {"currencyCode": "JPY", "units": "6000"},
-                                              "endPrice": {"currencyCode": "JPY", "units": "8000"}})],
-            "幻の店 恵比寿": [],                                               # 架空（ハルシネーション）
-            "鳥しき 恵比寿": [place("C", "鳥しき", status="CLOSED_PERMANENTLY")],  # 閉店
-            "新店X 恵比寿": [place("N", "新店X")],
-        })
-        res = v2.search_shops("恵比寿 焼き鳥 デート", "ja", g, API_KEY, today=TODAY, session=s)
+        table = {"鳥幸": legacy_place("A", "鳥幸 恵比寿店", rating=4.3, user_ratings_total=200, phone="03-1"),
+                 "新店X": legacy_place("N", "新店X")}
+        with self.with_places(table):
+            res = v2.search_shops("恵比寿 焼き鳥 デート", "ja", g, today=TODAY)
         self.assertEqual(res["status"], "verified")
-        self.assertEqual([x["name"] for x in res["shops"]], ["新店X", "鳥幸"])   # 順位順・未確認は出さない
+        self.assertEqual([x["name"] for x in res["shops"]], ["新店X", "鳥幸 恵比寿店"])   # 順位順・名前は Places
         a = res["shops"][1]
-        self.assertEqual((a["rating"], a["reviewCount"], a["priceRange"]), (4.3, 200, "6,000円〜8,000円"))
-        self.assertIsNone(res["shops"][0]["rating"])
+        self.assertEqual((a["rating"], a["reviewCount"], a["phone"]), (4.3, 200, "03-1"))
+        self.assertIsNone(a["image"])                       # キー入り写真 URL は渡さない
         self.assertEqual(res["shops"][0]["recent"]["event_type"], "opened")
-        self.assertEqual(res["shops"][0]["source_type"], "search")
-        self.assertEqual(res["recent_check"]["status"], "ok")
-        self.assertEqual(res["stats"]["rejected"], {"no_name_match": 1, "status_CLOSED_PERMANENTLY": 1})
-        self.assertEqual(set(res["photo_refs"]), {"A", "N"})
-        for k in ("a_ms", "b_ms", "rank_ms", "places_ms", "total_ms"):
+        self.assertEqual(res["stats"]["rejected"], {"not_found": 2})
+        self.assertEqual({d["name"] for d in res["rejected_detail"]}, {"幻の店", "鳥しき"})
+        for k in ("a_ms", "b_ms", "area_ms", "rank_ms", "places_ms", "total_ms"):
             self.assertIn(k, res["timings"])
 
     def test_recent_failure_is_recorded_and_a_used(self):
         g = FakeGemini({"gemini-3.8-flash": knowledge_json(("鳥幸", "恵比寿")),
                         "gemini-2.5-flash+search": TimeoutError("deadline")})
-        s = PlacesSession({"鳥幸 恵比寿": [place("A", "鳥幸")]})
-        res = v2.search_shops("q", "ja", g, API_KEY, today=TODAY, session=s)
+        with self.with_places({"鳥幸": legacy_place("A", "鳥幸")}):
+            res = v2.search_shops("q", "ja", g, today=TODAY)
         self.assertEqual(res["recent_check"]["status"], "failed")
         self.assertEqual([x["name"] for x in res["shops"]], ["鳥幸"])
 
     def test_zero_verified_is_zero_cards(self):
         g = FakeGemini({"gemini-3.8-flash": knowledge_json(("幻の店", "恵比寿")),
                         "gemini-2.5-flash+search": json.dumps({"updates": []})})
-        res = v2.search_shops("q", "ja", g, API_KEY, today=TODAY, session=PlacesSession({}))
+        with self.with_places({}):
+            res = v2.search_shops("q", "ja", g, today=TODAY)
         self.assertEqual(res["status"], "no_verified")
         self.assertEqual(res["shops"], [])
 
     def test_no_candidates(self):
         g = FakeGemini({"gemini-3.8-flash": json.dumps({"candidates": []}),
                         "gemini-2.5-flash+search": json.dumps({"updates": []})})
-        s = PlacesSession({})
-        res = v2.search_shops("q", "ja", g, API_KEY, today=TODAY, session=s)
+        called = []
+        with patch.object(v2.legacy, "search_place", lambda *a: called.append(a)):
+            res = v2.search_shops("q", "ja", g, today=TODAY)
         self.assertEqual(res["status"], "no_candidates")
-        self.assertEqual(s.posts, [])
+        self.assertEqual(called, [])
 
     def test_knowledge_failure_raises(self):
         g = FakeGemini({"gemini-3.8-flash": TimeoutError("x"),
                         "gemini-2.5-flash+search": json.dumps({"updates": []})})
-        with self.assertRaises(v2.ShopSearchError) as cm:
-            v2.search_shops("q", "ja", g, API_KEY, today=TODAY, session=PlacesSession({}))
+        with self.with_places({}), self.assertRaises(v2.ShopSearchError) as cm:
+            v2.search_shops("q", "ja", g, today=TODAY)
         self.assertEqual(cm.exception.stage, "knowledge")
 
     def test_max_five_and_place_id_dedupe(self):
         names = [(f"店{i}", "恵比寿") for i in range(8)]
         g = FakeGemini({"gemini-3.8-flash": knowledge_json(*names)})
-        table = {f"店{i} 恵比寿": [place(f"P{i}", f"店{i}")] for i in range(8)}
-        table["店1 恵比寿"] = [place("P0", "店1")]     # 別候補が同じ Place ID に照合された
-        res = v2.search_shops("q", "ja", g, API_KEY, today=TODAY, use_recent=False,
-                              session=PlacesSession(table))
+        table = {f"店{i}": legacy_place(f"P{i}", f"店{i}") for i in range(8)}
+        table["店1"] = legacy_place("P0", "店0")      # 別候補が同じ Place ID に照合された
+        with self.with_places(table):
+            res = v2.search_shops("q", "ja", g, today=TODAY, use_recent=False)
         ids = [x["place_id"] for x in res["shops"]]
         self.assertEqual(len(ids), 5)
         self.assertEqual(len(set(ids)), 5)
@@ -281,8 +225,8 @@ class TestFlow(unittest.TestCase):
         try:
             g = FakeGemini({"gemini-3.8-flash": knowledge_json(("鳥幸", "恵比寿")),
                             "gemini-2.5-flash+search": json.dumps({"updates": []})})
-            v2.search_shops("q", "ja", g, API_KEY, today=TODAY,
-                            session=PlacesSession({"鳥幸 恵比寿": [place("A", "鳥幸")]}))
+            with self.with_places({"鳥幸": legacy_place("A", "鳥幸")}):
+                v2.search_shops("q", "ja", g, today=TODAY)
             s = PlacesSession({})
             s.get_resp = FakeHttpResp(500)
             v2.fetch_photo(API_KEY, {"name": "places/A/photos/p1"}, session=s)
@@ -312,14 +256,6 @@ class TestAsyncHelpers(unittest.TestCase):
         self.assertEqual(s.gets[0]["headers"]["X-Goog-FieldMask"], "nationalPhoneNumber,internationalPhoneNumber")
         s.get_resp = FakeHttpResp(404)
         self.assertIsNone(v2.fetch_phone(API_KEY, "A", "ja", session=s))
-
-    def test_price_format(self):
-        f = v2.format_price_range
-        self.assertEqual(f({"startPrice": {"currencyCode": "JPY", "units": "3000"}}), "3,000円〜")
-        self.assertEqual(f({"endPrice": {"currencyCode": "JPY", "units": "2000"}}), "〜2,000円")
-        self.assertEqual(f({"startPrice": {"currencyCode": "USD", "units": "20"},
-                            "endPrice": {"currencyCode": "USD", "units": "30"}}), "USD 20〜30")
-        self.assertIsNone(f(None))
 
 
 if __name__ == "__main__":
