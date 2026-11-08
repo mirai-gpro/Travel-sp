@@ -23,6 +23,8 @@ export class CoreController {
   protected isTTSEnabled = true;
   protected isUserInteracted = false;
   protected currentShops: any[] = [];
+  // 新方式（2 段表示）: 1 段目のカードの検索 ID。2 段目の追加はこの ID のものだけ受け付ける
+  protected currentShopSearchId: string | null = null;
   protected isFromVoiceInput = false;
   protected lastAISpeech = '';
   protected preGeneratedAcks: Map<string, string> = new Map();
@@ -481,6 +483,7 @@ export class CoreController {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
       this.hideWaitOverlay();
       const shops = data?.shops || [];
+      this.currentShopSearchId = data?.search_id || null;
       if (shops.length > 0) {
         this.currentShops = shops;
         this.els.reservationBtn?.classList.add('visible');
@@ -501,6 +504,25 @@ export class CoreController {
           }, 300);
         }
       }
+    });
+
+    // ★ ショップ検索の追加分（新方式の 2 段目: 最新情報で見つかった店）。既存のカードは残して後ろに追加する
+    this.socket.on('shop_search_append', (data: any) => {
+      const added = data?.shops || [];
+      console.log('[LiveAPI] shop_search_append:', added.length, '件');
+      if (added.length === 0) return;
+      if (!data?.search_id || data.search_id !== this.currentShopSearchId) {
+        console.log('[LiveAPI] shop_search_append: 別の検索の追加分のため表示しない');
+        return;
+      }
+      this.hideWaitOverlay();
+      this.currentShops = [...(this.currentShops || []), ...added];
+      this.els.reservationBtn?.classList.add('visible');
+      document.dispatchEvent(new CustomEvent('displayShops', {
+        detail: { shops: this.currentShops, language: this.currentLanguage }
+      }));
+      const section = document.getElementById('shopListSection');
+      if (section) section.classList.add('has-shops');
     });
   }
 
