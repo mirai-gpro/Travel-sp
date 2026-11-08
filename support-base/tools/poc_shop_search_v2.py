@@ -65,8 +65,7 @@ def probe(client, timeout_s, gap_s, model):
          types.GenerateContentConfig(http_options=http, thinking_config=think)),
         ("knowledge", f"希望条件: {QUERIES[1][2]}",
          types.GenerateContentConfig(
-             system_instruction=v2.KNOWLEDGE_INSTRUCTION.format(min_n=v2.KNOWLEDGE_MIN, max_n=v2.KNOWLEDGE_MAX,
-                                                                language="日本語"),
+             system_instruction=v2.knowledge_instruction("ja"),
              response_mime_type="application/json", response_json_schema=v2.KNOWLEDGE_SCHEMA,
              thinking_config=think, http_options=http)),
     ]

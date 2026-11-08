@@ -24,6 +24,16 @@ class TestKnowledge(unittest.TestCase):
         self.assertEqual(call["config"].response_mime_type, "application/json")
         self.assertEqual(call["config"].thinking_config.thinking_level.value, "LOW")
         self.assertIn("恵比寿 焼き鳥 デート", call["contents"])
+        self.assertIn("yakitori_restaurant", call["config"].system_instruction)          # タイプ一覧は指示文で渡す
+        self.assertNotIn("enum", json.dumps(call["config"].response_json_schema))       # enum は 400 になったため使わない
+
+    def test_genre_types_filtered_to_official_list(self):
+        text = {"genre_types": ["yakitori_restaurant", "made_up_type", "chicken_restaurant"],
+                "candidates": [{"name": "鳥幸", "area": "恵比寿", "genre": "焼き鳥", "reason": ""}]}
+        g = FakeGemini({"gemini-3.8-flash": json.dumps(text, ensure_ascii=False)})
+        cands, types = v2.knowledge_call(g, "q", "ja")
+        self.assertEqual(types, ["yakitori_restaurant", "chicken_restaurant"])
+        self.assertEqual([c["name"] for c in cands], ["鳥幸"])
 
     def test_more_than_max_truncated_and_incomplete_items_skipped(self):
         cands = [(f"店{i}", "恵比寿") for i in range(10)]

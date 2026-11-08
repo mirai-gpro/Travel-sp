@@ -125,7 +125,8 @@ GENERIC_TYPES = frozenset({"restaurant", "food", "point_of_interest", "establish
 KNOWLEDGE_SCHEMA = {
     "type": "object",
     "properties": {
-        "genre_types": {"type": "array", "items": {"type": "string", "enum": FOOD_TYPES}},
+        # 列挙値（enum）をスキーマに入れると 400 INVALID_ARGUMENT になったため、一覧は指示文で渡し、コードで絞る
+        "genre_types": {"type": "array", "items": {"type": "string"}},
         "candidates": {
             "type": "array",
             "maxItems": KNOWLEDGE_MAX,
@@ -153,10 +154,17 @@ KNOWLEDGE_INSTRUCTION = """あなたはグルメに詳しいレストランの�
 3. genre は料理ジャンル。reason は条件に合う理由を{language}で1文。
 4. 価格・評価・口コミ数などの数値、営業時間、住所は書かない。
 5. 条件に合う店が少なければ、件数は少なくてよい。無理に件数をそろえない。
-6. genre_types には、希望条件のジャンルの店が Google Places で持ちうる店舗タイプを、列挙値から選ぶ。
-   近い上位のタイプも含める（例: 焼き鳥 → yakitori_restaurant, chicken_restaurant, japanese_izakaya_restaurant）。
+6. genre_types には、希望条件のジャンルに当たる Google Places の店舗タイプを、下の一覧から選ぶ。
+   希望ジャンルそのものを表すタイプだけを選び、和食・居酒屋のような広いタイプは、希望条件自体がそれを指す場合だけ選ぶ
+   （例: 焼き鳥 → yakitori_restaurant, chicken_restaurant / 居酒屋 → japanese_izakaya_restaurant）。
    希望条件にジャンルの指定がなければ空配列。
+   一覧: {food_types}
 出力は指定された JSON スキーマのみ。"""
+
+
+def knowledge_instruction(language: str) -> str:
+    return KNOWLEDGE_INSTRUCTION.format(min_n=KNOWLEDGE_MIN, max_n=KNOWLEDGE_MAX, language=_lang(language),
+                                        food_types=", ".join(t for t in FOOD_TYPES if t not in GENERIC_TYPES))
 
 
 def knowledge_candidates(client, user_request: str, language: str) -> list:
@@ -169,8 +177,7 @@ def knowledge_candidates(client, user_request: str, language: str) -> list:
 
 def knowledge_call(client, user_request: str, language: str) -> tuple:
     """A の本体。戻り値: (候補リスト, genre_types: 希望ジャンルに合う Places 店舗タイプ)"""
-    instruction = KNOWLEDGE_INSTRUCTION.format(min_n=KNOWLEDGE_MIN, max_n=KNOWLEDGE_MAX,
-                                               language=_lang(language))
+    instruction = knowledge_instruction(language)
     data = _call_json_llm(client, "knowledge", KNOWLEDGE_MODEL, instruction,
                           f"希望条件: {user_request}", KNOWLEDGE_SCHEMA)
     items = data.get("candidates")
