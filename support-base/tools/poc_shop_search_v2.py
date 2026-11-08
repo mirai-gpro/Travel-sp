@@ -203,6 +203,7 @@ def main():
     p2 = sub.add_parser("run")
     p2.add_argument("--pocs", default="A,B")
     p2.add_argument("--queries", default="all")
+    p2.add_argument("--query", action="append", default=[], help="任意の検索条件（日本語）。指定すると --queries より優先")
     p2.add_argument("--runs", type=int, default=1)
     p2.add_argument("--gap", type=int, default=3, help="検索ごとの間隔（秒）。429 回避用")
     p2.add_argument("--llm-timeout", type=int, default=None, help="LLM のタイムアウト（秒）。既定は v2 の値")
@@ -237,7 +238,11 @@ def main():
         v2.RECENT_MODEL = args.recent_model
     print(json.dumps({"knowledge_model": v2.KNOWLEDGE_MODEL, "rank_model": v2.RANK_MODEL,
                       "recent_model": v2.RECENT_MODEL, "llm_timeout_ms": v2.LLM_TIMEOUT_MS}), flush=True)
-    q_idx = range(len(QUERIES)) if args.queries == "all" else [int(x) for x in args.queries.split(",")]
+    if args.query:
+        QUERIES[:] = [("custom", "ja", q) for q in args.query]
+        q_idx = range(len(QUERIES))
+    else:
+        q_idx = range(len(QUERIES)) if args.queries == "all" else [int(x) for x in args.queries.split(",")]
     pocs = [p for p in args.pocs.split(",") if p in ("A", "B")]
     run(client, places_key, pocs, q_idx, args.runs, args.gap, args.gates)
 
