@@ -26,7 +26,7 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # A: 知識ベースの候補生成（Google 検索なし）
-KNOWLEDGE_MODEL = "gemini-3.8-flash"
+KNOWLEDGE_MODEL = "gemini-3.5-flash-lite"   # PoC 計測: 3.8-flash は 36〜81 秒、3.5-flash-lite は 1〜2 秒
 # 3.8 Flash の thinking_level（low / medium / high。minimal はエラー）
 THINKING_LEVEL = "low"
 LLM_TIMEOUT_MS = 30000
@@ -367,7 +367,7 @@ def recent_updates(client, user_request: str, language: str, today) -> dict:
 # ------------------------------------------------------------
 # 統合・重複除去・順位づけ
 # ------------------------------------------------------------
-RANK_MODEL = "gemini-3.8-flash"
+RANK_MODEL = "gemini-3.5-flash-lite"
 MAX_SHOPS = 5
 
 _PUNCT = set(" 　・･'’\"「」『』()（）[]［］.,、。-‐－&＆/／")
@@ -701,6 +701,130 @@ def search_shops(user_request: str, language: str, gemini_client, places_api_key
     return {"search_id": search_id, "status": status, "shops": shops, "photo_refs": photo_refs,
             "recent_check": recent, "timings": timings, "stats": stats, "rejected_detail": rejected_detail,
             "matched": matched}
+
+
+# ------------------------------------------------------------
+# 2 段表示（Phase B）: 1 段目 = A の照合済みカード、2 段目 = B（最新情報）で見つかった店の追加
+# ------------------------------------------------------------
+ADDITION_MAX = 3   # 2 段目で追加する店の上限（暫定）
+
+
+def _select_shops(cands: list, results: list, seen: set, limit: int) -> tuple:
+    """照合結果から採用する店を選ぶ（place_id 重複は除く）。戻り値: (shops, matched, rejected_detail)"""
+    shops, matched = [], []
+    rejected_detail = [{"name": c["name"], "area": c["area"], "source_type": c.get("source_type"),
+                        "reason": r["reason"], "place": (r["place"] or {}).get("name"), "gate": r.get("gate")}
+                       for c, r in zip(cands, results) if not r["ok"]]
+    for cand, r in zip(cands, results):
+        if len(shops) >= limit:
+            break
+        if not r["ok"]:
+            continue
+        pid = r["place"]["place_id"]
+        if pid in seen:
+            rejected_detail.append({"name": cand["name"], "area": cand["area"],
+                                    "source_type": cand.get("source_type"), "reason": "duplicate_place",
+                                    "place": r["place"].get("name"), "gate": r.get("gate")})
+            continue
+        seen.add(pid)
+        shops.append(build_shop(cand, r["place"]))
+        matched.append({"cand": cand["name"], "place": r["place"].get("name"), "gate": r.get("gate")})
+    return shops, matched, rejected_detail
+
+
+class ProgressiveSearch:
+    """
+    1 回の検索を 2 段で返す。作成した時点で A・B・エリア取得を並列に開始する。
+      initial()   : A の候補を Places で照合・判定し、カード用の店（最大 MAX_SHOPS）を返す
+      additions() : B の完了を待ち、1 段目に無い店だけを照合・判定して返す（最大 ADDITION_MAX）
+    initial() → additions() の順に 1 回ずつ呼ぶ。A の失敗は ShopSearchError。B の失敗は additions が空になる。
+    """
+
+    def __init__(self, user_request: str, language: str, gemini_client, places_api_key: str = "",
+                 today=None, use_recent: bool = True, gates: str = "enforce"):
+        from datetime import date
+        if gates not in GATE_MODES:
+            raise ValueError(f"gates は {GATE_MODES} のいずれか")
+        self.user_request = user_request
+        self.language = language
+        self.search_id = str(uuid.uuid4())
+        self.gates = gates
+        self.places_api_key = places_api_key
+        self.timings = {}
+        self._t0 = time.monotonic()
+        self._seen_place_ids = set()
+        self._shown_keys = set()
+        self._knowledge_keys = set()
+        self._genre_types = []
+        self._area, self._geo_info = "", None
+        self._ex = ThreadPoolExecutor(max_workers=3)
+        self._fa = self._ex.submit(self._timed, "a_ms", knowledge_call, gemini_client, user_request, language)
+        self._fb = (self._ex.submit(self._timed, "b_ms", recent_updates, gemini_client, user_request, language,
+                                    today or date.today()) if use_recent else None)
+        self._fg = self._ex.submit(self._timed, "area_ms", area_context, user_request, language)
+
+    def _timed(self, key, fn, *args):
+        s = time.monotonic()
+        try:
+            return fn(*args)
+        finally:
+            self.timings[key] = round((time.monotonic() - s) * 1000)
+
+    def _elapsed(self):
+        return round((time.monotonic() - self._t0) * 1000)
+
+    def _verify(self, cands: list, area: str, geo_info, timing_key: str) -> list:
+        ctx = {"mode": self.gates, "genre_types": self._genre_types, "places_api_key": self.places_api_key}
+        results, _ = self._timed(timing_key, verify_candidates, cands, area, geo_info, self.language, ctx)
+        return results
+
+    def initial(self) -> dict:
+        try:
+            knowledge, self._genre_types = self._fa.result()
+            self._area, self._geo_info = self._fg.result()
+        except BaseException:
+            self.close()
+            raise
+        self._knowledge_keys = {(normalize_name(c["name"]), normalize_area(c["area"])) for c in knowledge}
+        results = self._verify(knowledge, self._area, self._geo_info, "places_ms")
+        shops, matched, rejected = _select_shops(knowledge, results, self._seen_place_ids, MAX_SHOPS)
+        self._shown_keys = {normalize_name(s["name"]) for s in shops}
+        self.timings["initial_ms"] = self._elapsed()
+        logger.info(f"[ShopSearchV2] search_id={self.search_id} 1段目 {len(shops)}件 "
+                    f"(候補 {len(knowledge)}) timings={self.timings}")
+        return {"search_id": self.search_id, "stage": "initial", "shops": shops,
+                "recent_pending": self._fb is not None, "timings": dict(self.timings),
+                "stats": {"knowledge": len(knowledge), "shown": len(shops), "genre_types": self._genre_types},
+                "matched": matched, "rejected_detail": rejected}
+
+    def additions(self) -> dict:
+        try:
+            if self._fb is None:
+                return {"search_id": self.search_id, "stage": "additions", "shops": [],
+                        "recent_check": {"status": "skipped"}, "timings": dict(self.timings)}
+            recent = self._fb.result()
+            cands = []
+            for u in recent["updates"]:
+                key = (normalize_name(u["name"]), normalize_area(u["area"]))
+                # A の候補と同じ店（1 段目で扱い済み）と、1 段目のカードと同じ店名は除く
+                if key in self._knowledge_keys or normalize_name(u["name"]) in self._shown_keys:
+                    continue
+                item = dict(u)
+                item["recent"] = {k: u.get(k) for k in ("event_type", "event_date", "source_url")}
+                cands.append(item)
+            results = self._verify(cands, self._area, self._geo_info, "places_b_ms") if cands else []
+            shops, matched, rejected = _select_shops(cands, results, self._seen_place_ids, ADDITION_MAX)
+            self.timings["additions_ms"] = self._elapsed()
+            logger.info(f"[ShopSearchV2] search_id={self.search_id} 2段目 {len(shops)}件 "
+                        f"recent={recent['status']} (更新情報 {len(recent['updates'])}) timings={self.timings}")
+            return {"search_id": self.search_id, "stage": "additions", "shops": shops,
+                    "recent_check": recent, "timings": dict(self.timings),
+                    "matched": matched, "rejected_detail": rejected}
+        finally:
+            self.close()
+
+    def close(self):
+        self._ex.shutdown(wait=False)
 
 
 # ------------------------------------------------------------

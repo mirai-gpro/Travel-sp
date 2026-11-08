@@ -13,13 +13,13 @@ from fakes import FakeGemini, knowledge_json  # noqa: E402
 
 class TestKnowledge(unittest.TestCase):
     def test_normal(self):
-        g = FakeGemini({"gemini-3.8-flash": knowledge_json(("鳥幸", "恵比寿"), ("鳥しき", "目黒"))})
+        g = FakeGemini({"gemini-3.5-flash-lite": knowledge_json(("鳥幸", "恵比寿"), ("鳥しき", "目黒"))})
         res = v2.knowledge_candidates(g, "恵比寿 焼き鳥 デート", "ja")
         self.assertEqual([c["name"] for c in res], ["鳥幸", "鳥しき"])
         self.assertEqual([c["cand_id"] for c in res], ["k1", "k2"])
         self.assertTrue(all(c["source_type"] == "knowledge" for c in res))
         call = g.models.calls[0]
-        self.assertEqual(call["model"], "gemini-3.8-flash")
+        self.assertEqual(call["model"], "gemini-3.5-flash-lite")
         self.assertFalse(getattr(call["config"], "tools", None))           # Google 検索なし
         self.assertEqual(call["config"].response_mime_type, "application/json")
         self.assertEqual(call["config"].thinking_config.thinking_level.value, "LOW")
@@ -30,7 +30,7 @@ class TestKnowledge(unittest.TestCase):
     def test_genre_types_filtered_to_official_list(self):
         text = {"genre_types": ["yakitori_restaurant", "made_up_type", "chicken_restaurant"], "genre_exact": True,
                 "candidates": [{"name": "鳥幸", "area": "恵比寿", "genre": "焼き鳥", "reason": ""}]}
-        g = FakeGemini({"gemini-3.8-flash": json.dumps(text, ensure_ascii=False)})
+        g = FakeGemini({"gemini-3.5-flash-lite": json.dumps(text, ensure_ascii=False)})
         cands, types = v2.knowledge_call(g, "q", "ja")
         self.assertEqual(types, ["yakitori_restaurant", "chicken_restaurant"])
         self.assertEqual([c["name"] for c in cands], ["鳥幸"])
@@ -41,7 +41,7 @@ class TestKnowledge(unittest.TestCase):
             text = {"genre_types": ["japanese_restaurant"], "candidates": []}
             if exact is not None:
                 text["genre_exact"] = exact
-            _, types = v2.knowledge_call(FakeGemini({"gemini-3.8-flash": json.dumps(text)}), "q", "ja")
+            _, types = v2.knowledge_call(FakeGemini({"gemini-3.5-flash-lite": json.dumps(text)}), "q", "ja")
             self.assertEqual(types, [])
 
     def test_more_than_max_truncated_and_incomplete_items_skipped(self):
@@ -50,7 +50,7 @@ class TestKnowledge(unittest.TestCase):
         text["candidates"].insert(0, {"name": "", "area": "恵比寿", "genre": "", "reason": ""})
         text["candidates"].insert(1, {"name": "エリアなし", "area": "", "genre": "", "reason": ""})
         text["candidates"].insert(2, "not-a-dict")
-        g = FakeGemini({"gemini-3.8-flash": json.dumps(text, ensure_ascii=False)})
+        g = FakeGemini({"gemini-3.5-flash-lite": json.dumps(text, ensure_ascii=False)})
         res = v2.knowledge_candidates(g, "q", "ja")
         self.assertEqual(len(res), v2.KNOWLEDGE_MAX)
         self.assertEqual(res[0]["name"], "店0")
@@ -59,11 +59,11 @@ class TestKnowledge(unittest.TestCase):
         for route in ("not json", json.dumps({"x": 1}), json.dumps([1, 2]), "",
                       TimeoutError("deadline")):
             with self.assertRaises(v2.ShopSearchError) as cm:
-                v2.knowledge_candidates(FakeGemini({"gemini-3.8-flash": route}), "q", "ja")
+                v2.knowledge_candidates(FakeGemini({"gemini-3.5-flash-lite": route}), "q", "ja")
             self.assertEqual(cm.exception.stage, "knowledge")
 
     def test_empty_candidates_is_not_error(self):
-        res = v2.knowledge_candidates(FakeGemini({"gemini-3.8-flash": json.dumps({"candidates": []})}), "q", "ja")
+        res = v2.knowledge_candidates(FakeGemini({"gemini-3.5-flash-lite": json.dumps({"candidates": []})}), "q", "ja")
         self.assertEqual(res, [])
 
 

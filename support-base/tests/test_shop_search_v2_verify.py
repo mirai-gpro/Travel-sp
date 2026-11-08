@@ -112,7 +112,7 @@ class TestMergeRank(unittest.TestCase):
         text = json.dumps({"ranked": [{"cand_id": "r1", "reason": "新しい理由"}, {"cand_id": "zzz", "reason": ""},
                                       {"cand_id": "k1", "reason": ""}, {"cand_id": "r1", "reason": "dup"}]},
                           ensure_ascii=False)
-        g = FakeGemini({"gemini-3.8-flash": text})
+        g = FakeGemini({"gemini-3.5-flash-lite": text})
         ranked = v2.rank_candidates(g, "q", merged, "ja")
         self.assertEqual([c["cand_id"] for c in ranked], ["r1", "k1"])
         self.assertEqual(ranked[0]["reason"], "新しい理由")
@@ -123,7 +123,7 @@ class TestMergeRank(unittest.TestCase):
         for route in ("not json", json.dumps({"ranked": [{"cand_id": "zzz", "reason": ""}]}),
                       TimeoutError("x")):
             with self.assertRaises(v2.ShopSearchError) as cm:
-                v2.rank_candidates(FakeGemini({"gemini-3.8-flash": route}), "q", merged, "ja")
+                v2.rank_candidates(FakeGemini({"gemini-3.5-flash-lite": route}), "q", merged, "ja")
             self.assertEqual(cm.exception.stage, "rank")
 
 
@@ -192,7 +192,7 @@ class TestFlow(unittest.TestCase):
 
     def test_full_flow(self):
         g = FakeGemini({
-            "gemini-3.8-flash": [knowledge_json(("鳥幸", "恵比寿"), ("幻の店", "恵比寿"), ("鳥しき", "恵比寿")),
+            "gemini-3.5-flash-lite": [knowledge_json(("鳥幸", "恵比寿"), ("幻の店", "恵比寿"), ("鳥しき", "恵比寿")),
                                  json.dumps({"ranked": [{"cand_id": "r1", "reason": "新店"},
                                                         {"cand_id": "k1", "reason": ""},
                                                         {"cand_id": "k2", "reason": ""},
@@ -220,7 +220,7 @@ class TestFlow(unittest.TestCase):
 
     def test_gates_observe_and_enforce(self):
         def gem():
-            return FakeGemini({"gemini-3.8-flash": json.dumps({"genre_types": ["yakitori_restaurant"], "genre_exact": True, "candidates": [
+            return FakeGemini({"gemini-3.5-flash-lite": json.dumps({"genre_types": ["yakitori_restaurant"], "genre_exact": True, "candidates": [
                 {"name": n, "area": "恵比寿", "genre": "焼き鳥", "reason": ""} for n in ("鳥幸", "地鶏やおまへん")]},
                 ensure_ascii=False)})
         table = {"鳥幸": legacy_place("A", "鳥幸"), "地鶏やおまへん": legacy_place("B", "食鶏 しまや")}
@@ -238,7 +238,7 @@ class TestFlow(unittest.TestCase):
             v2.search_shops("q", "ja", gem(), today=TODAY, gates="x")
 
     def test_recent_failure_is_recorded_and_a_used(self):
-        g = FakeGemini({"gemini-3.8-flash": knowledge_json(("鳥幸", "恵比寿")),
+        g = FakeGemini({"gemini-3.5-flash-lite": knowledge_json(("鳥幸", "恵比寿")),
                         "gemini-2.5-flash+search": TimeoutError("deadline")})
         with self.with_places({"鳥幸": legacy_place("A", "鳥幸")}):
             res = v2.search_shops("q", "ja", g, today=TODAY)
@@ -246,7 +246,7 @@ class TestFlow(unittest.TestCase):
         self.assertEqual([x["name"] for x in res["shops"]], ["鳥幸"])
 
     def test_zero_verified_is_zero_cards(self):
-        g = FakeGemini({"gemini-3.8-flash": knowledge_json(("幻の店", "恵比寿")),
+        g = FakeGemini({"gemini-3.5-flash-lite": knowledge_json(("幻の店", "恵比寿")),
                         "gemini-2.5-flash+search": json.dumps({"updates": []})})
         with self.with_places({}):
             res = v2.search_shops("q", "ja", g, today=TODAY)
@@ -254,7 +254,7 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(res["shops"], [])
 
     def test_no_candidates(self):
-        g = FakeGemini({"gemini-3.8-flash": json.dumps({"candidates": []}),
+        g = FakeGemini({"gemini-3.5-flash-lite": json.dumps({"candidates": []}),
                         "gemini-2.5-flash+search": json.dumps({"updates": []})})
         called = []
         with patch.object(v2.legacy, "search_place", lambda *a: called.append(a)):
@@ -263,7 +263,7 @@ class TestFlow(unittest.TestCase):
         self.assertEqual(called, [])
 
     def test_knowledge_failure_raises(self):
-        g = FakeGemini({"gemini-3.8-flash": TimeoutError("x"),
+        g = FakeGemini({"gemini-3.5-flash-lite": TimeoutError("x"),
                         "gemini-2.5-flash+search": json.dumps({"updates": []})})
         with self.with_places({}), self.assertRaises(v2.ShopSearchError) as cm:
             v2.search_shops("q", "ja", g, today=TODAY)
@@ -271,7 +271,7 @@ class TestFlow(unittest.TestCase):
 
     def test_max_five_and_place_id_dedupe(self):
         names = [(f"店{i}", "恵比寿") for i in range(8)]
-        g = FakeGemini({"gemini-3.8-flash": knowledge_json(*names)})
+        g = FakeGemini({"gemini-3.5-flash-lite": knowledge_json(*names)})
         table = {f"店{i}": legacy_place(f"P{i}", f"店{i}") for i in range(8)}
         table["店1"] = legacy_place("P0", "店0")      # 別候補が同じ Place ID に照合された
         with self.with_places(table):
@@ -292,7 +292,7 @@ class TestFlow(unittest.TestCase):
         lg.addHandler(h)
         lg.setLevel(logging.DEBUG)
         try:
-            g = FakeGemini({"gemini-3.8-flash": knowledge_json(("鳥幸", "恵比寿")),
+            g = FakeGemini({"gemini-3.5-flash-lite": knowledge_json(("鳥幸", "恵比寿")),
                             "gemini-2.5-flash+search": json.dumps({"updates": []})})
             with self.with_places({"鳥幸": legacy_place("A", "鳥幸")}):
                 v2.search_shops("q", "ja", g, today=TODAY)
