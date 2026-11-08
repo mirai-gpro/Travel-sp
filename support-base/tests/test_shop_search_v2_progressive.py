@@ -33,7 +33,10 @@ class TestProgressive(unittest.TestCase):
     def setUp(self):
         self.patches = [patch.object(v2.legacy, "extract_area_from_text", lambda t, l: "恵比寿"),
                         patch.object(v2.legacy, "get_region_from_area", lambda a, l: {"country_code": "JP"}),
-                        patch.object(v2, "fetch_place_types", lambda *a: ["yakitori_restaurant"])]
+                        patch.object(v2, "fetch_place_types", lambda *a: ["yakitori_restaurant"]),
+                        patch.object(v2, "fetch_shop_photo", lambda key, pid, session=None: None if pid == "K" else
+                                     {"image": f"https://photo.example/{pid}",
+                                      "attributions": [{"displayName": "撮影者", "uri": "https://maps.google.com/c/1"}]})]
         for p_ in self.patches:
             p_.start()
 
@@ -61,6 +64,12 @@ class TestProgressive(unittest.TestCase):
         # B の「鳥幸」は 1 段目と同じ店なので除く。place_id が 1 段目と同じ店（K）も除く
         self.assertEqual([s["name"] for s in second["shops"]], ["酒場くし亭", "恵比寿 鳥泉"])
         self.assertEqual(second["shops"][0]["recent"]["event_type"], "renamed")
+        # 写真: キーを含まない photoUri と撮影者表記。取れない店（K）は既定画像のまま
+        self.assertEqual(first["shops"][0]["image"], "https://photo.example/A")
+        self.assertEqual(first["shops"][0]["image_attributions"][0]["displayName"], "撮影者")
+        self.assertIsNone(first["shops"][1]["image"])
+        self.assertEqual(second["shops"][0]["image"], "https://photo.example/C")
+        self.assertIn("photos_ms", first["timings"])
         self.assertIn("duplicate_place", [d["reason"] for d in second["rejected_detail"]])
         for k in ("a_ms", "b_ms", "places_ms", "initial_ms", "additions_ms"):
             self.assertIn(k, second["timings"])
@@ -117,6 +126,35 @@ class TestProgressive(unittest.TestCase):
         ps2 = v2.ProgressiveSearch("q", "ja", FakeGemini({K: a_json()}), "key", today=TODAY, use_recent=False)
         self.assertFalse(ps2.initial()["recent_pending"])
         self.assertEqual(ps2.additions()["shops"], [])
+
+
+
+class TestPhoto(unittest.TestCase):
+    class Seq:
+        def __init__(self, resps):
+            self.resps, self.calls = list(resps), []
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "params": params, "headers": headers})
+            return self.resps.pop(0)
+
+    def test_fetch_shop_photo(self):
+        from fakes import FakeHttpResp
+        photo = {"name": "places/P/photos/x1", "authorAttributions": [{"displayName": "撮影者", "uri": "https://a"}]}
+        s = self.Seq([FakeHttpResp(200, {"photos": [photo]}), FakeHttpResp(200, {"photoUri": "https://lh3.example/p"})])
+        out = v2.fetch_shop_photo("SECRET-KEY", "P", session=s)
+        self.assertEqual(out, {"image": "https://lh3.example/p", "attributions": [{"displayName": "撮影者", "uri": "https://a"}]})
+        self.assertEqual(s.calls[0]["headers"]["X-Goog-FieldMask"], "photos")
+        for c in s.calls:
+            self.assertNotIn("SECRET-KEY", c["url"])
+            self.assertNotIn("SECRET-KEY", json.dumps(c["params"] or {}))
+        self.assertNotIn("SECRET-KEY", json.dumps(out))
+
+    def test_no_photos_or_error(self):
+        from fakes import FakeHttpResp
+        self.assertIsNone(v2.fetch_shop_photo("k", "P", session=self.Seq([FakeHttpResp(200, {})])))
+        self.assertIsNone(v2.fetch_shop_photo("k", "P", session=self.Seq([FakeHttpResp(403)])))
+        self.assertIsNone(v2.fetch_shop_photo("", "P"))
 
 
 if __name__ == "__main__":
