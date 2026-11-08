@@ -923,6 +923,18 @@ def handle_live_start(data):
             logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)
             return None
 
+    # 新方式のショップ検索（SHOP_SEARCH_V2=1 の時だけ。既定は上の案C）。
+    # LLM の知識候補 → Google Places 照合（今までの search_place）→ カード 2 段表示（最新情報は後から追加）。
+    # 新方式の失敗時に案C へ自動で切り替えることはしない。
+    shop_search_v2_start = None
+    if os.getenv('SHOP_SEARCH_V2') == '1' and mode != 'lesson':
+        import shop_search_v2
+
+        def _start_progressive_search(user_request, lang):
+            return shop_search_v2.ProgressiveSearch(user_request, lang, gemini_client, GOOGLE_PLACES_API_KEY)
+        shop_search_v2_start = _start_progressive_search
+        logger.info("[ShopSearchV2] 新方式のショップ検索を使用")
+
     # LiveAPIセッション作成
     live_session = LiveAPISession(
         session_id=session_id,
@@ -934,7 +946,8 @@ def handle_live_start(data):
         shop_search_callback=shop_search_callback,
         user_id=user_id,
         voice_model=voice_model,
-        live_voice=live_voice
+        live_voice=live_voice,
+        shop_search_v2_start=shop_search_v2_start
     )
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ

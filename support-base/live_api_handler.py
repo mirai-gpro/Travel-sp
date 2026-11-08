@@ -11,6 +11,7 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import json
 import os
 import logging
 import struct
@@ -246,6 +247,43 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     )
 )
 
+# 新方式（SHOP_SEARCH_V2=1）の search_shops は NON_BLOCKING:
+#   検索中もモデルは会話を続け、結果は 2 段（1 段目 = A の照合済み / 2 段目 = 最新情報の追加）で
+#   scheduling=WHEN_IDLE の tool_response として返す（1 段目は will_continue=True）。
+SEARCH_SHOPS_DECLARATION_NON_BLOCKING = SEARCH_SHOPS_DECLARATION.model_copy(
+    update={"behavior": types.Behavior.NON_BLOCKING})
+
+# search_shops 呼び出し直後にモデルへ送る指示（決まったセリフではなく、言い回しはモデルに任せる）
+SHOP_SEARCH_STARTED_NUDGE = (
+    "（システムからの連絡）お店の検索を開始しました。結果はまだ届いていません。"
+    "お店を探していることを、ユーザーと話している言語で、自分の言葉で一言だけ伝えてください。"
+    "お店の名前や内容は、検索結果が届くまで話さないでください。"
+)
+
+# 検索中に search_shops がもう一度呼ばれた時に返す結果（scheduling=SILENT）
+SHOP_SEARCH_BUSY_RESULT = (
+    "前のお店の検索がまだ実行中のため、この呼び出しは受け付けていません。"
+    "検索結果が届くまで待ってください。"
+)
+
+# 検索中に再接続が起きた時、新しい接続へ検索結果を渡す際の前置き
+SHOP_SEARCH_RESULT_AFTER_RECONNECT = (
+    "（システムからの連絡）先ほど依頼されたお店の検索結果が届きました。"
+    "以下の内容に従って、ユーザーにお店を紹介してください。\n"
+)
+
+# 2 段目（最新情報の追加）は、1 段目の読み上げターンが終わるまで渡さない。
+# 1 段目の読み上げは長く（500 文字超）、終了時に再接続が起きるため、先に渡すと旧接続と一緒に失われる。
+# 読み上げターンの判定: tool_response の指示で各店を「N軒目は、」で始めさせているため「軒目」を含むターン。
+# 判定できないまま待ち続けないよう、上限時間を過ぎたら渡す（暫定値。プレビューで確認する）
+SHOP_INTRO_WAIT_MAX_SEC = 120
+
+# 最新情報（B）の出来事の読み方
+RECENT_EVENT_LABELS = {
+    "opened": "新規開店", "renovated": "リニューアル", "moved": "移転",
+    "concept_change": "業態変更", "renamed": "店名変更",
+}
+
 UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
     name="update_user_profile",
     behavior=types.Behavior.BLOCKING,
@@ -309,7 +347,8 @@ class LiveAPISession:
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
                  shop_search_callback=None, user_id: str = None,
-                 voice_model: str = '', live_voice: str = ''):
+                 voice_model: str = '', live_voice: str = '',
+                 shop_search_v2_start=None):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -317,6 +356,8 @@ class LiveAPISession:
         self.socketio = socketio
         self.client_sid = client_sid
         self._shop_search_callback = shop_search_callback  # v5 §5.5: ショップ検索用コールバック
+        # 新方式（SHOP_SEARCH_V2=1）: (user_request, language) → shop_search_v2.ProgressiveSearch
+        self._shop_search_v2_start = shop_search_v2_start
         self.voice_model = voice_model  # REST TTS用音声モデル名（例: ja-JP-Chirp3-HD-Leda）
         self.live_voice = live_voice    # LiveAPI用音声名（例: Leda）
         self.user_id = user_id  # 長期記憶のプロファイル更新に使用
@@ -342,6 +383,12 @@ class LiveAPISession:
         self._resume_message = None
         # ショップ紹介（LiveAPI 読み上げ）のターン待ち
         self._shop_intro_turn_pending = False
+        # 新方式: search_shops（NON_BLOCKING）をバックグラウンドで実行中のタスク
+        self._shop_search_task: asyncio.Task | None = None
+        # 現在接続中の LiveAPI セッション（再接続で入れ替わる）
+        self._active_session = None
+        # 新方式: 1 段目の読み上げ完了を待っている 2 段目（{"event", "intro_done", "ready", "delivered"}）
+        self._shop_v2_hold: dict | None = None
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -408,7 +455,9 @@ class LiveAPISession:
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
             # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+            search_decl = (SEARCH_SHOPS_DECLARATION_NON_BLOCKING if self._shop_search_v2_start
+                           else SEARCH_SHOPS_DECLARATION)
+            config["tools"] = [types.Tool(function_declarations=[search_decl, UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -478,6 +527,7 @@ class LiveAPISession:
                         model=LIVE_API_MODEL,
                         config=config
                     ) as session:
+                        self._active_session = session
 
                         if self.session_count == 1:
                             # 初回接続: ダミーメッセージで初期あいさつを発火
@@ -546,6 +596,9 @@ class LiveAPISession:
             if self._a2e_worker_task:
                 self._a2e_worker_task.cancel()
                 self._a2e_worker_task = None
+            if self._shop_search_task and not self._shop_search_task.done():
+                self._shop_search_task.cancel()
+            self._shop_search_task = None
             self.is_running = False
             logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
@@ -611,6 +664,10 @@ class LiveAPISession:
                         self.needs_reconnect = True
                     else:
                         logger.error(f"[LiveAPI] タスクエラー: {e}")
+        finally:
+            # このセッションは閉じる（以後の検索結果はこのセッションに送らない）
+            if self._active_session is session:
+                self._active_session = None
 
     async def _receive_and_forward(self, session):
         """
@@ -718,7 +775,9 @@ class LiveAPISession:
         search_shops の場合、ショップ検索を実行する。
         """
         for fc in tool_call.function_calls:
-            if fc.name == "search_shops":
+            if fc.name == "search_shops" and self._shop_search_v2_start:
+                await self._start_shop_search_v2(fc, session)
+            elif fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
@@ -783,6 +842,199 @@ class LiveAPISession:
                 )
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
+
+    # ------------------------------------------------------------
+    # 新方式（SHOP_SEARCH_V2=1）: NON_BLOCKING・2 段表示
+    # ------------------------------------------------------------
+    async def _start_shop_search_v2(self, fc, session):
+        user_request = (fc.args or {}).get("user_request", "")
+
+        # 検索中にもう一度呼ばれた場合は受け付けない（カードの入れ替わりを防ぐ）
+        if self._shop_search_task and not self._shop_search_task.done():
+            logger.info(f"[ShopSearchV2] search_shops呼び出し（検索中のため受け付けない）: '{user_request}'")
+            await session.send_tool_response(
+                function_responses=[types.FunctionResponse(
+                    name=fc.name,
+                    id=fc.id,
+                    response={"result": SHOP_SEARCH_BUSY_RESULT},
+                    scheduling=types.FunctionResponseScheduling.SILENT,
+                )]
+            )
+            return
+
+        logger.info(f"[ShopSearchV2] search_shops呼び出し（NON_BLOCKING）: '{user_request}'")
+        self.socketio.emit('shop_search_start', {}, room=self.client_sid)
+
+        # 受信ループを止めないよう、検索はバックグラウンドで実行する
+        self._shop_search_task = asyncio.create_task(
+            self._shop_search_v2_in_background(session, fc.name, fc.id, user_request)
+        )
+
+        # 検索中の無言を避けるため、お店を探していることを自分の言葉で伝えるよう促す（決まったセリフは渡さない）
+        try:
+            await session.send_realtime_input(text=SHOP_SEARCH_STARTED_NUDGE)
+            logger.info("[ShopSearchV2] 検索開始の発話を促す指示を送信")
+        except Exception as e:
+            logger.warning(f"[ShopSearchV2] 検索開始の指示送信失敗: {e}")
+
+    async def _shop_search_v2_in_background(self, session, name: str, call_id: str, user_request: str):
+        """1 段目（A の照合済み）をカード表示して返し、2 段目（最新情報の追加）が届いたら追加して返す"""
+        holder = {}
+        try:
+            await self._shop_search_v2_run(session, name, call_id, user_request, holder)
+        finally:
+            # 途中で取り消された場合も、検索用のスレッドを片付ける（close は何度呼んでもよい）
+            if holder.get("search") is not None:
+                holder["search"].close()
+
+    async def _shop_search_v2_run(self, session, name: str, call_id: str, user_request: str, holder: dict):
+        from shop_search_v2 import ShopSearchError
+        loop = asyncio.get_running_loop()
+        t0 = time.time()
+        search = None
+        try:
+            search = self._shop_search_v2_start(user_request, self.language)
+            holder["search"] = search
+            first = await loop.run_in_executor(None, search.initial)
+        except Exception as e:
+            stage = e.stage if isinstance(e, ShopSearchError) else type(e).__name__
+            logger.error(f"[ShopSearchV2] 1段目失敗 stage={stage}: {e}")
+            if search is not None:
+                search.close()
+            self.socketio.emit('shop_search_result', {'shops': [], 'response': ''}, room=self.client_sid)
+            await self._deliver_shop_response(session, name, call_id,
+                                              self._build_shop_tool_response_v2([], 1, pending=False),
+                                              will_continue=False)
+            return
+
+        shops = first["shops"]
+        pending = first["recent_pending"]
+        self.socketio.emit('shop_search_result', {
+            'shops': shops, 'response': '', 'search_id': first["search_id"], 'stage': 'initial',
+        }, room=self.client_sid)
+        logger.info(f"[ShopSearchV2] 1段目 {len(shops)}件をブラウザに送信 {time.time() - t0:.1f}秒")
+        await self._deliver_shop_response(session, name, call_id,
+                                          self._build_shop_tool_response_v2(shops, 1, pending=pending),
+                                          will_continue=pending)
+        if not pending:
+            return
+
+        # 1 段目に読み上げる店がある時は、その読み上げが終わるまで 2 段目を渡さない
+        hold = None
+        if shops:
+            hold = {"event": asyncio.Event(), "intro_done": False, "ready": None, "delivered": False}
+            self._shop_v2_hold = hold
+        try:
+            try:
+                second = await loop.run_in_executor(None, search.additions)
+                added = second["shops"]
+            except Exception as e:
+                logger.error(f"[ShopSearchV2] 2段目失敗: {e}")
+                added = []
+            if added:
+                self.socketio.emit('shop_search_append', {
+                    'shops': added, 'search_id': first["search_id"], 'stage': 'additions',
+                }, room=self.client_sid)
+                logger.info(f"[ShopSearchV2] 2段目 {len(added)}件をブラウザに追加 {time.time() - t0:.1f}秒")
+            response = self._build_shop_tool_response_v2(added, len(shops) + 1, pending=False, is_addition=True,
+                                                         shown_before=len(shops))
+            if hold is not None:
+                hold["ready"] = response
+                if not hold["intro_done"]:
+                    try:
+                        await asyncio.wait_for(hold["event"].wait(), timeout=SHOP_INTRO_WAIT_MAX_SEC)
+                    except asyncio.TimeoutError:
+                        logger.warning("[ShopSearchV2] 1段目の読み上げ完了を確認できないまま上限時間を超えたため2段目を渡す")
+                if hold["delivered"]:      # 読み上げ完了時に再接続へ引き渡し済み
+                    return
+            await self._deliver_shop_response(session, name, call_id, response, will_continue=False)
+        finally:
+            if self._shop_v2_hold is hold:
+                self._shop_v2_hold = None
+
+    async def _deliver_shop_response(self, session, name: str, call_id: str, response: dict, will_continue: bool):
+        """tool_response（WHEN_IDLE）で返す。呼び出し元の接続が再接続で閉じていれば、新しい接続にテキストで渡す"""
+        has_shops = bool(response.get("shops"))
+        if session is self._active_session and not self.needs_reconnect:
+            try:
+                await session.send_tool_response(
+                    function_responses=[types.FunctionResponse(
+                        name=name,
+                        id=call_id,
+                        response=response,
+                        will_continue=will_continue,
+                        scheduling=types.FunctionResponseScheduling.WHEN_IDLE,
+                    )]
+                )
+                logger.info(f"[ShopDesc] tool_response（WHEN_IDLE, will_continue={will_continue}）送信: "
+                            f"{len(response.get('shops') or [])}件")
+                if has_shops:
+                    self._shop_intro_turn_pending = True
+                return
+            except Exception as e:
+                logger.warning(f"[ShopDesc] tool_response送信失敗: {e}")
+
+        # 検索中に再接続が起きた: 呼び出し元のセッションは閉じているため、
+        # 同じ内容を新しい接続にテキストで渡す（接続中なら即送信、再接続中なら再接続時に送る）
+        text = SHOP_SEARCH_RESULT_AFTER_RECONNECT + json.dumps(response, ensure_ascii=False)
+        active = self._active_session
+        if active is not None:
+            try:
+                await active.send_realtime_input(text=text)
+                logger.info(f"[ShopDesc] 再接続後のセッションに検索結果を送信: {len(response.get('shops') or [])}件")
+                if has_shops:
+                    self._shop_intro_turn_pending = True
+                return
+            except Exception as e:
+                logger.warning(f"[ShopDesc] 再接続後のセッションへの送信失敗: {e}")
+        self._resume_message = text
+        logger.info(f"[ShopDesc] 再接続時に検索結果を送信予定: {len(response.get('shops') or [])}件")
+
+    def _build_shop_tool_response_v2(self, shops: list, start_no: int, pending: bool,
+                                     is_addition: bool = False, shown_before: int = 0) -> dict:
+        """新方式の tool_response。1 段目は A の照合済み、2 段目は最新情報で見つかった追加分"""
+        if not shops:
+            if is_addition:
+                if shown_before:
+                    return {"result": "最新情報の検索では、追加のお店は見つかりませんでした。"
+                                      "「気になるお店はありましたか？」と一言で締めてください。"}
+                return {"result": "条件に合うお店が見つかりませんでした。条件を変えて探すことを提案してください。"}
+            if pending:
+                return {"result": "最初の検索では、条件に合うお店を確認できませんでした。"
+                                  "最新の情報で引き続き探しているので、少し待ってほしいと一言だけ伝えてください。"}
+            return {"result": "条件に合うお店が見つかりませんでした。条件を変えて探すことを提案してください。"}
+
+        items = []
+        for i, shop in enumerate(shops, start=start_no):
+            item = {
+                "number": i,
+                "name": shop.get('name', ''),
+                "area": shop.get('area', ''),
+                "category": shop.get('category', ''),
+                "description": shop.get('description', ''),
+            }
+            recent = shop.get('recent') or {}
+            if recent.get('event_type') in RECENT_EVENT_LABELS:
+                item["recent"] = f"{recent.get('event_date') or ''} {RECENT_EVENT_LABELS[recent['event_type']]}".strip()
+            items.append(item)
+        end_no = start_no + len(shops) - 1
+        common = ("各店は「N軒目は、店名です。」から始め、エリア・ジャンル・説明を含めること。"
+                  "recent がある店は、その最新情報（開店・店名変更など）にも触れること。"
+                  "マークダウン記法や記号は使わないこと。")
+        if is_addition:
+            instruction = (
+                f"最新情報の検索で、さらに{len(shops)}軒が見つかり、画面のショップカードに追加しました。"
+                f"shops の順に{start_no}軒目から{end_no}軒目まで全て、話し言葉で紹介してください。" + common +
+                f"最後は「以上、全部で{end_no}軒のお店をご紹介しました。気になるお店はありましたか？」で締めること。"
+            )
+        else:
+            closing = ("最後は「最新の開店情報も確認していますので、少々お待ちください。」で締めること。" if pending else
+                       f"最後は「以上、{end_no}軒のお店をご紹介しました。気になるお店はありましたか？」で締めること。")
+            instruction = (
+                f"検索結果の{len(shops)}軒をショップカードとしてユーザーの画面に表示しました。"
+                f"shops の順に1軒目から{end_no}軒目まで全て、話し言葉で紹介してください。" + common + closing
+            )
+        return {"result": instruction, "shops": items}
 
     async def _handle_shop_search(self, user_request: str):
         """
@@ -919,6 +1171,23 @@ class LiveAPISession:
                 if self.needs_reconnect:
                     # 旧 REST 方式の読み上げ後と同じ再開メッセージ（「続きをお願いします」で再度読み上げさせない）
                     self._resume_message = "ありがとうございます。気になるお店について教えてください。"
+
+            # 新方式: 1 段目の読み上げターンが終わったら、待たせている 2 段目を渡す
+            # （上の再開メッセージより後に置く: 再接続する場合は 2 段目の内容で上書きする）
+            hold = self._shop_v2_hold
+            if hold is not None and not hold["intro_done"] and "軒目" in ai_text:
+                hold["intro_done"] = True
+                if hold["ready"] is not None and self.needs_reconnect:
+                    # この後すぐ再接続する: 新しい接続の最初のメッセージとして渡す
+                    self._resume_message = (SHOP_SEARCH_RESULT_AFTER_RECONNECT
+                                            + json.dumps(hold["ready"], ensure_ascii=False))
+                    hold["delivered"] = True
+                    if hold["ready"].get("shops"):
+                        self._shop_intro_turn_pending = True
+                    logger.info("[ShopSearchV2] 1段目の読み上げ完了: 2段目を再接続時に渡す")
+                else:
+                    logger.info("[ShopSearchV2] 1段目の読み上げ完了")
+                hold["event"].set()
 
     async def _describe_shops_via_live(self, shops: list):
         """
