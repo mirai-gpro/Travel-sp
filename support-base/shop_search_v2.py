@@ -497,15 +497,19 @@ def _norm_name(s: str) -> str:
 
 
 def name_overlaps(cand_name: str, place_name: str, areas) -> bool:
-    """候補名からエリア名（と「エリア名+店/本店」）を除いた中核部分が、Places の店名に含まれるか（またはその逆）"""
-    cand, place = _norm_name(cand_name), _norm_name(place_name)
+    """候補名と Places の店名から、エリア名（と「エリア名+店/本店」）を除いた中核部分の一方が他方に含まれるか"""
+    area_keys = sorted({_norm_name(x) for x in areas if x}, key=len, reverse=True)
+
+    def core(s):
+        s = _norm_name(s)
+        for a in area_keys:
+            for suffix in ("本店", "店", ""):
+                s = s.replace(a + suffix, "")
+        return s
+    cand, place = core(cand_name), core(place_name)
     if not cand or not place:
         return False
-    core = cand
-    for a in sorted({_norm_name(x) for x in areas if x}, key=len, reverse=True):
-        for suffix in ("本店", "店", ""):
-            core = core.replace(a + suffix, "")
-    return bool(core) and (core in place or place in cand)
+    return cand in place or place in cand
 
 
 def legacy_text_search_results(name: str, area: str, geo_info, language: str) -> list | None:
