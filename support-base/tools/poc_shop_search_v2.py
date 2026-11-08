@@ -140,6 +140,7 @@ def main():
     p2.add_argument("--runs", type=int, default=1)
     p2.add_argument("--gap", type=int, default=3, help="検索ごとの間隔（秒）。429 回避用")
     p2.add_argument("--llm-timeout", type=int, default=None, help="LLM のタイムアウト（秒）。既定は v2 の値")
+    p2.add_argument("--knowledge-model", default=None, help="A と順位づけのモデル（比較用。本番の設定は変えない）")
     args = ap.parse_args()
 
     places_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
@@ -154,6 +155,11 @@ def main():
         return
     if args.llm_timeout:
         v2.LLM_TIMEOUT_MS = args.llm_timeout * 1000
+    if args.knowledge_model:
+        v2.KNOWLEDGE_MODEL = args.knowledge_model
+        v2.RANK_MODEL = args.knowledge_model
+    print(json.dumps({"knowledge_model": v2.KNOWLEDGE_MODEL, "rank_model": v2.RANK_MODEL,
+                      "recent_model": v2.RECENT_MODEL, "llm_timeout_ms": v2.LLM_TIMEOUT_MS}), flush=True)
     q_idx = range(len(QUERIES)) if args.queries == "all" else [int(x) for x in args.queries.split(",")]
     pocs = [p for p in args.pocs.split(",") if p in ("A", "B")]
     run(client, places_key, pocs, q_idx, args.runs, args.gap)
