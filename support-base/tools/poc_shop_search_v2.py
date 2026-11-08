@@ -50,30 +50,32 @@ def usage(resp):
             ("prompt_token_count", "candidates_token_count", "thoughts_token_count", "total_token_count")}
 
 
-def probe(client, timeout_s, gap_s):
+def probe(client, timeout_s, gap_s, model):
     http = types.HttpOptions(timeout=timeout_s * 1000)
+    # gemini-2.x は thinking_level に対応しないため指定しない（比較用）
+    think = (None if model.startswith("gemini-2")
+             else types.ThinkingConfig(thinking_level="low"))
     steps = [
         ("minimal", "こんにちは。一言で返事してください。", types.GenerateContentConfig(http_options=http)),
         ("minimal-low", "こんにちは。一言で返事してください。",
-         types.GenerateContentConfig(http_options=http,
-                                     thinking_config=types.ThinkingConfig(thinking_level="low"))),
+         types.GenerateContentConfig(http_options=http, thinking_config=think)),
         ("knowledge", f"希望条件: {QUERIES[1][2]}",
          types.GenerateContentConfig(
              system_instruction=v2.KNOWLEDGE_INSTRUCTION.format(min_n=v2.KNOWLEDGE_MIN, max_n=v2.KNOWLEDGE_MAX,
                                                                 language="日本語"),
              response_mime_type="application/json", response_json_schema=v2.KNOWLEDGE_SCHEMA,
-             thinking_config=types.ThinkingConfig(thinking_level="low"), http_options=http)),
+             thinking_config=think, http_options=http)),
     ]
     for i, (label, contents, cfg) in enumerate(steps):
         if i:
             time.sleep(gap_s)
         t0 = time.monotonic()
         try:
-            resp = client.models.generate_content(model=v2.KNOWLEDGE_MODEL, contents=contents, config=cfg)
-            out = {"step": label, "ok": True, "sec": round(time.monotonic() - t0, 2),
+            resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+            out = {"model": model, "step": label, "ok": True, "sec": round(time.monotonic() - t0, 2),
                    "usage": usage(resp), "text_len": len(resp.text or "")}
         except Exception as e:
-            out = {"step": label, "ok": False, "sec": round(time.monotonic() - t0, 2),
+            out = {"model": model, "step": label, "ok": False, "sec": round(time.monotonic() - t0, 2),
                    "error": f"{type(e).__name__}: {str(e)[:160]}"}
         print(json.dumps(out, ensure_ascii=False), flush=True)
 
@@ -131,6 +133,7 @@ def main():
     p1 = sub.add_parser("probe")
     p1.add_argument("--timeout", type=int, default=90)
     p1.add_argument("--gap", type=int, default=10)
+    p1.add_argument("--model", default=v2.KNOWLEDGE_MODEL, help="比較用。本番の設定は変えない")
     p2 = sub.add_parser("run")
     p2.add_argument("--pocs", default="A,B")
     p2.add_argument("--queries", default="all")
@@ -147,7 +150,7 @@ def main():
     client = genai.Client(api_key=gemini_key)
 
     if args.cmd == "probe":
-        probe(client, args.timeout, args.gap)
+        probe(client, args.timeout, args.gap, args.model)
         return
     if args.llm_timeout:
         v2.LLM_TIMEOUT_MS = args.llm_timeout * 1000
