@@ -127,6 +127,7 @@ KNOWLEDGE_SCHEMA = {
     "properties": {
         # 列挙値（enum）をスキーマに入れると 400 INVALID_ARGUMENT になったため、一覧は指示文で渡し、コードで絞る
         "genre_types": {"type": "array", "items": {"type": "string"}},
+        "genre_exact": {"type": "boolean"},
         "candidates": {
             "type": "array",
             "maxItems": KNOWLEDGE_MAX,
@@ -142,7 +143,7 @@ KNOWLEDGE_SCHEMA = {
             },
         }
     },
-    "required": ["genre_types", "candidates"],
+    "required": ["genre_types", "genre_exact", "candidates"],
 }
 
 KNOWLEDGE_INSTRUCTION = """あなたはグルメに詳しいレストランのコンシェルジュです。
@@ -159,6 +160,8 @@ KNOWLEDGE_INSTRUCTION = """あなたはグルメに詳しいレストランの�
    （例: 焼き鳥 → yakitori_restaurant, chicken_restaurant / 居酒屋 → japanese_izakaya_restaurant）。
    希望条件にジャンルの指定がなければ空配列。
    一覧: {food_types}
+7. genre_exact は、genre_types の中に希望ジャンルそのものを表すタイプがあれば true。
+   一覧に希望ジャンルのタイプが無く、近いタイプしか選べなかった場合は false（例: 串揚げ → japanese_restaurant, false）。
 出力は指定された JSON スキーマのみ。"""
 
 
@@ -202,6 +205,9 @@ def knowledge_call(client, user_request: str, language: str) -> tuple:
         if len(out) >= KNOWLEDGE_MAX:
             break
     genre_types = [t for t in (data.get("genre_types") or []) if t in FOOD_TYPES]
+    # 希望ジャンルそのもののタイプが一覧に無い場合（串揚げ等）は、ジャンル判定に使わない
+    if data.get("genre_exact") is not True:
+        genre_types = []
     return out, genre_types
 
 

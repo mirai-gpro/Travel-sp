@@ -220,7 +220,7 @@ class TestFlow(unittest.TestCase):
 
     def test_gates_observe_and_enforce(self):
         def gem():
-            return FakeGemini({"gemini-3.8-flash": json.dumps({"genre_types": ["yakitori_restaurant"], "candidates": [
+            return FakeGemini({"gemini-3.8-flash": json.dumps({"genre_types": ["yakitori_restaurant"], "genre_exact": True, "candidates": [
                 {"name": n, "area": "恵比寿", "genre": "焼き鳥", "reason": ""} for n in ("鳥幸", "地鶏やおまへん")]},
                 ensure_ascii=False)})
         table = {"鳥幸": legacy_place("A", "鳥幸"), "地鶏やおまへん": legacy_place("B", "食鶏 しまや")}

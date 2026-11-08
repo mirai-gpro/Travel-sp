@@ -28,12 +28,21 @@ class TestKnowledge(unittest.TestCase):
         self.assertNotIn("enum", json.dumps(call["config"].response_json_schema))       # enum は 400 になったため使わない
 
     def test_genre_types_filtered_to_official_list(self):
-        text = {"genre_types": ["yakitori_restaurant", "made_up_type", "chicken_restaurant"],
+        text = {"genre_types": ["yakitori_restaurant", "made_up_type", "chicken_restaurant"], "genre_exact": True,
                 "candidates": [{"name": "鳥幸", "area": "恵比寿", "genre": "焼き鳥", "reason": ""}]}
         g = FakeGemini({"gemini-3.8-flash": json.dumps(text, ensure_ascii=False)})
         cands, types = v2.knowledge_call(g, "q", "ja")
         self.assertEqual(types, ["yakitori_restaurant", "chicken_restaurant"])
         self.assertEqual([c["name"] for c in cands], ["鳥幸"])
+
+    def test_genre_types_dropped_when_not_exact(self):
+        # 串揚げは Places に専用タイプが無い。近いタイプだけでは判定しない（PoC で「串揚げ 豊」が bar 扱いで外れたため）
+        for exact in (False, None):
+            text = {"genre_types": ["japanese_restaurant"], "candidates": []}
+            if exact is not None:
+                text["genre_exact"] = exact
+            _, types = v2.knowledge_call(FakeGemini({"gemini-3.8-flash": json.dumps(text)}), "q", "ja")
+            self.assertEqual(types, [])
 
     def test_more_than_max_truncated_and_incomplete_items_skipped(self):
         cands = [(f"店{i}", "恵比寿") for i in range(10)]
