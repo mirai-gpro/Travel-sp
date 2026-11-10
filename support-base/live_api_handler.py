@@ -11,8 +11,10 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import base64
+import functools
 import os
 import logging
+import re
 import struct
 import time
 import httpx
@@ -136,7 +138,8 @@ def build_system_instruction(mode: str, user_profile: dict = None,
     if mode == 'concierge':
         # ユーザープロファイルに応じた初期あいさつ指示を構築
         user_context = _build_concierge_user_context(user_profile)
-        return base_prompt.replace('{user_context}', user_context)
+        # v11 の後ろに Live 用の規則を足す（R1.4 §6.3）
+        return base_prompt.replace('{user_context}', user_context) + concierge_live_rules(language)
     elif mode == 'lesson':
         # レッスンモード: 講師名・ユーザー名・user_contextを埋め込む
         teacher_name = (user_profile or {}).get('lesson_teacher_name', 'Lisa')
@@ -266,6 +269,94 @@ UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
     )
 )
 
+# コンシェルジュだけが使う（R1.4 §6.1）。ネットワークは使わず SupportSession を読むだけ
+GET_CURRENT_SHOPS_DECLARATION = types.FunctionDeclaration(
+    name="get_current_shops",
+    behavior=types.Behavior.BLOCKING,
+    description="画面に表示している最新の確定店（版・紹介の印つき）を返す。画面の店はキーボード操作でも変わるので、お店について答える前に必ず呼ぶこと。",
+    parameters=types.Schema(type="OBJECT", properties={}),
+)
+
+
+# ============================================================
+# コンシェルジュの Live 用規則・紹介の記録・再開文（R1.4 §6.3〜§6.5）
+# 文面は草案で、実装前の承認（D-4）を受けて確定する
+# ============================================================
+
+# 紹介の言い出し（言語ごと）。{n} は店の番号
+CONCIERGE_INTRO_LEADS = {
+    'ja': '{n}軒目は、',
+    'en': 'Number {n} is',
+    'zh': '第{n}家是',
+    'ko': '{n}번째는',
+}
+
+_KANJI_NUMS = {1: '一', 2: '二', 3: '三', 4: '四', 5: '五'}
+_EN_WORDS = {1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five'}
+_ZENKAKU = {i: chr(ord('０') + i) for i in range(10)}
+
+
+def _intro_lead_pattern(language: str, n: int):
+    """文の頭に「n 番目の言い出し」が出たかを見る正規表現（算用数字・漢数字。店名では判定しない）"""
+    num = f"(?:{n}|{_ZENKAKU[n]}|{_KANJI_NUMS.get(n, str(n))})"
+    head = r'(?:^|(?<=[。．.!！?？\s]))\s*'
+    if language == 'en':
+        return re.compile(head + rf'number\s*(?:{n}|{_EN_WORDS.get(n, str(n))})\s+is\b', re.IGNORECASE)
+    if language == 'zh':
+        return re.compile(head + rf'第\s*{num}\s*家\s*是')
+    if language == 'ko':
+        return re.compile(head + rf'{num}\s*번째\s*는')
+    return re.compile(head + rf'{num}\s*軒目\s*は')
+
+
+# 紹介の印
+MARK_NOT_STARTED = 'not_started'
+MARK_IN_PROGRESS = 'in_progress'
+MARK_DONE = 'done'
+MARK_INTERRUPTED = 'interrupted'
+MARK_UNKNOWN = 'unknown'
+MARK_SCREEN_ONLY = 'screen_only'
+
+_MARK_LABELS_JA = {
+    MARK_NOT_STARTED: 'まだ',
+    MARK_IN_PROGRESS: '紹介中',
+    MARK_DONE: '紹介済み',
+    MARK_INTERRUPTED: '途中で中断',
+    MARK_UNKNOWN: '不明',
+    MARK_SCREEN_ONLY: '画面に表示済み・音声では未紹介',
+}
+
+CONCIERGE_RESUME_TEXTS = {
+    'ja': {'continue': '{j}軒目のお店から紹介を続けてください。',
+           'done': 'ありがとうございます。気になるお店について教えてください。',
+           'unknown': 'どのお店について詳しく話すか、利用者に尋ねてください。'},
+    'en': {'continue': 'Please continue the introduction from restaurant number {j}.',
+           'done': 'Thank you. Please tell me which restaurant interests you.',
+           'unknown': 'Please ask the user which restaurant they would like to hear more about.'},
+    'zh': {'continue': '请从第{j}家餐厅继续介绍。',
+           'done': '谢谢。请告诉我您对哪家餐厅感兴趣。',
+           'unknown': '请询问用户想详细了解哪家餐厅。'},
+    'ko': {'continue': '{j}번째 식당부터 소개를 계속해 주세요.',
+           'done': '감사합니다. 관심 있는 식당을 알려주세요.',
+           'unknown': '어느 식당에 대해 자세히 이야기할지 사용자에게 물어봐 주세요.'},
+}
+
+
+def concierge_live_rules(language: str) -> str:
+    """Live 用の規則（コードの定数。v11 の後ろに足す。R1.4 §6.3）"""
+    lead = CONCIERGE_INTRO_LEADS.get(language, CONCIERGE_INTRO_LEADS['ja']).format(n='N')
+    return f"""
+
+【音声の会話の規則（コンシェルジュ）】
+- 条件を確認して同意を得てから search_shops を呼ぶ。呼ぶときは話さない。
+- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・エリア・ジャンル・推薦理由を簡潔に紹介する。N は店の番号。
+- status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が fresh_disabled のときは、最近開店したお店の検索は準備中だと伝え、通常の探し方でよいか尋ねる。
+- status が error のときは一時的に探せなかったと伝える。busy のときは前の検索を続けていると伝える。superseded のときは、新しい検索を受け付けたため、この検索の結果は表示しなかったと伝える。
+- 画面の店はキーボード操作でも変わる。お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。
+- 店の印（mark）に従う。done（紹介済み）の店は繰り返さない。interrupted（途中で中断）の店は、その店の最初から紹介する。screen_only は画面に表示済みで、音声ではまだ紹介していない店。
+- JSON・項目名・状態の名前を読み上げない。
+"""
+
 
 # ============================================================
 # LiveAPISession クラス
@@ -309,7 +400,8 @@ class LiveAPISession:
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
                  shop_search_callback=None, user_id: str = None,
-                 voice_model: str = '', live_voice: str = ''):
+                 voice_model: str = '', live_voice: str = '',
+                 shops_store=None):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -342,6 +434,10 @@ class LiveAPISession:
         self._resume_message = None
         # ショップ紹介（LiveAPI 読み上げ）のターン待ち
         self._shop_intro_turn_pending = False
+
+        # コンシェルジュ：確定店の置き場所（SupportSession。R1.4 §7）と紹介の記録（§6.4）
+        self._shops_store = shops_store
+        self._intro = None
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -402,8 +498,17 @@ class LiveAPISession:
             },
         }
 
+        # コンシェルジュの再接続：最新の確定店と店ごとの印を足す（R1.4 §6.5）
+        if self.mode == 'concierge' and self.session_count > 1:
+            shops_context = self._concierge_shops_context()
+            if shops_context:
+                config["system_instruction"] = instruction + shops_context
+
         # モードに応じたfunction calling定義
-        if self.mode == 'lesson':
+        if self.mode == 'concierge':
+            config["tools"] = [types.Tool(function_declarations=[
+                SEARCH_SHOPS_DECLARATION, GET_CURRENT_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+        elif self.mode == 'lesson':
             # lessonモードはショップ検索不要、プロファイル更新のみ
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
@@ -661,6 +766,9 @@ class LiveAPISession:
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
+                        # コンシェルジュ：紹介中の店を「中断」にして紹介の記録を終える（R1.4 §6.4）
+                        if self.mode == 'concierge' and self._intro:
+                            self._interrupt_intro()
                         # ★ A2E: 割り込み時はキュークリア（未送信チャンク破棄）
                         self._clear_a2e_queue()
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
@@ -687,6 +795,9 @@ class LiveAPISession:
                         text = sc.output_transcription.text
                         if text:
                             self.ai_transcript_buffer += text
+                            # コンシェルジュ：AI の文字起こしから紹介の言い出しを見る（R1.4 §6.4）
+                            if self.mode == 'concierge' and self._intro:
+                                self._record_intro_text(text)
                             self.socketio.emit('ai_transcript',
                                                {'text': text},
                                                room=self.client_sid)
@@ -717,7 +828,22 @@ class LiveAPISession:
         LLMからのfunction calling応答を処理する（v5 §5.4）
         search_shops の場合、ショップ検索を実行する。
         """
+        concierge_searched = False
         for fc in tool_call.function_calls:
+            # コンシェルジュ（R1.4 §6.1・§6.2）。chat モードは下の既存の処理のまま
+            if self.mode == 'concierge' and fc.name == "search_shops":
+                if concierge_searched:
+                    # 1 つの tool_call に search_shops が複数あれば最初の 1 つだけ実行する
+                    await session.send_tool_response(function_responses=[types.FunctionResponse(
+                        name=fc.name, id=fc.id, response={"status": "busy"})])
+                    continue
+                concierge_searched = True
+                await self._handle_concierge_search(fc, session)
+                continue
+            if self.mode == 'concierge' and fc.name == "get_current_shops":
+                await session.send_tool_response(function_responses=[types.FunctionResponse(
+                    name=fc.name, id=fc.id, response=self._concierge_current_shops_payload())])
+                continue
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
@@ -873,6 +999,177 @@ class LiveAPISession:
         )
         return {"result": instruction, "shops": items}
 
+    # ========================================
+    # コンシェルジュ（R1.4 §6）。mode が concierge のときだけ呼ばれる
+    # ========================================
+
+    def _concierge_state(self):
+        """(確定店, 版, 印) か None（このインスタンスに SupportSession がない）"""
+        if not self._shops_store:
+            return None
+        return self._shops_store.get_shops_state()
+
+    @staticmethod
+    def _concierge_items(shops: list, marks: dict) -> list:
+        """会話用の項目に印を付ける（place_id は LLM に渡さない）"""
+        items = []
+        for s in shops:
+            item = {k: s.get(k, '') for k in ('order', 'name', 'area', 'genre', 'specialty',
+                                              'atmosphere', 'price_estimate', 'reason')}
+            if s.get('opened'):
+                item['opened'] = s['opened']
+            item['mark'] = marks.get(s.get('order'), MARK_NOT_STARTED)
+            items.append(item)
+        return items
+
+    def _concierge_current_shops_payload(self) -> dict:
+        """get_current_shops の応答（R1.4 §6.1）"""
+        state = self._concierge_state()
+        if state is None:
+            return {"status": "unavailable"}
+        shops, version, marks = state
+        if not shops:
+            return {"status": "none", "shops_version": version, "shops": []}
+        return {"status": "ok", "shops_version": version, "shops": self._concierge_items(shops, marks)}
+
+    def _concierge_search_payload(self, out: dict) -> dict:
+        """search_shops の tool_response。指示文は入れない（紹介の仕方は Live 用規則。R1.4 §6.2）"""
+        payload = {
+            "status": out.get('status'),
+            "reason_code": out.get('reason_code'),
+            "found_count": out.get('found_count', 0),
+            "shops_version": out.get('shops_version'),
+        }
+        state = self._concierge_state()
+        if state is not None:
+            shops, version, marks = state
+            payload["shops_version"] = version
+            payload["shops"] = self._concierge_items(shops, marks)
+        elif out.get('status') == 'complete':
+            # SupportSession がない（共有できない）ときは、この検索の結果で紹介する
+            payload["shops"] = self._concierge_items(out.get('shops', []), {})
+        else:
+            payload["shops"] = []
+        return payload
+
+    async def _handle_concierge_search(self, fc, session):
+        """コンシェルジュの search_shops（R1.4 §6.2）"""
+        user_request = fc.args.get("user_request", "")
+        logger.info(f"[Concierge] search_shops呼び出し: '{user_request}'")
+        seq = self._shops_store.begin_search() if self._shops_store else None
+        self.socketio.emit('shop_search_start', {'search_seq': seq}, room=self.client_sid)
+
+        out = None
+        if self._shop_search_callback:
+            try:
+                loop = asyncio.get_event_loop()
+                out = await loop.run_in_executor(
+                    None, functools.partial(self._shop_search_callback, user_request,
+                                            self.language, self.mode, seq))
+            except Exception as e:
+                logger.error(f"[Concierge] 検索の例外: {type(e).__name__}", exc_info=True)
+        if not out:
+            out = {'status': 'error', 'reason_code': 'exception', 'source': None, 'found_count': 0,
+                   'shops': [], 'cards': [], 'shops_version': None}
+
+        complete = out.get('status') == 'complete'
+        self.socketio.emit('shop_search_result', {
+            'session_id': self.session_id,
+            'search_seq': seq,
+            'status': out.get('status'),
+            'reason_code': out.get('reason_code'),
+            'source': out.get('source'),
+            'shops_version': out.get('shops_version'),
+            'found_count': out.get('found_count', 0),
+            'shops': out.get('cards', []) if complete else [],
+            'response': '',
+        }, room=self.client_sid)
+
+        await session.send_tool_response(function_responses=[types.FunctionResponse(
+            name=fc.name, id=fc.id, response=self._concierge_search_payload(out))])
+        if complete:
+            self._shop_intro_turn_pending = True
+            self._start_intro(out.get('shops_version'), len(out.get('shops', [])))
+            logger.info(f"[Concierge] complete: {len(out.get('shops', []))}店を tool_response で送信")
+
+    # ---- 紹介の記録（R1.4 §6.4）。サーバーだけで記録する ----
+
+    def _start_intro(self, version, count: int):
+        self._intro = {'version': version, 'count': count, 'current': 0, 'text': '', 'pos': 0, 'marks': {}}
+
+    def _set_mark(self, order: int, mark: str):
+        self._intro['marks'][order] = mark
+        if self._shops_store and self._intro.get('version') is not None:
+            self._shops_store.set_intro_mark(self._intro['version'], order, mark)
+
+    def _record_intro_text(self, text: str):
+        """文の頭に「次の番号の言い出し」が出たら、前の店を完了・次の店を紹介中にする"""
+        intro = self._intro
+        intro['text'] += text
+        while intro['current'] < intro['count']:
+            n = intro['current'] + 1
+            m = _intro_lead_pattern(self.language, n).search(intro['text'], intro['pos'])
+            if not m:
+                break
+            if intro['current'] > 0:
+                self._set_mark(intro['current'], MARK_DONE)
+            self._set_mark(n, MARK_IN_PROGRESS)
+            intro['current'] = n
+            intro['pos'] = m.end()
+
+    def _interrupt_intro(self):
+        """紹介中のまま割り込み（interrupted）が起きたら「中断」"""
+        if self._intro['current'] > 0:
+            self._set_mark(self._intro['current'], MARK_INTERRUPTED)
+        else:
+            self._mark_all_unknown()
+        self._intro = None
+        self._shop_intro_turn_pending = False
+
+    def _mark_all_unknown(self):
+        for order in range(1, self._intro['count'] + 1):
+            if self._intro['marks'].get(order) not in (MARK_DONE, MARK_INTERRUPTED):
+                self._set_mark(order, MARK_UNKNOWN)
+
+    def _finish_intro(self, is_incomplete: bool):
+        """紹介のターンの終わり。言い出しが一つも出なければ「不明」、途切れなら「中断」、最後まで行けば「完了」"""
+        if not self._intro:
+            return
+        current = self._intro['current']
+        if current == 0:
+            self._mark_all_unknown()
+        elif is_incomplete:
+            self._set_mark(current, MARK_INTERRUPTED)
+        elif current == self._intro['count']:
+            self._set_mark(current, MARK_DONE)
+
+    def _concierge_resume_text(self) -> str:
+        """紹介ターンの後の再開文を印から決める（R1.4 §6.5。914–919 の固定文の置き換え）"""
+        texts = CONCIERGE_RESUME_TEXTS.get(self.language, CONCIERGE_RESUME_TEXTS['ja'])
+        intro, self._intro = self._intro, None
+        if not intro:
+            return texts['done']
+        marks = intro['marks']
+        if intro['current'] == 0:
+            return texts['unknown']
+        for order in range(1, intro['count'] + 1):
+            if marks.get(order) != MARK_DONE:
+                return texts['continue'].format(j=order)
+        return texts['done']
+
+    def _concierge_shops_context(self) -> str:
+        """再接続のときの system_instruction に足す、最新の確定店と店ごとの印（R1.4 §6.5）"""
+        state = self._concierge_state()
+        if not state or not state[0]:
+            return ""
+        shops, version, marks = state
+        lines = ["", "", f"【最新の確定店と紹介の印（画面のカードと同じ。版 {version}）】"]
+        for item in self._concierge_items(shops, marks):
+            lines.append(f"{item['order']}. {item['name']}（{item['area']}） / {item['genre']} / "
+                         f"推薦理由: {item['reason']} / 印: {_MARK_LABELS_JA.get(item['mark'], item['mark'])}")
+        lines.append("再送した会話履歴は途中で切れているので、どこまで紹介したかは上の印に従う。")
+        return "\n".join(lines)
+
     def _process_turn_complete(self):
         """
         ターン完了時の処理
@@ -916,7 +1213,12 @@ class LiveAPISession:
             if self._shop_intro_turn_pending:
                 self._shop_intro_turn_pending = False
                 logger.info(f"[ShopDesc] LiveAPI読み上げ完了: {char_count}文字")
-                if self.needs_reconnect:
+                if self.mode == 'concierge':
+                    # 紹介の記録を締め、再開文を印から決める（R1.4 §6.4・§6.5）
+                    self._finish_intro(is_incomplete)
+                    if self.needs_reconnect:
+                        self._resume_message = self._concierge_resume_text()
+                elif self.needs_reconnect:
                     # 旧 REST 方式の読み上げ後と同じ再開メッセージ（「続きをお願いします」で再度読み上げさせない）
                     self._resume_message = "ありがとうございます。気になるお店について教えてください。"
 
