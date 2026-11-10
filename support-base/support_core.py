@@ -9,6 +9,7 @@ import os
 import json
 import uuid
 import logging
+import threading
 from datetime import datetime
 from google import genai
 from google.genai import types
@@ -34,6 +35,10 @@ gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # RAMベースのセッション管理 (Firestore完全廃止)
 # ========================================
 _SESSION_CACHE = {}
+
+# 確定店の操作（begin_search・commit_shops・紹介の印）はプロセスで 1 つのロックの中で行う
+# （キーボードは Flask のスレッド、Live の検索は run_in_executor のスレッドで動くため。R1.4 §7）
+_SHOPS_LOCK = threading.Lock()
 
 # ========================================
 # プロンプト読み込み (GCS優先、ローカルフォールバック)
@@ -170,6 +175,27 @@ def load_system_prompts():
 
 # プロンプト読み込み実行(モジュールロード時)
 SYSTEM_PROMPTS = load_system_prompts()
+
+
+def load_concierge_v11():
+    """
+    コンシェルジュ専用の共通プロンプト v11（R1.4 §5.2・§11 #3）。
+    GCS は変えず、イメージに含めた prompts/concierge_v11_{lang}.txt だけを読む（PR-01）。
+    ない言語は登録しない（その言語のコンシェルジュは「現在ご利用いただけません」を返す。§9）。
+    """
+    prompts = {}
+    for lang in ['ja', 'en', 'zh', 'ko']:
+        path = f'prompts/concierge_v11_{lang}.txt'
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                prompts[lang] = f.read()
+            logger.info(f"[Prompt] v11 読み込み成功: concierge_v11_{lang}.txt")
+        except FileNotFoundError:
+            logger.warning(f"[Prompt] v11 がありません: {path}")
+    return prompts
+
+
+CONCIERGE_V11 = load_concierge_v11()
 INITIAL_GREETINGS = {
     'chat': {
         'ja': 'こんにちは!お店探しをお手伝いします。どのようなお店をお探しですか?(例:新宿で美味しいイタリアン、明日19時に予約できる焼肉店など)',
@@ -204,6 +230,137 @@ FINAL_SUMMARY_TEMPLATES = {
     'zh': '$8BF7$603B$7ED3以下整个$5BF9$8BDD并整理咨$8BE2内容。\n\n{conversation_text}\n\n$521B建$65F6$95F4:{timestamp}\n\n$603B$7ED3:',
     'ko': '$B2E4$C74C $B300$D654$B97C $D55C $BB38$C7A5$C73C$B85C $C694$C57D$D558$C138$C694.\n\n$C0AC$C6A9$C790: {user_message}\n$C5B4$C2DC$C2A4$D134$D2B8: {assistant_response}\n\n$C694$C57D:'
 }
+
+# ========================================
+# コンシェルジュのキーボード会話（R1.4 §5）
+# 文面は草案で、実装前の承認（D-4）を受けて確定する。モデルは §4.1（D-3）
+# ========================================
+CONCIERGE_C1_MODEL = 'gemini-3.6-flash'
+CONCIERGE_C2_MODEL = 'gemini-3.5-flash-lite'
+CONCIERGE_LLM_TIMEOUT_MS = 20000  # concierge_recommender.LLM_TIMEOUT_MS と同じ（推奨値）
+
+CONCIERGE_C1_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'message': {'type': 'string'},
+        'action': {
+            'type': 'object',
+            'properties': {
+                'type': {'type': 'string'},
+                'updates': {
+                    'type': 'object',
+                    'properties': {
+                        'preferred_name': {'type': 'string'},
+                        'name_honorific': {'type': 'string'},
+                    },
+                },
+            },
+            'required': ['type', 'updates'],
+        },
+        'shop_request': {
+            'type': 'object',
+            'properties': {'user_request': {'type': 'string'}},
+            'required': ['user_request'],
+        },
+    },
+    'required': ['message'],
+}
+
+CONCIERGE_REST_RULES = """
+【文字の会話の規則（キーボード）】
+- 返答は指定された JSON スキーマに従う。message は画面に出す文章で、マークダウンや記号の装飾を使わない。
+- 推薦を依頼するときは shop_request.user_request に、確認した条件を全て入れる。このとき message は短い前置きだけにし、店名を書かない。
+- 推薦を依頼しないときは shop_request を出さない。追質問か新しい推薦かは、会話の意味で判断する。
+- 名前の登録・変更の意図が明確なときだけ action を出す（type は update_user_profile、updates に preferred_name と name_honorific）。
+- お店について聞かれたら、下の【現在の確定店】の情報だけで答える。そこにない店名を挙げない。営業時間・評価・住所は答えず、画面のカードを案内する。
+"""
+
+CONCIERGE_TEXTS = {
+    'ja': {
+        'intro': 'ご希望に合うお店を 5 件ご紹介します。',
+        'too_few': '条件に合うと確認できたお店は {n} 軒で、5 軒に届きませんでした。エリア・予算・ジャンルなど、少し広げてもよい条件はありますか？',
+        'fresh_disabled': '最近開店したお店の検索は準備中です。通常の探し方でお探ししてもよろしいでしょうか？',
+        'superseded': '新しい検索を受け付けたため、この検索の結果は表示しませんでした。',
+        'summary': '5軒のお店を提案しました。',
+        'unsupported_language': 'この言語では現在ご利用いただけません。',
+        'no_shops': 'まだご提案したお店はありません。',
+    },
+    'en': {
+        'intro': 'Here are 5 restaurants that match your request.',
+        'too_few': 'We could confirm only {n} restaurants matching your conditions, short of 5. Is there a condition such as area, budget or cuisine that we could relax?',
+        'fresh_disabled': 'Searching for newly opened restaurants is not available yet. Shall I search in the usual way instead?',
+        'superseded': 'A newer search was received, so the results of this search were not shown.',
+        'summary': 'Suggested 5 restaurants.',
+        'unsupported_language': 'This language is currently not available.',
+        'no_shops': 'No restaurants have been suggested yet.',
+    },
+    'zh': {
+        'intro': '为您推荐 5 家符合要求的餐厅。',
+        'too_few': '能确认符合条件的餐厅只有 {n} 家，不足 5 家。地区、预算、菜系等条件中，有可以放宽的吗？',
+        'fresh_disabled': '新开餐厅的搜索功能尚在准备中。可以按通常的方式为您搜索吗？',
+        'superseded': '由于收到了新的搜索请求，本次搜索结果未予显示。',
+        'summary': '推荐了5家餐厅。',
+        'unsupported_language': '目前暂不支持该语言。',
+        'no_shops': '目前还没有推荐的餐厅。',
+    },
+    'ko': {
+        'intro': '조건에 맞는 식당 5곳을 소개해 드립니다.',
+        'too_few': '조건에 맞는 것으로 확인된 식당은 {n}곳으로 5곳에 미치지 못했습니다. 지역, 예산, 장르 등 조금 넓혀도 되는 조건이 있으신가요?',
+        'fresh_disabled': '최근 개업한 식당 검색은 준비 중입니다. 일반적인 방법으로 찾아 드려도 될까요?',
+        'superseded': '새로운 검색을 받았기 때문에 이번 검색 결과는 표시하지 않았습니다.',
+        'summary': '5곳의 식당을 제안했습니다.',
+        'unsupported_language': '이 언어는 현재 이용하실 수 없습니다.',
+        'no_shops': '아직 제안한 식당이 없습니다.',
+    },
+}
+
+CONCIERGE_ERROR_TEXTS = {
+    'ja': 'エラーが発生しました。もう一度お試しください。',
+    'en': 'An error occurred. Please try again.',
+    'zh': '発生錯誤。請重試。',
+    'ko': '오류가 발생했습니다. 다시 시도해주세요.',
+}
+
+
+def concierge_text(language: str, key: str, **kw) -> str:
+    texts = CONCIERGE_TEXTS.get(language, CONCIERGE_TEXTS['ja'])
+    return texts[key].format(**kw)
+
+
+def format_concierge_shops_for_llm(shops: list, version: int, language: str = 'ja') -> str:
+    """確定店の会話用の項目を LLM 用の文字列にする（C1・Live 共通。place_id は渡さない）"""
+    if not shops:
+        return concierge_text(language, 'no_shops')
+    lines = [f"版 {version}"]
+    for s in shops:
+        parts = [f"{s.get('order')}. {s.get('name', '')}（{s.get('area', '')}）",
+                 f"ジャンル: {s.get('genre', '')}",
+                 f"看板料理: {s.get('specialty', '')}",
+                 f"雰囲気: {s.get('atmosphere', '')}",
+                 f"予算の目安: {s.get('price_estimate', '')}",
+                 f"推薦理由: {s.get('reason', '')}"]
+        if s.get('opened'):
+            parts.append(f"開店時期: {s.get('opened')}")
+        lines.append(' / '.join(parts))
+    return '\n'.join(lines)
+
+
+def build_concierge_reply(language: str, outcome: dict) -> str:
+    """推薦の結果の状態ごとに、キーボードの返答の文章をサーバーが作る（§5.3・§9）"""
+    status = outcome.get('status')
+    if status == 'complete':
+        lines = [concierge_text(language, 'intro'), '']
+        for s in outcome.get('shops', []):
+            lines.append(f"{s['order']}. {s['name']}（{s.get('area', '')}）: {s.get('reason', '')}")
+        return '\n'.join(lines)
+    if status == 'superseded':
+        return concierge_text(language, 'superseded')
+    if status == 'not_found':
+        if outcome.get('reason_code') == 'fresh_disabled':
+            return concierge_text(language, 'fresh_disabled')
+        return concierge_text(language, 'too_few', n=outcome.get('found_count', 0))
+    return CONCIERGE_ERROR_TEXTS.get(language, CONCIERGE_ERROR_TEXTS['ja'])
+
 
 class SupportSession:
     """サポートセッション管理 (RAM版)"""
@@ -269,6 +426,10 @@ class SupportSession:
             'summary': None,
             'inquiry_summary': None,
             'current_shops': [],
+            # 確定店の共有（R1.4 §7）
+            'search_seq': 0,        # 最後に始めた検索の番号
+            'shops_version': 0,     # 確定ごとに 1 増える
+            'intro_marks': {},      # 店の順番 → 紹介の印
             # 長期記憶関連の追加フィールド
             'is_first_visit': is_first_visit,
             'user_context': user_context,
@@ -339,6 +500,58 @@ class SupportSession:
         """現在の店舗リストを取得"""
         data = self.get_data()
         return data.get('current_shops', []) if data else []
+
+    # ---- 確定店の共有（R1.4 §7）。ロックの中では外部 API を呼ばない ----
+
+    def begin_search(self):
+        """search_seq を 1 増やして返す。セッションがなければ None"""
+        with _SHOPS_LOCK:
+            data = self.get_data()
+            if not data:
+                return None
+            data['search_seq'] = data.get('search_seq', 0) + 1
+            logger.info(f"[Session] 検索開始: seq={data['search_seq']}")
+            return data['search_seq']
+
+    def commit_shops(self, seq, shops, origin='text'):
+        """
+        seq が最新なら current_shops を置き換えて shops_version を 1 増やし、版を返す。
+        最新でなければ None（superseded）。セッションがなければ False。
+        キーボードで確定した店の印は「画面に表示済み・音声では未紹介」、音声は「未開始」。
+        """
+        with _SHOPS_LOCK:
+            data = self.get_data()
+            if not data:
+                return False
+            if seq != data.get('search_seq'):
+                logger.info(f"[Session] superseded: seq={seq}, 最新={data.get('search_seq')}")
+                return None
+            data['current_shops'] = shops
+            data['shops_version'] = data.get('shops_version', 0) + 1
+            mark = 'screen_only' if origin == 'text' else 'not_started'
+            data['intro_marks'] = {s['order']: mark for s in shops}
+            logger.info(f"[Session] 確定: seq={seq}, 版={data['shops_version']}, {len(shops)}店, origin={origin}")
+            return data['shops_version']
+
+    def get_shops_state(self):
+        """(確定店, 版, 紹介の印) を返す。セッションがなければ None"""
+        with _SHOPS_LOCK:
+            data = self.get_data()
+            if not data:
+                return None
+            return (list(data.get('current_shops', [])), data.get('shops_version', 0),
+                    dict(data.get('intro_marks', {})))
+
+    def set_intro_mark(self, version, order, mark):
+        """紹介の印を 1 つ書く。版が変わっていれば書かない（古い紹介の記録で新しい店を汚さない）"""
+        with _SHOPS_LOCK:
+            data = self.get_data()
+            if not data or data.get('shops_version') != version:
+                return False
+            if order in data.get('intro_marks', {}):
+                data['intro_marks'][order] = mark
+                return True
+            return False
 
     def update_status(self, status, **kwargs):
         """ステータス更新"""
@@ -753,6 +966,139 @@ class SupportAssistant:
                 'should_confirm': False,
                 'is_followup': False
             }
+
+    # ---- コンシェルジュ（R1.4 §5。mode が concierge のときだけ /api/chat から呼ぶ） ----
+
+    def _concierge_user_context(self) -> str:
+        """v11 の {user_context}。現行の REST と同じく SupportSession のプロフィールから作る"""
+        session_data = self.session.get_data() or {}
+        if session_data.get('is_first_visit', True):
+            return """【重要: 初回訪問ユーザー】
+このユーザーは初めての訪問です。
+- ユーザーが名前を教えてくれたら、必ず action フィールドを使って名前を登録してください
+- 敬称はユーザーの希望がなければデフォルトで「様」を使用
+- ユーザーが名前を教えたくない場合は、名前なしで会話を続けてください"""
+        profile = session_data.get('long_term_profile') or {}
+        preferred_name = profile.get('preferred_name', '')
+        visit_count = profile.get('visit_count', 1)
+        if preferred_name:
+            return f"""【ユーザー情報】
+- 呼び方: {preferred_name}{profile.get('name_honorific', '')}
+- 訪問回数: {visit_count}回目"""
+        return f"""【ユーザー情報】
+- 名前: 未登録（名前での呼びかけはしないでください）
+- 訪問回数: {visit_count}回目"""
+
+    def _concierge_system_prompt(self) -> str:
+        """C1 のプロンプト：v11 + REST 用の規則 + SupportSession の確定店（会話用の項目だけ）"""
+        v11 = CONCIERGE_V11[self.language].replace('{user_context}', self._concierge_user_context())
+        state = self.session.get_shops_state() or ([], 0, {})
+        shops_text = format_concierge_shops_for_llm(state[0], state[1], self.language)
+        return f"{v11}\n{CONCIERGE_REST_RULES}\n【現在の確定店】\n{shops_text}\n"
+
+    def _call_concierge_c1(self):
+        """C1 を 1 回呼ぶ。JSON として読めなければ None（自動のやり直しはしない）"""
+        config = types.GenerateContentConfig(
+            system_instruction=self._concierge_system_prompt(),
+            response_mime_type='application/json',
+            response_json_schema=CONCIERGE_C1_SCHEMA,
+            http_options=types.HttpOptions(timeout=CONCIERGE_LLM_TIMEOUT_MS),
+        )
+        try:
+            response = gemini_client.models.generate_content(
+                model=CONCIERGE_C1_MODEL,
+                contents=self.session.get_history_for_api(),
+                config=config,
+            )
+            data = json.loads(response.text or '')
+        except Exception as e:
+            logger.error(f"[Concierge] C1 失敗: {type(e).__name__}")
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get('message'), str):
+            logger.error("[Concierge] C1 の JSON に message がない")
+            return None
+        return data
+
+    def _generate_concierge_summary(self, user_message, assistant_response):
+        """C2：現行と同じ要約のテンプレートを、安いモデルで呼ぶ"""
+        template = CONVERSATION_SUMMARY_TEMPLATES.get(self.language, CONVERSATION_SUMMARY_TEMPLATES['ja'])
+        try:
+            response = gemini_client.models.generate_content(
+                model=CONCIERGE_C2_MODEL,
+                contents=template.format(user_message=user_message, assistant_response=assistant_response),
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"[Concierge] C2 失敗: {type(e).__name__}")
+            return None
+
+    def process_concierge_message(self, user_message, conversation_stage='conversation', on_action=None):
+        """
+        キーボードのコンシェルジュ会話（R1.4 §5.3）。
+        1. C1 を呼ぶ。2. action があれば on_action で名前登録（推薦より先。失敗しても推薦は続ける）。
+        3. shop_request があれば recommend_shops(origin='text') を 1 回呼び、5 店なら commit_shops。
+           返答の文章は結果の状態ごとにサーバーが作り、要約は固定文（要約の LLM は呼ばない）。
+        4. shop_request がなければ message をそのまま使い、現行と同じ条件で要約を C2 で作る。
+        戻り値の record が False のときは、返答を履歴に記録しない（C1 の出力が読めなかったとき）。
+        """
+        lang = self.language
+        if lang not in CONCIERGE_V11:
+            return {'record': False, 'response': concierge_text(lang, 'unsupported_language'),
+                    'summary': None, 'shops': [], 'outcome': None}
+
+        c1 = self._call_concierge_c1()
+        if c1 is None:
+            return {'record': False, 'response': CONCIERGE_ERROR_TEXTS.get(lang, CONCIERGE_ERROR_TEXTS['ja']),
+                    'summary': None, 'shops': [], 'outcome': None}
+
+        action = c1.get('action')
+        if isinstance(action, dict) and action.get('type') == 'update_user_profile' and on_action:
+            try:
+                on_action(action)
+            except Exception as e:
+                logger.error(f"[Concierge] 名前登録の例外: {type(e).__name__}")
+
+        shop_request = c1.get('shop_request') if isinstance(c1.get('shop_request'), dict) else None
+        user_request = (shop_request or {}).get('user_request', '').strip()
+        if not user_request:
+            message = c1['message']
+            summary = None
+            if conversation_stage == 'conversation':
+                summary = self._generate_concierge_summary(user_message, message)
+            return {'record': True, 'response': message, 'summary': summary, 'shops': [], 'outcome': None}
+
+        from concierge_recommender import recommend_shops
+        seq = self.session.begin_search()
+        result = recommend_shops(user_request, lang, 'text', gemini_client)
+        status = result['status']
+        version = None
+        if status == 'complete':
+            version = self.session.commit_shops(seq, result['shops'], origin='text')
+            if version is None:
+                status = 'superseded'
+        if version is None:
+            state = self.session.get_shops_state()
+            version = state[1] if state else 0
+        outcome_for_text = dict(result, status=status)
+        response = build_concierge_reply(lang, outcome_for_text)
+        complete = status == 'complete'
+        return {
+            'record': True,
+            'response': response,
+            'summary': concierge_text(lang, 'summary') if complete else None,
+            'shops': result['cards'] if complete else [],
+            'shop_names': [s['name'] for s in result['shops']] if complete else [],
+            'user_request': user_request,
+            'outcome': {
+                'session_id': self.session.session_id,
+                'search_seq': seq,
+                'status': status,
+                'reason_code': result.get('reason_code') if status != 'superseded' else None,
+                'source': result.get('source'),
+                'shops_version': version,
+                'found_count': result.get('found_count', 0),
+            },
+        }
 
     def generate_final_summary(self):
         """最終要約を生成"""
