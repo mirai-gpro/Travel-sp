@@ -40,7 +40,9 @@ from support_core import (
     SYSTEM_PROMPTS,
     SupportSession,
     SupportAssistant,
-    gemini_client
+    gemini_client,
+    CONCIERGE_V11,
+    concierge_text,
 )
 from live_api_handler import LiveAPISession, build_system_instruction
 
@@ -229,6 +231,62 @@ def start_session():
         return jsonify({'error': str(e)}), 500
 
 
+def _handle_concierge_chat(session, session_data, user_message, stage, language):
+    """
+    コンシェルジュのキーボード会話（R1.4 §5）。音は出さず、文字とカードだけを返す（③）。
+    返答の項目は既存の /api/chat と同じで、outcome を足す（§5.4）。
+    """
+    user_id = session_data.get('user_id')
+
+    def on_action(action):
+        # 現行の名前登録と同じ処理（推薦より先に呼ばれる。失敗しても推薦は続ける）
+        if not LONG_TERM_MEMORY_ENABLED:
+            return
+        updates = action.get('updates') or {}
+        if updates and user_id:
+            ltm = LongTermMemory()
+            if ltm.update_profile(user_id, updates):
+                logger.info(f"[LTM] LLMからの指示でプロファイル更新成功: updates={updates}, user_id={user_id}")
+            else:
+                logger.error(f"[LTM] LLMからの指示でプロファイル更新失敗: updates={updates}, user_id={user_id}")
+        elif not user_id:
+            logger.warning(f"[LTM] user_id が空のためプロファイル更新をスキップ: action={action}")
+
+    assistant = SupportAssistant(session, SYSTEM_PROMPTS)
+    result = assistant.process_concierge_message(user_message, stage, on_action=on_action)
+
+    # 返答を履歴に 1 回記録する。C1 の出力が読めなかったときは表示も記録もしない
+    if result['record']:
+        session.add_message('model', result['response'], 'chat')
+        if result['summary']:
+            session.add_message('model', result['summary'], 'summary')
+
+    outcome = result.get('outcome')
+    if outcome and outcome['status'] == 'complete' and LONG_TERM_MEMORY_ENABLED and user_id:
+        try:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+            shop_summary = f"[{timestamp}] 検索条件: {user_message[:100]}\n提案店舗: {', '.join(result['shop_names'])}"
+            ltm = LongTermMemory()
+            if ltm.append_conversation_summary(user_id, shop_summary):
+                logger.info(f"[LTM] ショップ提案サマリー保存成功: {len(result['shop_names'])}件")
+            else:
+                logger.warning("[LTM] ショップ提案サマリー保存失敗")
+        except Exception as e:
+            logger.error(f"[LTM] ショップサマリー保存エラー: {e}")
+
+    response_data = {
+        'response': result['response'],
+        'summary': result['summary'],
+        'shops': result['shops'],
+        'should_confirm': result['record'] and stage == 'conversation',
+        'is_followup': False,
+    }
+    if outcome:
+        response_data['outcome'] = outcome
+    logger.info(f"[Chat] コンシェルジュ: outcome={outcome['status'] if outcome else None}, shops={len(result['shops'])}件")
+    return jsonify(response_data)
+
+
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
 def chat():
     """
@@ -269,6 +327,10 @@ def chat():
 
         # 2. ユーザー入力を記録
         session.add_message('user', user_message, 'chat')
+
+        # コンシェルジュは C1 → 推薦 → 確定（R1.4 §5）。chat・lesson は以下の既存の処理のまま
+        if mode == 'concierge':
+            return _handle_concierge_chat(session, session_data, user_message, stage, language)
 
         # 3. 知能生成 (Assistant作成)
         assistant = SupportAssistant(session, SYSTEM_PROMPTS)
@@ -790,6 +852,45 @@ def handle_live_start(data):
     system_prompt = build_system_instruction(mode, user_profile=user_profile,
                                                system_prompts=SYSTEM_PROMPTS, language=language)
 
+    # コンシェルジュ：v11 + Live 用規則、共通の推薦、SupportSession の確定店（R1.4 §6・§7）
+    shops_store = None
+    concierge_search_callback = None
+    if mode == 'concierge':
+        if language not in CONCIERGE_V11:
+            # その言語の v11 がなければ Live を始めずエラーを送る（§9）
+            emit('error', {'message': concierge_text(language, 'unsupported_language')})
+            logger.warning(f"[LiveAPI] v11 がない言語のため Live を始めない: {language}")
+            return
+        system_prompt = build_system_instruction('concierge', user_profile=user_profile,
+                                                 system_prompts={'concierge': CONCIERGE_V11}, language=language)
+        shops_store = SupportSession(session_id) if session_id else None
+
+        def _concierge_search(user_request, lang, search_mode, search_seq):
+            """Live の search_shops：recommend_shops(origin='live') を呼び、5 店なら commit_shops で保存する"""
+            from concierge_recommender import recommend_shops
+            out = recommend_shops(user_request, lang, 'live', gemini_client)
+            out['shops_version'] = None
+            if out['status'] == 'complete':
+                if search_seq is None:
+                    # このインスタンスに SupportSession がない：保存せず、カードと紹介は現行どおり行う
+                    logger.warning("[Concierge] SupportSession がないため確定店を保存できない")
+                else:
+                    version = shops_store.commit_shops(search_seq, out['shops'], origin='live')
+                    if version is None:
+                        out['status'] = 'superseded'
+                        out['reason_code'] = None
+                    elif version is False:
+                        logger.warning("[Concierge] SupportSession がないため確定店を保存できない")
+                    else:
+                        out['shops_version'] = version
+            if out['shops_version'] is None and shops_store:
+                state = shops_store.get_shops_state()
+                if state:
+                    out['shops_version'] = state[1]
+            return out
+
+        concierge_search_callback = _concierge_search
+
     # ショップ検索コールバック（案C: SupportAssistant迂回、検索専用プロンプトで直接API呼び出し）
     def shop_search_callback(user_request, lang, search_mode):
         """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）"""
@@ -931,10 +1032,11 @@ def handle_live_start(data):
         system_prompt=system_prompt,
         socketio=socketio,
         client_sid=client_sid,
-        shop_search_callback=shop_search_callback,
+        shop_search_callback=concierge_search_callback if mode == 'concierge' else shop_search_callback,
         user_id=user_id,
         voice_model=voice_model,
-        live_voice=live_voice
+        live_voice=live_voice,
+        shops_store=shops_store,
     )
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
