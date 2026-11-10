@@ -13,7 +13,6 @@ from datetime import datetime
 from google import genai
 from google.genai import types
 from google.cloud import storage
-import google.generativeai as genai_legacy
 
 # api_integrations から必要な関数をインポート
 from api_integrations import extract_shops_from_response
@@ -30,8 +29,6 @@ except Exception as e:
 
 # Gemini クライアント初期化
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-genai_legacy.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai_legacy.GenerativeModel('gemini-2.5-flash')
 
 # ========================================
 # RAMベースのセッション管理 (Firestore完全廃止)
