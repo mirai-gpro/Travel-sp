@@ -184,6 +184,48 @@ class TestToolCalls(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(sess.responses[1].response, {'status': 'busy'})
 
+    def test_card_links_fetched_after_tool_response(self):
+        import concierge_places
+        store = new_store()
+        l, sock = live(store=store, callback=complete_callback(store))
+        sess = FakeLive()
+        seen = {}
+
+        def fake_links(cards, geos, language):
+            seen['responses_before_fetch'] = len(sess.responses)   # 紹介を始める tool_response の後に取る
+            return [{'place_id': 'P1', 'links': {'hotpepper_url': 'https://h/1'}}]
+
+        async def scenario():
+            with mock.patch.object(concierge_places, 'links_for_cards', side_effect=fake_links):
+                await l._handle_tool_call(SimpleNamespace(function_calls=[fc('search_shops', {'user_request': 'x'})]), sess)
+                self.assertEqual(len(l._card_link_tasks), 1)        # 待たずに戻る
+                await asyncio.gather(*list(l._card_link_tasks))
+
+        asyncio.run(scenario())
+        self.assertEqual(seen['responses_before_fetch'], 1)
+        names = [n for n, _ in sock.events]
+        self.assertLess(names.index('shop_search_result'), names.index('shop_cards_update'))
+        update = sock.named('shop_cards_update')[0]
+        self.assertEqual((update['shops_version'], update['updates'][0]['place_id']), (1, 'P1'))
+
+    def test_card_links_not_sent_when_shops_changed(self):
+        import concierge_places
+        store = new_store()
+        l, sock = live(store=store, callback=complete_callback(store))
+        sess = FakeLive()
+
+        def fake_links(cards, geos, language):
+            store.commit_shops(store.begin_search(), FIVE, origin='text')   # 取得中に新しい確定が出た
+            return [{'place_id': 'P1', 'links': {'hotpepper_url': 'https://h/1'}}]
+
+        async def scenario():
+            with mock.patch.object(concierge_places, 'links_for_cards', side_effect=fake_links):
+                await l._handle_tool_call(SimpleNamespace(function_calls=[fc('search_shops', {'user_request': 'x'})]), sess)
+                await asyncio.gather(*list(l._card_link_tasks))
+
+        asyncio.run(scenario())
+        self.assertEqual(sock.named('shop_cards_update'), [])
+
     def test_not_found_keeps_previous_shops_and_no_cards(self):
         store = new_store()
         store.commit_shops(store.begin_search(), FIVE, origin='text')

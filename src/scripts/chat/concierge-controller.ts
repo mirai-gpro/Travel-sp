@@ -18,6 +18,8 @@ export class ConciergeController extends CoreController {
   private liveTextReady = false;
   // 送れない間に打たれたテキスト。送れるようになったら順に送る（/api/chat には送らない）
   private pendingLiveTexts: string[] = [];
+  // 画面に出しているカードの版（shop_cards_update を同じ版のカードにだけ反映する。R2.0 §8.4）
+  private displayedShopsVersion: number | null = null;
 
   constructor(container: HTMLElement, apiBase: string) {
     super(container, apiBase);
@@ -186,6 +188,7 @@ export class ConciergeController extends CoreController {
       this.liveTextReady = true;
       this.flushPendingLiveTexts();
     });
+    this.socket.on('shop_cards_update', (data: any) => this.applyCardLinks(data));
     this.socket.on('live_text_rejected', (data: any) => {
       console.warn('[Concierge] キーボード入力を Live に送れなかった:', data?.reason);
       this.showError('メッセージの送信に失敗しました。');
@@ -234,7 +237,30 @@ export class ConciergeController extends CoreController {
       }, 300);
     }
     if (seq !== null) this.lastAppliedSearchSeq = seq;
+    this.displayedShopsVersion = typeof outcome.shops_version === 'number' ? outcome.shops_version : null;
     return true;
+  }
+
+  // ========================================
+  // R2.0 §8.4: 表示の後に届く外部リンクを、同じ版のカードにだけ足す
+  // ========================================
+  private applyCardLinks(data: any): void {
+    if (!data || data.session_id !== this.sessionId) return;
+    if (typeof data.shops_version !== 'number' || data.shops_version !== this.displayedShopsVersion) return;
+    const updates: any[] = Array.isArray(data.updates) ? data.updates : [];
+    const linksById = new Map(updates.map((u: any) => [u.place_id, u.links || {}]));
+    let changed = false;
+    const merged = (this.currentShops || []).map((shop: any) => {
+      const links = linksById.get(shop.place_id);
+      if (!links) return shop;
+      changed = true;
+      return { ...shop, ...links };
+    });
+    if (!changed) return;
+    this.currentShops = merged;
+    document.dispatchEvent(new CustomEvent('displayShops', {
+      detail: { shops: merged, language: this.currentLanguage }
+    }));
   }
 
   // コンシェルジュモード固有: REST TTS を止める（R1.4 §8.1、ミッション③）
