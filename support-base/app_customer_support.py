@@ -865,10 +865,10 @@ def handle_live_start(data):
                                                  system_prompts={'concierge': CONCIERGE_V11}, language=language)
         shops_store = SupportSession(session_id) if session_id else None
 
-        def _concierge_search(user_request, lang, search_mode, search_seq):
+        def _concierge_search(user_request, lang, search_mode, search_seq, area=''):
             """Live の search_shops：recommend_shops(origin='live') を呼び、5 店なら commit_shops で保存する"""
             from concierge_recommender import recommend_shops
-            out = recommend_shops(user_request, lang, 'live', gemini_client)
+            out = recommend_shops(user_request, lang, 'live', gemini_client, area=area)
             out['shops_version'] = None
             if out['status'] == 'complete':
                 if search_seq is None:

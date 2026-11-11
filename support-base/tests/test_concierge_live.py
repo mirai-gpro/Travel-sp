@@ -66,7 +66,7 @@ def live(mode='concierge', store=None, callback=None, language='ja'):
 
 
 def complete_callback(store):
-    def cb(user_request, lang, mode, seq):
+    def cb(user_request, lang, mode, seq, area=''):
         v = store.commit_shops(seq, FIVE, origin='live')
         return {'status': 'complete', 'reason_code': None, 'source': 'knowledge', 'found_count': 5,
                 'shops': FIVE, 'cards': [{'name': s['name']} for s in FIVE], 'shops_version': v}
@@ -79,6 +79,34 @@ class TestConfigAndPrompt(unittest.TestCase):
         names = [d.name for d in l._build_config()['tools'][0].function_declarations]
         self.assertEqual(names, ['search_shops', 'get_current_shops', 'update_user_profile'])
         self.assertEqual(lah.GET_CURRENT_SHOPS_DECLARATION.behavior, lah.types.Behavior.BLOCKING)
+
+    def test_search_shops_declaration_requires_consent_and_has_area(self):
+        decl = lah.SEARCH_SHOPS_DECLARATION
+        self.assertIn('承諾したときだけ', decl.description)
+        self.assertNotIn('十分に揃った', decl.description)
+        self.assertEqual(set(decl.parameters.properties), {'user_request', 'area'})
+        self.assertEqual(decl.parameters.required, ['user_request'])
+
+    def test_v11_body_has_no_fixed_hearing_or_consent_exception(self):
+        for lang in ('ja', 'en'):
+            body = sc.CONCIERGE_V11[lang]
+            for old in ('ヒアリング順序', '必ずこの順序', '確認なしで依頼してよい', '50文字', '電話で確認することもできます',
+                        'Hearing Order', 'without confirmation'):
+                self.assertNotIn(old, body, (lang, old))
+        self.assertIn('この条件で探してもよろしいですか', sc.CONCIERGE_V11['ja'])
+        rules = lah.concierge_live_rules('ja')
+        self.assertNotIn('同意を得てから', rules)          # 同意の規則は本文だけに書く
+        self.assertNotIn('fresh_disabled', rules)
+        self.assertIn('places_partial', rules)
+
+    def test_user_context_for_returning_user_without_name(self):
+        ctx = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': ''})
+        self.assertIn('お帰りなさいませ。', ctx)
+        self.assertIn('名前は聞き直さない', ctx)
+        first = lah._build_concierge_user_context({'is_first_visit': True})
+        self.assertIn('名前より先にお店の希望を言われたら', first)
+        named = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': '太郎', 'name_honorific': '様'})
+        self.assertIn('太郎様', named)
 
     def test_chat_tools_unchanged(self):
         l, _ = live(mode='chat')
@@ -143,7 +171,7 @@ class TestToolCalls(unittest.TestCase):
         store = new_store()
         store.commit_shops(store.begin_search(), FIVE, origin='text')
 
-        def cb(user_request, lang, mode, seq):
+        def cb(user_request, lang, mode, seq, area=''):
             return {'status': 'not_found', 'reason_code': 'too_few_verified', 'source': 'knowledge',
                     'found_count': 2, 'shops': [], 'cards': [], 'shops_version': 1}
 
@@ -273,7 +301,7 @@ class TestLiveStart(unittest.TestCase):
         store = new_store()
         fake_cls, _ = self.start('ja', store)
         kwargs = fake_cls.call_args.kwargs
-        self.assertIn('推薦の依頼', kwargs['system_prompt'])          # v11
+        self.assertIn('お店探しの依頼', kwargs['system_prompt'])      # v11（R2.0 の本文）
         self.assertIn('get_current_shops', kwargs['system_prompt'])   # Live 用規則
         self.assertEqual(kwargs['shops_store'].session_id, store.session_id)
         cb = kwargs['shop_search_callback']
@@ -282,8 +310,9 @@ class TestLiveStart(unittest.TestCase):
         import concierge_recommender
         with mock.patch.object(concierge_recommender, 'recommend_shops', return_value=dict(result)) as rec:
             seq = store.begin_search()
-            out = cb('恵比寿 焼き鳥', 'ja', 'concierge', seq)
+            out = cb('恵比寿 焼き鳥', 'ja', 'concierge', seq, '恵比寿')
         self.assertEqual(rec.call_args[0][:3], ('恵比寿 焼き鳥', 'ja', 'live'))
+        self.assertEqual(rec.call_args.kwargs['area'], '恵比寿')            # search_shops の area を渡す
         self.assertEqual((out['status'], out['shops_version']), ('complete', 1))
         self.assertEqual(store.get_shops_state()[2][1], 'not_started')
         with mock.patch.object(concierge_recommender, 'recommend_shops', return_value=dict(result)):
