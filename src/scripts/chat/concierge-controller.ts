@@ -14,6 +14,11 @@ export class ConciergeController extends CoreController {
   // 画面に反映した最後の検索番号（R1.4 §8.2。古い結果を捨てる）
   private lastAppliedSearchSeq = 0;
 
+  // キーボード入力を Live に送れる状態か（Greeting の後で、再接続中でない）。R2.0 §8.2・§8.3
+  private liveTextReady = false;
+  // 送れない間に打たれたテキスト。送れるようになったら順に送る（/api/chat には送らない）
+  private pendingLiveTexts: string[] = [];
+
   constructor(container: HTMLElement, apiBase: string) {
     super(container, apiBase);
 
@@ -136,6 +141,11 @@ export class ConciergeController extends CoreController {
       // 3. ★ LiveAPIで初期挨拶を開始
       //    REST APIの greetingText + speakTextGCP() は全て削除
       //    preGeneratedAcks のTTS事前生成も削除
+      //    R2.0 §8.3: マイクがなくても Live を始める。音を出せる状態にしてから live_start を送る
+      this.liveTextReady = false;
+      this.pendingLiveTexts = [];
+      this.liveAudioManager.allowWithoutMic = true;
+      await this.prepareAudioOutput();
       await this.startLiveMode();
 
     } catch (e) {
@@ -162,6 +172,23 @@ export class ConciergeController extends CoreController {
       } else {
         this.els.userInput.value = text;
       }
+    });
+
+    // キーボード入力を Live に送れるかどうか（R2.0 §8.2・§8.3）。親のリスナーはそのまま残し、追加で聞く
+    this.socket.on('greeting_done', () => {
+      this.liveTextReady = true;
+      this.flushPendingLiveTexts();
+    });
+    this.socket.on('live_reconnecting', () => {
+      this.liveTextReady = false;
+    });
+    this.socket.on('live_reconnected', () => {
+      this.liveTextReady = true;
+      this.flushPendingLiveTexts();
+    });
+    this.socket.on('live_text_rejected', (data: any) => {
+      console.warn('[Concierge] キーボード入力を Live に送れなかった:', data?.reason);
+      this.showError('メッセージの送信に失敗しました。');
     });
 
     // ショップ検索の開始・結果は親のリスナーを外して、applySearchOutcome() を通す（R1.4 §8.2・§8.3）
@@ -324,94 +351,77 @@ export class ConciergeController extends CoreController {
 
   // ========================================
   // 🎯 コンシェルジュモード専用: メッセージ送信処理
+  // R2.0 §8.2: キーボード入力も Live に送り、Live の 1 回の応答から音声（live_audio）と
+  // テキスト（ai_transcript）を出す。/api/chat（文字だけの返答）には送らない
   // ========================================
   protected async sendMessage() {
     this.unlockAudioParams();
     const message = this.els.userInput.value.trim();
-    if (!message || this.isProcessing) return;
-    
-    const currentSessionId = this.sessionId;
-    
-    this.isProcessing = true; 
-    this.els.sendBtn.disabled = true;
-    this.els.micBtn.disabled = true; 
-    this.els.userInput.disabled = true;
+    if (!message) return;
 
-    // ✅ テキスト入力時も「はい」だけに簡略化
-    if (!this.isFromVoiceInput) {
-      this.addMessage('user', message);
-      const textLength = message.trim().replace(/\s+/g, '').length;
-      if (textLength < 2) {
-           // 短文の注意は文字表示だけ（R1.4 §8.1）
-           const msg = this.t('shortMsgWarning');
-           this.addMessage('assistant', msg);
-           this.resetInputState();
-           return;
-      }
-      
-      this.els.userInput.value = '';
-      
-      // 「はい」の相槌は文字表示だけ（R1.4 §8.1）
-      const ackText = this.t('ackYes');
-      this.currentAISpeech = ackText;
-      this.addMessage('assistant', ackText);
-    }
-
+    this.els.userInput.value = '';
     this.isFromVoiceInput = false;
-    
-    // ✅ 待機アニメーションは6.5秒後に表示(LLM送信直前にタイマースタート)
-    if (this.waitOverlayTimer) clearTimeout(this.waitOverlayTimer);
-    let responseReceived = false;
-    
-    // タイマーセットをtry直前に移動(即答処理の後)
-    this.waitOverlayTimer = window.setTimeout(() => { 
-      if (!responseReceived) {
-        this.showWaitOverlay(); 
-      }
-    }, 6500);
+    this.addMessage('user', message);
+    // 利用者の操作の中で再生を再開しておく（自動再生の制限への備え）
+    this.liveAudioManager.resumeOutput().catch(() => {});
 
-    try {
-      const response = await fetch(`${this.apiBase}/api/chat`, { 
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' }, 
-        body: JSON.stringify({ 
-          session_id: currentSessionId, 
-          message: message, 
-          stage: this.currentStage, 
-          language: this.currentLanguage,
-          mode: this.currentMode
-        }) 
-      });
-      const data = await response.json();
-      
-      // ✅ レスポンス到着フラグを立てる
-      responseReceived = true;
-      
-      if (this.sessionId !== currentSessionId) return;
-      
-      // ✅ タイマーをクリアしてアニメーションを非表示
-      if (this.waitOverlayTimer) {
-        clearTimeout(this.waitOverlayTimer);
-        this.waitOverlayTimer = null;
-      }
-      this.hideWaitOverlay();
-      this.currentAISpeech = data.response;
-      // キーボードの返答は文字だけ。音は出さない（R1.4 §5.4・§8.1、ミッション③）
-      this.addMessage('assistant', data.response, data.summary);
+    this.pendingLiveTexts.push(message);
+    this.flushPendingLiveTexts();
+    this.els.userInput.blur();
+  }
 
-      // カードは outcome を applySearchOutcome() に通して反映する（R1.4 §8.2）。
-      // 本文から店を抽出する処理は使わない
-      if (data.outcome) {
-        this.applySearchOutcome(data.outcome, data.shops || []);
-      }
-    } catch (error) { 
-      console.error('送信エラー:', error);
-      this.hideWaitOverlay(); 
-      this.showError('メッセージの送信に失敗しました。'); 
-    } finally { 
-      this.resetInputState();
-      this.els.userInput.blur();
+  // 送れる状態なら、溜まっているテキストを順に Live へ送る
+  private flushPendingLiveTexts() {
+    if (!this.isLiveMode || !this.socket || !this.socket.connected || !this.liveTextReady) return;
+    while (this.pendingLiveTexts.length > 0) {
+      const text = this.pendingLiveTexts.shift() as string;
+      this.socket.emit('live_text_in', { text });
     }
+  }
+
+  // ========================================
+  // R2.0 §8.3: Live を始める前に、音を出せる状態にする
+  // AudioContext が suspended なら、既存の音声許可の案内をタップしてもらってから Live を始める。
+  // Greeting は live_start を受けてサーバーが作るので、必ず再生できる状態で届く
+  // （届いた Greeting は今と同じく AVATAR_VISIBLE まで保留される）
+  // ========================================
+  private async prepareAudioOutput(): Promise<void> {
+    if (!this.socket) return;
+    await this.liveAudioManager.initialize(this.socket);
+    if (this.liveAudioManager.isOutputRunning()) return;
+    await new Promise<void>((resolve) => {
+      const prompt = document.createElement('div');
+      prompt.className = 'click-prompt';
+      prompt.innerHTML = `<p>🔊</p><p>${this.t('clickPrompt')}</p><p>🔊</p>`;
+      prompt.addEventListener('click', async () => {
+        try {
+          await this.liveAudioManager.resumeOutput();
+        } catch (e) {
+          console.warn('[Concierge] 再生の再開に失敗:', e);
+        }
+        this.enableAudioPlayback();
+        prompt.remove();
+        resolve();
+      }, { once: true });
+      this.container.style.position = 'relative';
+      this.container.appendChild(prompt);
+    });
+  }
+
+  // ========================================
+  // R2.0 §8.3: マイクがない状態でマイクボタンが押されたら、そこで改めてマイクを求める
+  // ========================================
+  protected async toggleRecording() {
+    if (this.isLiveMode && !this.liveAudioManager.hasMicrophone()) {
+      try {
+        await this.liveAudioManager.enableMicrophone();
+      } catch (e) {
+        console.warn('[Concierge] マイクを取得できない:', e);
+        this.showError(this.t('micAccessError'));
+        return;
+      }
+    }
+    await super.toggleRecording();
   }
 
 }
