@@ -44,7 +44,7 @@ SUPERSEDED = 'superseded'
 
 LANGUAGE_NAMES = {'ja': '日本語', 'en': 'English', 'zh': '中文', 'ko': '한국어'}
 
-# 候補の項目（R2.0 §7.3）。照合に使う 5 項目と、カード・紹介に使う 5 項目
+# 候補の項目（R2.0 §7.3）。照合に使う 5 項目と、ショップカードに載せる 7 項目。詳しい内容はカードで表す
 _CANDIDATE_ITEM = {
     'type': 'object',
     'properties': {
@@ -56,11 +56,13 @@ _CANDIDATE_ITEM = {
         'genre': {'type': 'string'},
         'specialty': {'type': 'string'},
         'atmosphere': {'type': 'string'},
+        'scene': {'type': 'string'},
         'price_estimate': {'type': 'string'},
+        'tips': {'type': 'string'},
         'reason': {'type': 'string'},
     },
     'required': ['name', 'aliases', 'branch', 'area', 'locality', 'genre', 'specialty',
-                 'atmosphere', 'price_estimate', 'reason'],
+                 'atmosphere', 'scene', 'price_estimate', 'tips', 'reason'],
 }
 
 _FRESH_ITEM = {
@@ -100,8 +102,8 @@ _CANDIDATE_RULES = """【候補の規則】
 4. 条件に合わない店は挙げない。同じチェーンの店を重ねない。
 5. name は店の正式名称、branch は支店名（なければ空）、aliases は今使われている別表記（旧店名は入れない）。
 6. area は最寄り駅または地域名、locality は住所に含まれる市区町村名や町名。店の確認に使うので正確に書く。
-7. 評価点・営業時間・URL は書かない。price_estimate は一人あたりの予算の目安。
-8. 短く書く。specialty はその店ならではの料理や専門性を短い句 1 つ、atmosphere は店の雰囲気を短い句 1 つ、reason は依頼に合う推薦理由を一文で書く。文章は{language}で書く。
+7. 評価点・営業時間・URL は書かない。price_estimate は一人あたりの予算の目安。ランチとディナーで違うときは両方を書く（例：ランチ1,500円〜、ディナー6,000円〜8,000円）。
+8. 次はショップカードに載せる文章。specialty は看板メニューや得意料理、atmosphere は雰囲気や設備の特徴、scene は向いている利用シーンを、それぞれ短い句 1 つで書く。reason は料理の内容・体験・雰囲気と、依頼に合う理由を含めて 2〜3 文で書く。tips は来店時のおすすめポイントを一文で書く。文章は{language}で書く。
 9. 条件に合う店が少なければ、無理に数をそろえない。"""
 
 # Google 検索を有効にしたときだけ足す（R2.0 §7.2）
@@ -220,7 +222,9 @@ def conversation_item(order: int, c: dict, place_id: str, source: str) -> dict:
         'genre': c.get('genre', ''),
         'specialty': c.get('specialty', ''),
         'atmosphere': c.get('atmosphere', ''),
+        'scene': c.get('scene', ''),
         'price_estimate': c.get('price_estimate', ''),
+        'tips': c.get('tips', ''),
         'reason': c.get('reason', ''),
         'source': source,
         'place_id': place_id,

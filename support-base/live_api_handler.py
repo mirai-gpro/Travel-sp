@@ -362,7 +362,7 @@ def concierge_live_rules(language: str) -> str:
     return f"""
 
 【音声の会話の規則（コンシェルジュ）】
-- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・ジャンル・推薦理由を一、二文で紹介する。N は店の番号。この紹介だけは、短く話す規則の例外とする。
+- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名とその店のいちばんの魅力を一文で紹介する。N は店の番号。詳しい内容（料理・雰囲気・予算・おすすめ）は画面のショップカードにあるので、話して繰り返さない。
 - status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が places_partial のときは、一部のお店を確認できなかったことも伝える。
 - status が error のときは一時的に探せなかったと伝える。busy のときは前の検索を続けていると伝える。superseded のときは、新しい検索を受け付けたため、この検索の結果は表示しなかったと伝える。
 - お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。

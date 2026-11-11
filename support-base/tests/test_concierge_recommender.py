@@ -24,8 +24,8 @@ GEO = {'country_code': 'JP', 'region': '東京都', 'lat': 35.6467, 'lng': 139.7
 def cand(name, area='恵比寿', locality='恵比寿', branch='', aliases=(), **kw):
     c = {
         'name': name, 'aliases': list(aliases), 'branch': branch, 'area': area, 'locality': locality,
-        'genre': '焼き鳥', 'specialty': 'つくね', 'atmosphere': '落ち着いた', 'price_estimate': '6,000円',
-        'reason': '推薦理由。',
+        'genre': '焼き鳥', 'specialty': 'つくね', 'atmosphere': '落ち着いた', 'scene': '接待',
+        'price_estimate': '6,000円', 'tips': 'カウンター席がおすすめ。', 'reason': '推薦理由。',
     }
     c.update(kw)
     return c
@@ -204,8 +204,9 @@ class TestRecommend(BaseCase):
         out, _, _ = self.run_recommend([r1([cand(n) for n in names])], table)
         card = out['cards'][0]
         self.assertEqual((card['name'], card['place_id'], card['priceRange']), ('店1', 'P1', '6,000円（目安）'))
-        self.assertEqual(card['highlights'], ['つくね', '落ち着いた'])   # specialty・atmosphere
+        self.assertEqual(card['highlights'], ['つくね', '落ち着いた', '接待'])   # 看板・雰囲気・利用シーン
         self.assertEqual(card['description'], '推薦理由。')
+        self.assertEqual(card['tips'], 'カウンター席がおすすめ。')
         self.assertIn('photo_reference=REF', card['image'])
         self.assertIn('google.com/search', card['hotpepper_url'])     # 表示前は検索 URL
         self.assertIn('tabelog.com/tokyo/', card['tabelog_url'])

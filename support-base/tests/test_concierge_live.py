@@ -98,6 +98,7 @@ class TestConfigAndPrompt(unittest.TestCase):
         self.assertNotIn('同意を得てから', rules)          # 同意の規則は本文だけに書く
         self.assertNotIn('fresh_disabled', rules)
         self.assertIn('places_partial', rules)
+        self.assertIn('ショップカード', rules)            # 詳しい内容はカードで表し、話して繰り返さない
 
     def test_user_context_for_returning_user_without_name(self):
         ctx = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': ''})
