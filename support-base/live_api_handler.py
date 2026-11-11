@@ -154,7 +154,7 @@ def build_system_instruction(mode: str, user_profile: dict = None,
 
 
 def _build_concierge_user_context(user_profile: dict = None) -> str:
-    """コンシェルジュモードのユーザーコンテキストを構築"""
+    """コンシェルジュモードのユーザーコンテキストを構築（R2.0 §6.4）"""
     if not user_profile:
         # プロファイル不明 → 新規ユーザー扱い
         return _get_first_visit_context()
@@ -163,18 +163,28 @@ def _build_concierge_user_context(user_profile: dict = None) -> str:
     preferred_name = user_profile.get('preferred_name', '')
     name_honorific = user_profile.get('name_honorific', '')
 
-    if is_first_visit or not preferred_name:
+    if is_first_visit:
         return _get_first_visit_context()
-    else:
-        return _get_returning_user_context(preferred_name, name_honorific)
+    if not preferred_name:
+        # リピーターで名前が未登録：毎回名前を聞き直さない
+        return _get_returning_unnamed_context()
+    return _get_returning_user_context(preferred_name, name_honorific)
 
 
 def _get_first_visit_context() -> str:
-    """新規ユーザー用コンテキスト: 名前を聞く"""
+    """新規ユーザー用コンテキスト: 名前を聞くが、お店探しを妨げない"""
     return """## 初期あいさつ（新規ユーザー）
 このユーザーは初めての来訪です。
 最初の発話で「初めまして、AIコンシェルジュです。よろしければ、何とお呼びすればいいか教えてください。」と名前を聞いてください。
-ユーザーが名前を教えてくれたら、その名前で呼びかけてから、お店探しの会話を始めてください。"""
+ユーザーが名前を教えてくれたら、その名前で呼びかけてから、お店探しの会話を始めてください。
+名前より先にお店の希望を言われたら、そのままお店探しを進めてください。"""
+
+
+def _get_returning_unnamed_context() -> str:
+    """リピーターで名前が未登録のときのコンテキスト"""
+    return """## 初期あいさつ（リピーター・名前は未登録）
+このユーザーは以前にも来訪しています。名前は分かりません。
+最初の発話で「お帰りなさいませ。今日はどのようなお食事をお考えですか？」と挨拶してください。名前は聞き直さないでください。"""
 
 
 def _get_returning_user_context(preferred_name: str, name_honorific: str) -> str:
@@ -236,14 +246,18 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
     behavior=types.Behavior.BLOCKING,
-    description="ユーザーの条件に基づいてレストランを検索する。条件が十分に揃ったと判断した時に呼び出す。user_requestには会話で確認した全条件を必ず含めること。",
+    description="お客様が条件の確認に承諾したときだけ呼ぶ。推薦システムにお店の候補を依頼する。",
     parameters=types.Schema(
         type="OBJECT",
         properties={
             "user_request": types.Schema(
                 type="STRING",
-                description="検索条件の要約。会話で確定した全条件（エリア・ジャンル/シーン・予算・人数・その他希望）を漏れなく含めること。例: '六本木 接待向けイタリアン 予算1万円 4名 個室希望'"
-            )
+                description="確認でお客様に伝えた条件の要約。お客様が言っていない条件は入れない。例: '恵比寿 イタリアン'、'恵比寿 デート イタリアン 予算1万円 2名'"
+            ),
+            "area": types.Schema(
+                type="STRING",
+                description="確認したエリア名（駅名や地域名）。分からなければ空"
+            ),
         },
         required=["user_request"]
     )
@@ -273,7 +287,7 @@ UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
 GET_CURRENT_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="get_current_shops",
     behavior=types.Behavior.BLOCKING,
-    description="画面に表示している最新の確定店（版・紹介の印つき）を返す。画面の店はキーボード操作でも変わるので、お店について答える前に必ず呼ぶこと。",
+    description="画面に表示している最新の確定店（版・紹介の印つき）を返す。",
     parameters=types.Schema(type="OBJECT", properties={}),
 )
 
@@ -343,16 +357,15 @@ CONCIERGE_RESUME_TEXTS = {
 
 
 def concierge_live_rules(language: str) -> str:
-    """Live 用の規則（コードの定数。v11 の後ろに足す。R1.4 §6.3）"""
+    """Live 用の規則（コードの定数。v11 の後ろに足す）。同意の規則は本文だけに書く（R2.0 §6.4）"""
     lead = CONCIERGE_INTRO_LEADS.get(language, CONCIERGE_INTRO_LEADS['ja']).format(n='N')
     return f"""
 
 【音声の会話の規則（コンシェルジュ）】
-- 条件を確認して同意を得てから search_shops を呼ぶ。呼ぶときは話さない。
-- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・エリア・ジャンル・推薦理由を簡潔に紹介する。N は店の番号。
-- status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が fresh_disabled のときは、最近開店したお店の検索は準備中だと伝え、通常の探し方でよいか尋ねる。
+- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・ジャンル・推薦理由を一、二文で紹介する。N は店の番号。この紹介だけは、短く話す規則の例外とする。
+- status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が places_partial のときは、一部のお店を確認できなかったことも伝える。
 - status が error のときは一時的に探せなかったと伝える。busy のときは前の検索を続けていると伝える。superseded のときは、新しい検索を受け付けたため、この検索の結果は表示しなかったと伝える。
-- 画面の店はキーボード操作でも変わる。お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。
+- お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。
 - 店の印（mark）に従う。done（紹介済み）の店は繰り返さない。interrupted（途中で中断）の店は、その店の最初から紹介する。screen_only は画面に表示済みで、音声ではまだ紹介していない店。
 - JSON・項目名・状態の名前を読み上げない。
 """
@@ -449,6 +462,11 @@ class LiveAPISession:
 
         # 非同期キュー
         self.audio_queue_to_gemini = None
+        # キーボード入力のテキスト（R2.0 §8.2）。音声のキューは満杯なら捨てるので、別のキューにする
+        self.text_queue_to_gemini = None
+        self._loop = None
+        # カードの表示後に外部リンクを取るタスク（R2.0 §8.4）。セッションの終了時に cancel する
+        self._card_link_tasks = set()
         self.is_running = False
 
     def _build_config(self, with_context=None):
@@ -552,6 +570,16 @@ class LiveAPISession:
             except asyncio.QueueFull:
                 pass  # キューが満杯の場合はドロップ
 
+    def enqueue_text(self, text: str) -> bool:
+        """
+        キーボード入力のテキストを Live に送る（R2.0 §8.2）。Socket.IO のスレッドから呼ばれるので、
+        Live のイベントループに call_soon_threadsafe で渡す。捨てずに順番どおり送る。
+        """
+        if not (self.text_queue_to_gemini and self.is_running and self._loop):
+            return False
+        self._loop.call_soon_threadsafe(self.text_queue_to_gemini.put_nowait, text)
+        return True
+
     def stop(self):
         """セッションを停止"""
         self.is_running = False
@@ -563,6 +591,8 @@ class LiveAPISession:
         仕様書 セクション6.1 の run() を移植
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
+        self.text_queue_to_gemini = asyncio.Queue()
+        self._loop = asyncio.get_running_loop()
         self.is_running = True
         self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
 
@@ -651,6 +681,8 @@ class LiveAPISession:
             if self._a2e_worker_task:
                 self._a2e_worker_task.cancel()
                 self._a2e_worker_task = None
+            for task in list(self._card_link_tasks):
+                task.cancel()
             self.is_running = False
             logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
@@ -676,6 +708,25 @@ class LiveAPISession:
                     if self.needs_reconnect or not self.is_running:
                         return
                     logger.error(f"[LiveAPI] 送信エラー: {e}")
+                    self.needs_reconnect = True
+                    return
+
+        async def send_text():
+            """キーボード入力のテキストを LiveAPI に送る（R2.0 §8.2）。再開文と同じ send_realtime_input(text=) を使う"""
+            while not self.needs_reconnect and self.is_running:
+                try:
+                    text = await asyncio.wait_for(self.text_queue_to_gemini.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    await session.send_realtime_input(text=text)
+                    # 再接続時の履歴に残す（テキスト入力には入力の文字起こしが来ない）
+                    self._add_to_history("user", text)
+                    logger.info(f"[LiveAPI] キーボード入力を送信: {len(text)}文字")
+                except Exception as e:
+                    if self.needs_reconnect or not self.is_running:
+                        return
+                    logger.error(f"[LiveAPI] テキスト送信エラー: {e}")
                     self.needs_reconnect = True
                     return
 
@@ -706,6 +757,7 @@ class LiveAPISession:
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(send_audio())
+                tg.create_task(send_text())
                 tg.create_task(receive())
         except* Exception as eg:
             if not self.needs_reconnect:
@@ -1055,6 +1107,7 @@ class LiveAPISession:
     async def _handle_concierge_search(self, fc, session):
         """コンシェルジュの search_shops（R1.4 §6.2）"""
         user_request = fc.args.get("user_request", "")
+        area = fc.args.get("area", "") or ""
         logger.info(f"[Concierge] search_shops呼び出し: '{user_request}'")
         seq = self._shops_store.begin_search() if self._shops_store else None
         self.socketio.emit('shop_search_start', {'search_seq': seq}, room=self.client_sid)
@@ -1065,7 +1118,7 @@ class LiveAPISession:
                 loop = asyncio.get_event_loop()
                 out = await loop.run_in_executor(
                     None, functools.partial(self._shop_search_callback, user_request,
-                                            self.language, self.mode, seq))
+                                            self.language, self.mode, seq, area))
             except Exception as e:
                 logger.error(f"[Concierge] 検索の例外: {type(e).__name__}", exc_info=True)
         if not out:
@@ -1091,6 +1144,40 @@ class LiveAPISession:
             self._shop_intro_turn_pending = True
             self._start_intro(out.get('shops_version'), len(out.get('shops', [])))
             logger.info(f"[Concierge] complete: {len(out.get('shops', []))}店を tool_response で送信")
+            # 外部リンクは、紹介の音声を止めないよう tool_response の後に別タスクで取る（R2.0 §8.4）
+            if out.get('cards'):
+                self._start_card_links(out.get('shops_version'), out['cards'], out.get('card_geos') or [])
+
+    def _start_card_links(self, version, cards: list, geos: list):
+        """外部リンクの取得を始めて、すぐ戻る（待たない）"""
+        task = asyncio.ensure_future(self._send_card_links(version, cards, geos))
+        self._card_link_tasks.add(task)
+        task.add_done_callback(self._card_link_tasks.discard)
+
+    async def _send_card_links(self, version, cards: list, geos: list):
+        """既定のスレッドプールで外部リンクを取り、確定店の版がまだ最新なら shop_cards_update を送る"""
+        import concierge_places
+        loop = asyncio.get_event_loop()
+        try:
+            updates = await loop.run_in_executor(
+                None, functools.partial(concierge_places.links_for_cards, cards, geos, self.language))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[Concierge] 外部リンクの取得の例外: {type(e).__name__}")
+            return
+        if not updates:
+            return
+        state = self._concierge_state()
+        if state is not None and version is not None and state[1] != version:
+            logger.info("[Concierge] 確定店が新しくなったため、外部リンクは送らない")
+            return
+        self.socketio.emit('shop_cards_update', {
+            'session_id': self.session_id,
+            'shops_version': version,
+            'updates': updates,
+        }, room=self.client_sid)
+        logger.info(f"[Concierge] 外部リンクを送信: {len(updates)}店")
 
     # ---- 紹介の記録（R1.4 §6.4）。サーバーだけで記録する ----
 

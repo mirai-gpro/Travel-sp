@@ -66,7 +66,7 @@ def live(mode='concierge', store=None, callback=None, language='ja'):
 
 
 def complete_callback(store):
-    def cb(user_request, lang, mode, seq):
+    def cb(user_request, lang, mode, seq, area=''):
         v = store.commit_shops(seq, FIVE, origin='live')
         return {'status': 'complete', 'reason_code': None, 'source': 'knowledge', 'found_count': 5,
                 'shops': FIVE, 'cards': [{'name': s['name']} for s in FIVE], 'shops_version': v}
@@ -79,6 +79,51 @@ class TestConfigAndPrompt(unittest.TestCase):
         names = [d.name for d in l._build_config()['tools'][0].function_declarations]
         self.assertEqual(names, ['search_shops', 'get_current_shops', 'update_user_profile'])
         self.assertEqual(lah.GET_CURRENT_SHOPS_DECLARATION.behavior, lah.types.Behavior.BLOCKING)
+
+    def test_search_shops_declaration_requires_consent_and_has_area(self):
+        decl = lah.SEARCH_SHOPS_DECLARATION
+        self.assertIn('承諾したときだけ', decl.description)
+        self.assertNotIn('十分に揃った', decl.description)
+        self.assertEqual(set(decl.parameters.properties), {'user_request', 'area'})
+        self.assertEqual(decl.parameters.required, ['user_request'])
+
+    def test_v11_body_has_no_fixed_hearing_or_consent_exception(self):
+        for lang in ('ja', 'en'):
+            body = sc.CONCIERGE_V11[lang]
+            for old in ('ヒアリング順序', '必ずこの順序', '確認なしで依頼してよい', '50文字', '電話で確認することもできます',
+                        'Hearing Order', 'without confirmation'):
+                self.assertNotIn(old, body, (lang, old))
+        self.assertIn('この条件で探してもよろしいですか', sc.CONCIERGE_V11['ja'])
+        rules = lah.concierge_live_rules('ja')
+        self.assertNotIn('同意を得てから', rules)          # 同意の規則は本文だけに書く
+        self.assertNotIn('fresh_disabled', rules)
+        self.assertIn('places_partial', rules)
+
+    def test_user_context_for_returning_user_without_name(self):
+        ctx = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': ''})
+        self.assertIn('お帰りなさいませ。', ctx)
+        self.assertIn('名前は聞き直さない', ctx)
+        first = lah._build_concierge_user_context({'is_first_visit': True})
+        self.assertIn('名前より先にお店の希望を言われたら', first)
+        named = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': '太郎', 'name_honorific': '様'})
+        self.assertIn('太郎様', named)
+
+    def test_enqueue_text_from_another_thread_keeps_order(self):
+        import threading
+        l, _ = live(store=new_store())
+
+        async def scenario():
+            l.text_queue_to_gemini = asyncio.Queue()
+            l._loop = asyncio.get_running_loop()
+            l.is_running = True
+            t = threading.Thread(target=lambda: [l.enqueue_text(x) for x in ('a', 'b', 'c')])
+            t.start()
+            t.join()
+            return [await asyncio.wait_for(l.text_queue_to_gemini.get(), 1) for _ in range(3)]
+
+        self.assertEqual(asyncio.run(scenario()), ['a', 'b', 'c'])
+        l.is_running = False
+        self.assertFalse(l.enqueue_text('d'))
 
     def test_chat_tools_unchanged(self):
         l, _ = live(mode='chat')
@@ -139,11 +184,53 @@ class TestToolCalls(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(sess.responses[1].response, {'status': 'busy'})
 
+    def test_card_links_fetched_after_tool_response(self):
+        import concierge_places
+        store = new_store()
+        l, sock = live(store=store, callback=complete_callback(store))
+        sess = FakeLive()
+        seen = {}
+
+        def fake_links(cards, geos, language):
+            seen['responses_before_fetch'] = len(sess.responses)   # 紹介を始める tool_response の後に取る
+            return [{'place_id': 'P1', 'links': {'hotpepper_url': 'https://h/1'}}]
+
+        async def scenario():
+            with mock.patch.object(concierge_places, 'links_for_cards', side_effect=fake_links):
+                await l._handle_tool_call(SimpleNamespace(function_calls=[fc('search_shops', {'user_request': 'x'})]), sess)
+                self.assertEqual(len(l._card_link_tasks), 1)        # 待たずに戻る
+                await asyncio.gather(*list(l._card_link_tasks))
+
+        asyncio.run(scenario())
+        self.assertEqual(seen['responses_before_fetch'], 1)
+        names = [n for n, _ in sock.events]
+        self.assertLess(names.index('shop_search_result'), names.index('shop_cards_update'))
+        update = sock.named('shop_cards_update')[0]
+        self.assertEqual((update['shops_version'], update['updates'][0]['place_id']), (1, 'P1'))
+
+    def test_card_links_not_sent_when_shops_changed(self):
+        import concierge_places
+        store = new_store()
+        l, sock = live(store=store, callback=complete_callback(store))
+        sess = FakeLive()
+
+        def fake_links(cards, geos, language):
+            store.commit_shops(store.begin_search(), FIVE, origin='text')   # 取得中に新しい確定が出た
+            return [{'place_id': 'P1', 'links': {'hotpepper_url': 'https://h/1'}}]
+
+        async def scenario():
+            with mock.patch.object(concierge_places, 'links_for_cards', side_effect=fake_links):
+                await l._handle_tool_call(SimpleNamespace(function_calls=[fc('search_shops', {'user_request': 'x'})]), sess)
+                await asyncio.gather(*list(l._card_link_tasks))
+
+        asyncio.run(scenario())
+        self.assertEqual(sock.named('shop_cards_update'), [])
+
     def test_not_found_keeps_previous_shops_and_no_cards(self):
         store = new_store()
         store.commit_shops(store.begin_search(), FIVE, origin='text')
 
-        def cb(user_request, lang, mode, seq):
+        def cb(user_request, lang, mode, seq, area=''):
             return {'status': 'not_found', 'reason_code': 'too_few_verified', 'source': 'knowledge',
                     'found_count': 2, 'shops': [], 'cards': [], 'shops_version': 1}
 
@@ -264,6 +351,43 @@ class TestLiveStart(unittest.TestCase):
         self.app.active_live_sessions.pop('client-1', None)
         return fake_cls, emit
 
+    def test_missing_session_is_created_for_shops_only(self):
+        # REST のセッションが別インスタンスにある（このインスタンスにない）場合（R2.0 §8.6）
+        sid = 'from-another-instance'
+        sc.SupportSession(sid)  # 何も作らない
+        fake_cls = mock.Mock()
+        with mock.patch.object(self.app, 'LiveAPISession', fake_cls), \
+                mock.patch.object(self.app.threading, 'Thread'), \
+                mock.patch.object(self.app, 'request', SimpleNamespace(sid='client-2')), \
+                mock.patch.object(self.app, 'emit', mock.Mock()):
+            self.app.handle_live_start({'session_id': sid, 'mode': 'concierge', 'language': 'ja'})
+        self.app.active_live_sessions.pop('client-2', None)
+        store = fake_cls.call_args.kwargs['shops_store']
+        self.assertEqual(store.get_shops_state(), ([], 0, {}))      # 確定店の保存先はある
+        self.assertIsNone(store.get_data()['user_id'])              # user_id はない（長期記憶は使えない）
+
+    def test_live_text_in_enqueues_text(self):
+        live_session = mock.Mock(is_running=True)
+        live_session.enqueue_text.return_value = True
+        emit = mock.Mock()
+        self.app.active_live_sessions['client-3'] = live_session
+        try:
+            with mock.patch.object(self.app, 'request', SimpleNamespace(sid='client-3')), \
+                    mock.patch.object(self.app, 'emit', emit):
+                self.app.handle_live_text_in({'text': '  恵比寿でイタリアン  '})
+                self.app.handle_live_text_in({'text': '   '})
+        finally:
+            self.app.active_live_sessions.pop('client-3', None)
+        live_session.enqueue_text.assert_called_once_with('恵比寿でイタリアン')
+        emit.assert_not_called()
+
+    def test_live_text_in_without_live_is_rejected(self):
+        emit = mock.Mock()
+        with mock.patch.object(self.app, 'request', SimpleNamespace(sid='client-4')), \
+                mock.patch.object(self.app, 'emit', emit):
+            self.app.handle_live_text_in({'text': 'x'})
+        emit.assert_called_once_with('live_text_rejected', {'reason': 'not_running'})
+
     def test_language_without_v11_does_not_start_live(self):
         fake_cls, emit = self.start('ko', new_store())
         fake_cls.assert_not_called()
@@ -273,7 +397,7 @@ class TestLiveStart(unittest.TestCase):
         store = new_store()
         fake_cls, _ = self.start('ja', store)
         kwargs = fake_cls.call_args.kwargs
-        self.assertIn('推薦の依頼', kwargs['system_prompt'])          # v11
+        self.assertIn('お店探しの依頼', kwargs['system_prompt'])      # v11（R2.0 の本文）
         self.assertIn('get_current_shops', kwargs['system_prompt'])   # Live 用規則
         self.assertEqual(kwargs['shops_store'].session_id, store.session_id)
         cb = kwargs['shop_search_callback']
@@ -282,8 +406,9 @@ class TestLiveStart(unittest.TestCase):
         import concierge_recommender
         with mock.patch.object(concierge_recommender, 'recommend_shops', return_value=dict(result)) as rec:
             seq = store.begin_search()
-            out = cb('恵比寿 焼き鳥', 'ja', 'concierge', seq)
+            out = cb('恵比寿 焼き鳥', 'ja', 'concierge', seq, '恵比寿')
         self.assertEqual(rec.call_args[0][:3], ('恵比寿 焼き鳥', 'ja', 'live'))
+        self.assertEqual(rec.call_args.kwargs['area'], '恵比寿')            # search_shops の area を渡す
         self.assertEqual((out['status'], out['shops_version']), ('complete', 1))
         self.assertEqual(store.get_shops_state()[2][1], 'not_started')
         with mock.patch.object(concierge_recommender, 'recommend_shops', return_value=dict(result)):

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-コンシェルジュの照合と表示用データ（R1.4 最終版 §3.2〜§3.4・§4.4・§8.4）
+コンシェルジュの照合と表示用データ（R2.0 §7.4・§8.4）
 
 - Places（旧版 Text Search）は「今その名前でその場所に営業しているか」を確かめるだけに使う。
 - 同一性判定に LLM は使わない。結果をすべて 5 条件（名前・支店・場所・業態・営業）で調べる。
@@ -26,7 +26,7 @@ PHOTO_URL = 'https://maps.googleapis.com/maps/api/place/photo'
 
 # 各要求の待ち時間は現行（search_place）と同じ 10 秒（§3.2）
 REQUEST_TIMEOUT_SEC = 10
-# 1 段あたり同時に呼ぶ Places の数（§3.2）
+# 同時に呼ぶ Places の数（R2.0 §7.4）
 MAX_PARALLEL = 8
 # 位置バイアスの半径は現行（search_place）と同じ
 RADIUS_JP_M = 3000
@@ -44,6 +44,8 @@ SAME = 'same'
 AMBIGUOUS = 'ambiguous'
 CLOSED = 'closed'
 NOT_FOUND = 'not_found'
+# Places の応答を受け取れなかった（時間切れ・通信の例外・OK と ZERO_RESULTS 以外の status）。R2.0 §7.4
+NO_RESPONSE = 'no_response'
 
 _SYMBOLS = re.compile(r'[\W_]+', re.UNICODE)
 
@@ -155,7 +157,8 @@ def judge(candidate: dict, results: list, geo: dict):
 def text_search(candidate: dict, geo: dict, language: str):
     """
     旧版 Text Search に「店名 支店 エリア」を渡す。
-    (結果のリスト, 応答を受け取れたか) を返す。時間切れは「見つからない」と同じ扱い（§3.2）。
+    (結果のリスト, 応答を受け取れたか) を返す。
+    応答を受け取れたのは OK と ZERO_RESULTS だけ。時間切れは「応答なし」で、「見つからない」とは区別する（R2.0 §7.4）。
     """
     api_key = api_integrations.GOOGLE_PLACES_API_KEY
     if not api_key:
@@ -173,7 +176,7 @@ def text_search(candidate: dict, geo: dict, language: str):
         data = requests.get(TEXT_SEARCH_URL, params=params, timeout=REQUEST_TIMEOUT_SEC).json()
     except requests.exceptions.Timeout:
         logger.warning(f'[ConciergePlaces] 時間切れ: {query}')
-        return [], True
+        return [], False
     except Exception as e:
         logger.error(f'[ConciergePlaces] Text Search の例外: {type(e).__name__}')
         return [], False
@@ -186,27 +189,46 @@ def text_search(candidate: dict, geo: dict, language: str):
     return [], False
 
 
-def match_candidates(candidates: list, geo_for, language: str):
-    """
-    候補を並列に照合する。geo_for(candidate) は位置の情報を返す関数。
-    [(候補, 判定, 結果)] を候補の順で返し、あわせて Places の応答を 1 つでも受け取れたかを返す。
-    """
-    def one(c):
-        geo = geo_for(c)
-        results, ok = text_search(c, geo, language)
-        verdict, place = judge(c, results, geo)
-        logger.info(f"[ConciergePlaces] {c.get('name', '')}: {verdict}")
-        return c, verdict, place, ok
+def _match_one(candidate: dict, geo_for, language: str):
+    """候補 1 件の照合。共有の状態は書かず、(候補, 判定, 結果) を返すだけ（R2.0 §7.4）"""
+    try:
+        geo = geo_for(candidate)
+        results, ok = text_search(candidate, geo, language)
+        if ok:
+            verdict, place = judge(candidate, results, geo)
+        else:
+            verdict, place = NO_RESPONSE, None
+    except Exception as e:
+        logger.error(f'[ConciergePlaces] 照合の例外: {type(e).__name__}')
+        verdict, place = NO_RESPONSE, None
+    logger.info(f"[ConciergePlaces] {candidate.get('name', '')}: {verdict}")
+    return candidate, verdict, place
 
+
+def match_in_order(candidates: list, geo_for, language: str, accept, need: int) -> None:
+    """
+    候補を並列に照合し、結果は LLM の順位の順に accept(候補, 判定, 結果) へ渡す（R2.0 §7.4）。
+    accept は確定数を返す。need に達したら残りを待たずに戻る。
+    - with は使わない（抜けるときに全件の終了を待つため）。
+    - 打ち切ったら、まだ始まっていない照合は取り消す。実行中の照合は止められないので、結果を捨てる。
+    - accept はこの関数を呼んだスレッドだけで呼ぶ。確定のリストを書くのはそこだけ。
+    """
     if not candidates:
-        return [], False
-    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(candidates))) as ex:
-        out = list(ex.map(one, candidates))
-    return [(c, v, p) for c, v, p, _ in out], any(ok for *_, ok in out)
+        return
+    ex = ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(candidates)))
+    futures = [ex.submit(_match_one, c, geo_for, language) for c in candidates]
+    try:
+        for f in futures:
+            c, verdict, place = f.result()
+            if accept(c, verdict, place) >= need:
+                break
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
-def _photo_url(place: dict, details: dict):
-    photos = place.get('photos') or (details or {}).get('photos')
+def _photo_url(place: dict):
+    """写真は照合で受け取った Text Search の結果から作る（R2.0 §8.4。Place Details は呼ばない）"""
+    photos = place.get('photos')
     if not photos:
         return None
     ref = photos[0].get('photo_reference')
@@ -216,22 +238,49 @@ def _photo_url(place: dict, details: dict):
             f"&photo_reference={ref}&key={api_integrations.GOOGLE_PLACES_API_KEY}")
 
 
-def _external_links(name: str, area: str, geo: dict, country: str, lat, lng, language: str) -> dict:
-    """出し分けは現行（enrich_shops_with_photos）どおり。問い合わせには LLM の店名と地域を使う"""
+_PREF_CODES = {'東京': 'tokyo', '神奈川': 'kanagawa', '大阪': 'osaka', '京都': 'kyoto', '兵庫': 'hyogo',
+               '北海道': 'hokkaido', '愛知': 'aichi', '福岡': 'fukuoka'}
+
+
+def _pref_key(region_name: str) -> str:
+    """都道府県名の末尾の「都・府・県」を 1 文字だけ除く。北海道はそのまま（R2.0 §7.4。旧 rstrip の不具合を直す）"""
+    name = region_name or ''
+    if name != '北海道' and name[-1:] in ('都', '府', '県'):
+        return name[:-1]
+    return name
+
+
+def _country(geo: dict):
+    """外部リンクの出し分けに使う国。Geocoding の結果から取る（R2.0 §8.4）"""
+    return (geo or {}).get('country_code')
+
+
+def card_links_now(name: str, area: str, geo: dict, language: str) -> dict:
+    """カードの初期表示に入れるリンク（A）。外部 API を呼ばず、文字列を組み立てるだけ（R2.0 §8.4）"""
+    if language == 'ja' and _country(geo) == 'JP':
+        region_name = (geo or {}).get('region') or '東京'
+        pref_code = _PREF_CODES.get(_pref_key(region_name), 'tokyo')
+        return {
+            'hotpepper_url': f"https://www.google.com/search?q={name}+{area}+ホットペッパーグルメ",
+            'tabelog_url': f"https://tabelog.com/{pref_code}/rstLst/?sw={requests.utils.quote(name)}",
+            'gnavi_url': f"https://www.google.com/search?q={name}+{area}+ぐるなび",
+        }
+    return {}
+
+
+def card_links_later(name: str, area: str, geo: dict, lat, lng, language: str) -> dict:
+    """
+    カードの表示後に足すリンク（B）。外部 API を呼ぶ（R2.0 §8.4）。
+    出し分けは現行どおり：日本語かつ日本の店は Hot Pepper、それ以外は TripAdvisor。取れなかったものは返さない。
+    """
     links = {}
-    if language == 'ja' and country == 'JP':
-        hotpepper = None
+    if language == 'ja' and _country(geo) == 'JP':
         try:
             hotpepper = api_integrations.search_hotpepper(name, area, geo)
         except Exception:
             hotpepper = None
-        links['hotpepper_url'] = hotpepper or f"https://www.google.com/search?q={name}+{area}+ホットペッパーグルメ"
-        pref_code_map = {'東京': 'tokyo', '神奈川': 'kanagawa', '大阪': 'osaka', '京都': 'kyoto', '兵庫': 'hyogo',
-                         '北海道': 'hokkaido', '愛知': 'aichi', '福岡': 'fukuoka'}
-        region_name = (geo or {}).get('region') or '東京'
-        pref_code = pref_code_map.get(region_name.rstrip('都道府県'), 'tokyo')
-        links['tabelog_url'] = f"https://tabelog.com/{pref_code}/rstLst/?sw={requests.utils.quote(name)}"
-        links['gnavi_url'] = f"https://www.google.com/search?q={name}+{area}+ぐるなび"
+        if hotpepper:
+            links['hotpepper_url'] = hotpepper
         return links
     if api_integrations.TRIPADVISOR_API_KEY:
         try:
@@ -251,14 +300,12 @@ def _external_links(name: str, area: str, geo: dict, country: str, lat, lng, lan
 
 def build_card(item: dict, place: dict, geo: dict, language: str) -> dict:
     """
-    確定店 1 件のカード（§8.4。既存の ShopCardList の項目名）。
+    確定店 1 件のカード（既存の ShopCardList の項目名）。外部 API は呼ばない（R2.0 §8.4 の A）。
     item は会話用の項目（推薦の結果）、place は同一性判定を通った Text Search の結果。
     """
-    details = api_integrations.get_place_details(place['place_id'], language) or {}
     point = (place.get('geometry') or {}).get('location') or {}
     lat, lng = point.get('lat'), point.get('lng')
     highlights = [x for x in [item.get('specialty'), item.get('atmosphere')] if x]
-    highlights += [x for x in (item.get('fit') or []) if x][:max(0, 3 - len(highlights))]
     price = item.get('price_estimate') or ''
     card = {
         'name': item.get('name', ''),
@@ -267,24 +314,37 @@ def build_card(item: dict, place: dict, geo: dict, language: str) -> dict:
         'description': item.get('reason', ''),
         'highlights': highlights,
         'priceRange': f"{price}（目安）" if price else '',
-        'image': _photo_url(place, details),
+        'image': _photo_url(place),
         'rating': place.get('rating'),
         'reviewCount': place.get('user_ratings_total'),
-        'location': place.get('formatted_address') or details.get('formatted_address'),
-        'phone': details.get('phone'),
+        'location': place.get('formatted_address'),
         'maps_url': f"https://www.google.com/maps/place/?q=place_id:{place['place_id']}",
         'latitude': lat,
         'longitude': lng,
         'place_id': place['place_id'],
     }
-    card.update(_external_links(item.get('name', ''), item.get('area', ''), geo,
-                                details.get('country_code'), lat, lng, language))
+    card.update(card_links_now(item.get('name', ''), item.get('area', ''), geo, language))
     return card
 
 
 def build_cards(items_with_places: list, language: str) -> list:
-    """確定店のカードを並列に作る。items_with_places は [(会話用の項目, 結果, 位置の情報)]"""
-    if not items_with_places:
+    """確定店のカードを作る。items_with_places は [(会話用の項目, 結果, 位置の情報)]。外部 API を呼ばないので逐次で作る"""
+    return [build_card(item, place, geo, language) for item, place, geo in items_with_places]
+
+
+def links_for_cards(cards: list, geos: list, language: str) -> list:
+    """
+    表示後に足すリンク（B）を 5 店並列で取る（R2.0 §8.4）。
+    [{'place_id', 'links'}] を返す。足すリンクがない店は含めない。
+    """
+    if not cards:
         return []
-    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(items_with_places))) as ex:
-        return list(ex.map(lambda t: build_card(t[0], t[1], t[2], language), items_with_places))
+
+    def one(pair):
+        card, geo = pair
+        links = card_links_later(card.get('name', ''), card.get('area', ''), geo,
+                                 card.get('latitude'), card.get('longitude'), language)
+        return {'place_id': card.get('place_id'), 'links': links} if links else None
+
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(cards))) as ex:
+        return [x for x in ex.map(one, zip(cards, geos)) if x]

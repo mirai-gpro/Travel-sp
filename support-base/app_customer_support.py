@@ -864,11 +864,16 @@ def handle_live_start(data):
         system_prompt = build_system_instruction('concierge', user_profile=user_profile,
                                                  system_prompts={'concierge': CONCIERGE_V11}, language=language)
         shops_store = SupportSession(session_id) if session_id else None
+        if shops_store and shops_store.get_data() is None:
+            # このインスタンスに REST のセッションがない（別のインスタンスで作られた）：確定店の保存先だけを作る。
+            # user_info がないので user_id はなく、長期記憶の読み込みと名前の保存はできない（R2.0 §8.6・A-7）
+            shops_store.initialize({}, language=language, mode='concierge')
+            logger.warning("[LiveAPI] このインスタンスに SupportSession がないため、確定店の保存先だけを作成")
 
-        def _concierge_search(user_request, lang, search_mode, search_seq):
+        def _concierge_search(user_request, lang, search_mode, search_seq, area=''):
             """Live の search_shops：recommend_shops(origin='live') を呼び、5 店なら commit_shops で保存する"""
             from concierge_recommender import recommend_shops
-            out = recommend_shops(user_request, lang, 'live', gemini_client)
+            out = recommend_shops(user_request, lang, 'live', gemini_client, area=area)
             out['shops_version'] = None
             if out['status'] == 'complete':
                 if search_seq is None:
@@ -1090,6 +1095,22 @@ def handle_live_audio_in(data):
         live_session.enqueue_audio(pcm_bytes)
     except Exception as e:
         logger.error(f"[LiveAPI] 音声デコードエラー: {e}")
+
+
+@socketio.on('live_text_in')
+def handle_live_text_in(data):
+    """ブラウザ → LiveAPI キーボード入力のテキスト（R2.0 §8.2）。応答は音声とテキストの両方で Live から返る"""
+    client_sid = request.sid
+    live_session = active_live_sessions.get(client_sid)
+    text = ((data or {}).get('text') or '').strip()
+    if not text:
+        return
+    if not live_session or not live_session.is_running:
+        logger.warning("[LiveAPI] Live が動いていないため、キーボード入力を送れない")
+        emit('live_text_rejected', {'reason': 'not_running'})
+        return
+    if not live_session.enqueue_text(text):
+        emit('live_text_rejected', {'reason': 'not_ready'})
 
 
 @socketio.on('live_stop')
