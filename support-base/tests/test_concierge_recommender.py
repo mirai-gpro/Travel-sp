@@ -6,6 +6,8 @@ concierge_recommender / concierge_places の決定的テスト（外部 API は�
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -19,11 +21,11 @@ import concierge_recommender as cr  # noqa: E402
 GEO = {'country_code': 'JP', 'region': '東京都', 'lat': 35.6467, 'lng': 139.7101}
 
 
-def cand(name, area='恵比寿', locality='恵比寿', branch='', aliases=(), fresh=False, **kw):
+def cand(name, area='恵比寿', locality='恵比寿', branch='', aliases=(), **kw):
     c = {
         'name': name, 'aliases': list(aliases), 'branch': branch, 'area': area, 'locality': locality,
         'genre': '焼き鳥', 'specialty': 'つくね', 'atmosphere': '落ち着いた', 'price_estimate': '6,000円',
-        'fit': ['接待に向く個室'], 'reason': '推薦理由。', 'freshness_concern': fresh,
+        'reason': '推薦理由。',
     }
     c.update(kw)
     return c
@@ -62,25 +64,28 @@ class FakeClient:
         self.models = FakeModels(replies)
 
 
-def r1(candidates, recency=False, area='恵比寿'):
-    return {
-        'conditions': {'area': area, 'cuisine': '焼き鳥', 'budget': '', 'occasion': '接待', 'atmosphere': '',
-                       'party_size': '', 'must_have': [], 'avoid': [], 'recency_requested': recency,
-                       'prefecture': '東京都'},
-        'candidates': candidates,
-    }
+def r1(candidates, area='恵比寿'):
+    return {'area': area, 'candidates': candidates}
 
 
 class PlacesStub:
     """店名 → Text Search の結果。登録のない店は ZERO_RESULTS"""
 
-    def __init__(self, table):
+    def __init__(self, table, slow=None, fail=()):
         self.table = table
         self.queries = []
+        self.slow = slow or {}      # 店名 → 応答の前に待つ threading.Event か秒数
+        self.fail = set(fail)       # 店名 → 時間切れにする
 
     def get(self, url, params=None, timeout=None):
         assert url == cp.TEXT_SEARCH_URL
         self.queries.append(params['query'])
+        for name, wait in self.slow.items():
+            if params['query'].startswith(name + ' '):
+                wait.wait(5) if isinstance(wait, threading.Event) else time.sleep(wait)
+        for name in self.fail:
+            if params['query'].startswith(name + ' '):
+                raise cp.requests.exceptions.Timeout()
         for name, results in self.table.items():
             if params['query'].startswith(name + ' '):
                 return FakeResponse({'status': 'OK', 'results': results})
@@ -155,39 +160,64 @@ class TestNormalizeAndJudge(BaseCase):
 
 
 class TestRecommend(BaseCase):
-    def run_recommend(self, replies, table, request='恵比寿で接待の焼き鳥'):
+    def run_recommend(self, replies, table, request='恵比寿で接待の焼き鳥', area='', **stub_kw):
         client = FakeClient(replies)
-        stub = PlacesStub(table)
+        stub = PlacesStub(table, **stub_kw)
         with mock.patch.object(cp.requests, 'get', side_effect=stub.get):
-            out = cr.recommend_shops(request, 'ja', 'text', gemini_client=client)
+            out = cr.recommend_shops(request, 'ja', 'live', gemini_client=client, area=area)
         return out, client, stub
 
-    def test_complete_in_stage1_keeps_llm_order(self):
+    def test_complete_keeps_llm_order(self):
         names = [f'店{i}' for i in range(1, 13)]
         table = {n: [result(f'P{i}', n)] for i, n in enumerate(names, 1)}
-        out, client, stub = self.run_recommend([r1([cand(n) for n in names])], table)
+        out, client, _ = self.run_recommend([r1([cand(n) for n in names])], table)
         self.assertEqual(out['status'], cr.COMPLETE)
         self.assertEqual([s['name'] for s in out['shops']], names[:5])
         self.assertEqual([s['order'] for s in out['shops']], [1, 2, 3, 4, 5])
-        self.assertEqual(len(stub.queries), 7)          # 第 1 段だけ
         self.assertEqual(len(client.models.calls), 1)   # R4 は呼ばない
+        config = client.models.calls[0]['config']
         self.assertEqual(client.models.calls[0]['model'], cr.RECOMMEND_MODEL)
-        self.assertIsNone(client.models.calls[0]['config'].tools)  # 通常の推薦で検索を使わない
+        self.assertIsNone(config.tools)                 # D-1 の承認まで検索を使わない
+        self.assertEqual(config.thinking_config.thinking_level, cr.types.ThinkingLevel.LOW)
+        self.assertEqual(len(out['card_geos']), 5)
 
-    def test_cards_use_llm_name_not_places_name(self):
+    def test_order_kept_when_lower_rank_answers_first(self):
+        names = [f'店{i}' for i in range(1, 7)]
+        table = {n: [result(f'P{n}', n)] for n in names}
+        out, _, _ = self.run_recommend([r1([cand(n) for n in names])], table, slow={'店1': 0.2})
+        self.assertEqual([s['name'] for s in out['shops']], names[:5])
+
+    def test_does_not_wait_for_remaining_after_five(self):
+        names = [f'店{i}' for i in range(1, 9)]
+        table = {n: [result(f'P{n}', n)] for n in names}
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        started = time.monotonic()
+        out, _, _ = self.run_recommend([r1([cand(n) for n in names])], table, slow={'店7': gate, '店8': gate})
+        self.assertLess(time.monotonic() - started, 2)  # 7・8 位の照合を待たずに返る
+        self.assertEqual(out['status'], cr.COMPLETE)
+        self.assertEqual([s['name'] for s in out['shops']], names[:5])
+
+    def test_cards_without_details_and_external_api(self):
         names = [f'店{i}' for i in range(1, 6)]
         table = {n: [result(f'P{i}', f'{n} 本店（Places の名前）')] for i, n in enumerate(names, 1)}
         out, _, _ = self.run_recommend([r1([cand(n) for n in names])], table)
-        self.assertEqual(out['cards'][0]['name'], '店1')
-        self.assertEqual(out['cards'][0]['place_id'], 'P1')
-        self.assertEqual(out['cards'][0]['priceRange'], '6,000円（目安）')
-        self.assertIn('hotpepper_url', out['cards'][0])
-        api_integrations.search_hotpepper.assert_any_call('店1', '恵比寿', GEO)
-        # 会話用の項目に Places の値（評価・住所）を入れない
+        card = out['cards'][0]
+        self.assertEqual((card['name'], card['place_id'], card['priceRange']), ('店1', 'P1', '6,000円（目安）'))
+        self.assertEqual(card['highlights'], ['つくね', '落ち着いた'])   # specialty・atmosphere
+        self.assertEqual(card['description'], '推薦理由。')
+        self.assertIn('photo_reference=REF', card['image'])
+        self.assertIn('google.com/search', card['hotpepper_url'])     # 表示前は検索 URL
+        self.assertIn('tabelog.com/tokyo/', card['tabelog_url'])
+        self.assertNotIn('phone', card)
+        api_integrations.get_place_details.assert_not_called()
+        api_integrations.search_hotpepper.assert_not_called()
+        # 会話用の項目に Places の値（評価・住所）を入れない。specialty・atmosphere・reason は残す
         self.assertNotIn('rating', out['shops'][0])
-        self.assertNotIn('location', out['shops'][0])
+        self.assertEqual((out['shops'][0]['specialty'], out['shops'][0]['atmosphere']), ('つくね', '落ち着いた'))
+        self.assertNotIn('fit', out['shops'][0])
 
-    def test_stage2_then_supplement(self):
+    def test_supplement_after_all_candidates(self):
         names = [f'店{i}' for i in range(1, 13)]
         ok = {'店1', '店9'}
         table = {n: [result(f'P{n}', n)] for n in ok}
@@ -197,8 +227,9 @@ class TestRecommend(BaseCase):
         self.assertEqual(out['status'], cr.COMPLETE)
         self.assertEqual([s['name'] for s in out['shops']], ['店1', '店9', '補A', '補B', '補C'])
         self.assertEqual(len(client.models.calls), 2)
-        self.assertIn('店12', client.models.calls[1]['contents'])  # 試した店を渡す
-        self.assertEqual(stub.queries.count('店1 恵比寿'), 1)       # 試した店は照合し直さない
+        self.assertIn('店12', client.models.calls[1]['contents'])       # 試した店を渡す
+        self.assertIn('恵比寿で接待の焼き鳥', client.models.calls[1]['contents'])  # 元の依頼を渡す
+        self.assertEqual(stub.queries.count('店1 恵比寿'), 1)             # 試した店は照合し直さない
 
     def test_too_few_verified_is_not_found(self):
         names = [f'店{i}' for i in range(1, 13)]
@@ -206,27 +237,44 @@ class TestRecommend(BaseCase):
         out, _, _ = self.run_recommend([r1([cand(n) for n in names]), {'candidates': []}], table)
         self.assertEqual((out['status'], out['reason_code'], out['found_count']),
                          (cr.NOT_FOUND, 'too_few_verified', 3))
-        self.assertEqual(out['shops'], [])
-        self.assertEqual(out['cards'], [])
+        self.assertEqual((out['shops'], out['cards']), ([], []))
+
+    def test_partial_no_response_is_places_partial(self):
+        names = [f'店{i}' for i in range(1, 7)]
+        table = {n: [result(f'P{n}', n)] for n in ['店1', '店2', '店3']}
+        out, client, _ = self.run_recommend([r1([cand(n) for n in names]), {'candidates': []}], table,
+                                            fail={'店4'})
+        self.assertEqual((out['status'], out['reason_code'], out['found_count']),
+                         (cr.NOT_FOUND, 'places_partial', 3))
+        self.assertEqual(len(client.models.calls), 2)   # 一部の応答なしでは R4 を呼ぶ
+
+    def test_all_no_response_is_error_without_r4(self):
+        names = [f'店{i}' for i in range(1, 4)]
+        out, client, _ = self.run_recommend([r1([cand(n) for n in names])], {}, fail=set(names))
+        self.assertEqual((out['status'], out['reason_code']), (cr.ERROR, 'places'))
+        self.assertEqual(len(client.models.calls), 1)   # R4 は呼ばない
 
     def test_no_candidates(self):
         out, _, stub = self.run_recommend([r1([])], {})
         self.assertEqual((out['status'], out['reason_code']), (cr.NOT_FOUND, 'no_candidates'))
         self.assertEqual(stub.queries, [])
 
-    def test_fresh_disabled(self):
-        out, client, stub = self.run_recommend([r1([cand('店1')], recency=True)], {})
-        self.assertEqual((out['status'], out['reason_code']), (cr.NOT_FOUND, 'fresh_disabled'))
-        self.assertEqual(stub.queries, [])
-        self.assertEqual(len(client.models.calls), 1)
-
-    def test_freshness_concern_not_matched(self):
-        names = [f'店{i}' for i in range(1, 7)]
-        cands = [cand(n, fresh=(n == '店1')) for n in names]
+    def test_area_from_search_shops_is_geocoded_once(self):
+        names = [f'店{i}' for i in range(1, 6)]
         table = {n: [result(f'P{n}', n)] for n in names}
-        out, _, stub = self.run_recommend([r1(cands)], table)
-        self.assertEqual([s['name'] for s in out['shops']], names[1:6])
-        self.assertNotIn('店1 恵比寿', stub.queries)
+        out, _, _ = self.run_recommend([r1([cand(n) for n in names], area='恵比寿駅')], table, area='恵比寿')
+        self.assertEqual(out['status'], cr.COMPLETE)
+        api_integrations.get_region_from_area.assert_called_once_with('恵比寿', 'ja')
+
+    def test_grounding_flag_adds_search_tool_and_rule(self):
+        names = [f'店{i}' for i in range(1, 6)]
+        table = {n: [result(f'P{n}', n)] for n in names}
+        with mock.patch.object(cr, 'GROUNDING_ENABLED', True):
+            _, client, _ = self.run_recommend([r1([cand(n) for n in names])], table)
+        config = client.models.calls[0]['config']
+        self.assertEqual(len(config.tools), 1)
+        self.assertIsNotNone(config.tools[0].google_search)
+        self.assertIn('Google 検索', config.system_instruction)
 
     def test_duplicate_place_and_chain(self):
         cands = [cand('店1'), cand('店1', branch='西口店'), cand('店2'), cand('店3'), cand('店4'),
@@ -246,11 +294,38 @@ class TestRecommend(BaseCase):
         self.assertEqual(out['status'], cr.ERROR)
         self.assertEqual(len(client.models.calls), 1)  # 自動のやり直しはしない
 
-    def test_places_never_answered_is_error(self):
+    def test_error_text_has_http_status(self):
+        err = RuntimeError('server')
+        err.code = 504
+        with self.assertRaisesRegex(cr.RecommendError, 'RuntimeError 504'):
+            cr._call_json(FakeClient([err]), 'i', 'c', cr.R1_SCHEMA)
+
+    def test_places_exception_is_error(self):
         client = FakeClient([r1([cand('店1')])])
         with mock.patch.object(cp.requests, 'get', side_effect=RuntimeError('net')):
             out = cr.recommend_shops('x', 'ja', 'text', gemini_client=client)
         self.assertEqual((out['status'], out['reason_code']), (cr.ERROR, 'places'))
+
+
+class TestPlacesHelpers(BaseCase):
+    def test_timeout_is_no_response_and_zero_results_is_response(self):
+        with mock.patch.object(cp.requests, 'get', side_effect=cp.requests.exceptions.Timeout()):
+            self.assertEqual(cp.text_search(cand('店1'), GEO, 'ja'), ([], False))
+        with mock.patch.object(cp.requests, 'get',
+                               return_value=FakeResponse({'status': 'ZERO_RESULTS', 'results': []})):
+            self.assertEqual(cp.text_search(cand('店1'), GEO, 'ja'), ([], True))
+
+    def test_pref_key(self):
+        self.assertEqual([cp._pref_key(x) for x in ['京都府', '北海道', '東京都', '大阪府', '福岡県']],
+                         ['京都', '北海道', '東京', '大阪', '福岡'])
+
+    def test_links_for_cards_calls_external_api(self):
+        api_integrations.search_hotpepper.return_value = 'https://www.hotpepper.jp/strJ000/'
+        cards = [{'name': '店1', 'area': '恵比寿', 'place_id': 'P1', 'latitude': 1, 'longitude': 2},
+                 {'name': '店2', 'area': '恵比寿', 'place_id': 'P2', 'latitude': 1, 'longitude': 2}]
+        out = cp.links_for_cards(cards, [GEO, GEO], 'ja')
+        self.assertEqual(out[0], {'place_id': 'P1', 'links': {'hotpepper_url': 'https://www.hotpepper.jp/strJ000/'}})
+        self.assertEqual(len(out), 2)
 
 
 if __name__ == '__main__':
