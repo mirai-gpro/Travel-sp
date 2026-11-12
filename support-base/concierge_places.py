@@ -305,8 +305,7 @@ def build_card(item: dict, place: dict, geo: dict, language: str) -> dict:
     """
     point = (place.get('geometry') or {}).get('location') or {}
     lat, lng = point.get('lat'), point.get('lng')
-    # 特徴は 3 つ（看板メニュー・雰囲気・利用シーン）。詳しい内容はカードで表す
-    highlights = [x for x in [item.get('specialty'), item.get('atmosphere'), item.get('scene')] if x]
+    highlights = [x for x in [item.get('specialty'), item.get('atmosphere')] if x]
     price = item.get('price_estimate') or ''
     card = {
         'name': item.get('name', ''),
@@ -315,7 +314,6 @@ def build_card(item: dict, place: dict, geo: dict, language: str) -> dict:
         'description': item.get('reason', ''),
         'highlights': highlights,
         'priceRange': f"{price}（目安）" if price else '',
-        'tips': item.get('tips', ''),
         'image': _photo_url(place),
         'rating': place.get('rating'),
         'reviewCount': place.get('user_ratings_total'),

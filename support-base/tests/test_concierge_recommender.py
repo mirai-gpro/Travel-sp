@@ -24,8 +24,8 @@ GEO = {'country_code': 'JP', 'region': '東京都', 'lat': 35.6467, 'lng': 139.7
 def cand(name, area='恵比寿', locality='恵比寿', branch='', aliases=(), **kw):
     c = {
         'name': name, 'aliases': list(aliases), 'branch': branch, 'area': area, 'locality': locality,
-        'genre': '焼き鳥', 'specialty': 'つくね', 'atmosphere': '落ち着いた', 'scene': '接待',
-        'price_estimate': '6,000円', 'tips': 'カウンター席がおすすめ。', 'reason': '推薦理由。',
+        'genre': '焼き鳥', 'specialty': 'つくね', 'atmosphere': '落ち着いた', 'price_estimate': '6,000円',
+        'reason': '推薦理由。',
     }
     c.update(kw)
     return c
@@ -204,9 +204,8 @@ class TestRecommend(BaseCase):
         out, _, _ = self.run_recommend([r1([cand(n) for n in names])], table)
         card = out['cards'][0]
         self.assertEqual((card['name'], card['place_id'], card['priceRange']), ('店1', 'P1', '6,000円（目安）'))
-        self.assertEqual(card['highlights'], ['つくね', '落ち着いた', '接待'])   # 看板・雰囲気・利用シーン
+        self.assertEqual(card['highlights'], ['つくね', '落ち着いた'])   # specialty・atmosphere
         self.assertEqual(card['description'], '推薦理由。')
-        self.assertEqual(card['tips'], 'カウンター席がおすすめ。')
         self.assertIn('photo_reference=REF', card['image'])
         self.assertIn('google.com/search', card['hotpepper_url'])     # 表示前は検索 URL
         self.assertIn('tabelog.com/tokyo/', card['tabelog_url'])
@@ -217,18 +216,43 @@ class TestRecommend(BaseCase):
         self.assertNotIn('rating', out['shops'][0])
         self.assertEqual((out['shops'][0]['specialty'], out['shops'][0]['atmosphere']), ('つくね', '落ち着いた'))
         self.assertNotIn('fit', out['shops'][0])
+        # 紹介の要点は確定後に既存の項目から組み立てる（カードには入れない）
+        self.assertEqual(out['shops'][0]['talking_points'],
+                         ['看板料理：つくね', '雰囲気：落ち着いた', 'おすすめ理由：推薦理由。', '予算目安：6,000円'])
+        self.assertNotIn('talking_points', card)
+
+    def test_initial_candidates_limited_to_eight(self):
+        names = [f'店{i}' for i in range(1, 13)]
+        out, client, stub = self.run_recommend([r1([cand(n) for n in names]), {'candidates': []}], {})
+        self.assertEqual(out['status'], cr.NOT_FOUND)
+        self.assertEqual(len(stub.queries), 8)                          # 9 位以降は照合しない
+        config = client.models.calls[0]['config']
+        self.assertEqual(config.response_json_schema['properties']['candidates']['maxItems'], 8)
+        self.assertIn('最大8件', config.system_instruction)
+        self.assertEqual(client.models.calls[1]['config']
+                         .response_json_schema['properties']['candidates']['maxItems'], 8)   # R4 は 8 のまま
+
+    def test_talking_points_skip_empty_values(self):
+        item = {'specialty': '', 'atmosphere': '落ち着いた', 'reason': '理由。', 'price_estimate': ' '}
+        self.assertEqual(cr.talking_points(item, 'ja'), ['雰囲気：落ち着いた', 'おすすめ理由：理由。'])
+        self.assertEqual(cr.talking_points(item, 'en'), ['Atmosphere: 落ち着いた', 'Why we recommend it: 理由。'])
+
+    def test_candidate_schema_same_as_before(self):
+        self.assertEqual(cr._CANDIDATE_ITEM['required'],
+                         ['name', 'aliases', 'branch', 'area', 'locality', 'genre', 'specialty',
+                          'atmosphere', 'price_estimate', 'reason'])
 
     def test_supplement_after_all_candidates(self):
-        names = [f'店{i}' for i in range(1, 13)]
-        ok = {'店1', '店9'}
+        names = [f'店{i}' for i in range(1, 9)]
+        ok = {'店1', '店8'}
         table = {n: [result(f'P{n}', n)] for n in ok}
         extra = [cand('補A'), cand('補B'), cand('補C'), cand('店1')]
         table.update({n: [result(f'P{n}', n)] for n in ['補A', '補B', '補C']})
         out, client, stub = self.run_recommend([r1([cand(n) for n in names]), {'candidates': extra}], table)
         self.assertEqual(out['status'], cr.COMPLETE)
-        self.assertEqual([s['name'] for s in out['shops']], ['店1', '店9', '補A', '補B', '補C'])
+        self.assertEqual([s['name'] for s in out['shops']], ['店1', '店8', '補A', '補B', '補C'])
         self.assertEqual(len(client.models.calls), 2)
-        self.assertIn('店12', client.models.calls[1]['contents'])       # 試した店を渡す
+        self.assertIn('店8', client.models.calls[1]['contents'])        # 試した店を渡す
         self.assertIn('恵比寿で接待の焼き鳥', client.models.calls[1]['contents'])  # 元の依頼を渡す
         self.assertEqual(stub.queries.count('店1 恵比寿'), 1)             # 試した店は照合し直さない
 
