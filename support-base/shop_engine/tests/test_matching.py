@@ -107,3 +107,85 @@ def test_address_contains_area_without_geocode():
 def test_empty_results_not_found():
     st, p, _ = m.classify(cand('串若丸'), [], '中目黒', NAKAMEGURO)
     assert st == m.NOT_FOUND and p is None
+
+
+# ---------------------------------------------------------------
+# 修正5: 同名の別支店・近接した別店舗・表記揺れ・店名変更
+# ---------------------------------------------------------------
+YUTENJI = dict(addr='日本、〒153-0052 東京都目黒区祐天寺1丁目', lat=35.6372, lng=139.6912)   # 中目黒から約1km
+
+
+def test_same_name_other_branch_nearby_is_not_verified():
+    """候補が「中目黒店」を名指し、Places には近くの「祐天寺店」しか無い → 2km 以内でも同一店舗にしない"""
+    st, p, d = m.classify(cand('鳥よし 中目黒店'), [place('PY', '鳥よし 祐天寺店', **YUTENJI)], '中目黒', NAKAMEGURO)
+    assert st == m.AMBIGUOUS and p is None
+    assert d['evaluated'][0]['branch_conflict'] is True
+
+
+def test_named_branch_chosen_among_same_name_branches():
+    results = [place('PY', '鳥よし 祐天寺店', **YUTENJI), place('PN', '鳥よし 中目黒店')]
+    st, p, _ = m.classify(cand('鳥よし 中目黒店'), results, '中目黒', NAKAMEGURO)
+    assert st == m.VERIFIED and p['place_id'] == 'PN'
+
+
+def test_annex_and_numbered_branch_are_different_shops():
+    """別館・2号店は同じ屋号の別店舗。候補が本館なら本館だけを VERIFIED にする"""
+    results = [place('PA', 'おみ乃 別館'), place('PM', 'おみ乃')]
+    st, p, _ = m.classify(cand('おみ乃'), results, '中目黒', NAKAMEGURO)
+    assert st == m.VERIFIED and p['place_id'] == 'PM'
+    st, p, _ = m.classify(cand('おみ乃'), [place('P2', 'おみ乃 2号店')], '中目黒', NAKAMEGURO)
+    assert st == m.AMBIGUOUS and p is None
+    st, p, _ = m.classify(cand('おみ乃 別館'), [place('PM', 'おみ乃')], '中目黒', NAKAMEGURO)
+    assert st == m.AMBIGUOUS and p is None
+
+
+def test_nearby_different_shops_with_similar_names_not_verified():
+    """同じエリアにある、名前が似ているだけの別店舗"""
+    for llm_name, other in [('鳥しき', '鳥しげ'), ('とり茂', 'とり喜'), ('串若丸', '串若'),
+                            ('焼鳥 はちまん', '焼鳥 はちや'), ('Bar Kura', 'Bar Kurara')]:
+        st, p, d = m.classify(cand(llm_name), [place('PO', other, types=('restaurant', 'bar'))], '中目黒', NAKAMEGURO)
+        assert st != m.VERIFIED and p is None, (llm_name, other, d)
+
+
+def test_notation_variants_kana_width_symbols():
+    for llm_name, places_name in [('トリカツ', 'とりかつ'),            # カタカナ／ひらがな
+                                  ('ＫＵＲＡ', 'KURA'),               # 全角／半角
+                                  ('鳥 しき', '鳥しき'),               # 空白
+                                  ('Pizzeria Eight', 'ピッツェリア エイト'),  # 英字と片仮名 → 別表記が無ければ一致しない
+                                  ]:
+        st, _, _ = m.classify(cand(llm_name), [place('P', places_name)], '中目黒', NAKAMEGURO)
+        if llm_name == 'Pizzeria Eight':
+            assert st != m.VERIFIED          # 翻字は推測しない（LLM の name_variants に頼る）
+        else:
+            assert st == m.VERIFIED, (llm_name, places_name)
+    st, _, _ = m.classify(cand('Pizzeria Eight', ['ピッツェリア エイト']), [place('P', 'ピッツェリアエイト 中目黒店')],
+                          '中目黒', NAKAMEGURO)
+    assert st == m.VERIFIED
+
+
+def test_renamed_shop_verified_only_via_llm_variants():
+    """店名変更: LLM が旧名・新名の両方を出していれば照合できる。片方だけなら推測で同一視しない"""
+    new_place = [place('PR', '焼鳥 はなび')]
+    st, p, _ = m.classify(cand('鳥はる', ['焼鳥 はなび']), new_place, '中目黒', NAKAMEGURO)       # 旧名＋新名を別表記
+    assert st == m.VERIFIED and p['place_id'] == 'PR'
+    st, p, _ = m.classify(cand('焼鳥 はなび', ['鳥はる']), new_place, '中目黒', NAKAMEGURO)       # 新名＋旧名を別表記
+    assert st == m.VERIFIED
+    st, p, _ = m.classify(cand('鳥はる'), new_place, '中目黒', NAKAMEGURO)                         # 旧名だけ
+    assert st == m.NOT_FOUND and p is None
+
+
+def test_location_uses_address_first_and_center_only_when_needed():
+    calls = []
+
+    def center():
+        calls.append(1)
+        return NAKAMEGURO
+    p_addr = place('P1', '串若丸', addr='東京都目黒区上目黒1丁目 中目黒駅前')
+    st, _, d = m.classify(cand('串若丸'), [p_addr], '中目黒', center)
+    assert st == m.VERIFIED and calls == [] and d['evaluated'][0]['location_method'] == 'address'
+    st, _, d = m.classify(cand('串若丸'), [place('P2', '串若丸')], '中目黒', center)
+    assert st == m.VERIFIED and calls == [1] and d['evaluated'][0]['location_method'] == 'distance'
+    # 名前が遠い結果では中心座標を取りに行かない
+    calls.clear()
+    m.classify(cand('串若丸'), [place('P3', '全然違う店')], '中目黒', center)
+    assert calls == []

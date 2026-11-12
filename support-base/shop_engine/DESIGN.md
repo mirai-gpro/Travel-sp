@@ -28,8 +28,8 @@ user_request ─▶ [A] Recommender（LLM・ストリーミング・検索ツー
                     │  1行目: plan（area / genre / freshness 判断）
                     │  2行目〜: candidate（推薦順に1件ずつ）
                     ▼
-                ├─▶ [B] Freshness Search（plan.freshness.required のときだけ。別スレッド）
-                ├─▶ Geocoding（plan.area。1回だけ）
+                ├─▶ [B] Freshness Search … Step 1〜2 では実行しない（判断と理由の記録のみ。Step 3 で実装）
+                ├─▶ Geocoding（plan.area。1回だけ。照合の開始はこれを待たない）
                 └─▶ [C] Place Verifier（candidate が届いた順に並列照会）
                          │ VERIFIED / AMBIGUOUS / NOT_FOUND / CLOSED / ERROR
                          ▼
@@ -84,11 +84,11 @@ user_request ─▶ [A] Recommender（LLM・ストリーミング・検索ツー
 
 ---
 
-## 3. [B] Freshness Search（Step 3 で本実装。Step 1 では判断の記録と所要時間の計測のみ）
+## 3. [B] Freshness Search（Step 3 で実装。**Step 1〜2 では Google 検索を一切実行しない**）
 
-- 起動条件: `plan.freshness.required == true` のときだけ。候補不足・照合失敗では起動しない。
-- 呼び出し: Google 検索ツール付きの別 LLM 呼び出し（`query` と `user_request` を入力）。出力は「最新情報メモ」。
-- Step 1 の扱い: 起動・終了時刻とメモを記録するだけで、カードには反映しない。
+- Step 1〜2: LLM の `freshness.required` / `central` / `reason` / `query` を記録するだけ。検索付きの呼び出しはコードに存在しない（テストで確認）。
+- Step 3 以降の起動条件: `plan.freshness.required == true` のときだけ。候補不足・照合失敗では起動しない。
+- Step 3 以降の呼び出し: Google 検索ツール付きの別 LLM 呼び出し（`query` と `user_request` を入力）。
 - 反映方式（基本仕様 §12-4, 5）は未決定。**提案（要承認）**:
   - `central == false`: カードは検索を待たずに表示。検索結果は表示済みカードの順位・内容を変えない。
   - `central == true`: 検索付き呼び出しで候補を作る経路に切り替える（速度より品質を優先。基本仕様 §5.2）。
@@ -100,16 +100,16 @@ user_request ─▶ [A] Recommender（LLM・ストリーミング・検索ツー
 ### 4.1 照会
 
 - API: 現行と同じ Places Text Search（legacy, `textsearch/json`）。**Places 側の順位は採用基準に使わない**。上位 5 件すべてを照合して、最もよく一致する 1 件を選ぶ。
-- クエリ: `"{name} {area}"`、`language=ja`, `region=jp`。Geocoding が取れていれば `location` + `radius=3000` で位置バイアス（現行と同じ値）。`type` は付けない（カフェ・バーを除外しないため。業態は §4.3 で判定）。
+- クエリ: `"{name} {area}"`、`language=ja`, `region=jp`。**位置バイアス（location/radius）は付けない**: Geocoding の完了を待たずに照会を始めるため。また、Geocoding の完了時刻によって検索結果が変わらないようにするため（計測の再現性）。エリアはクエリ文字列に含め、位置は §4.3 の照合で確認する。`type` は付けない（カフェ・バーを除外しないため。業態は §4.3 で判定）。
 - `NOT_FOUND` のときだけ、`name_variants` の先頭で 1 回だけ再照会する。
 - タイムアウト: 1 リクエスト 5 秒（暫定）。超過は `ERROR`（表示しない）。
 - Place Details は照合には使わない（往復を増やさないため）。
 
 ### 4.2 名前の正規化（決定的ルール）
 
-1. NFKC 正規化、小文字化。
+1. NFKC 正規化（全角・半角を統一）、小文字化、カタカナ→ひらがな。
 2. 括弧内（`(...)`・`（...）`・`【...】`）を別表記として分離。
-3. 末尾の支店名を除去: 空白区切りの最終語が `店` で終わる（`中目黒店`・`本店` 等）、または `{area}店` で終わる場合。
+3. 末尾の支店名を分離: 空白区切りの最終語が `店` で終わる（`中目黒店`・`本店` 等）、または `{area}店` で終わる場合。分離した支店名は §4.3 の支店照合に使う。
 4. 業態の一般語（`炭火焼鳥` `焼鳥` `焼き鳥` `やきとり` `串焼き` `居酒屋` `レストラン` `trattoria` `ristorante` `pizzeria` `bistro` `cafe` 等。一覧はコード内定数）を除去。ただし除去後の残りが 2 文字未満なら除去しない。
 5. 空白・記号を除去 → **コア名**。
 
@@ -118,10 +118,13 @@ user_request ─▶ [A] Recommender（LLM・ストリーミング・検索ツー
 候補の名前群（`name` と `name_variants`）× Places 結果の名前群（`name` と括弧内）について、コア名の類似度の最大値 `S` を求める。
 
 - 一致: コア名が完全一致 → 1.0
-- 包含: 短い方が 2 文字以上で長い方に含まれ、長さ比 ≥ 0.5 → 0.9
+- 包含: 短い方が 2 文字以上で長い方に含まれ、長さ比 ≥ 0.5 → **0.75（AMBIGUOUS 帯。包含だけでは VERIFIED にしない）**。「串若」と「串若丸」のような近接した別店舗のすり替えを防ぐため。
 - それ以外: 文字 bigram の Dice 係数
+- **支店・別店舗の照合**: 候補と Places の双方に支店名があり、それが異なる場合（例: 候補「鳥よし 中目黒店」、Places「鳥よし 祐天寺店」）、または「別館・新館・分店・離れ・N号店」の表示が片方にだけある場合は、`S` を 0.6 以下に抑える（＝ VERIFIED にしない）。
+- 翻字（英字⇔カタカナ）や店名変更は推測しない。LLM が `name_variants` に別表記・旧名を出した場合だけ照合できる。
 
 位置の一致 `L`: Places の住所に `area` 文字列が含まれる、または Geocoding した area 中心から `R` km 以内（暫定 `R=2.0`）。
+**住所で確認できればそれで確定し、Geocoding は待たない。** 住所で確認できず、かつ名前が近い（`S ≥ 0.6`）結果についてだけ、中心座標の取得を待って距離で判定する。Geocoding が失敗した場合は住所だけで判定する（確認できなければ VERIFIED にしない）。
 
 業態 `F`: Places の `types` に飲食系（`restaurant` `food` `bar` `cafe` `bakery` `meal_takeaway` `meal_delivery`）のいずれかを含む。
 
@@ -149,7 +152,8 @@ user_request ─▶ [A] Recommender（LLM・ストリーミング・検索ツー
   - LLM 由来: `category`, `description`（= reason）, `priceRange`, `highlights`（specialty）
   - Places 由来: `name`（照合済みの Places 名）, `location`（住所）, `latitude`/`longitude`, `rating`, `reviewCount`, `maps_url`, `place_id`, `image`
   - 付加: `recommend_rank`（推薦順）, `display_rank`（表示順）, `verification`（判定と S）
-- `image` は現行と同じ Places Photo URL 形式（API キーを含む URL がブラウザに渡る点は現行と同じ。変更するかは別途判断）。
+- **写真は `photo_reference`（参照 ID）だけを持つ。API キーを含む写真 URL は作らない。** ブラウザへの配信方法（キーを露出しない方式）は Step 4 で決める。
+- エラー文字列（requests の例外は URL の `key=` を含むことがある）は必ず伏せ字化する（`redact.py`）。ベンチは画面出力も伏せ字化し、JSON 保存前に API キーが残っていないか検査して、残っていれば保存せず異常終了する。
 - Hot Pepper / TripAdvisor / 食べログ等の外部リンクは Step 4 で扱う（カードの必須項目ではない）。
 
 ---
@@ -185,7 +189,8 @@ user_request ─▶ [A] Recommender（LLM・ストリーミング・検索ツー
 | T7 | 推薦処理の完了 | `pipeline.run` 終了 |
 | Fs/Fe | Freshness Search の開始・終了と理由 | Freshness |
 
-- 基本仕様の T5/T6 は**ブラウザでの実表示**。サーバー側の確定時刻との差（転送＋描画）は Step 4 でフロント計測を入れて測る。
+- **本 PoC の T5/T6 はサーバー側でカードを確定した時刻であり、ブラウザでの表示時刻ではない**（転送・描画を含まない）。ベンチの画面出力と JSON（`timing_note`）にも明記する。基本仕様の T5/T6（ブラウザでの実表示）は Step 4 でフロント計測を入れて測る。
+- `Tgeo`: 距離判定のために中心座標を最初に参照した時刻（参照が不要なら記録されない）。
 - 失敗の種類（`upstream_error` / `timeout` / `parse_error` / `no_candidates`）は成功と分けて記録し、成功時の統計に混ぜない。
 
 ---

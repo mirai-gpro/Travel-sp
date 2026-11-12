@@ -4,7 +4,7 @@
 - ストリーミング: 1件目の候補が届いた時点で照合を始め、全文を待たない
 - 照合は並列でも、カードは推薦順でしか確定しない（後から順位が変わらない）
 - VERIFIED 以外はカードにしない。足りなければ次順位で補い、未検証で埋めない
-- 503 / 0件 / 解析不能行の扱い、Freshness は required のときだけ
+- 503 / 0件 / 解析不能行の扱い。Google 検索は required でも実行しない（Step 1〜2）
 """
 import json
 import os
@@ -83,7 +83,7 @@ class FakePlaces:
     def geocode(self, area, language='ja'):
         return CENTER
 
-    def text_search(self, query, area_center=None, language='ja'):
+    def text_search(self, query, language='ja'):
         name = query.rsplit(' ', 1)[0]
         with self.lock:
             self.queries.append(query)
@@ -95,8 +95,6 @@ class FakePlaces:
             raise v
         return v
 
-    def photo_url(self, place):
-        return f"photo:{place['place_id']}"
 
 
 def P(pid, name, status='OPERATIONAL'):
@@ -115,8 +113,6 @@ def run(models, places, cfg=None):
     client = SimpleNamespace(models=models)
     r = RecommendationRun('中目黒 焼き鳥 予算5000円', client, types, places, cfg or EngineConfig(), on_event)
     result = r.run()
-    if r.fresh_thread:
-        r.fresh_thread.join(2)
     return result, events, r
 
 
@@ -226,18 +222,24 @@ def test_no_candidates():
     assert result['status'] == 'no_candidates'
 
 
-def test_freshness_only_when_required_and_grounding_only_there():
-    m1 = FakeModels([plan_line(False)] + [cand_line(1, '串若丸')] + ['{"type":"end"}'])
-    run(m1, FakePlaces(full_db()))
-    assert m1.grounded_calls == []
-    assert not m1.stream_calls[0].config.tools          # 推薦呼び出しは検索ツールなし
-    m2 = FakeModels([plan_line(True, False, '中目黒 焼き鳥 新店')] + [cand_line(1, '串若丸')] + ['{"type":"end"}'])
-    result, _, r = run(m2, FakePlaces(full_db()))
-    assert len(m2.grounded_calls) == 1
-    assert m2.grounded_calls[0].config.tools[0].google_search is not None
-    assert r.freshness['status'] == 'ok' and r.freshness['query'] == '中目黒 焼き鳥 新店'
-    # Step 1 では Freshness はカードに反映しない
-    assert [c['llm_name'] for c in result['cards']] == ['串若丸']
+def test_google_search_never_executed_even_if_llm_says_required():
+    """修正2: Step 1〜2 では freshness.required=true でも Google 検索を実行せず、判断と理由だけ記録する"""
+    for required, central in [(False, False), (True, False), (True, True)]:
+        m = FakeModels([plan_line(required, central, '中目黒 焼き鳥 新店')] + [cand_line(1, '串若丸')] + ['{"type":"end"}'])
+        result, _, _ = run(m, FakePlaces(full_db()))
+        assert m.grounded_calls == []                              # 非ストリーム（検索付き）呼び出しなし
+        assert len(m.stream_calls) == 1
+        assert not getattr(m.stream_calls[0].config, 'tools', None)  # 推薦呼び出しにツールなし
+        assert result['google_search_executed'] is False
+        fd = result['freshness_decision']
+        assert fd['required'] is required and fd['central'] is central
+        assert fd['reason'] == 'r' and fd['query'] == ('中目黒 焼き鳥 新店')
+        assert [c['llm_name'] for c in result['cards']] == ['串若丸']
+
+
+def test_timing_note_states_server_side():
+    result, _, _ = run(FakeModels([plan_line(), cand_line(1, '串若丸'), '{"type":"end"}']), FakePlaces(full_db()))
+    assert 'サーバー側' in result['timing_note'] and 'ブラウザ' in result['timing_note']
 
 
 def test_alias_retry_only_on_not_found():

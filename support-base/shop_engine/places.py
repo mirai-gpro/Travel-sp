@@ -5,15 +5,17 @@ Places の結果は照合と表示にだけ使い、LLM には渡さない。
 """
 import requests
 
+from .redact import register_secret
+
 TEXTSEARCH_URL = 'https://maps.googleapis.com/maps/api/place/textsearch/json'
 GEOCODE_URL = 'https://maps.googleapis.com/maps/api/geocode/json'
-PHOTO_URL = 'https://maps.googleapis.com/maps/api/place/photo'
 REQUEST_TIMEOUT_SEC = 5.0   # 暫定（PoC で決める）
 
 
 class PlacesClient:
     def __init__(self, api_key, http_get=None, timeout=REQUEST_TIMEOUT_SEC):
         self.api_key = api_key
+        register_secret(api_key)
         self.get = http_get or requests.get
         self.timeout = timeout
 
@@ -31,12 +33,11 @@ class PlacesClient:
             return None
         return (loc['lat'], loc['lng'])
 
-    def text_search(self, query, area_center=None, language='ja'):
-        """results のリスト。API エラーは例外"""
+    def text_search(self, query, language='ja'):
+        """results のリスト。API エラーは例外。
+        位置バイアス（location/radius）は付けない: Geocoding の完了を待たずに照会を始めるため（修正1）。
+        エリアはクエリ文字列に含める。位置の確認は照合（matching.location_ok）で行う。"""
         params = {'query': query, 'key': self.api_key, 'language': language, 'region': 'jp'}
-        if area_center:
-            params['location'] = f'{area_center[0]},{area_center[1]}'
-            params['radius'] = 3000
         r = self.get(TEXTSEARCH_URL, params=params, timeout=self.timeout)
         data = r.json()
         status = data.get('status')
@@ -46,11 +47,8 @@ class PlacesClient:
             raise RuntimeError(f'places_status_{status}')
         return data.get('results') or []
 
-    def photo_url(self, place):
+    @staticmethod
+    def photo_reference(place):
+        """写真の参照 ID のみを返す。API キー入りの写真 URL は作らない（修正3。配信方法は Step 4 で決める）"""
         photos = place.get('photos') or []
-        if not photos:
-            return None
-        ref = photos[0].get('photo_reference')
-        if not ref:
-            return None
-        return f'{PHOTO_URL}?maxwidth=800&photo_reference={ref}&key={self.api_key}'
+        return (photos[0].get('photo_reference') if photos else None) or None

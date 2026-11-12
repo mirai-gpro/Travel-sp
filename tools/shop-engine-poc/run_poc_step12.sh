@@ -8,8 +8,10 @@
 # - GitHub の shop-engine-v2 ブランチを一時ディレクトリに取得し、その SHA を記録して実行する。
 # - API キーは本番リビジョン travel-sp-base-00060-car の環境変数から読み、このプロセス内だけで使う
 #   （画面・ファイル・シェル履歴に出さない）。Cloud Run・トラフィック・設定は変更しない。
-# - 実際の Gemini / Places を呼ぶため API 利用料が発生する（1 クエリあたり LLM 1 回＋Places 8〜16 回程度。
-#   検索要と判断された場合は検索付き LLM がもう 1 回）。
+# - 実際の Gemini / Places を呼ぶため API 利用料が発生する（1 クエリあたり LLM 1 回＋Geocoding 1 回＋
+#   Places 照会 最大 16 回程度）。Google 検索は実行しない（Step 1〜2）。
+# - 画面出力と保存 JSON には API キーを含めない（保存前に検査。見つかれば保存せず異常終了）。
+# - 結果の T5 / T6 はサーバー側のカード確定時刻であり、ブラウザでの表示時刻ではない。
 # =====================================================================
 set -euo pipefail
 PROJECT_ID="ai-avator-492205"
@@ -37,20 +39,31 @@ SHA="$(git -C "${WORK}/src" rev-parse HEAD)"
 echo "    SHA: ${SHA}"
 
 echo "[2/3] Python 環境（google-genai / requests は本番 requirements と同じ版）"
-python3 -m venv "${WORK}/venv"
-"${WORK}/venv/bin/pip" install -q "google-genai==1.68.0" "requests==2.32.5" 2>&1 | grep -v -i notice || true
+python3 -m venv "${WORK}/venv" || { echo "venv の作成に失敗しました" >&2; exit 1; }
+if ! "${WORK}/venv/bin/pip" install -q --disable-pip-version-check "google-genai==1.68.0" "requests==2.32.5" \
+     > "${WORK}/pip.log" 2>&1; then
+  echo "依存ライブラリのインストールに失敗しました。pip の出力:" >&2
+  tail -n 40 "${WORK}/pip.log" >&2
+  exit 1
+fi
+"${WORK}/venv/bin/python" -c "import google.genai, requests" || { echo "依存ライブラリを import できません" >&2; exit 1; }
+echo "    google-genai $("${WORK}/venv/bin/python" -c 'import google.genai as g; print(g.__version__)')"
 
 echo "[3/3] API キーを ${KEY_REVISION} から読み込み（表示しない）→ ベンチ実行"
-gcloud run revisions describe "${KEY_REVISION}" --project="${PROJECT_ID}" --region="${REGION}" --format=json > "${WORK}/rev.json"
+# リビジョン設定（API キーを含む）はファイルに書かず、Python プロセス内で gcloud から直接読む
 OUT_DIR="${HOME}/shop_engine_poc"
 mkdir -p "${OUT_DIR}"
 OUT="${OUT_DIR}/poc_$(date -u +%Y%m%dT%H%M%SZ).json"
 cd "${WORK}/src/support-base"
-POC_GIT_SHA="${SHA}" "${WORK}/venv/bin/python" - "${WORK}/rev.json" "${OUT}" "$@" <<'PYEOF'
-import json, os, runpy, sys
-rev_path, out = sys.argv[1], sys.argv[2]
+POC_GIT_SHA="${SHA}" "${WORK}/venv/bin/python" - "${KEY_REVISION}" "${PROJECT_ID}" "${REGION}" "${OUT}" "$@" <<'PYEOF'
+import json, os, runpy, subprocess, sys
+rev, project, region, out = sys.argv[1:5]
+proc = subprocess.run(['gcloud', 'run', 'revisions', 'describe', rev, f'--project={project}', f'--region={region}',
+                       '--format=json'], capture_output=True, text=True)
+if proc.returncode != 0:
+    sys.exit(f'リビジョン {rev} の設定を取得できません（gcloud 終了コード {proc.returncode}）')
 env = {}
-for c in json.load(open(rev_path))['spec']['containers']:
+for c in json.loads(proc.stdout)['spec']['containers']:
     for e in c.get('env') or []:
         if 'value' in e:
             env[e['name']] = e['value']
@@ -58,9 +71,9 @@ for k in ('GEMINI_API_KEY', 'GOOGLE_PLACES_API_KEY'):
     if not env.get(k):
         sys.exit(f'{k} がリビジョンの環境変数（平文値）にありません。Secret 参照の場合はこのスクリプトでは読めません')
     os.environ[k] = env[k]
-del env
+del env, proc
 sys.path.insert(0, os.getcwd())
-args = sys.argv[3:]
+args = sys.argv[5:]
 if '--list-models' not in args and '--out' not in args:
     args += ['--out', out]
 sys.argv = ['poc_bench'] + args

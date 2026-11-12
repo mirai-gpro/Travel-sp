@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-[A] Recommender（DESIGN.md §2）と [B] Freshness Search（§3。Step 1 は記録のみ）。
+[A] Recommender（DESIGN.md §2）。
+- Step 1〜2 では Google 検索を一切実行しない（修正2）。freshness は LLM の判断と理由を記録するだけ。
 - 検索ツールなしで推薦候補を NDJSON でストリーミング生成する。
 - モデル名・思考設定・候補数は引数（PoC で決める。推測で既定値を変えない）。
 """
 import json
 import time
+
+from .redact import redact
 
 DEFAULT_MODEL = 'gemini-2.5-flash'   # 現行コードで使用実績のあるモデル。PoC で比較して決める
 DEFAULT_CANDIDATES = 8               # 基本仕様 §4 Phase 2 の検証初期値
@@ -54,12 +57,11 @@ def classify_error(e):
     return 'error'
 
 
-def build_config(types_mod, thinking_budget=None, tools=None):
+def build_config(types_mod, thinking_budget=None):
+    """推薦呼び出しの設定。ツール（Google 検索等）は付けない"""
     kwargs = {}
     if thinking_budget is not None:
         kwargs['thinking_config'] = types_mod.ThinkingConfig(thinking_budget=thinking_budget)
-    if tools:
-        kwargs['tools'] = tools
     return types_mod.GenerateContentConfig(**kwargs)
 
 
@@ -90,12 +92,12 @@ class LineParser:
         if not s or s.startswith('```'):
             return None
         if not s.startswith('{'):
-            self.bad_lines.append(s[:200])
+            self.bad_lines.append(redact(s[:200]))
             return None
         try:
             obj = json.loads(s)
         except json.JSONDecodeError:
-            self.bad_lines.append(s[:200])
+            self.bad_lines.append(redact(s[:200]))
             return None
         return obj if isinstance(obj, dict) else None
 
@@ -141,7 +143,7 @@ def stream_recommendations(client, types_mod, user_request, model=DEFAULT_MODEL,
     except RecommenderError:
         raise
     except Exception as e:  # SDK の例外（503 等）
-        raise RecommenderError(classify_error(e), f'{type(e).__name__}: {str(e)[:200]}')
+        raise RecommenderError(classify_error(e), redact(f'{type(e).__name__}: {str(e)[:300]}'))
     finally:
         timing['T2'] = now()
         timing['bad_lines'] = parser.bad_lines
@@ -174,28 +176,4 @@ def _normalize_item(obj, rank, seen_names, timing, now):
         return {'type': 'end'}
     return None
 
-
-FRESHNESS_PROMPT = """次の検索テーマについて、Google 検索で最新情報（開店・リニューアル・移転・話題・受賞など）を調べ、
-飲食店の推薦に役立つ事実だけを箇条書きで簡潔にまとめてください。確認できなかったことは「確認できず」と書くこと。
-
-検索テーマ: {query}
-ユーザーの条件: {request}
-"""
-
-
-def freshness_search(client, types_mod, query, user_request, model=DEFAULT_MODEL, timing=None, now=time.monotonic):
-    """[B] Step 1 では結果を記録するだけで、カードには反映しない"""
-    timing = timing if timing is not None else {}
-    timing['Fs'] = now()
-    try:
-        config = build_config(types_mod, None, tools=[types_mod.Tool(google_search=types_mod.GoogleSearch())])
-        resp = client.models.generate_content(
-            model=model,
-            contents=[{'role': 'user', 'parts': [{'text': FRESHNESS_PROMPT.format(query=query, request=user_request)}]}],
-            config=config,
-        )
-        return {'status': 'ok', 'notes': (resp.text or '')[:2000]}
-    except Exception as e:
-        return {'status': classify_error(e), 'notes': '', 'error': f'{type(e).__name__}: {str(e)[:200]}'}
-    finally:
-        timing['Fe'] = now()
+# Freshness Search（Google 検索付きの呼び出し）は Step 3 で実装する。Step 1〜2 には存在しない（修正2）。
