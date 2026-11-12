@@ -23,6 +23,9 @@ export class CoreController {
   protected isTTSEnabled = true;
   protected isUserInteracted = false;
   protected currentShops: any[] = [];
+  // 後送りの外部リンクの反映先：最後の検索の ID と、そのとき表示したカードの配列
+  protected linkSearchId: string | null = null;
+  protected linkTargetShops: any[] | null = null;
   protected isFromVoiceInput = false;
   protected lastAISpeech = '';
   protected preGeneratedAcks: Map<string, string> = new Map();
@@ -479,6 +482,8 @@ export class CoreController {
     // ★ 外部リンクの後送り（カード表示の後に届く）。同じ位置・同じ店名のカードにだけ反映する
     this.socket.on('shop_links_update', (data: any) => {
       const updates = data?.updates || [];
+      // 別の検索のリンクは反映しない（ID が違う、または表示中のカードが別の結果に置き換わっている）
+      if (!data?.search_id || data.search_id !== this.linkSearchId || this.currentShops !== this.linkTargetShops) return;
       if (!updates.length || !this.currentShops.length) return;
       let changed = false;
       for (const u of updates) {
@@ -500,6 +505,8 @@ export class CoreController {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
       this.hideWaitOverlay();
       const shops = data?.shops || [];
+      this.linkSearchId = data?.search_id || null;
+      this.linkTargetShops = shops.length > 0 ? shops : null;
       if (shops.length > 0) {
         this.currentShops = shops;
         this.els.reservationBtn?.classList.add('visible');
