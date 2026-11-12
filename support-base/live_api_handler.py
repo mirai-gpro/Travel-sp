@@ -10,6 +10,7 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 """
 
 import asyncio
+import functools
 import base64
 import os
 import logging
@@ -802,17 +803,38 @@ class LiveAPISession:
             }, room=self.client_sid)
             return
 
+        # 高速化（選定ロジックは従来どおり。変えたのは処理の並べ方だけ）
+        # - 検索開始と同時にエリア抽出・Geocoding を始める
+        # - LLM の受信中に、書き終わった店舗から Places の照合を並列で始める
+        # - 推薦順の先頭から照合が揃った分を、途中経過としてカードに出す
+        # - ホットペッパー / TripAdvisor はカード確定の後に取得し、カードを差し替える
+        from api_integrations import ParallelShopEnricher
+        self._shop_search_token = getattr(self, '_shop_search_token', 0) + 1
+        token = self._shop_search_token
+        t0 = time.monotonic()
+
+        def emit_shops(shops, response=''):
+            self.socketio.emit('shop_search_result', {
+                'shops': shops,
+                'response': response,
+            }, room=self.client_sid)
+
+        enricher = ParallelShopEnricher(user_request, self.language,
+                                        on_partial=lambda s: emit_shops(s), t0=t0)
+        enricher.start()
+        extras_started = False
         try:
-            # 1. callbackでLLM JSON生成（enrichなし）
+            # 1. callbackでLLM JSON生成（受信中に Places の照合を前倒し）
             loop = asyncio.get_event_loop()
             shop_data = await loop.run_in_executor(
                 None,
-                self._shop_search_callback,
-                user_request, self.language, self.mode
+                functools.partial(self._shop_search_callback, user_request, self.language, self.mode,
+                                  on_shop=enricher.submit)
             )
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
+                enricher.close()
                 self.socketio.emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
                 }, room=self.client_sid)
@@ -820,24 +842,33 @@ class LiveAPISession:
 
             raw_shops = shop_data['shops']
             response_text = shop_data.get('response', '')
-            area = shop_data.get('area', '')
 
-            # 2. enrich実行
-            from api_integrations import enrich_shops_with_photos
-            enriched = await loop.run_in_executor(
-                None, enrich_shops_with_photos, raw_shops, area, self.language
-            )
+            # 2. 確定（従来と同じ解析結果を、推薦順に重複除外・反映）
+            enriched = await loop.run_in_executor(None, enricher.finalize, raw_shops)
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
 
             # 3. ショップカードデータをブラウザに送信
-            self.socketio.emit('shop_search_result', {
-                'shops': shops,
-                'response': response_text,
-            }, room=self.client_sid)
-            logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
+            emit_shops(shops, response_text)
+            logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信 "
+                        f"(+{time.monotonic() - t0:.1f}s)")
 
-            # 4. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
+            # 4. 付加情報（ホットペッパー / TripAdvisor）は表示の後に取得し、同じ検索のカードにだけ反映する
+            if enriched:
+                def fetch_extras_and_update():
+                    try:
+                        changed = enricher.fetch_extras()
+                        if changed and self._shop_search_token == token:
+                            emit_shops(shops)
+                            logger.info(f"[ShopSearch] 付加情報をカードに反映 (+{time.monotonic() - t0:.1f}s)")
+                    except Exception as e:
+                        logger.error(f"[ShopSearch] 付加情報の取得エラー: {e}", exc_info=True)
+                    finally:
+                        enricher.close()
+                loop.run_in_executor(None, fetch_extras_and_update)
+                extras_started = True
+
+            # 5. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
             #    旧方式: await self._describe_shops_via_live(shops)  ※REST TTS
             return shops
 
@@ -847,6 +878,9 @@ class LiveAPISession:
                 'shops': [], 'response': '',
             }, room=self.client_sid)
             return []
+        finally:
+            if not extras_started:
+                enricher.close()
 
     def _build_shop_tool_response(self, shops: list) -> dict:
         """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""

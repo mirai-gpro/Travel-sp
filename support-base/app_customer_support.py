@@ -82,6 +82,7 @@ allowed_origins = [
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
     "https://travel-sp-git-preview-live38-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（本番に merge しない）
+    "https://travel-sp-git-fastsearch-frontend-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（高速化版・本番に merge しない）
     "http://localhost:4321"
 ]
 
@@ -792,8 +793,12 @@ def handle_live_start(data):
                                                system_prompts=SYSTEM_PROMPTS, language=language)
 
     # ショップ検索コールバック（案C: SupportAssistant迂回、検索専用プロンプトで直接API呼び出し）
-    def shop_search_callback(user_request, lang, search_mode):
-        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）"""
+    def shop_search_callback(user_request, lang, search_mode, on_shop=None):
+        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）
+
+        on_shop: 応答の受信中に、書き終わった店舗を (順位, 店舗) で受け取る関数（Places 照合の前倒し用）。
+                 採用する店舗の一覧は、受信完了後に従来と同じ方法で解析した結果が正。
+        """
         SEARCH_ONLY_PROMPT = (
             "あなたはグルメレストラン検索エンジンです。\n"
             "ユーザーの条件に合う実在のレストランをGoogle検索で見つけ、必ず5軒をJSON形式で返してください。\n\n"
@@ -870,12 +875,29 @@ def handle_live_start(data):
                 system_instruction=SEARCH_ONLY_PROMPT,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             )
-            response = gemini_client.models.generate_content(
+            # モデル・プロンプト・Google 検索は従来と同じ。受信をストリーミングにして、
+            # 書き終わった店舗から Places の照合を前倒しで始められるようにする
+            from api_integrations import StreamingShopExtractor
+            extractor = StreamingShopExtractor(on_shop) if on_shop else None
+            t_llm = time.monotonic()
+            first_chunk_logged = False
+            parts = []
+            for chunk in gemini_client.models.generate_content_stream(
                 model="gemini-2.5-flash",
                 contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
                 config=config
-            )
-            assistant_text = response.text
+            ):
+                piece = chunk.text or ''
+                if not piece:
+                    continue
+                if not first_chunk_logged:
+                    first_chunk_logged = True
+                    logger.info(f"[ShopSearchTiming] Gemini 最初の受信 +{time.monotonic() - t_llm:.1f}s")
+                parts.append(piece)
+                if extractor:
+                    extractor.feed(''.join(parts))
+            assistant_text = ''.join(parts)
+            logger.info(f"[ShopSearchTiming] Gemini 受信完了 +{time.monotonic() - t_llm:.1f}s")
             logger.info(f"[ShopSearch] 案C: Gemini応答 {len(assistant_text)}文字: {assistant_text[:200]}")
 
             # JSON解析（extract_shops_from_responseでフォールバック）
@@ -916,9 +938,8 @@ def handle_live_start(data):
                 'should_confirm': True,
                 'is_followup': False,
             }
-            if shops:
-                area = extract_area_from_text(user_request, lang)
-                result['area'] = area
+            # エリアの抽出（extract_area_from_text）は、検索開始と同時に
+            # ParallelShopEnricher が同じ関数・同じ入力で行う（LLM の後に直列で待たないため）
             return result
         except Exception as e:
             logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)

@@ -701,6 +701,419 @@ def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') 
     return enriched_shops
 
 
+# ========================================
+# ショップ情報 拡張ロジック（並列版）
+# 店舗の選び方・照合・採用条件は enrich_shops_with_photos() と同じ。
+# 変えたのは実行の順序だけ：
+#   - Places の照合（search_place）を店舗ごとに並列で走らせる
+#   - 結果は LLM の推薦順に並べ直してから、重複除外・カードへの反映を行う
+#   - ホットペッパー / TripAdvisor（外部 API）はカード表示の後に取得して差し替える
+# ========================================
+
+FAST_ENRICH_MAX_PARALLEL = 5
+
+
+def _hotpepper_fallback_url(shop_name: str, area: str) -> str:
+    """enrich_shops_with_photos() でホットペッパーが見つからないときの URL と同じ"""
+    return f"https://www.google.com/search?q={shop_name}+{area}+ホットペッパーグルメ"
+
+
+def apply_place_core(shop: dict, shop_name: str, place_data: dict, area: str,
+                     geo_info: dict, language: str):
+    """
+    enrich_shops_with_photos() の「2. ロジック判定」「3. データの注入」のうち、
+    外部 API を呼ばない部分（値は同じ）。ホットペッパーは仮の URL を入れておき、
+    fetch_place_extras() の結果で差し替える。
+    戻り値: (show_tripadvisor, show_domestic_sites)
+    """
+    shop_country = place_data.get('country_code', '')
+
+    show_tripadvisor = True
+    show_domestic_sites = False
+    if language == 'ja' and shop_country == 'JP':
+        show_tripadvisor = False
+        show_domestic_sites = True
+
+    logger.info(f"[Enrich] 判定結果: {shop_name} (Country: {shop_country}, Lang: {language}) "
+               f"-> TripAdvisor: {show_tripadvisor}, Domestic: {show_domestic_sites}")
+
+    if place_data.get('name'):
+        shop['name'] = place_data['name']
+    if place_data.get('photo_url'):
+        shop['image'] = place_data['photo_url']
+    if place_data.get('rating'):
+        shop['rating'] = place_data['rating']
+    if place_data.get('user_ratings_total'):
+        shop['reviewCount'] = place_data['user_ratings_total']
+    if place_data.get('formatted_address'):
+        shop['location'] = place_data['formatted_address']
+    if place_data.get('maps_url'):
+        shop['maps_url'] = place_data['maps_url']
+    if place_data.get('phone'):
+        shop['phone'] = place_data['phone']
+    if place_data.get('place_id'):
+        shop['place_id'] = place_data['place_id']
+
+    if show_domestic_sites:
+        try:
+            shop.pop('tripadvisor_url', None)
+            shop.pop('tripadvisor_rating', None)
+            shop.pop('tripadvisor_reviews', None)
+
+            # ホットペッパーは表示の後に取得する。取れなかったときと同じ URL を先に入れておく
+            shop['hotpepper_url'] = _hotpepper_fallback_url(shop_name, area)
+
+            # 食べログ
+            try:
+                places_name = place_data.get('name', '')
+                region_name = geo_info.get('region', '') if geo_info else '東京'
+                pref_code_map = {'東京': 'tokyo', '神奈川': 'kanagawa', '大阪': 'osaka', '京都': 'kyoto', '兵庫': 'hyogo', '北海道': 'hokkaido', '愛知': 'aichi', '福岡': 'fukuoka'}
+                pref = region_name.rstrip('都道府県') if region_name else '東京'
+                pref_code = pref_code_map.get(pref, 'tokyo')
+
+                tabelog_search_query = requests.utils.quote(places_name if places_name else shop_name)
+                shop['tabelog_url'] = f"https://tabelog.com/{pref_code}/rstLst/?sw={tabelog_search_query}"
+            except Exception:
+                shop['tabelog_url'] = f"https://tabelog.com/tokyo/rstLst/?sw={shop_name}"
+
+            # ぐるなび
+            shop['gnavi_url'] = f"https://www.google.com/search?q={shop_name}+{area}+ぐるなび"
+
+        except Exception as e:
+            logger.error(f"[Enrich] Domestic Sites Error: {e}")
+
+    return show_tripadvisor, show_domestic_sites
+
+
+def fetch_place_extras(shop_name: str, area: str, geo_info: dict, place_data: dict, language: str,
+                       show_tripadvisor: bool, show_domestic_sites: bool) -> dict:
+    """
+    enrich_shops_with_photos() のホットペッパー / TripAdvisor の取得（外部 API）。
+    カードに反映する項目だけを返す（値の決め方は同じ）。
+    """
+    updates = {}
+
+    if show_domestic_sites:
+        hotpepper_url = None
+        try:
+            hotpepper_url = search_hotpepper(shop_name, area, geo_info)
+            if not hotpepper_url:
+                places_name = place_data.get('name', '')
+                if places_name and places_name != shop_name:
+                    hotpepper_url = search_hotpepper(places_name, area, geo_info)
+        except Exception:
+            pass
+        updates['hotpepper_url'] = hotpepper_url if hotpepper_url else _hotpepper_fallback_url(shop_name, area)
+
+    if show_tripadvisor:
+        try:
+            lat = place_data.get('lat')
+            lng = place_data.get('lng')
+
+            if TRIPADVISOR_API_KEY:
+                tripadvisor_lang_map = {'ja': 'ja', 'en': 'en', 'zh': 'zh', 'ko': 'ko'}
+                search_lang = tripadvisor_lang_map.get(language, 'en')
+
+                tripadvisor_data = get_tripadvisor_data(shop_name, lat, lng, search_lang)
+
+                if not tripadvisor_data and search_lang == 'ja':
+                    logger.info(f"[TripAdvisor] 日本語でヒットせず。英語で再検索: {shop_name}")
+                    tripadvisor_data = get_tripadvisor_data(shop_name, lat, lng, 'en')
+
+                if tripadvisor_data:
+                    updates['tripadvisor_url'] = tripadvisor_data.get('web_url')
+                    updates['tripadvisor_rating'] = tripadvisor_data.get('rating')
+                    updates['tripadvisor_reviews'] = tripadvisor_data.get('num_reviews')
+                    logger.info(f"[TripAdvisor] リンク生成成功: {shop_name}")
+        except Exception as e:
+            logger.error(f"[Enrich] TripAdvisor Error: {e}")
+
+    return updates
+
+
+class StreamingShopExtractor:
+    """
+    LLM の応答を受信しながら、"shops" 配列の中で書き終わった店舗オブジェクトを順に取り出す。
+    取り出した店舗は Places の照合を前倒しで始めるためだけに使う。
+    採用する店舗の一覧は、受信完了後に従来と同じ方法で解析した結果が正とする。
+    """
+    _SHOPS_KEY = re.compile(r'"shops"\s*:\s*\[')
+
+    def __init__(self, on_shop):
+        self._on_shop = on_shop
+        self._pos = None      # 次に読む位置（"shops": [ の直後から）
+        self._count = 0
+
+    def feed(self, text: str):
+        if self._pos is None:
+            m = self._SHOPS_KEY.search(text)
+            if not m:
+                return
+            self._pos = m.end()
+        while True:
+            i = self._pos
+            n = len(text)
+            while i < n and text[i] in ' \t\r\n,':
+                i += 1
+            if i >= n or text[i] != '{':
+                return  # まだ届いていない、または配列の終わり
+            end = self._object_end(text, i)
+            if end < 0:
+                return  # 書き途中
+            self._pos = end
+            try:
+                import json as _json
+                shop = _json.loads(text[i:end])
+            except ValueError:
+                return  # 解析できない場合は前倒しをやめる（受信完了後の解析で処理する）
+            if isinstance(shop, dict):
+                index = self._count
+                self._count += 1
+                try:
+                    self._on_shop(index, shop)
+                except Exception as e:
+                    logger.error(f"[FastEnrich] 前倒し照合の開始に失敗: {e}")
+
+    @staticmethod
+    def _object_end(text: str, start: int) -> int:
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(text)):
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+        return -1
+
+
+class ParallelShopEnricher:
+    """
+    enrich_shops_with_photos() と同じ結果を、店舗ごとの並列処理で作る。
+
+    - start(): 検索開始と同時に、エリア抽出と Geocoding を始める（従来は LLM の後に直列で実行）
+    - submit(): LLM の受信中に、書き終わった店舗から Places の照合（search_place）を始める
+    - 照合が推薦順の先頭から揃った分だけ、途中経過として on_partial() に渡す（カードの段階表示）
+    - finalize(): 受信完了後の店舗一覧（従来と同じ解析結果）で、推薦順に重複除外・反映を行い確定する
+    - fetch_extras(): 確定後にホットペッパー / TripAdvisor を並列で取得し、カードの値を差し替える
+    """
+
+    def __init__(self, user_request: str, language: str, on_partial=None, t0: float = None):
+        import copy
+        import threading
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+        self._copy = copy
+        self._time = _time
+        self._t0 = t0 if t0 is not None else _time.monotonic()
+        self._user_request = user_request
+        self._language = language
+        self._on_partial = on_partial
+        self._lock = threading.Lock()
+        self._pool = ThreadPoolExecutor(max_workers=FAST_ENRICH_MAX_PARALLEL)
+        self._geo_pool = ThreadPoolExecutor(max_workers=1)
+        self._geo_future = None
+        self._streamed = {}      # index -> 受信中に取り出した店舗（照合に使った内容の写し）
+        self._futures = {}       # index -> search_place の Future
+        self._next = 0           # 段階表示で次に確定させる推薦順位
+        self._partial_shops = []
+        self._partial_seen = set()
+        self._closed = False
+        self._first_partial_logged = False
+
+    def _elapsed(self) -> str:
+        return f"+{self._time.monotonic() - self._t0:.1f}s"
+
+    # ---------- エリアと Geocoding（従来と同じ関数・同じ入力） ----------
+    def start(self):
+        self._geo_future = self._geo_pool.submit(self._resolve_area_and_geo)
+
+    def _resolve_area_and_geo(self):
+        area = extract_area_from_text(self._user_request, self._language)
+        geo_info = None
+        if area:
+            try:
+                geo_info = get_region_from_area(area, self._language)
+                if geo_info:
+                    logger.info(f"[Enrich] Geocoding成功: {geo_info.get('formatted_address', '')} "
+                               f"(国: {geo_info.get('country_code', '')}, "
+                               f"座標: {geo_info.get('lat', '')}, {geo_info.get('lng', '')})")
+            except Exception as e:
+                logger.error(f"[Enrich] Geocoding Error: {e}")
+        logger.info(f"[ShopSearchTiming] area='{area}' geocode完了 {self._elapsed()}")
+        return area, geo_info
+
+    def area_and_geo(self):
+        if self._geo_future is None:
+            self.start()
+        return self._geo_future.result()
+
+    # ---------- Places の照合（店舗単位で並列） ----------
+    def _search(self, shop: dict):
+        area, geo_info = self.area_and_geo()
+        shop_name = shop.get('name', '')
+        shop_area = shop.get('area', '') or area
+        logger.info(f"[Enrich] 検索: '{shop_name}' → 使用エリア: '{shop_area}'")
+        return search_place(shop_name, shop_area, geo_info, self._language)
+
+    def submit(self, index: int, shop: dict):
+        """LLM の受信中に呼ばれる。書き終わった店舗の照合を前倒しで始める"""
+        if not shop.get('name'):
+            return
+        with self._lock:
+            if self._closed or index in self._futures:
+                return
+            self._streamed[index] = self._copy.deepcopy(shop)
+            fut = self._pool.submit(self._search, self._streamed[index])
+            self._futures[index] = fut
+        logger.info(f"[ShopSearchTiming] 店舗{index + 1}の照合開始 '{shop.get('name', '')}' {self._elapsed()}")
+        fut.add_done_callback(lambda _f: self._advance())
+
+    def _advance(self):
+        """推薦順の先頭から照合が揃った分を、途中経過として表示する（重複除外は従来と同じく推薦順）"""
+        with self._lock:
+            if self._closed:
+                return
+            added = False
+            while self._next in self._futures and self._futures[self._next].done():
+                index = self._next
+                self._next += 1
+                try:
+                    place_data = self._futures[index].result()
+                except Exception:
+                    place_data = None
+                if not place_data:
+                    continue
+                place_id = place_data.get('place_id')
+                if place_id in self._partial_seen:
+                    continue
+                self._partial_seen.add(place_id)
+                area, geo_info = self.area_and_geo()
+                shop = self._copy.deepcopy(self._streamed[index])
+                apply_place_core(shop, shop.get('name', ''), place_data, area, geo_info, self._language)
+                self._partial_shops.append(shop)
+                added = True
+            if added and self._on_partial:
+                if not self._first_partial_logged:
+                    self._first_partial_logged = True
+                    logger.info(f"[ShopSearchTiming] 最初のカード表示 {self._elapsed()}")
+                try:
+                    self._on_partial([self._copy.deepcopy(s) for s in self._partial_shops])
+                except Exception as e:
+                    logger.error(f"[FastEnrich] 途中経過の送信に失敗: {e}")
+
+    # ---------- 確定（従来と同じ解析結果を、推薦順に処理する） ----------
+    def finalize(self, shops: list) -> list:
+        with self._lock:
+            self._closed = True  # 以降は途中経過を送らない
+        area, geo_info = self.area_and_geo()
+
+        logger.info(f"[Enrich] 開始: area='{area}', language={self._language}, shops={len(shops)}件")
+        logger.info(f"[Enrich] LLMの回答店舗:")
+        for i, shop in enumerate(shops, 1):
+            logger.info(f"[Enrich]   {i}. {shop.get('name', '')}")
+
+        # 受信中に始めた照合は、確定の店舗と内容が同じときだけ使う。違えばやり直す
+        futures = []
+        reused = 0
+        for index, shop in enumerate(shops):
+            if not shop.get('name', ''):
+                futures.append(None)
+                continue
+            fut = self._futures.get(index)
+            if fut is not None and self._streamed.get(index) == shop:
+                reused += 1
+            else:
+                fut = self._pool.submit(self._search, shop)
+            futures.append(fut)
+        logger.info(f"[ShopSearchTiming] 前倒しの照合を再利用: {reused}/{len(shops)}件")
+
+        enriched_shops = []
+        seen_place_ids = set()
+        duplicate_count = 0
+        validation_failed_count = 0
+        self._extras_plan = []
+
+        for i, (shop, fut) in enumerate(zip(shops, futures), 1):
+            if fut is None:
+                continue
+            shop_name = shop.get('name', '')
+            try:
+                place_data = fut.result()
+            except Exception as e:
+                logger.error(f"[Enrich] 照合の例外: {e}")
+                place_data = None
+
+            if not place_data:
+                logger.warning(f"[Enrich] Places APIで見つからない。除外します: {shop_name}")
+                validation_failed_count += 1
+                continue
+
+            place_id = place_data.get('place_id')
+            place_name = place_data.get('name')
+            logger.info(f"[Enrich] {i}/{len(shops)} '{shop_name}' → '{place_name}' ({place_id})")
+
+            if place_id in seen_place_ids:
+                duplicate_count += 1
+                logger.warning(f"[Enrich] → 重複のためスキップ: LLM店舗名 '{shop_name}' → Google店舗名 '{place_name}'")
+                continue
+            seen_place_ids.add(place_id)
+
+            show_tripadvisor, show_domestic_sites = apply_place_core(
+                shop, shop_name, place_data, area, geo_info, self._language)
+            self._extras_plan.append((shop, shop_name, place_data, show_tripadvisor, show_domestic_sites))
+            enriched_shops.append(shop)
+
+        logger.info(f"[Enrich] ========== 完了 ==========")
+        logger.info(f"[Enrich] 出力: {len(enriched_shops)}件 / 重複除外: {duplicate_count}件 / "
+                   f"検証失敗: {validation_failed_count}件 / 合計入力: {len(shops)}件")
+        logger.info(f"[ShopSearchTiming] 全カード確定 {self._elapsed()}")
+        return enriched_shops
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+        self._pool.shutdown(wait=False)
+        self._geo_pool.shutdown(wait=False)
+
+    # ---------- 表示の後に取る付加情報（ホットペッパー / TripAdvisor） ----------
+    def fetch_extras(self) -> bool:
+        """確定した店舗に付加情報を並列で取得して反映する。値が変わった店舗があれば True"""
+        plan = getattr(self, '_extras_plan', [])
+        if not plan:
+            return False
+        area, geo_info = self.area_and_geo()
+        futs = [self._pool.submit(fetch_place_extras, shop_name, area, geo_info, place_data,
+                                  self._language, show_ta, show_dom)
+                for (_shop, shop_name, place_data, show_ta, show_dom) in plan]
+        changed = False
+        for (shop, _name, _pd, _ta, _dom), fut in zip(plan, futs):
+            try:
+                updates = fut.result()
+            except Exception as e:
+                logger.error(f"[Enrich] 付加情報の例外: {e}")
+                continue
+            for key, value in updates.items():
+                if shop.get(key) != value:
+                    shop[key] = value
+                    changed = True
+        logger.info(f"[ShopSearchTiming] 付加情報の取得完了 {self._elapsed()} (変更あり={changed})")
+        return changed
+
+
 def extract_area_from_text(text: str, language: str = 'ja') -> str:
     """
     テキストからエリア名を抽出(Geocoding APIで動的に検証)
