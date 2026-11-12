@@ -154,7 +154,7 @@ def build_system_instruction(mode: str, user_profile: dict = None,
 
 
 def _build_concierge_user_context(user_profile: dict = None) -> str:
-    """コンシェルジュモードのユーザーコンテキストを構築"""
+    """コンシェルジュモードのユーザーコンテキストを構築（R2.0 §6.4）"""
     if not user_profile:
         # プロファイル不明 → 新規ユーザー扱い
         return _get_first_visit_context()
@@ -163,18 +163,28 @@ def _build_concierge_user_context(user_profile: dict = None) -> str:
     preferred_name = user_profile.get('preferred_name', '')
     name_honorific = user_profile.get('name_honorific', '')
 
-    if is_first_visit or not preferred_name:
+    if is_first_visit:
         return _get_first_visit_context()
-    else:
-        return _get_returning_user_context(preferred_name, name_honorific)
+    if not preferred_name:
+        # リピーターで名前が未登録：毎回名前を聞き直さない
+        return _get_returning_unnamed_context()
+    return _get_returning_user_context(preferred_name, name_honorific)
 
 
 def _get_first_visit_context() -> str:
-    """新規ユーザー用コンテキスト: 名前を聞く"""
+    """新規ユーザー用コンテキスト: 名前を聞くが、お店探しを妨げない"""
     return """## 初期あいさつ（新規ユーザー）
 このユーザーは初めての来訪です。
 最初の発話で「初めまして、AIコンシェルジュです。よろしければ、何とお呼びすればいいか教えてください。」と名前を聞いてください。
-ユーザーが名前を教えてくれたら、その名前で呼びかけてから、お店探しの会話を始めてください。"""
+ユーザーが名前を教えてくれたら、その名前で呼びかけてから、お店探しの会話を始めてください。
+名前より先にお店の希望を言われたら、そのままお店探しを進めてください。"""
+
+
+def _get_returning_unnamed_context() -> str:
+    """リピーターで名前が未登録のときのコンテキスト"""
+    return """## 初期あいさつ（リピーター・名前は未登録）
+このユーザーは以前にも来訪しています。名前は分かりません。
+最初の発話で「お帰りなさいませ。今日はどのようなお食事をお考えですか？」と挨拶してください。名前は聞き直さないでください。"""
 
 
 def _get_returning_user_context(preferred_name: str, name_honorific: str) -> str:
@@ -236,14 +246,18 @@ def _get_lesson_returning_context(preferred_name: str, name_honorific: str,
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
     behavior=types.Behavior.BLOCKING,
-    description="ユーザーの条件に基づいてレストランを検索する。条件が十分に揃ったと判断した時に呼び出す。user_requestには会話で確認した全条件を必ず含めること。",
+    description="お客様が条件の確認に承諾したときだけ呼ぶ。推薦システムにお店の候補を依頼する。",
     parameters=types.Schema(
         type="OBJECT",
         properties={
             "user_request": types.Schema(
                 type="STRING",
-                description="検索条件の要約。会話で確定した全条件（エリア・ジャンル/シーン・予算・人数・その他希望）を漏れなく含めること。例: '六本木 接待向けイタリアン 予算1万円 4名 個室希望'"
-            )
+                description="確認でお客様に伝えた条件の要約。お客様が言っていない条件は入れない。例: '恵比寿 イタリアン'、'恵比寿 デート イタリアン 予算1万円 2名'"
+            ),
+            "area": types.Schema(
+                type="STRING",
+                description="確認したエリア名（駅名や地域名）。分からなければ空"
+            ),
         },
         required=["user_request"]
     )
@@ -273,7 +287,7 @@ UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
 GET_CURRENT_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="get_current_shops",
     behavior=types.Behavior.BLOCKING,
-    description="画面に表示している最新の確定店（版・紹介の印つき）を返す。画面の店はキーボード操作でも変わるので、お店について答える前に必ず呼ぶこと。",
+    description="画面に表示している最新の確定店（版・紹介の印つき）を返す。",
     parameters=types.Schema(type="OBJECT", properties={}),
 )
 
@@ -343,16 +357,15 @@ CONCIERGE_RESUME_TEXTS = {
 
 
 def concierge_live_rules(language: str) -> str:
-    """Live 用の規則（コードの定数。v11 の後ろに足す。R1.4 §6.3）"""
+    """Live 用の規則（コードの定数。v11 の後ろに足す）。同意の規則は本文だけに書く（R2.0 §6.4）"""
     lead = CONCIERGE_INTRO_LEADS.get(language, CONCIERGE_INTRO_LEADS['ja']).format(n='N')
     return f"""
 
 【音声の会話の規則（コンシェルジュ）】
-- 条件を確認して同意を得てから search_shops を呼ぶ。呼ぶときは話さない。
-- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・エリア・ジャンル・推薦理由を簡潔に紹介する。N は店の番号。
-- status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が fresh_disabled のときは、最近開店したお店の検索は準備中だと伝え、通常の探し方でよいか尋ねる。
+- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・ジャンル・推薦理由を一、二文で紹介する。N は店の番号。この紹介だけは、短く話す規則の例外とする。
+- status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が places_partial のときは、一部のお店を確認できなかったことも伝える。
 - status が error のときは一時的に探せなかったと伝える。busy のときは前の検索を続けていると伝える。superseded のときは、新しい検索を受け付けたため、この検索の結果は表示しなかったと伝える。
-- 画面の店はキーボード操作でも変わる。お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。
+- お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。
 - 店の印（mark）に従う。done（紹介済み）の店は繰り返さない。interrupted（途中で中断）の店は、その店の最初から紹介する。screen_only は画面に表示済みで、音声ではまだ紹介していない店。
 - JSON・項目名・状態の名前を読み上げない。
 """
@@ -1055,6 +1068,7 @@ class LiveAPISession:
     async def _handle_concierge_search(self, fc, session):
         """コンシェルジュの search_shops（R1.4 §6.2）"""
         user_request = fc.args.get("user_request", "")
+        area = fc.args.get("area", "") or ""
         logger.info(f"[Concierge] search_shops呼び出し: '{user_request}'")
         seq = self._shops_store.begin_search() if self._shops_store else None
         self.socketio.emit('shop_search_start', {'search_seq': seq}, room=self.client_sid)
@@ -1065,7 +1079,7 @@ class LiveAPISession:
                 loop = asyncio.get_event_loop()
                 out = await loop.run_in_executor(
                     None, functools.partial(self._shop_search_callback, user_request,
-                                            self.language, self.mode, seq))
+                                            self.language, self.mode, seq, area))
             except Exception as e:
                 logger.error(f"[Concierge] 検索の例外: {type(e).__name__}", exc_info=True)
         if not out:

@@ -113,7 +113,7 @@ class TestConciergeMessage(unittest.TestCase):
         s.commit_shops(s.begin_search(), FIVE, origin='live')
         _, fake, _ = self.run_c1(s, [{'message': 'はい'}, '要約'])
         prompt = fake.calls[0]['config'].system_instruction
-        self.assertIn('推薦の依頼', prompt)            # v11
+        self.assertIn('お店探しの依頼', prompt)        # v11（R2.0 の本文）
         self.assertIn('文字の会話の規則', prompt)       # REST 用の規則
         self.assertIn('店3（恵比寿）', prompt)          # 確定店
         self.assertNotIn('{user_context}', prompt)
