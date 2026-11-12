@@ -11,6 +11,7 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 
 import asyncio
 import functools
+import uuid
 import base64
 import os
 import logging
@@ -808,6 +809,8 @@ class LiveAPISession:
 
         self._shop_search_seq += 1
         search_seq = self._shop_search_seq
+        # 検索ごとの ID。カードと後送りの外部リンクに付け、画面は同じ ID のカードにだけリンクを反映する
+        search_id = uuid.uuid4().hex
         try:
             # 1. callbackでLLM JSON生成（enrichなし）
             loop = asyncio.get_event_loop()
@@ -843,12 +846,13 @@ class LiveAPISession:
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
+                'search_id': search_id,
             }, room=self.client_sid)
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
             # 3b. 外部リンクを取り、届いたら同じカードに反映する（待たない）
             if enriched and link_jobs:
-                task = asyncio.ensure_future(self._send_deferred_links(search_seq, link_jobs))
+                task = asyncio.ensure_future(self._send_deferred_links(search_seq, search_id, link_jobs))
                 self._link_tasks.add(task)
                 task.add_done_callback(self._link_tasks.discard)
 
@@ -863,7 +867,7 @@ class LiveAPISession:
             }, room=self.client_sid)
             return []
 
-    async def _send_deferred_links(self, search_seq: int, link_jobs: list):
+    async def _send_deferred_links(self, search_seq: int, search_id: str, link_jobs: list):
         """後送りの外部リンクを取り、まだ同じ検索のカードが表示中なら shop_links_update を送る"""
         from api_integrations import fetch_deferred_links
         loop = asyncio.get_event_loop()
@@ -876,7 +880,8 @@ class LiveAPISession:
             logger.info("[ShopSearch] 新しい検索が始まったため、外部リンクは送らない")
             return
         if updates:
-            self.socketio.emit('shop_links_update', {'updates': updates}, room=self.client_sid)
+            self.socketio.emit('shop_links_update', {'search_id': search_id, 'updates': updates},
+                               room=self.client_sid)
             logger.info(f"[ShopSearch] 外部リンクを送信: {len(updates)}件")
 
     def _build_shop_tool_response(self, shops: list) -> dict:
