@@ -29,7 +29,7 @@ THINKING_LEVEL = types.ThinkingLevel.LOW
 # Google 検索（方法B）。D-1 の承認まで本番で有効にしない（R2.0 §7.7）
 GROUNDING_ENABLED = False
 
-MAX_CANDIDATES = 12      # R1.4 と同じ（R2.0 §7.3）
+MAX_CANDIDATES = 8       # 初回の候補の上限（12 から 8 に変更。5 店の確定率や時間を保証するものではない）
 MAX_SUPPLEMENT = 8       # R4
 CONFIRM_COUNT = 5
 
@@ -44,7 +44,7 @@ SUPERSEDED = 'superseded'
 
 LANGUAGE_NAMES = {'ja': '日本語', 'en': 'English', 'zh': '中文', 'ko': '한국어'}
 
-# 候補の項目（R2.0 §7.3）。照合に使う 5 項目と、ショップカードに載せる 7 項目。詳しい内容はカードで表す
+# 候補の項目（R2.0 §7.3）。照合に使う 5 項目と、カード・紹介に使う 5 項目
 _CANDIDATE_ITEM = {
     'type': 'object',
     'properties': {
@@ -56,13 +56,11 @@ _CANDIDATE_ITEM = {
         'genre': {'type': 'string'},
         'specialty': {'type': 'string'},
         'atmosphere': {'type': 'string'},
-        'scene': {'type': 'string'},
         'price_estimate': {'type': 'string'},
-        'tips': {'type': 'string'},
         'reason': {'type': 'string'},
     },
     'required': ['name', 'aliases', 'branch', 'area', 'locality', 'genre', 'specialty',
-                 'atmosphere', 'scene', 'price_estimate', 'tips', 'reason'],
+                 'atmosphere', 'price_estimate', 'reason'],
 }
 
 _FRESH_ITEM = {
@@ -102,8 +100,8 @@ _CANDIDATE_RULES = """【候補の規則】
 4. 条件に合わない店は挙げない。同じチェーンの店を重ねない。
 5. name は店の正式名称、branch は支店名（なければ空）、aliases は今使われている別表記（旧店名は入れない）。
 6. area は最寄り駅または地域名、locality は住所に含まれる市区町村名や町名。店の確認に使うので正確に書く。
-7. 評価点・営業時間・URL は書かない。price_estimate は一人あたりの予算の目安。ランチとディナーで違うときは両方を書く（例：ランチ1,500円〜、ディナー6,000円〜8,000円）。
-8. 次はショップカードに載せる文章。specialty は看板メニューや得意料理、atmosphere は雰囲気や設備の特徴、scene は向いている利用シーンを、それぞれ短い句 1 つで書く。reason は料理の内容・体験・雰囲気と、依頼に合う理由を含めて 2〜3 文で書く。tips は来店時のおすすめポイントを一文で書く。文章は{language}で書く。
+7. 評価点・営業時間・URL は書かない。price_estimate は一人あたりの予算の目安。
+8. 短く書く。specialty はその店ならではの料理や専門性を短い句 1 つ、atmosphere は店の雰囲気を短い句 1 つ、reason は依頼に合う推薦理由を一文で書く。文章は{language}で書く。
 9. 条件に合う店が少なければ、無理に数をそろえない。"""
 
 # Google 検索を有効にしたときだけ足す（R2.0 §7.2）
@@ -222,9 +220,7 @@ def conversation_item(order: int, c: dict, place_id: str, source: str) -> dict:
         'genre': c.get('genre', ''),
         'specialty': c.get('specialty', ''),
         'atmosphere': c.get('atmosphere', ''),
-        'scene': c.get('scene', ''),
         'price_estimate': c.get('price_estimate', ''),
-        'tips': c.get('tips', ''),
         'reason': c.get('reason', ''),
         'source': source,
         'place_id': place_id,
@@ -232,6 +228,31 @@ def conversation_item(order: int, c: dict, place_id: str, source: str) -> dict:
     if source == 'fresh':
         item['opened'] = c.get('opened', '')
     return item
+
+
+# 紹介の要点（talking_points）の見出し。値は推薦の項目をそのまま使い、新しく作らない
+_TALKING_LABELS = {
+    'ja': (('specialty', '看板料理'), ('atmosphere', '雰囲気'), ('reason', 'おすすめ理由'),
+           ('price_estimate', '予算目安')),
+    'en': (('specialty', 'Signature dish'), ('atmosphere', 'Atmosphere'), ('reason', 'Why we recommend it'),
+           ('price_estimate', 'Budget')),
+}
+
+
+def talking_points(item: dict, language: str = 'ja') -> list:
+    """
+    確定店の紹介の要点（Live が紹介に使う箇条書き）。
+    既存の推薦の項目（specialty・atmosphere・reason・price_estimate）から組み立てるだけで、
+    LLM や外部 API は呼ばない。空の項目は入れない。
+    """
+    labels = _TALKING_LABELS.get(language, _TALKING_LABELS['en'])
+    sep = '：' if language == 'ja' else ': '
+    points = []
+    for key, label in labels:
+        value = (item.get(key) or '').strip()
+        if value:
+            points.append(f'{label}{sep}{value}')
+    return points
 
 
 def _result(status: str, reason_code: str = None, source: str = None, found_count: int = 0,
@@ -356,6 +377,9 @@ def recommend_shops(user_request: str, language: str = 'ja', origin: str = 'text
 
     shops = [conversation_item(i, c, place['place_id'], source)
              for i, (c, place, _) in enumerate(confirmed, start=1)]
+    # 5 店が確定した後だけ、紹介の要点を足す（確定店・順位・place_id は変えない）
+    for item in shops:
+        item['talking_points'] = talking_points(item, language)
     cards = places.build_cards(
         [(item, place, geo) for item, (_, place, geo) in zip(shops, confirmed)], language)
     logger.info(f'[Recommend] complete: {found}店')

@@ -22,7 +22,8 @@ import support_core as sc  # noqa: E402
 def item(order, name):
     return {'order': order, 'name': name, 'area': '恵比寿', 'genre': '焼き鳥', 'specialty': 'つくね',
             'atmosphere': '落ち着いた', 'price_estimate': '6,000円', 'reason': f'{name}の理由。',
-            'fit': [], 'source': 'knowledge', 'place_id': f'P{order}'}
+            'fit': [], 'source': 'knowledge', 'place_id': f'P{order}',
+            'talking_points': ['看板料理：つくね', f'おすすめ理由：{name}の理由。']}
 
 
 FIVE = [item(i, f'店{i}') for i in range(1, 6)]
@@ -98,6 +99,7 @@ class TestConfigAndPrompt(unittest.TestCase):
         self.assertNotIn('同意を得てから', rules)          # 同意の規則は本文だけに書く
         self.assertNotIn('fresh_disabled', rules)
         self.assertIn('places_partial', rules)
+        self.assertIn('talking_points', rules)            # 紹介は talking_points を根拠にする
 
     def test_user_context_for_returning_user_without_name(self):
         ctx = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': ''})
@@ -140,6 +142,7 @@ class TestConfigAndPrompt(unittest.TestCase):
         self.assertIn('版 1', inst)
         self.assertIn('店3（恵比寿）', inst)
         self.assertIn('画面に表示済み・音声では未紹介', inst)
+        self.assertIn('紹介の要点: 看板料理：つくね；おすすめ理由：店3の理由。', inst)   # 紹介の要点も渡す
         self.assertNotIn('P3', inst)
 
     def test_build_system_instruction_appends_rules_only_for_concierge(self):
@@ -266,6 +269,8 @@ class TestToolCalls(unittest.TestCase):
         asyncio.run(l._handle_tool_call(call, sess))
         r = sess.responses[-1].response
         self.assertEqual((r['status'], r['shops_version'], r['shops'][0]['mark']), ('ok', 1, 'screen_only'))
+        self.assertEqual(r['shops'][0]['talking_points'], ['看板料理：つくね', 'おすすめ理由：店1の理由。'])
+        self.assertNotIn('place_id', r['shops'][0])
         unavailable, _ = live(store=sc.SupportSession('missing'))
         asyncio.run(unavailable._handle_tool_call(call, sess))
         self.assertEqual(sess.responses[-1].response, {'status': 'unavailable'})
