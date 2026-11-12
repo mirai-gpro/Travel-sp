@@ -10,6 +10,7 @@ stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
 """
 
 import asyncio
+import functools
 import base64
 import os
 import logging
@@ -342,6 +343,9 @@ class LiveAPISession:
         self._resume_message = None
         # ショップ紹介（LiveAPI 読み上げ）のターン待ち
         self._shop_intro_turn_pending = False
+        # 外部リンクの後送り：検索ごとの番号（古い検索のリンクを送らないため）と実行中のタスク
+        self._shop_search_seq = 0
+        self._link_tasks = set()
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -802,6 +806,8 @@ class LiveAPISession:
             }, room=self.client_sid)
             return
 
+        self._shop_search_seq += 1
+        search_seq = self._shop_search_seq
         try:
             # 1. callbackでLLM JSON生成（enrichなし）
             loop = asyncio.get_event_loop()
@@ -823,9 +829,12 @@ class LiveAPISession:
             area = shop_data.get('area', '')
 
             # 2. enrich実行
+            # Places の照合は店ごとに並列。ホットペッパー・TripAdvisor の照会はカード表示の後に回す
             from api_integrations import enrich_shops_with_photos
+            link_jobs = []
             enriched = await loop.run_in_executor(
-                None, enrich_shops_with_photos, raw_shops, area, self.language
+                None, functools.partial(enrich_shops_with_photos, raw_shops, area, self.language,
+                                        defer_links=True, link_jobs=link_jobs)
             )
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
@@ -837,6 +846,12 @@ class LiveAPISession:
             }, room=self.client_sid)
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
+            # 3b. 外部リンクを取り、届いたら同じカードに反映する（待たない）
+            if enriched and link_jobs:
+                task = asyncio.ensure_future(self._send_deferred_links(search_seq, link_jobs))
+                self._link_tasks.add(task)
+                task.add_done_callback(self._link_tasks.discard)
+
             # 4. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
             #    旧方式: await self._describe_shops_via_live(shops)  ※REST TTS
             return shops
@@ -847,6 +862,22 @@ class LiveAPISession:
                 'shops': [], 'response': '',
             }, room=self.client_sid)
             return []
+
+    async def _send_deferred_links(self, search_seq: int, link_jobs: list):
+        """後送りの外部リンクを取り、まだ同じ検索のカードが表示中なら shop_links_update を送る"""
+        from api_integrations import fetch_deferred_links
+        loop = asyncio.get_event_loop()
+        try:
+            updates = await loop.run_in_executor(None, fetch_deferred_links, link_jobs, self.language)
+        except Exception as e:
+            logger.error(f"[ShopSearch] 外部リンクの取得エラー: {e}")
+            return
+        if search_seq != self._shop_search_seq:
+            logger.info("[ShopSearch] 新しい検索が始まったため、外部リンクは送らない")
+            return
+        if updates:
+            self.socketio.emit('shop_links_update', {'updates': updates}, room=self.client_sid)
+            logger.info(f"[ShopSearch] 外部リンクを送信: {len(updates)}件")
 
     def _build_shop_tool_response(self, shops: list) -> dict:
         """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""

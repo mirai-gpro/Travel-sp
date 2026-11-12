@@ -19,6 +19,7 @@ import threading
 import asyncio
 import queue
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
@@ -82,6 +83,7 @@ allowed_origins = [
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
     "https://travel-sp-git-preview-live38-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（本番に merge しない）
+    "https://travel-sp-git-speed-a-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（本番に merge しない）
     "http://localhost:4321"
 ]
 
@@ -870,6 +872,10 @@ def handle_live_start(data):
                 system_instruction=SEARCH_ONLY_PROMPT,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             )
+            # エリア名の抽出（Geocoding）は依頼文だけで決まるので、Gemini の応答を待つ間に並行して行う
+            area_ex = ThreadPoolExecutor(max_workers=1)
+            area_future = area_ex.submit(extract_area_from_text, user_request, lang)
+            area_ex.shutdown(wait=False)
             response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
@@ -917,7 +923,7 @@ def handle_live_start(data):
                 'is_followup': False,
             }
             if shops:
-                area = extract_area_from_text(user_request, lang)
+                area = area_future.result()
                 result['area'] = area
             return result
         except Exception as e:

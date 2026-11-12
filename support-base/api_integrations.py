@@ -11,6 +11,7 @@ import os
 import re
 import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 # ロギング
 logger = logging.getLogger(__name__)
@@ -509,7 +510,8 @@ def search_place(shop_name: str, area: str = '', geo_info: dict = None, language
 # ショップ情報 拡張ロジック (刷新版)
 # ========================================
 
-def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') -> list:
+def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja',
+                             defer_links: bool = False, link_jobs: list = None) -> list:
     """
     ショップリストに外部APIデータを追加 (place_id重複排除付き、国コード検証強化版)
     - 基本: トリップアドバイザーを表示
@@ -539,6 +541,17 @@ def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') 
     for i, shop in enumerate(shops, 1):
         logger.info(f"[Enrich]   {i}. {shop.get('name', '')}")
 
+    # Places 検索は店ごとに独立しているので、先に並列で実行する（最大 5 並列）。
+    # 採否・重複排除・データの注入は、下のループで元の順番どおりに行う（選定結果は直列と同じ）
+    place_targets = [(i, shop.get('name', ''), shop.get('area', '') or area)
+                     for i, shop in enumerate(shops, 1) if shop.get('name', '')]
+    place_results = {}
+    if place_targets:
+        with ThreadPoolExecutor(max_workers=min(5, len(place_targets))) as place_ex:
+            found = place_ex.map(lambda t: search_place(t[1], t[2], geo_info, language), place_targets)
+            for (idx, _, _), result in zip(place_targets, found):
+                place_results[idx] = result
+
     for i, shop in enumerate(shops, 1):
         shop_name = shop.get('name', '')
         if not shop_name:
@@ -553,7 +566,7 @@ def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') 
         # 店舗ごとのエリアを使用(LLMのJSONから取得)
         shop_area = shop.get('area', '') or area  # LLMのareaを優先、なければグローバルのareaを使用
         logger.info(f"[Enrich] → 使用エリア: '{shop_area}'")
-        place_data = search_place(shop_name, shop_area, geo_info, language)
+        place_data = place_results.get(i)
         
         if not place_data:
             logger.warning(f"[Enrich] Places APIで見つからない。除外します: {shop_name}")
@@ -630,18 +643,25 @@ def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') 
                 shop.pop('tripadvisor_reviews', None)
 
                 # ホットペッパー
-                hotpepper_url = None
-                try:
-                    hotpepper_url = search_hotpepper(shop_name, area, geo_info)
-                    if not hotpepper_url:
-                        # 名前を変えて再トライ
-                        places_name = place_data.get('name', '')
-                        if places_name and places_name != shop_name:
-                            hotpepper_url = search_hotpepper(places_name, area, geo_info)
-                except Exception:
-                    pass
+                if defer_links and link_jobs is not None:
+                    # ホットペッパーの API 照会はカード表示の後に回す。表示時点は従来の検索 URL
+                    shop['hotpepper_url'] = f"https://www.google.com/search?q={shop_name}+{area}+ホットペッパーグルメ"
+                    link_jobs.append({'kind': 'hotpepper', 'index': len(enriched_shops), 'name': shop.get('name', ''),
+                                      'shop_name': shop_name, 'places_name': place_data.get('name', ''),
+                                      'area': area, 'geo_info': geo_info})
+                else:
+                    hotpepper_url = None
+                    try:
+                        hotpepper_url = search_hotpepper(shop_name, area, geo_info)
+                        if not hotpepper_url:
+                            # 名前を変えて再トライ
+                            places_name = place_data.get('name', '')
+                            if places_name and places_name != shop_name:
+                                hotpepper_url = search_hotpepper(places_name, area, geo_info)
+                    except Exception:
+                        pass
 
-                shop['hotpepper_url'] = hotpepper_url if hotpepper_url else f"https://www.google.com/search?q={shop_name}+{area}+ホットペッパーグルメ"
+                    shop['hotpepper_url'] = hotpepper_url if hotpepper_url else f"https://www.google.com/search?q={shop_name}+{area}+ホットペッパーグルメ"
 
                 # 食べログ
                 try:
@@ -664,7 +684,11 @@ def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') 
                 logger.error(f"[Enrich] Domestic Sites Error: {e}")
 
         # B. トリップアドバイザーのリンク生成 (デフォルト適用時)
-        if show_tripadvisor:
+        if show_tripadvisor and defer_links and link_jobs is not None:
+            # TripAdvisor の照会はカード表示の後に回す
+            link_jobs.append({'kind': 'tripadvisor', 'index': len(enriched_shops), 'name': shop.get('name', ''),
+                              'shop_name': shop_name, 'lat': place_data.get('lat'), 'lng': place_data.get('lng')})
+        elif show_tripadvisor:
             try:
                 lat = place_data.get('lat')
                 lng = place_data.get('lng')
@@ -699,6 +723,48 @@ def enrich_shops_with_photos(shops: list, area: str = '', language: str = 'ja') 
     logger.info(f"[Enrich] 合計入力: {len(shops)}件")
 
     return enriched_shops
+
+
+def _run_link_job(job: dict, language: str) -> dict:
+    """後送りの外部リンク 1 件。enrich_shops_with_photos の元の処理と同じ照会をする"""
+    if job['kind'] == 'hotpepper':
+        hotpepper_url = None
+        try:
+            hotpepper_url = search_hotpepper(job['shop_name'], job['area'], job['geo_info'])
+            if not hotpepper_url:
+                places_name = job['places_name']
+                if places_name and places_name != job['shop_name']:
+                    hotpepper_url = search_hotpepper(places_name, job['area'], job['geo_info'])
+        except Exception:
+            pass
+        return {'hotpepper_url': hotpepper_url} if hotpepper_url else {}
+    if job['kind'] == 'tripadvisor':
+        try:
+            if TRIPADVISOR_API_KEY:
+                tripadvisor_lang_map = {'ja': 'ja', 'en': 'en', 'zh': 'zh', 'ko': 'ko'}
+                search_lang = tripadvisor_lang_map.get(language, 'en')
+                tripadvisor_data = get_tripadvisor_data(job['shop_name'], job['lat'], job['lng'], search_lang)
+                if not tripadvisor_data and search_lang == 'ja':
+                    tripadvisor_data = get_tripadvisor_data(job['shop_name'], job['lat'], job['lng'], 'en')
+                if tripadvisor_data:
+                    return {'tripadvisor_url': tripadvisor_data.get('web_url'),
+                            'tripadvisor_rating': tripadvisor_data.get('rating'),
+                            'tripadvisor_reviews': tripadvisor_data.get('num_reviews')}
+        except Exception as e:
+            logger.error(f"[Enrich] TripAdvisor Error: {e}")
+    return {}
+
+
+def fetch_deferred_links(link_jobs: list, language: str = 'ja') -> list:
+    """
+    カード表示の後に外部リンクを並列で取る。
+    戻り値: [{'index': カードの位置, 'name': カードの店名, 'fields': {更新する項目}}]（取れなかったものは含めない）
+    """
+    if not link_jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(5, len(link_jobs))) as ex:
+        results = list(ex.map(lambda j: _run_link_job(j, language), link_jobs))
+    return [{'index': j['index'], 'name': j['name'], 'fields': r} for j, r in zip(link_jobs, results) if r]
 
 
 def extract_area_from_text(text: str, language: str = 'ja') -> str:
