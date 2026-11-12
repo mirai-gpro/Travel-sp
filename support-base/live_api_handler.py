@@ -362,7 +362,7 @@ def concierge_live_rules(language: str) -> str:
     return f"""
 
 【音声の会話の規則（コンシェルジュ）】
-- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名と、その店の talking_points（紹介の要点）を根拠に、自然な話し言葉で紹介する。箇条書きをそのまま読み上げなくてよい。talking_points にない店の情報は補わない。店の順番と名前は変えない。N は店の番号。この紹介だけは、短く話す規則の例外とする。
+- search_shops の結果の status が complete のときは、shops の順に、各店を決まった言い出し「{lead}」で始め、店名・ジャンル・推薦理由を一、二文で紹介する。N は店の番号。この紹介だけは、短く話す規則の例外とする。
 - status が not_found のときは、確認できた数（found_count）を伝え、緩められそうな条件を尋ねる。店名は出さない。reason_code が places_partial のときは、一部のお店を確認できなかったことも伝える。
 - status が error のときは一時的に探せなかったと伝える。busy のときは前の検索を続けていると伝える。superseded のときは、新しい検索を受け付けたため、この検索の結果は表示しなかったと伝える。
 - お店について答える前には必ず get_current_shops を呼び、その結果を優先して答える。status が unavailable のときは、直前の search_shops の結果の店で答える。営業時間・評価・住所は答えず、画面のカードを案内する。
@@ -1068,7 +1068,6 @@ class LiveAPISession:
         for s in shops:
             item = {k: s.get(k, '') for k in ('order', 'name', 'area', 'genre', 'specialty',
                                               'atmosphere', 'price_estimate', 'reason')}
-            item['talking_points'] = list(s.get('talking_points') or [])
             if s.get('opened'):
                 item['opened'] = s['opened']
             item['mark'] = marks.get(s.get('order'), MARK_NOT_STARTED)
@@ -1253,9 +1252,8 @@ class LiveAPISession:
         shops, version, marks = state
         lines = ["", "", f"【最新の確定店と紹介の印（画面のカードと同じ。版 {version}）】"]
         for item in self._concierge_items(shops, marks):
-            points = '；'.join(item['talking_points'])
             lines.append(f"{item['order']}. {item['name']}（{item['area']}） / {item['genre']} / "
-                         f"紹介の要点: {points} / 印: {_MARK_LABELS_JA.get(item['mark'], item['mark'])}")
+                         f"推薦理由: {item['reason']} / 印: {_MARK_LABELS_JA.get(item['mark'], item['mark'])}")
         lines.append("再送した会話履歴は途中で切れているので、どこまで紹介したかは上の印に従う。")
         return "\n".join(lines)
 

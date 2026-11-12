@@ -29,7 +29,7 @@ THINKING_LEVEL = types.ThinkingLevel.LOW
 # Google 検索（方法B）。D-1 の承認まで本番で有効にしない（R2.0 §7.7）
 GROUNDING_ENABLED = False
 
-MAX_CANDIDATES = 8       # 初回の候補の上限（12 から 8 に変更。5 店の確定率や時間を保証するものではない）
+MAX_CANDIDATES = 12      # R1.4 と同じ（R2.0 §7.3）
 MAX_SUPPLEMENT = 8       # R4
 CONFIRM_COUNT = 5
 
@@ -230,31 +230,6 @@ def conversation_item(order: int, c: dict, place_id: str, source: str) -> dict:
     return item
 
 
-# 紹介の要点（talking_points）の見出し。値は推薦の項目をそのまま使い、新しく作らない
-_TALKING_LABELS = {
-    'ja': (('specialty', '看板料理'), ('atmosphere', '雰囲気'), ('reason', 'おすすめ理由'),
-           ('price_estimate', '予算目安')),
-    'en': (('specialty', 'Signature dish'), ('atmosphere', 'Atmosphere'), ('reason', 'Why we recommend it'),
-           ('price_estimate', 'Budget')),
-}
-
-
-def talking_points(item: dict, language: str = 'ja') -> list:
-    """
-    確定店の紹介の要点（Live が紹介に使う箇条書き）。
-    既存の推薦の項目（specialty・atmosphere・reason・price_estimate）から組み立てるだけで、
-    LLM や外部 API は呼ばない。空の項目は入れない。
-    """
-    labels = _TALKING_LABELS.get(language, _TALKING_LABELS['en'])
-    sep = '：' if language == 'ja' else ': '
-    points = []
-    for key, label in labels:
-        value = (item.get(key) or '').strip()
-        if value:
-            points.append(f'{label}{sep}{value}')
-    return points
-
-
 def _result(status: str, reason_code: str = None, source: str = None, found_count: int = 0,
             shops: list = None, cards: list = None, card_geos: list = None) -> dict:
     return {
@@ -377,9 +352,6 @@ def recommend_shops(user_request: str, language: str = 'ja', origin: str = 'text
 
     shops = [conversation_item(i, c, place['place_id'], source)
              for i, (c, place, _) in enumerate(confirmed, start=1)]
-    # 5 店が確定した後だけ、紹介の要点を足す（確定店・順位・place_id は変えない）
-    for item in shops:
-        item['talking_points'] = talking_points(item, language)
     cards = places.build_cards(
         [(item, place, geo) for item, (_, place, geo) in zip(shops, confirmed)], language)
     logger.info(f'[Recommend] complete: {found}店')
