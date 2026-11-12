@@ -23,6 +23,10 @@ export class CoreController {
   protected isTTSEnabled = true;
   protected isUserInteracted = false;
   protected currentShops: any[] = [];
+  // speed-clean: ショップ検索ID（外部リンク後送りを同じ検索のカードにだけ反映するため）
+  protected activeShopSearchId: string | null = null;     // 最後に開始した検索
+  protected displayedShopSearchId: string | null = null;  // 現在カード表示中の検索
+  protected shopSearchStartedAt = 0;
   protected isFromVoiceInput = false;
   protected lastAISpeech = '';
   protected preGeneratedAcks: Map<string, string> = new Map();
@@ -186,6 +190,8 @@ export class CoreController {
     this.els.reservationBtn?.classList.remove('visible');
 
     this.currentShops = [];
+    this.activeShopSearchId = null;
+    this.displayedShopSearchId = null;
     this.sessionId = null;
     this.lastAISpeech = '';
     this.preGeneratedAcks.clear();
@@ -310,6 +316,12 @@ export class CoreController {
     });
 
     this.socket.on('connect', () => { });
+
+    // speed-clean: 切断・再接続時は未反映のリンク更新を無効化（再接続後は別の socket になる）
+    this.socket.on('disconnect', () => {
+      this.activeShopSearchId = null;
+      this.displayedShopSearchId = null;
+    });
 
     // 既存リスナー（STTフォールバック用に残す）
     this.socket.on('transcript', (data: any) => {
@@ -471,21 +483,29 @@ export class CoreController {
     });
 
     // ★ ショップ検索開始（§3.6: 待機アニメーション表示）
-    this.socket.on('shop_search_start', () => {
+    this.socket.on('shop_search_start', (data: any) => {
       console.log('[LiveAPI] shop_search_start: 待機アニメーション表示');
+      // speed-clean: 新しい検索の開始で、それ以前の検索のリンク更新はすべて無効
+      this.activeShopSearchId = data?.search_id || null;
+      this.shopSearchStartedAt = performance.now();
+      console.log(`[ShopTiming] search_id=${this.activeShopSearchId} start`);
       this.showWaitOverlay();
     });
 
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
+      const resultSearchId = data?.search_id || null;
+      console.log(`[ShopTiming] search_id=${resultSearchId} result shops=${data?.shops?.length || 0} ` +
+        `client_ms=${this.shopSearchStartedAt ? Math.round(performance.now() - this.shopSearchStartedAt) : -1}`);
       this.hideWaitOverlay();
       const shops = data?.shops || [];
       if (shops.length > 0) {
         this.currentShops = shops;
+        this.displayedShopSearchId = resultSearchId;
         this.els.reservationBtn?.classList.add('visible');
         document.dispatchEvent(new CustomEvent('displayShops', {
-          detail: { shops: shops, language: this.currentLanguage }
+          detail: { shops: shops, language: this.currentLanguage, searchId: resultSearchId }
         }));
         const section = document.getElementById('shopListSection');
         if (section) section.classList.add('has-shops');
@@ -500,6 +520,35 @@ export class CoreController {
             if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
           }, 300);
         }
+      }
+    });
+
+    // ★ speed-clean: 外部リンク（Hot Pepper / TripAdvisor）の後送り更新
+    //   search_id が「最後に開始した検索」かつ「表示中カードの検索」と一致する場合だけ、
+    //   place_id が一致するカードのリンク項目だけを更新する（店名・順位・説明は変更しない）
+    this.socket.on('shop_links_update', (data: any) => {
+      const searchId = data?.search_id || null;
+      if (!searchId || searchId !== this.activeShopSearchId || searchId !== this.displayedShopSearchId) {
+        console.log(`[ShopTiming] search_id=${searchId} links_ignored active=${this.activeShopSearchId} displayed=${this.displayedShopSearchId}`);
+        return;
+      }
+      const allowed = ['hotpepper_url', 'tripadvisor_url', 'tripadvisor_rating', 'tripadvisor_reviews'];
+      const updatedPlaceIds: string[] = [];
+      for (const u of (data?.updates || [])) {
+        if (!u || !u.place_id || !u.fields) continue;
+        const target = this.currentShops.find((s: any) => s && s.place_id === u.place_id);
+        if (!target) continue;
+        for (const key of allowed) {
+          if (Object.prototype.hasOwnProperty.call(u.fields, key)) target[key] = u.fields[key];
+        }
+        updatedPlaceIds.push(u.place_id);
+      }
+      console.log(`[ShopTiming] search_id=${searchId} links_applied=${updatedPlaceIds.length} ` +
+        `client_ms=${this.shopSearchStartedAt ? Math.round(performance.now() - this.shopSearchStartedAt) : -1}`);
+      if (updatedPlaceIds.length > 0) {
+        document.dispatchEvent(new CustomEvent('updateShopLinks', {
+          detail: { searchId: searchId, shops: this.currentShops, placeIds: updatedPlaceIds }
+        }));
       }
     });
   }
@@ -976,6 +1025,8 @@ export class CoreController {
       
       if (data.shops && data.shops.length > 0) {
         this.currentShops = data.shops;
+        this.activeShopSearchId = null;
+        this.displayedShopSearchId = null;
         this.els.reservationBtn?.classList.add('visible');
         this.els.userInput.value = '';
         document.dispatchEvent(new CustomEvent('displayShops', { 
@@ -1115,6 +1166,8 @@ export class CoreController {
           const extractedShops = this.extractShopsFromResponse(data.response);
           if (extractedShops.length > 0) {
             this.currentShops = extractedShops;
+            this.activeShopSearchId = null;
+            this.displayedShopSearchId = null;
             this.els.reservationBtn?.classList.add('visible');
             document.dispatchEvent(new CustomEvent('displayShops', { 
               detail: { shops: extractedShops, language: this.currentLanguage } 

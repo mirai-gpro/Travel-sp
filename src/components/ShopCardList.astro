@@ -634,6 +634,7 @@ const { apiBaseUrl = '' } = Astro.props;
     tripadvisor_url?: string;
     tripadvisor_rating?: number;
     tripadvisor_reviews?: number;
+    place_id?: string;
     latitude?: number;
     longitude?: number;
   }
@@ -710,8 +711,12 @@ const { apiBaseUrl = '' } = Astro.props;
     }
 
     // ショップリストを表示
-    displayShops(shops: ShopData[], language?: string) {
+    // speed-clean: 表示中カードの検索ID（Live の検索結果のみ。その他の表示経路では null）
+    private currentSearchId: string | null = null;
+
+    displayShops(shops: ShopData[], language?: string, searchId?: string | null) {
       console.log('[ShopCardList] displayShops called with language:', language, 'shops:', shops);
+      this.currentSearchId = searchId || null;
       if (language) {
         this.currentLanguage = language;
         console.log('[ShopCardList] Language set to:', language);
@@ -736,6 +741,23 @@ const { apiBaseUrl = '' } = Astro.props;
       console.log(`[ShopCardList] ${shops.length} cards created`);
     }
 
+    // speed-clean: 同じ検索のカードについて、place_id が一致するカードのリンクボタンだけを再生成
+    updateLinks(searchId: string, shops: ShopData[], placeIds: string[]) {
+      if (!searchId || searchId !== this.currentSearchId) {
+        console.log('[ShopCardList] updateLinks ignored (search mismatch):', searchId, this.currentSearchId);
+        return;
+      }
+      for (const placeId of placeIds) {
+        const shop = shops.find(s => s && s.place_id === placeId);
+        if (!shop) continue;
+        const cards = Array.from(this.container.querySelectorAll<HTMLElement>('.shop-card'))
+          .filter(c => c.dataset.placeId === placeId);
+        if (cards.length !== 1) continue;
+        const linkButtons = cards[0].querySelector('.link-buttons');
+        if (linkButtons) linkButtons.innerHTML = this.createLinksHtml(shop);
+      }
+    }
+
     // ショップカードを追加
     addShop(shop: ShopData) {
       const card = this.createShopCard(shop);
@@ -746,6 +768,7 @@ const { apiBaseUrl = '' } = Astro.props;
     private createShopCard(shop: ShopData): HTMLElement {
       const card = document.createElement('div');
       card.className = 'shop-card';
+      if (shop.place_id) card.dataset.placeId = shop.place_id;
 
       // デフォルト画像
       const imageUrl = shop.image || 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=800&h=450&fit=crop';
@@ -1099,7 +1122,15 @@ const { apiBaseUrl = '' } = Astro.props;
     document.addEventListener('displayShops', ((event: CustomEvent) => {
       if (event.detail && event.detail.shops) {
         const language = event.detail.language || 'ja';
-        manager.displayShops(event.detail.shops, language);
+        manager.displayShops(event.detail.shops, language, event.detail.searchId || null);
+      }
+    }) as EventListener);
+
+    // speed-clean: 外部リンクの後送り更新
+    document.addEventListener('updateShopLinks', ((event: CustomEvent) => {
+      const d = event.detail;
+      if (d && d.searchId && Array.isArray(d.shops) && Array.isArray(d.placeIds)) {
+        manager.updateLinks(d.searchId, d.shops, d.placeIds);
       }
     }) as EventListener);
   });
