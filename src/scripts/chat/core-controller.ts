@@ -476,6 +476,25 @@ export class CoreController {
       this.showWaitOverlay();
     });
 
+    // ★ 外部リンクの後送り（カード表示の後に届く）。同じ位置・同じ店名のカードにだけ反映する
+    this.socket.on('shop_links_update', (data: any) => {
+      const updates = data?.updates || [];
+      if (!updates.length || !this.currentShops.length) return;
+      let changed = false;
+      for (const u of updates) {
+        const shop = this.currentShops[u.index];
+        if (shop && shop.name === u.name) {
+          Object.assign(shop, u.fields);
+          changed = true;
+        }
+      }
+      if (changed) {
+        document.dispatchEvent(new CustomEvent('displayShops', {
+          detail: { shops: this.currentShops, language: this.currentLanguage }
+        }));
+      }
+    });
+
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
