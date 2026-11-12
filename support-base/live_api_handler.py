@@ -465,6 +465,8 @@ class LiveAPISession:
         # キーボード入力のテキスト（R2.0 §8.2）。音声のキューは満杯なら捨てるので、別のキューにする
         self.text_queue_to_gemini = None
         self._loop = None
+        # カードの表示後に外部リンクを取るタスク（R2.0 §8.4）。セッションの終了時に cancel する
+        self._card_link_tasks = set()
         self.is_running = False
 
     def _build_config(self, with_context=None):
@@ -679,6 +681,8 @@ class LiveAPISession:
             if self._a2e_worker_task:
                 self._a2e_worker_task.cancel()
                 self._a2e_worker_task = None
+            for task in list(self._card_link_tasks):
+                task.cancel()
             self.is_running = False
             logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
@@ -1140,6 +1144,40 @@ class LiveAPISession:
             self._shop_intro_turn_pending = True
             self._start_intro(out.get('shops_version'), len(out.get('shops', [])))
             logger.info(f"[Concierge] complete: {len(out.get('shops', []))}店を tool_response で送信")
+            # 外部リンクは、紹介の音声を止めないよう tool_response の後に別タスクで取る（R2.0 §8.4）
+            if out.get('cards'):
+                self._start_card_links(out.get('shops_version'), out['cards'], out.get('card_geos') or [])
+
+    def _start_card_links(self, version, cards: list, geos: list):
+        """外部リンクの取得を始めて、すぐ戻る（待たない）"""
+        task = asyncio.ensure_future(self._send_card_links(version, cards, geos))
+        self._card_link_tasks.add(task)
+        task.add_done_callback(self._card_link_tasks.discard)
+
+    async def _send_card_links(self, version, cards: list, geos: list):
+        """既定のスレッドプールで外部リンクを取り、確定店の版がまだ最新なら shop_cards_update を送る"""
+        import concierge_places
+        loop = asyncio.get_event_loop()
+        try:
+            updates = await loop.run_in_executor(
+                None, functools.partial(concierge_places.links_for_cards, cards, geos, self.language))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[Concierge] 外部リンクの取得の例外: {type(e).__name__}")
+            return
+        if not updates:
+            return
+        state = self._concierge_state()
+        if state is not None and version is not None and state[1] != version:
+            logger.info("[Concierge] 確定店が新しくなったため、外部リンクは送らない")
+            return
+        self.socketio.emit('shop_cards_update', {
+            'session_id': self.session_id,
+            'shops_version': version,
+            'updates': updates,
+        }, room=self.client_sid)
+        logger.info(f"[Concierge] 外部リンクを送信: {len(updates)}店")
 
     # ---- 紹介の記録（R1.4 §6.4）。サーバーだけで記録する ----
 
