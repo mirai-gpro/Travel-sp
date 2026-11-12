@@ -108,6 +108,23 @@ class TestConfigAndPrompt(unittest.TestCase):
         named = lah._build_concierge_user_context({'is_first_visit': False, 'preferred_name': '太郎', 'name_honorific': '様'})
         self.assertIn('太郎様', named)
 
+    def test_enqueue_text_from_another_thread_keeps_order(self):
+        import threading
+        l, _ = live(store=new_store())
+
+        async def scenario():
+            l.text_queue_to_gemini = asyncio.Queue()
+            l._loop = asyncio.get_running_loop()
+            l.is_running = True
+            t = threading.Thread(target=lambda: [l.enqueue_text(x) for x in ('a', 'b', 'c')])
+            t.start()
+            t.join()
+            return [await asyncio.wait_for(l.text_queue_to_gemini.get(), 1) for _ in range(3)]
+
+        self.assertEqual(asyncio.run(scenario()), ['a', 'b', 'c'])
+        l.is_running = False
+        self.assertFalse(l.enqueue_text('d'))
+
     def test_chat_tools_unchanged(self):
         l, _ = live(mode='chat')
         names = [d.name for d in l._build_config()['tools'][0].function_declarations]
@@ -291,6 +308,43 @@ class TestLiveStart(unittest.TestCase):
                                         'mode': 'concierge', 'language': language})
         self.app.active_live_sessions.pop('client-1', None)
         return fake_cls, emit
+
+    def test_missing_session_is_created_for_shops_only(self):
+        # REST のセッションが別インスタンスにある（このインスタンスにない）場合（R2.0 §8.6）
+        sid = 'from-another-instance'
+        sc.SupportSession(sid)  # 何も作らない
+        fake_cls = mock.Mock()
+        with mock.patch.object(self.app, 'LiveAPISession', fake_cls), \
+                mock.patch.object(self.app.threading, 'Thread'), \
+                mock.patch.object(self.app, 'request', SimpleNamespace(sid='client-2')), \
+                mock.patch.object(self.app, 'emit', mock.Mock()):
+            self.app.handle_live_start({'session_id': sid, 'mode': 'concierge', 'language': 'ja'})
+        self.app.active_live_sessions.pop('client-2', None)
+        store = fake_cls.call_args.kwargs['shops_store']
+        self.assertEqual(store.get_shops_state(), ([], 0, {}))      # 確定店の保存先はある
+        self.assertIsNone(store.get_data()['user_id'])              # user_id はない（長期記憶は使えない）
+
+    def test_live_text_in_enqueues_text(self):
+        live_session = mock.Mock(is_running=True)
+        live_session.enqueue_text.return_value = True
+        emit = mock.Mock()
+        self.app.active_live_sessions['client-3'] = live_session
+        try:
+            with mock.patch.object(self.app, 'request', SimpleNamespace(sid='client-3')), \
+                    mock.patch.object(self.app, 'emit', emit):
+                self.app.handle_live_text_in({'text': '  恵比寿でイタリアン  '})
+                self.app.handle_live_text_in({'text': '   '})
+        finally:
+            self.app.active_live_sessions.pop('client-3', None)
+        live_session.enqueue_text.assert_called_once_with('恵比寿でイタリアン')
+        emit.assert_not_called()
+
+    def test_live_text_in_without_live_is_rejected(self):
+        emit = mock.Mock()
+        with mock.patch.object(self.app, 'request', SimpleNamespace(sid='client-4')), \
+                mock.patch.object(self.app, 'emit', emit):
+            self.app.handle_live_text_in({'text': 'x'})
+        emit.assert_called_once_with('live_text_rejected', {'reason': 'not_running'})
 
     def test_language_without_v11_does_not_start_live(self):
         fake_cls, emit = self.start('ko', new_store())
