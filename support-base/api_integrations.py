@@ -750,3 +750,271 @@ def extract_shops_from_response(text: str) -> list:
         })
 
     logger.info(f"[Extract] {len(shops)}件のショップを抽出")
+
+
+# ========================================
+# 高速化版（speed-clean）: 店舗選定は enrich_shops_with_photos と同一
+# ========================================
+# 【方針】
+# - search_place / get_place_details / get_region_from_area / search_hotpepper /
+#   get_tripadvisor_data は一切変更せず、そのまま呼ぶ（API リクエスト・採用条件は旧版と同一）。
+# - 変更点は「待ち方」だけ:
+#   (1) 店舗ごとの search_place を最大5並列で実行する。
+#       採用・除外・place_id 重複判定・Places 名での上書きは、全結果が揃ってから
+#       LLM の推薦順で1件ずつ確定する（旧版の for ループと同じ順・同じ判定）。
+#   (2) カードに必須でない外部リンク（Hot Pepper / TripAdvisor の API 照会）は
+#       link_jobs として返し、カード送信後に run_shop_link_jobs() で実行する。
+#       照会に使う店名・エリア・geo_info・フォールバック URL の作り方は旧版と同一。
+#       初回カードと link 更新をマージした最終結果は、旧版の出力と一致する。
+# - 旧版 enrich_shops_with_photos は残す（/api/chat 経路と同等性テストの基準）。
+from concurrent.futures import ThreadPoolExecutor as _SpeedThreadPoolExecutor
+import time as _speed_time
+
+SPEED_PLACES_MAX_WORKERS = 5
+SPEED_LINKS_MAX_WORKERS = 5
+
+
+def _speed_domestic_links_job(shop_name: str, area: str, geo_info: dict, place_data: dict) -> dict:
+    """旧版の「ホットペッパー」部分だけを切り出したもの（処理内容は同一）"""
+    hotpepper_url = None
+    try:
+        hotpepper_url = search_hotpepper(shop_name, area, geo_info)
+        if not hotpepper_url:
+            # 名前を変えて再トライ
+            places_name = place_data.get('name', '')
+            if places_name and places_name != shop_name:
+                hotpepper_url = search_hotpepper(places_name, area, geo_info)
+    except Exception:
+        pass
+
+    return {
+        'hotpepper_url': hotpepper_url if hotpepper_url else f"https://www.google.com/search?q={shop_name}+{area}+ホットペッパーグルメ"
+    }
+
+
+def _speed_tripadvisor_links_job(shop_name: str, place_data: dict, language: str) -> dict:
+    """旧版の「B. トリップアドバイザーのリンク生成」を切り出したもの（処理内容は同一）"""
+    updates = {}
+    try:
+        lat = place_data.get('lat')
+        lng = place_data.get('lng')
+
+        if TRIPADVISOR_API_KEY:
+            # 言語マッピング
+            tripadvisor_lang_map = {'ja': 'ja', 'en': 'en', 'zh': 'zh', 'ko': 'ko'}
+            search_lang = tripadvisor_lang_map.get(language, 'en')
+
+            # 検索実行
+            tripadvisor_data = get_tripadvisor_data(shop_name, lat, lng, search_lang)
+
+            # 0件かつ日本語の場合、英語で再トライ(ヒット率向上策)
+            if not tripadvisor_data and search_lang == 'ja':
+                logger.info(f"[TripAdvisor] 日本語でヒットせず。英語で再検索: {shop_name}")
+                tripadvisor_data = get_tripadvisor_data(shop_name, lat, lng, 'en')
+
+            if tripadvisor_data:
+                updates['tripadvisor_url'] = tripadvisor_data.get('web_url')
+                updates['tripadvisor_rating'] = tripadvisor_data.get('rating')
+                updates['tripadvisor_reviews'] = tripadvisor_data.get('num_reviews')
+                logger.info(f"[TripAdvisor] リンク生成成功: {shop_name}")
+    except Exception as e:
+        logger.error(f"[Enrich] TripAdvisor Error: {e}")
+    return updates
+
+
+def enrich_shops_core_parallel(shops: list, area: str = '', language: str = 'ja', timing: dict = None):
+    """
+    enrich_shops_with_photos の高速化版（店舗選定は同一）。
+
+    Returns:
+        (enriched_shops, link_jobs)
+        - enriched_shops: 旧版と同じ店舗・同じ順序・同じ Places 由来データ。
+          外部 API が必要なリンク（hotpepper_url / tripadvisor_*）だけは未確定。
+        - link_jobs: [(place_id, callable)]。run_shop_link_jobs() に渡すと
+          旧版と同じリンク値を返す。
+    """
+    enriched_shops = []
+    link_jobs = []
+    seen_place_ids = set()  # ✅ 重複チェック用
+    duplicate_count = 0
+    validation_failed_count = 0
+    if timing is None:
+        timing = {}
+
+    logger.info(f"[Enrich] 開始(並列版): area='{area}', language={language}, shops={len(shops)}件")
+
+    # Geocodingはあくまで補助情報として取得(失敗しても止まらない) ※旧版と同一
+    t_geo = _speed_time.monotonic()
+    geo_info = None
+    if area:
+        try:
+            geo_info = get_region_from_area(area, language)
+            if geo_info:
+                logger.info(f"[Enrich] Geocoding成功: {geo_info.get('formatted_address', '')} "
+                           f"(国: {geo_info.get('country_code', '')}, "
+                           f"座標: {geo_info.get('lat', '')}, {geo_info.get('lng', '')})")
+        except Exception as e:
+            logger.error(f"[Enrich] Geocoding Error: {e}")
+    timing['enrich_geocode_sec'] = round(_speed_time.monotonic() - t_geo, 3)
+
+    # LLMが回答した店舗名をログ出力
+    logger.info(f"[Enrich] LLMの回答店舗:")
+    for i, shop in enumerate(shops, 1):
+        logger.info(f"[Enrich]   {i}. {shop.get('name', '')}")
+
+    # -------------------------------------------------------
+    # 1. Google Places API を店舗ごとに並列照会（引数は旧版と同一）
+    # -------------------------------------------------------
+    targets = []
+    for i, shop in enumerate(shops, 1):
+        shop_name = shop.get('name', '')
+        if not shop_name:
+            continue
+        # 店舗ごとのエリアを使用(LLMのJSONから取得)
+        shop_area = shop.get('area', '') or area  # LLMのareaを優先、なければグローバルのareaを使用
+        targets.append((i, shop, shop_name, shop_area))
+
+    t_places = _speed_time.monotonic()
+    place_results = []
+    if targets:
+        workers = min(SPEED_PLACES_MAX_WORKERS, len(targets))
+        with _SpeedThreadPoolExecutor(max_workers=workers, thread_name_prefix='places') as executor:
+            futures = [
+                executor.submit(search_place, shop_name, shop_area, geo_info, language)
+                for (_i, _shop, shop_name, shop_area) in targets
+            ]
+            # 推薦順に結果を受け取る（到着順ではない）
+            place_results = [f.result() for f in futures]
+    timing['places_parallel_sec'] = round(_speed_time.monotonic() - t_places, 3)
+
+    # -------------------------------------------------------
+    # 2. LLM の推薦順で確定（旧版の for ループ本体と同じ判定・同じ注入）
+    # -------------------------------------------------------
+    for (i, shop, shop_name, shop_area), place_data in zip(targets, place_results):
+        logger.info(f"[Enrich] ----------")
+        logger.info(f"[Enrich] {i}/{len(shops)} 確定: '{shop_name}' (使用エリア: '{shop_area}')")
+
+        if not place_data:
+            logger.warning(f"[Enrich] Places APIで見つからない。除外します: {shop_name}")
+            validation_failed_count += 1
+            continue  # ★append()せずにスキップ★
+
+        place_id = place_data.get('place_id')
+        place_name = place_data.get('name')
+
+        logger.info(f"[Enrich] → 検索結果: '{place_name}'")
+        logger.info(f"[Enrich] → place_id: {place_id}")
+
+        # ✅ place_id重複チェック
+        if place_id in seen_place_ids:
+            duplicate_count += 1
+            logger.warning(f"[Enrich] → ❌ 重複検出!既に追加済み(スキップ)")
+            logger.warning(f"[Enrich]    LLM店舗名: '{shop_name}' → Google店舗名: '{place_name}'")
+            continue
+
+        # ✅ place_idを記録
+        seen_place_ids.add(place_id)
+        logger.info(f"[Enrich] → ✅ 追加決定")
+
+        # 国コードの取得
+        shop_country = place_data.get('country_code', '')
+
+        # ロジック判定(フラグ設定) ※旧版と同一
+        show_tripadvisor = True
+        show_domestic_sites = False
+        if language == 'ja' and shop_country == 'JP':
+            show_tripadvisor = False      # トリップアドバイザーは出さない
+            show_domestic_sites = True    # 国内3サイトを出す
+
+        logger.info(f"[Enrich] 判定結果: {shop_name} (Country: {shop_country}, Lang: {language}) "
+                   f"-> TripAdvisor: {show_tripadvisor}, Domestic: {show_domestic_sites}")
+
+        # Google Placesの共通データ ※旧版と同一
+        if place_data.get('name'):
+            shop['name'] = place_data['name']
+        if place_data.get('photo_url'):
+            shop['image'] = place_data['photo_url']
+        if place_data.get('rating'):
+            shop['rating'] = place_data['rating']
+        if place_data.get('user_ratings_total'):
+            shop['reviewCount'] = place_data['user_ratings_total']
+        if place_data.get('formatted_address'):
+            shop['location'] = place_data['formatted_address']
+        if place_data.get('maps_url'):
+            shop['maps_url'] = place_data['maps_url']
+        if place_data.get('phone'):
+            shop['phone'] = place_data['phone']
+        if place_data.get('place_id'):
+            shop['place_id'] = place_data['place_id']
+
+        # A. 国内3サイト（例外ルール適用時）
+        if show_domestic_sites:
+            try:
+                # TripAdvisorフィールドを明示的に削除 ※旧版と同一
+                shop.pop('tripadvisor_url', None)
+                shop.pop('tripadvisor_rating', None)
+                shop.pop('tripadvisor_reviews', None)
+
+                # ホットペッパー: API 照会は後送り。旧版は必ず上書きするので、
+                # 初回カードでは LLM 由来の値を出さず、後送りで旧版と同じ値を設定する。
+                shop.pop('hotpepper_url', None)
+                link_jobs.append((place_id, (lambda sn=shop_name, ar=area, gi=geo_info, pd=place_data:
+                                             _speed_domestic_links_job(sn, ar, gi, pd))))
+
+                # 食べログ ※旧版と同一（外部 API なし）
+                try:
+                    places_name = place_data.get('name', '')
+                    region_name = geo_info.get('region', '') if geo_info else '東京'
+                    # 都道府県コード変換(簡易版)
+                    pref_code_map = {'東京': 'tokyo', '神奈川': 'kanagawa', '大阪': 'osaka', '京都': 'kyoto', '兵庫': 'hyogo', '北海道': 'hokkaido', '愛知': 'aichi', '福岡': 'fukuoka'}
+                    pref = region_name.rstrip('都道府県') if region_name else '東京'
+                    pref_code = pref_code_map.get(pref, 'tokyo')
+
+                    tabelog_search_query = requests.utils.quote(places_name if places_name else shop_name)
+                    shop['tabelog_url'] = f"https://tabelog.com/{pref_code}/rstLst/?sw={tabelog_search_query}"
+                except Exception:
+                    shop['tabelog_url'] = f"https://tabelog.com/tokyo/rstLst/?sw={shop_name}"
+
+                # ぐるなび ※旧版と同一（外部 API なし）
+                shop['gnavi_url'] = f"https://www.google.com/search?q={shop_name}+{area}+ぐるなび"
+
+            except Exception as e:
+                logger.error(f"[Enrich] Domestic Sites Error: {e}")
+
+        # B. トリップアドバイザー（デフォルト適用時）: API 照会は後送り
+        if show_tripadvisor:
+            link_jobs.append((place_id, (lambda sn=shop_name, pd=place_data, lg=language:
+                                         _speed_tripadvisor_links_job(sn, pd, lg))))
+
+        enriched_shops.append(shop)
+
+    logger.info(f"[Enrich] ========== 完了(並列版) ==========")
+    logger.info(f"[Enrich] 出力: {len(enriched_shops)}件")
+    logger.info(f"[Enrich] 重複除外: {duplicate_count}件")
+    logger.info(f"[Enrich] 検証失敗: {validation_failed_count}件")
+    logger.info(f"[Enrich] 合計入力: {len(shops)}件")
+    logger.info(f"[Enrich] 後送りリンク: {len(link_jobs)}件")
+
+    return enriched_shops, link_jobs
+
+
+def run_shop_link_jobs(link_jobs: list) -> list:
+    """
+    enrich_shops_core_parallel() が返した link_jobs を並列実行する。
+    Returns: [{'place_id': str, 'fields': dict}]（推薦順。fields が空のものは含めない）
+    """
+    if not link_jobs:
+        return []
+    workers = min(SPEED_LINKS_MAX_WORKERS, len(link_jobs))
+    with _SpeedThreadPoolExecutor(max_workers=workers, thread_name_prefix='shoplinks') as executor:
+        futures = [(place_id, executor.submit(job)) for place_id, job in link_jobs]
+        results = []
+        for place_id, f in futures:
+            try:
+                fields = f.result()
+            except Exception as e:
+                logger.error(f"[Enrich] link job error: {e}")
+                fields = {}
+            if fields:
+                results.append({'place_id': place_id, 'fields': fields})
+    return results

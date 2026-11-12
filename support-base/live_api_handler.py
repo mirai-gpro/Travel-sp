@@ -15,6 +15,8 @@ import os
 import logging
 import struct
 import time
+import uuid
+import functools
 import httpx
 from scipy.signal import resample_poly
 import numpy as np
@@ -342,6 +344,9 @@ class LiveAPISession:
         self._resume_message = None
         # ショップ紹介（LiveAPI 読み上げ）のターン待ち
         self._shop_intro_turn_pending = False
+        # speed-clean: 現在有効なショップ検索ID（リンク後送りの紐づけ用）と後送りタスク
+        self._shop_search_id = None
+        self._shop_links_task = None
 
         # ★ A2Eバッファリング機構（仕様書08 セクション3.1）
         self._a2e_audio_buffer = bytearray()       # PCMチャンク蓄積用
@@ -722,8 +727,18 @@ class LiveAPISession:
                 user_request = fc.args.get("user_request", "")
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
+                # speed-clean: 検索ごとの一意ID。新しい検索を開始した時点で旧検索のリンク後送りは無効
+                search_id = uuid.uuid4().hex
+                t_accept = time.monotonic()
+                self._shop_search_id = search_id
+                if self._shop_links_task is not None and not self._shop_links_task.done():
+                    self._shop_links_task.cancel()
+                    logger.info("[ShopTiming] 旧検索のリンク後送りを取り消し（新しい検索開始）")
+                self._shop_links_task = None
+                logger.info(f"[ShopTiming] search_id={search_id} stage=accepted")
+
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
-                self.socketio.emit('shop_search_start', {},
+                self.socketio.emit('shop_search_start', {'search_id': search_id},
                                    room=self.client_sid)
 
                 # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
@@ -738,7 +753,7 @@ class LiveAPISession:
                 please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
 
                 # ショップ検索を実行（カード表示まで。読み上げは LiveAPI が行う）
-                shops = await self._handle_shop_search(user_request)
+                shops = await self._handle_shop_search(user_request, search_id, t_accept)
 
                 # 検索完了 → 未再生のタスクをキャンセル
                 for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
@@ -784,22 +799,40 @@ class LiveAPISession:
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
-    async def _handle_shop_search(self, user_request: str):
+    async def _handle_shop_search(self, user_request: str, search_id: str = None, t_accept: float = None):
         """
-        ショップ検索を実行し、結果をブラウザに送信する（案A: enrich並行方式）
+        ショップ検索を実行し、結果をブラウザに送信する
 
-        【設計】
-        - callbackでLLM JSON生成のみ（enrichなし）→ raw_shopsを取得
-        - raw_shopsで即座にTTS並行生成を開始
-        - enrichをTTS生成と並行でrun_in_executor実行
-        - enrich完了後にショップカードをブラウザに送信
-        - TTS再生（生成済みタスクを_describe_shops_via_liveに渡す）
+        【設計】（speed-clean: 店舗選定は旧版と同一、待ち方だけ変更）
+        - callbackでLLM JSON生成（Google検索付き Gemini、旧版と同一）→ raw_shopsを取得
+        - enrich_shops_core_parallel で Places を店舗単位に並列照会し、LLM推薦順で確定
+        - ショップカードをブラウザに送信（search_id 付き）
+        - Hot Pepper / TripAdvisor のリンクはカード送信後に後送り（shop_links_update）
         """
+        if t_accept is None:
+            t_accept = time.monotonic()
+        timing = {}
+
+        def _since_accept():
+            return round(time.monotonic() - t_accept, 3)
+
+        def _log_summary(outcome: str, n_shops: int = 0):
+            logger.info(
+                f"[ShopTiming] search_id={search_id} summary outcome={outcome} "
+                f"gemini_status={timing.get('gemini_status', '-')} gemini_sec={timing.get('gemini_sec', '-')} "
+                f"area_sec={timing.get('area_sec', '-')} area_wait_after_gemini_sec={timing.get('area_wait_after_gemini_sec', '-')} "
+                f"enrich_geocode_sec={timing.get('enrich_geocode_sec', '-')} places_parallel_sec={timing.get('places_parallel_sec', '-')} "
+                f"enrich_sec={timing.get('enrich_sec', '-')} first_card_sec={timing.get('first_card_sec', '-')} "
+                f"total_sec={_since_accept()} shops={n_shops} raw_shops={timing.get('raw_shops', '-')} "
+                f"enriched={timing.get('enriched', '-')} fallback_raw={timing.get('fallback_raw', '-')}"
+            )
+
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
             self.socketio.emit('shop_search_result', {
-                'shops': [], 'response': '',
+                'shops': [], 'response': '', 'search_id': search_id,
             }, room=self.client_sid)
+            _log_summary('error')
             return
 
         try:
@@ -807,46 +840,109 @@ class LiveAPISession:
             loop = asyncio.get_event_loop()
             shop_data = await loop.run_in_executor(
                 None,
-                self._shop_search_callback,
-                user_request, self.language, self.mode
+                functools.partial(self._shop_search_callback,
+                                  user_request, self.language, self.mode,
+                                  search_id=search_id, timing=timing)
             )
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
                 self.socketio.emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
+                    'search_id': search_id,
                 }, room=self.client_sid)
+                timing['first_card_sec'] = _since_accept()
+                if shop_data:
+                    outcome = 'no_result'
+                else:
+                    status = timing.get('gemini_status', '')
+                    if status in ('http_503', 'http_504') or status.startswith('http_5'):
+                        outcome = 'upstream_error'
+                    elif status == 'timeout':
+                        outcome = 'timeout'
+                    else:
+                        outcome = 'error'
+                _log_summary(outcome)
                 return []
 
             raw_shops = shop_data['shops']
             response_text = shop_data.get('response', '')
             area = shop_data.get('area', '')
+            timing['raw_shops'] = len(raw_shops)
 
-            # 2. enrich実行
-            from api_integrations import enrich_shops_with_photos
-            enriched = await loop.run_in_executor(
-                None, enrich_shops_with_photos, raw_shops, area, self.language
+            # 2. enrich実行（Places 並列照会 + 推薦順で確定。選定は旧版と同一）
+            from api_integrations import enrich_shops_core_parallel
+            logger.info(f"[ShopTiming] search_id={search_id} stage=places_start t={_since_accept()}")
+            t_enrich = time.monotonic()
+            enriched, link_jobs = await loop.run_in_executor(
+                None,
+                functools.partial(enrich_shops_core_parallel, raw_shops, area, self.language, timing=timing)
             )
+            timing['enrich_sec'] = round(time.monotonic() - t_enrich, 3)
+            timing['enriched'] = len(enriched)
+            timing['fallback_raw'] = not bool(enriched)
+            logger.info(f"[ShopTiming] search_id={search_id} stage=places_end t={_since_accept()} "
+                        f"enrich_sec={timing['enrich_sec']} adopted={len(enriched)}")
             shops = enriched if enriched else raw_shops
+            if not enriched:
+                link_jobs = []  # 旧版同様、元候補フォールバック時は外部リンク照会なし
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
 
             # 3. ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
+                'search_id': search_id,
             }, room=self.client_sid)
+            timing['first_card_sec'] = _since_accept()
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
+            logger.info(f"[ShopTiming] search_id={search_id} stage=first_card t={timing['first_card_sec']} shops={len(shops)}")
+            _log_summary('success', len(shops))
 
-            # 4. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
+            # 4. 外部リンク（Hot Pepper / TripAdvisor）をカード送信後に後送り
+            if link_jobs:
+                self._shop_links_task = asyncio.ensure_future(
+                    self._deliver_shop_links(search_id, link_jobs, t_accept)
+                )
+
+            # 5. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
             #    旧方式: await self._describe_shops_via_live(shops)  ※REST TTS
             return shops
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
             self.socketio.emit('shop_search_result', {
-                'shops': [], 'response': '',
+                'shops': [], 'response': '', 'search_id': search_id,
             }, room=self.client_sid)
+            _log_summary('error')
             return []
+
+    async def _deliver_shop_links(self, search_id: str, link_jobs: list, t_accept: float):
+        """
+        speed-clean: カード送信後に外部リンク（Hot Pepper / TripAdvisor）を取得して送る。
+        送信時点で search_id が現在の検索と一致しなければ破棄する（別検索のカードへ誤反映しない）。
+        """
+        from api_integrations import run_shop_link_jobs
+        loop = asyncio.get_event_loop()
+        t0 = time.monotonic()
+        try:
+            updates = await loop.run_in_executor(None, run_shop_link_jobs, link_jobs)
+        except asyncio.CancelledError:
+            logger.info(f"[ShopTiming] search_id={search_id} stage=links_cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"[ShopTiming] search_id={search_id} stage=links_error error={e}")
+            return
+        links_sec = round(time.monotonic() - t0, 3)
+        if self._shop_search_id != search_id:
+            logger.info(f"[ShopTiming] search_id={search_id} stage=links_discarded reason=newer_search")
+            return
+        self.socketio.emit('shop_links_update', {
+            'search_id': search_id,
+            'updates': updates,
+        }, room=self.client_sid)
+        logger.info(f"[ShopTiming] search_id={search_id} stage=links_done t={round(time.monotonic() - t_accept, 3)} "
+                    f"links_sec={links_sec} updated={len(updates)}")
 
     def _build_shop_tool_response(self, shops: list) -> dict:
         """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""

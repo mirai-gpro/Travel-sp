@@ -43,6 +43,25 @@ from support_core import (
     gemini_client
 )
 from live_api_handler import LiveAPISession, build_system_instruction
+from concurrent.futures import ThreadPoolExecutor
+
+# speed-clean: ショップ検索のエリア抽出（Geocoding）を Gemini と並行実行するためのプール
+_SHOP_AREA_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix='shop-area')
+
+
+def _classify_gemini_error(e) -> str:
+    """計測ログ用: Gemini 呼び出し例外の分類（制御には使わない）"""
+    code = getattr(e, 'code', None)
+    if code is None:
+        code = getattr(e, 'status_code', None)
+    if code in (503, 504):
+        return f"http_{code}"
+    name = type(e).__name__
+    if 'Timeout' in name or 'timeout' in str(e).lower()[:200]:
+        return 'timeout'
+    if code is not None:
+        return f"http_{code}"
+    return f"error_{name}"
 
 # ロギング設定
 logging.basicConfig(
@@ -792,8 +811,15 @@ def handle_live_start(data):
                                                system_prompts=SYSTEM_PROMPTS, language=language)
 
     # ショップ検索コールバック（案C: SupportAssistant迂回、検索専用プロンプトで直接API呼び出し）
-    def shop_search_callback(user_request, lang, search_mode):
-        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）"""
+    def shop_search_callback(user_request, lang, search_mode, search_id=None, timing=None):
+        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）
+
+        speed-clean: Gemini の処理内容は旧版と同一。変更点は
+        - extract_area_from_text を Gemini と並行開始（入力は user_request と lang のみで Gemini 結果に依存しない）
+        - timing dict に計測値を記録（search_id でログを紐づけ）
+        """
+        if timing is None:
+            timing = {}
         SEARCH_ONLY_PROMPT = (
             "あなたはグルメレストラン検索エンジンです。\n"
             "ユーザーの条件に合う実在のレストランをGoogle検索で見つけ、必ず5軒をJSON形式で返してください。\n\n"
@@ -864,8 +890,20 @@ def handle_live_start(data):
             "2. 店舗リスト（1〜5の番号付き、各店舗2〜3文の説明、予算は漢数字）\n"
             "3. 締め文（「気になるお店はありましたか？」等）\n"
         )
+        def _timed_extract_area():
+            _t0 = time.monotonic()
+            try:
+                return extract_area_from_text(user_request, lang)
+            finally:
+                timing['area_sec'] = round(time.monotonic() - _t0, 3)
+
+        gemini_done = False
+        t_gemini = time.monotonic()
         try:
+            # エリア抽出（Geocoding）を Gemini と並行開始。結果は旧版と同じく shops がある場合のみ使う
+            area_future = _SHOP_AREA_EXECUTOR.submit(_timed_extract_area)
             logger.info(f"[ShopSearch] 案C: 検索専用プロンプトで直接API呼び出し: '{user_request}'")
+            logger.info(f"[ShopTiming] search_id={search_id} stage=gemini_start")
             config = types.GenerateContentConfig(
                 system_instruction=SEARCH_ONLY_PROMPT,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -875,6 +913,10 @@ def handle_live_start(data):
                 contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
                 config=config
             )
+            gemini_done = True
+            timing['gemini_sec'] = round(time.monotonic() - t_gemini, 3)
+            timing['gemini_status'] = 'ok'
+            logger.info(f"[ShopTiming] search_id={search_id} stage=gemini_end status=ok sec={timing['gemini_sec']}")
             assistant_text = response.text
             logger.info(f"[ShopSearch] 案C: Gemini応答 {len(assistant_text)}文字: {assistant_text[:200]}")
 
@@ -917,10 +959,17 @@ def handle_live_start(data):
                 'is_followup': False,
             }
             if shops:
-                area = extract_area_from_text(user_request, lang)
+                t_wait = time.monotonic()
+                area = area_future.result()
+                timing['area_wait_after_gemini_sec'] = round(time.monotonic() - t_wait, 3)
+                logger.info(f"[ShopTiming] search_id={search_id} stage=area_done area_sec={timing.get('area_sec')} wait_after_gemini_sec={timing['area_wait_after_gemini_sec']}")
                 result['area'] = area
             return result
         except Exception as e:
+            if not gemini_done:
+                timing['gemini_sec'] = round(time.monotonic() - t_gemini, 3)
+                timing['gemini_status'] = _classify_gemini_error(e)
+                logger.info(f"[ShopTiming] search_id={search_id} stage=gemini_end status={timing['gemini_status']} sec={timing['gemini_sec']}")
             logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)
             return None
 
