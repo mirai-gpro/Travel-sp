@@ -101,6 +101,7 @@ allowed_origins = [
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
     "https://travel-sp-git-preview-live38-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（本番に merge しない）
+    "https://travel-sp-git-speed-clean-web-mirais-projects-87257550.vercel.app",  # speed-clean 検証用プレビュー専用（本番に merge しない）
     "http://localhost:4321"
 ]
 
