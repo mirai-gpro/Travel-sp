@@ -43,6 +43,34 @@ RECOMMENDATION_SCHEMA = {
 }
 FRESHNESS_VALUES = ('not_needed', 'useful', 'essential')
 
+# ---------------------------------------------------------------- 同一性判定 LLM（Gate D1.5 PoC）
+# 推薦 LLM と同じモデル・thinking low。別リクエストで、1 検索につき 1 回だけ最大 7 組を一括判定する
+IDENTITY_MAX_OUTPUT_TOKENS = 1024
+IDENTITY_MAX_PAIRS = 7
+SAME = 'SAME'
+DIFFERENT = 'DIFFERENT'
+UNCERTAIN = 'UNCERTAIN'
+IDENTITY_VALUES = (SAME, DIFFERENT, UNCERTAIN)
+IDENTITY_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'results': {'type': 'array', 'items': {
+            'type': 'object',
+            'properties': {
+                'id': {'type': 'integer'},
+                'judgment': {'type': 'string', 'enum': list(IDENTITY_VALUES)},
+                'reason': {'type': 'string'},
+            },
+            'required': ['id', 'judgment', 'reason'],
+        }},
+    },
+    'required': ['results'],
+}
+# 実 Places データを判定 LLM に送るか（既定 OFF）。
+# Google Maps Platform 規約 3.2.3(a)(c)・Service Specific Terms 10 により許容を確認できていないため、
+# 規約確認が済むまで ON にしない。環境変数 NEW_SHOP_LLM_IDENTITY_CHECK=on のときだけ有効。
+IDENTITY_ENV_FLAG = 'NEW_SHOP_LLM_IDENTITY_CHECK'
+
 # ---------------------------------------------------------------- 状態
 COMPLETE = 'COMPLETE'        # 5 件
 PARTIAL = 'PARTIAL'          # 1〜4 件
