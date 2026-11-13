@@ -18,7 +18,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from . import contracts as c
-from . import legacy_places
+from . import agent_tools_places, legacy_places
 from .redact import redact
 
 logger = logging.getLogger(__name__)
@@ -85,10 +85,12 @@ def _credential_kind(key: str) -> str:
 
 class ShopRecommendationOrchestrator:
     def __init__(self, recommender, credential_kind: str = 'unknown', identity_verifier=None, candidate_selector=None,
-                 max_parallel: int = c.PLACES_MAX_PARALLEL, now=time.monotonic, wall=time.time):
+                 grounded_selector=None, maps_agent_key: str = '', max_parallel: int = c.PLACES_MAX_PARALLEL, now=time.monotonic, wall=time.time):
         self.recommender = recommender
         self.identity_verifier = identity_verifier   # None なら同一性判定なし（従来方式）
         self.candidate_selector = candidate_selector # Gate D1.6: Places 上位 5 候補から LLM が選択（None なら従来方式）
+        self.grounded_selector = grounded_selector   # Gate D1.7: Maps Experience Agent Tools + 選択 LLM（None なら従来方式）
+        self.maps_agent_key = maps_agent_key
         self.credential_kind = credential_kind
         self.max_parallel = max(1, min(int(max_parallel), c.PLACES_MAX_PARALLEL))
         self._now = now
@@ -127,6 +129,8 @@ class ShopRecommendationOrchestrator:
         geo_info = legacy_places.region_info(area, language_code)               # 33秒版 enrich 冒頭と同じ
         m['area_resolve_ms'] = int((self._now() - tp) * 1000)
         m['area'] = area
+        if self.grounded_selector:
+            return self._run_agent_tools(m, t0, tp, llm, area, geo_info, request_id)
         if self.candidate_selector:
             return self._run_selection(m, t0, tp, llm, area, geo_info, language_code, request_id)
         verifications = [None] * len(llm.candidates)
@@ -209,6 +213,123 @@ class ShopRecommendationOrchestrator:
         narration = [build_narration_item(v) for v in selected]
         result = self._finish(m, t0, cards, narration, verifications, identity=identity)
         result['legacy_cards'] = [build_card(v, i + 1, request_id) for i, v in enumerate(a_selected)]
+        return result
+
+    def _run_agent_tools(self, m, t0, tp, llm, area, geo_info, request_id):
+        """
+        Gate D1.7（方式 D）: 推薦 7 店舗それぞれ Maps Experience Agent Tools searchText（ja / JP / 最大 5 件）を並列 →
+        summary でグラウンディングした選択 LLM を 1 回 → 選ばれた place ID だけ Place Details →
+        33秒版と同じ採用規則（推薦順位維持・place_id 重複は後順位を不採用・最大 5 件）。候補が無ければ穴埋めしない。
+        カードには Agent Tools の placeUrl と attribution を保持する。
+        """
+        n = len(llm.candidates)
+        searched = [None] * n
+        ts = self._now()
+        pool = ThreadPoolExecutor(max_workers=min(self.max_parallel, n), thread_name_prefix='maps-agent')
+        try:
+            futs = {pool.submit(agent_tools_places.search_text, self.maps_agent_key, cd.name, cd.area_hint, area,
+                                geo_info): i for i, cd in enumerate(llm.candidates)}
+            done, not_done = wait(futs, timeout=PLACES_BATCH_TIMEOUT_SEC)
+            for f in done:
+                try:
+                    searched[futs[f]] = f.result()
+                except Exception as e:
+                    searched[futs[f]] = {'status': f'ERROR:{type(e).__name__}', 'summary': '', 'places': []}
+            for f in not_done:
+                searched[futs[f]] = {'status': 'ERROR:places_batch_timeout', 'summary': '', 'places': []}
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        m['maps_agent_search_ms'] = int((self._now() - ts) * 1000)
+        m['maps_agent_calls'] = n
+
+        next_id, id_map, recs, meta = 1, {}, [], {}
+        for cd, res in zip(llm.candidates, searched):
+            meta[cd.rank] = {'search_status': res['status'], 'n_candidates': len(res['places']), 'positions': {}}
+            entry = {'rank': cd.rank, 'recommended_name': cd.name, 'recommended_area': cd.area_hint,
+                     'maps_summary': res['summary'], 'maps_places': []}
+            for pos, p in enumerate(res['places'], 1):
+                id_map[next_id] = p
+                meta[cd.rank]['positions'][next_id] = pos
+                entry['maps_places'].append({'candidate_id': next_id, 'citation': pos - 1})
+                next_id += 1
+            if entry['maps_places']:
+                recs.append(entry)
+        m['places_candidates_total'] = len(id_map)
+        m['selection_calls'] = 0
+        selection = {}
+        if recs:
+            m['selection_calls'] = 1
+            try:
+                selection, dur, searches = self.grounded_selector.select(recs)
+                m['selection_duration_ms'] = dur
+                m['selection_google_search_calls'] = searches
+            except c.RecommendationError as e:
+                m['final_status'], m['error_type'] = c.ERROR, e.error_type
+                return self._finish(m, t0, [], [], [], error_detail=redact(e.detail))
+
+        chosen = {rank: id_map[cid] for rank, (cid, _r) in selection.items() if cid is not None}
+        td = self._now()
+        details = {}
+        if chosen:
+            dpool = ThreadPoolExecutor(max_workers=min(self.max_parallel, len(chosen)), thread_name_prefix='details')
+            try:
+                dfuts = {dpool.submit(agent_tools_places.details_for_card, p, geo_info): rank for rank, p in chosen.items()}
+                ddone, dnot = wait(dfuts, timeout=PLACES_BATCH_TIMEOUT_SEC)
+                for f in ddone:
+                    try:
+                        details[dfuts[f]] = f.result()
+                    except Exception:
+                        details[dfuts[f]] = (None, 'details_error')
+                for f in dnot:
+                    details[dfuts[f]] = (None, 'details_error')
+            finally:
+                dpool.shutdown(wait=False, cancel_futures=True)
+        m['details_ms'] = int((self._now() - td) * 1000)
+        m['details_calls'] = len(chosen)
+        m['places_finished'] = self._wall()
+        m['places_duration_ms'] = int((self._now() - tp) * 1000)
+
+        verifications, pos_counts = [], {}
+        for cd in llm.candidates:
+            md = meta[cd.rank]
+            md['selected_position'] = None
+            if md['n_candidates'] == 0:
+                v = c.Verification(cd, c.NOT_VERIFIED if md['search_status'] in ('OK', 'ZERO_RESULTS') else c.API_ERROR,
+                                   'no_maps_candidates')
+            else:
+                cid, _reason = selection.get(cd.rank, (None, ''))
+                if cid is None:
+                    v = c.Verification(cd, c.NOT_VERIFIED, 'selection_not_found')
+                else:
+                    pos = md['positions'][cid]
+                    md['selected_position'] = pos
+                    pos_counts[pos] = pos_counts.get(pos, 0) + 1
+                    d, why = details.get(cd.rank, (None, 'details_error'))
+                    if d is None:
+                        v = c.Verification(cd, c.API_ERROR if why.startswith('details_error') else c.NOT_VERIFIED, why)
+                    else:
+                        v = c.Verification(cd, c.VERIFIED, f'selected_position_{pos}', place=d)
+            verifications.append(v)
+        m['selection_positions'] = pos_counts
+        m['selection_not_found'] = sum(1 for v in verifications if v.reason == 'selection_not_found')
+
+        selected, rejected = select_display(verifications)
+        m['verified_count'] = len(selected)
+        m['rejected_counts_by_reason'] = rejected
+        k = len(selected)
+        m['final_status'] = c.COMPLETE if k >= c.DISPLAY_COUNT else (c.PARTIAL if k > 0 else c.EMPTY)
+        cards = []
+        for i, v in enumerate(selected):
+            card = build_card(v, i + 1, request_id)
+            card['maps_attribution'] = v.place.get('maps_attribution')   # 表示必須（Google Maps ソース）
+            cards.append(card)
+        narration = [build_narration_item(v) for v in selected]
+        result = self._finish(m, t0, cards, narration, verifications)
+        for vv in result['verifications']:
+            md = meta[vv['rank']]
+            vv.update({'n_candidates': md['n_candidates'], 'selected_position': md['selected_position'],
+                       'search_status': md['search_status']})
+        result['maps_candidates'] = {r: [id_map[cid]['place_id'] for cid in meta[r]['positions']] for r in meta}
         return result
 
     def _run_selection(self, m, t0, tp, llm, area, geo_info, language_code, request_id):
@@ -370,5 +491,14 @@ def build_from_env():
     if os.environ.get(c.SELECTION_ENV_FLAG, 'off') == 'on':   # 既定 OFF（規約確認前は ON にしない）
         from .llm_candidate_selector import LlmCandidateSelector
         selector = LlmCandidateSelector(gkey)
+    grounded, maps_key = None, ''
+    if os.environ.get(c.AGENT_TOOLS_ENV_FLAG, 'off') == 'on':   # 既定 OFF（Gate D1.7 PoC。フロントの出典表示が未対応）
+        from .llm_grounded_selector import LlmGroundedSelector
+        maps_key = os.environ.get('MAPS_AGENT_TOOLS_API_KEY', '')
+        if not maps_key:
+            raise c.ConfigError('MAPS_AGENT_TOOLS_API_KEY が設定されていません')
+        register_secret(maps_key)
+        grounded = LlmGroundedSelector(gkey)
     return ShopRecommendationOrchestrator(RecommendationClient(gkey), credential_kind=_credential_kind(gkey),
-                                          identity_verifier=identity, candidate_selector=selector)
+                                          identity_verifier=identity, candidate_selector=selector,
+                                          grounded_selector=grounded, maps_agent_key=maps_key)

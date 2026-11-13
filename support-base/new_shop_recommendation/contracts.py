@@ -132,3 +132,8 @@ class Verification:
     place: Optional[dict] = None     # VERIFIED のときだけ（カード用。LLM・Live には渡さない）
     evidence: List[dict] = field(default_factory=list)   # Places 各結果の判定根拠（place_id と判定のみ）
     duration_ms: int = 0
+
+# ---------------------------------------------------------------- Maps Experience Agent Tools + 選択 LLM（Gate D1.7）
+# 既定 OFF。ON にするには MAPS_AGENT_TOOLS_API_KEY も必要。本番投入にはフロントのカードに
+# Google Maps の出典（attribution・placeUrl）表示が必要（Service Specific Terms §10.2.1）
+AGENT_TOOLS_ENV_FLAG = 'NEW_SHOP_AGENT_TOOLS_SELECTION'
