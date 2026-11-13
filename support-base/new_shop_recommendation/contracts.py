@@ -71,6 +71,12 @@ IDENTITY_SCHEMA = {
 # 規約確認が済むまで ON にしない。環境変数 NEW_SHOP_LLM_IDENTITY_CHECK=on のときだけ有効。
 IDENTITY_ENV_FLAG = 'NEW_SHOP_LLM_IDENTITY_CHECK'
 
+# ---------------------------------------------------------------- Places 候補選択 LLM（Gate D1.6）
+# 1 検索につき 1 回、最大 7 店舗 × 最大 5 候補。既定 OFF（実 Places データを LLM に送る規約上の許容が未確認）
+SELECTION_MAX_CANDIDATES = 5
+SELECTION_MAX_OUTPUT_TOKENS = 2048
+SELECTION_ENV_FLAG = 'NEW_SHOP_PLACES_SELECTION'
+
 # ---------------------------------------------------------------- 状態
 COMPLETE = 'COMPLETE'        # 5 件
 PARTIAL = 'PARTIAL'          # 1〜4 件
