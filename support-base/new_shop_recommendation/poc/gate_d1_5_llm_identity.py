@@ -101,30 +101,43 @@ def run_real(gkey, repeat):
         for q in QUERIES:
             res = orch.run(q)
             m = res['metrics']
+            et = res['error_type'] or ''
+            m['_rec_fail'] = res['status'] in (c.ERROR, c.TIMED_OUT) and not et.startswith('identity_')
+            m['_identity_fail'] = et.startswith('identity_')
             rows.append(m)
-            say(f'\n[{q}] (#{r + 1}) status={res["status"]} error={res["error_type"] or "-"}')
-            say(f'  推薦LLM={m["llm_duration_ms"]}ms 候補={m["llm_candidate_count"]} Places={m["places_duration_ms"]}ms '
-                f'同一性LLM={m["identity_duration_ms"]}ms（呼び出し{m["identity_calls"]}回） 合計={m["total_duration_ms"]}ms '
-                f'検索呼び出し={m["google_search_calls"]}/{m["identity_google_search_calls"]}')
+            say(f'\n[{q}] (#{r + 1}) status={res["status"]} error={et or "-"}')
+            if m['_rec_fail']:
+                say(f'  推薦LLM失敗のため A/B 対象外: {(res.get("error_detail") or "")[:200]}')
+                time.sleep(2)
+                continue
+            say(f'  推薦LLM={m.get("llm_duration_ms")}ms 候補={m.get("llm_candidate_count")} Places={m.get("places_duration_ms")}ms '
+                f'同一性LLM={m.get("identity_duration_ms")}ms（呼び出し{m.get("identity_calls")}回） 合計={m.get("total_duration_ms")}ms '
+                f'検索呼び出し={m.get("google_search_calls")}/{m.get("identity_google_search_calls")}')
             say(f'  SAME={m.get("identity_same")} DIFFERENT={m.get("identity_different")} UNCERTAIN={m.get("identity_uncertain")}'
-                f'  カード A(従来)={m["legacy_card_count"]} B(SAME のみ)={m["identity_card_count"]}')
+                f'  カード A(従来)={m.get("legacy_card_count")} B(SAME のみ)={m.get("identity_card_count") if not m["_identity_fail"] else "照合エラー"}')
             for v in res['verifications']:
                 if v.get('identity') and v['identity'] != c.SAME:
                     say(f'    {v["rank"]}. {v["name"]} ⇔ {v["matched_name"]} → {v["identity"]}: {(v["identity_reason"] or "")[:80]}')
+            say('  A のカード（従来）: ' + ' / '.join(f'{x["llm_name"]}→{x["name"]}' for x in res.get('legacy_cards', [])))
+            say('  B のカード（SAME）: ' + ' / '.join(f'{x["llm_name"]}→{x["name"]}' for x in res['cards']))
             time.sleep(2)
-    ok = [x for x in rows if x['final_status'] not in (c.ERROR, c.TIMED_OUT)]
+    valid = [x for x in rows if not x['_rec_fail']]
+    n = len(valid)
+    b_cards = [0 if x['_identity_fail'] else (x.get('identity_card_count') or 0) for x in valid]
+    a_cards = [x.get('legacy_card_count') or 0 for x in valid]
     say('\n【A/B 比較（同じ試行のデータ）】')
+    say(f'  試行 {len(rows)} 回 / 推薦LLM失敗で対象外 {len(rows) - n} 回 / 同一性判定エラー {sum(1 for x in valid if x["_identity_fail"])} 回（B は 0 件扱い）')
     say('| 項目 | A 従来方式 | B SAME のみ |')
     say('|---|---:|---:|')
-    say(f'| 5店舗完成 | {sum(1 for x in ok if x["legacy_card_count"] >= 5)}/{len(rows)} | '
-        f'{sum(1 for x in ok if (x["identity_card_count"] or 0) >= 5)}/{len(rows)} |')
-    say(f'| 平均カード件数 | {statistics.mean([x["legacy_card_count"] for x in rows]):.2f} | '
-        f'{statistics.mean([(x["identity_card_count"] or 0) for x in ok] or [0]):.2f} |')
-    say(f'| カード0件 | {sum(1 for x in rows if x["legacy_card_count"] == 0)}/{len(rows)} | '
-        f'{sum(1 for x in ok if (x["identity_card_count"] or 0) == 0)}/{len(rows)} |')
-    say(f'  同一性判定 LLM 追加時間: {stats([x["identity_duration_ms"] for x in ok])}')
-    say(f'  合計（B）: {stats([x["total_duration_ms"] for x in ok])}')
-    say(f'  照合エラー: {len(rows) - len(ok)} 回')
+    say(f'| 5店舗完成 | {sum(1 for k in a_cards if k >= 5)}/{n} | {sum(1 for k in b_cards if k >= 5)}/{n} |')
+    say(f'| 平均カード件数 | {statistics.mean(a_cards) if a_cards else 0:.2f} | {statistics.mean(b_cards) if b_cards else 0:.2f} |')
+    say(f'| カード0件 | {sum(1 for k in a_cards if k == 0)}/{n} | {sum(1 for k in b_cards if k == 0)}/{n} |')
+    tot = {k: sum((x.get(f'identity_{k}') or 0) for x in valid) for k in ('same', 'different', 'uncertain')}
+    say(f'  判定の合計: SAME {tot["same"]} / DIFFERENT {tot["different"]} / UNCERTAIN {tot["uncertain"]}')
+    say(f'  推薦LLM: {stats([x.get("llm_duration_ms") for x in valid])}')
+    say(f'  Places: {stats([x.get("places_duration_ms") for x in valid])}')
+    say(f'  同一性判定 LLM 追加時間: {stats([x.get("identity_duration_ms") for x in valid if not x["_identity_fail"]])}')
+    say(f'  合計（B）: {stats([x.get("total_duration_ms") for x in valid])}')
 
 
 def main():
