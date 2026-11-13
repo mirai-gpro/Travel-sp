@@ -5,7 +5,7 @@
 上位仕様: 「Travel-sp 新ショップ推薦エンジン — Claude Code詳細実装指示書（確定版）」2026-11-13
 - 推薦 LLM: gemini-3.8-flash / thinking_level=low / REST Interactions API / 非ストリーミング一括
 - Google 検索・外部ツールは使わない（リクエストに tools キーを含めない）
-- Places API (New) は実在・同一店舗・営業状態・カード情報の確認にだけ使う
+- Places 照合は 33秒版本番と同じ方式（api_integrations.search_place をそのまま使用）
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -19,13 +19,8 @@ DISPLAY_COUNT = 5
 INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions'
 INTERACTIONS_API_REVISION = '2026-05-20'   # steps 形式の応答スキーマに固定（公式 May 2026 移行ガイド）
 
-PLACES_SEARCH_TEXT_URL = 'https://places.googleapis.com/v1/places:searchText'
-# '*' は使わない。いずれも Text Search Pro SKU の項目
-PLACES_FIELD_MASK = ('places.id,places.displayName,places.formattedAddress,places.location,'
-                     'places.primaryType,places.types,places.businessStatus,places.googleMapsUri,'
-                     'places.photos')
-PLACES_PAGE_SIZE = 5
-PLACES_MAX_PARALLEL = 7
+# Places 照合は 33秒版本番の api_integrations.search_place をそのまま使う（legacy_places.py）
+PLACES_MAX_PARALLEL = 7   # 候補ごとの search_place 呼び出しの並列数（上限 7）
 
 # 推薦 LLM の生成スキーマ（指示書 4.1 と同一）
 RECOMMENDATION_SCHEMA = {

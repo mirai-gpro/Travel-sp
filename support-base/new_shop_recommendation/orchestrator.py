@@ -2,8 +2,10 @@
 """
 新ショップ推薦オーケストレーター（1 検索リクエスト単位）
 
-  推薦 LLM 一括（1 回）→ 全候補を Places (New) で並列照合 → LLM 順位のまま VERIFIED を上から最大 5 件
+  推薦 LLM 一括（1 回）→ 33秒版本番と同じ Places 照合（legacy_places: extract_area_from_text →
+  get_region_from_area → 候補ごとに search_place。候補ごとの呼び出しは並列）→ LLM 順位のまま採用を上から最大 5 件
   → 同じ選定結果からカード（UI 用）と読み上げデータ（Live 用）を作る
+  ※ VERIFIED は「33秒版の search_place が店舗を返した」ことを意味する
 
 禁止事項（実装していないこと）: 再ランキング、評価値による並べ替え、Google 検索や別 LLM による補充、
 未検証店舗の表示、旧推薦方式へのフォールバック。
@@ -16,35 +18,30 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from . import contracts as c
-from .place_verifier import verify_candidate
+from . import legacy_places
 from .redact import redact
 
 logger = logging.getLogger(__name__)
 
-PLACES_BATCH_MARGIN_SEC = 2.0
+# search_place は内部で Text Search + Place Details（各 timeout=10 秒）を順に呼ぶ
+PLACES_BATCH_TIMEOUT_SEC = 25.0
 
 
 def build_card(v: c.Verification, display_rank: int, request_id: str) -> dict:
-    """既存 ShopCardList が読む項目に変換。店名・住所・地図リンク等は Places 由来（UI 専用）"""
-    p = v.place or {}
-    loc = p.get('location') or {}
-    return {
-        'name': ((p.get('displayName') or {}).get('text')) or v.candidate.name,
+    """LLM 由来の項目に、33秒版と同じ規則で Places の情報を反映（店名は Places 名で上書き）"""
+    card = {
+        'name': v.candidate.name,
         'llm_name': v.candidate.name,
         'category': '',
         'description': v.candidate.reason,
         'highlights': [v.candidate.specialty] if v.candidate.specialty else [],
         'area': v.candidate.area_hint,
-        'location': p.get('formattedAddress') or '',
-        'latitude': loc.get('latitude'),
-        'longitude': loc.get('longitude'),
-        'maps_url': p.get('googleMapsUri') or '',
-        'place_id': p.get('id'),
         'recommend_rank': v.candidate.rank,
         'display_rank': display_rank,
         'verification': c.VERIFIED,
         'request_id': request_id,
     }
+    return legacy_places.reflect_place_data(card, v.place or {})
 
 
 def build_narration_item(v: c.Verification) -> dict:
@@ -60,10 +57,9 @@ def _credential_kind(key: str) -> str:
 
 
 class ShopRecommendationOrchestrator:
-    def __init__(self, recommender, places_client, credential_kind: str = 'unknown',
+    def __init__(self, recommender, credential_kind: str = 'unknown',
                  max_parallel: int = c.PLACES_MAX_PARALLEL, now=time.monotonic, wall=time.time):
         self.recommender = recommender
-        self.places = places_client
         self.credential_kind = credential_kind
         self.max_parallel = max(1, min(int(max_parallel), c.PLACES_MAX_PARALLEL))
         self._now = now
@@ -95,16 +91,33 @@ class ShopRecommendationOrchestrator:
         m['google_search_calls'] = llm.google_search_calls
         m['freshness_intent'] = llm.freshness_intent
 
-        # ---- 2. Places (New) 全候補を同時に照合（LLM の JSON 完成後に開始）
+        # ---- 2. 33秒版と同じ Places 照合（LLM の JSON 完成後に開始）
         m['places_started'] = self._wall()
         tp = self._now()
+        area = legacy_places.resolve_area(user_request, language_code)          # 33秒版 callback と同じ
+        geo_info = legacy_places.region_info(area, language_code)               # 33秒版 enrich 冒頭と同じ
+        m['area_resolve_ms'] = int((self._now() - tp) * 1000)
+        m['area'] = area
         verifications = [None] * len(llm.candidates)
+
+        def _lookup(cand):
+            t = self._now()
+            try:
+                pd = legacy_places.lookup(cand.name, cand.area_hint, area, geo_info, language_code)
+            except Exception as e:      # search_place 自体は例外を内部で None にするが、念のため
+                return c.Verification(cand, c.API_ERROR, redact(f'{type(e).__name__}'),
+                                      duration_ms=int((self._now() - t) * 1000))
+            if not pd:
+                return c.Verification(cand, c.NOT_VERIFIED, 'places_not_found',
+                                      duration_ms=int((self._now() - t) * 1000))
+            return c.Verification(cand, c.VERIFIED, 'legacy_search_place', place=pd,
+                                  duration_ms=int((self._now() - t) * 1000))
+
         pool = ThreadPoolExecutor(max_workers=min(self.max_parallel, len(llm.candidates)),
-                                  thread_name_prefix='places-new')
+                                  thread_name_prefix='places-legacy')
         try:
-            futs = {pool.submit(verify_candidate, self.places, cand, language_code, region_code): i
-                    for i, cand in enumerate(llm.candidates)}
-            done, not_done = wait(futs, timeout=self.places.timeout_sec + PLACES_BATCH_MARGIN_SEC)
+            futs = {pool.submit(_lookup, cand): i for i, cand in enumerate(llm.candidates)}
+            done, not_done = wait(futs, timeout=PLACES_BATCH_TIMEOUT_SEC)
             for f in done:
                 verifications[futs[f]] = f.result()
             for f in not_done:
@@ -115,13 +128,13 @@ class ShopRecommendationOrchestrator:
         m['places_finished'] = self._wall()
         m['places_duration_ms'] = int((self._now() - tp) * 1000)
 
-        # ---- 3. LLM 順位のまま VERIFIED を上から採用（place_id 重複は後の方を除外）
+        # ---- 3. 33秒版 enrich と同じ: LLM 順に、見つからない店は除外、place_id 重複は後の方を除外
         selected = []
         seen = set()
         rejected = {}
         for v in verifications:              # verifications は LLM の rank 順
             if v.status == c.VERIFIED:
-                pid = (v.place or {}).get('id')
+                pid = (v.place or {}).get('place_id')
                 if pid in seen:
                     v.status, v.reason = c.NOT_VERIFIED, 'duplicate_place_id'
                 elif len(selected) < c.DISPLAY_COUNT:
@@ -129,7 +142,7 @@ class ShopRecommendationOrchestrator:
                     selected.append(v)
                     continue
                 else:
-                    continue                 # 予備で VERIFIED だが 5 件確定後のため不使用（棄却ではない）
+                    continue                 # 5 件確定後の予備（棄却ではない）
             key = f'{v.status}:{v.reason}' if v.status != c.API_ERROR else f'{c.API_ERROR}'
             rejected[key] = rejected.get(key, 0) + 1
         m['verified_count'] = len(selected)
@@ -153,18 +166,20 @@ class ShopRecommendationOrchestrator:
             'narration': narration,
             'verifications': [
                 {'rank': v.candidate.rank, 'name': v.candidate.name, 'area_hint': v.candidate.area_hint,
-                 'status': v.status, 'reason': v.reason, 'place_id': (v.place or {}).get('id'),
-                 'places_ms': v.duration_ms, 'evidence': v.evidence}
+                 'status': v.status, 'reason': v.reason, 'place_id': (v.place or {}).get('place_id'),
+                 'places_ms': v.duration_ms}
                 for v in verifications if v is not None],
             'metrics': m,
         }
 
 
 def build_from_env():
-    """Cloud Run 環境変数から構築。GEMINI_RECOMMEND_API_KEY が無ければ ConfigError（既存 GEMINI_API_KEY で代替しない）"""
-    from .place_verifier import PlacesNewClient
+    """
+    Cloud Run 環境変数から構築。GEMINI_RECOMMEND_API_KEY が無ければ ConfigError（既存 GEMINI_API_KEY で代替しない）。
+    Places / Geocoding は 33秒版と同じく api_integrations が GOOGLE_PLACES_API_KEY を使う。
+    """
     from .recommender import RecommendationClient
+    from .redact import register_secret
     gkey = os.environ.get('GEMINI_RECOMMEND_API_KEY', '')
-    pkey = os.environ.get('GOOGLE_PLACES_API_KEY', '')
-    return ShopRecommendationOrchestrator(RecommendationClient(gkey), PlacesNewClient(pkey),
-                                          credential_kind=_credential_kind(gkey))
+    register_secret(os.environ.get('GOOGLE_PLACES_API_KEY', ''))
+    return ShopRecommendationOrchestrator(RecommendationClient(gkey), credential_kind=_credential_kind(gkey))
