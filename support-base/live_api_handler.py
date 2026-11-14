@@ -721,6 +721,7 @@ class LiveAPISession:
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
+                logger.info(f"[NewShopRec] tool_call_received t={time.time():.3f}")   # M4 E1（計測ログのみ）
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
                 self.socketio.emit('shop_search_start', {},
@@ -834,7 +835,32 @@ class LiveAPISession:
         if result.get('status') in ('ERROR', 'TIMED_OUT'):
             return {"result": "お店の検索中にエラーが発生し、結果を表示できませんでした。"
                               "申し訳ないと伝え、少し時間をおいてもう一度探すことを提案してください。"}
+        if result.get('narration_mode') == 'D':
+            return self._build_shop_tool_response_d(result)
         return self._build_shop_tool_response(result.get('narration') or [])
+
+    def _build_shop_tool_response_d(self, result: dict) -> dict:
+        """
+        M4 方式 D（プレビュー専用 NEW_SHOP_FLOW=S10）: 推薦A 由来の店名・地区と依頼条件だけを渡す。
+        詳しい特徴・推薦理由はカードに後から表示されるため、ここには入れない（Google Maps の情報も入れない）。
+        """
+        shops = result.get('narration') or []
+        if not shops:
+            return {"result": "条件に合うお店を確認できませんでした。条件を変えて探すことを提案してください。"}
+        total = len(shops)
+        request = result.get('request') or ''
+        shortfall = result.get('shortfall') or 0
+        found = (f"確認できたお店は{total}軒で、5軒には届きませんでした。このことも正直に伝えてください。"
+                 if shortfall else '')
+        instruction = (
+            f"ご依頼（{request}）に合うお店を{total}軒、画面のカードに表示しました。{found}"
+            "最初に、ご依頼の条件に合わせて選んだことを一言で伝えてください。"
+            f"そのあと1軒目から{total}軒目まで順に、地区と店名を、前後のお店とのつながりが分かる自然な話し言葉で紹介してください。"
+            "渡した項目以外の特徴・料理・価格・受賞歴・営業時間は述べないでください。"
+            "各店の詳しい特徴と推薦理由はカードに順次表示されることを最後に案内し、気になるお店はありましたかと尋ねて締めてください。"
+            "マークダウン記法や記号は使わないこと。"
+        )
+        return {"result": instruction, "shops": [{"number": x['number'], "name": x['name'], "area": x['area']} for x in shops]}
 
     def _build_shop_tool_response(self, shops: list) -> dict:
         """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""
