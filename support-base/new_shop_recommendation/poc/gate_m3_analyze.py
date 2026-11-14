@@ -202,6 +202,50 @@ def prefix_stable(r, deadline=DEADLINE_MS):
     return shown
 
 
+def two_stage(r, multi=False, deadline=DEADLINE_MS):
+    """
+    二段階表示: 先行カード（判定順。multi=False は 1 枚、True は最大 5 枚）を「確認中」として出し、
+    推薦順位の上位 5 件が確定した時点（上位確定後表示の 5 枚目の時刻。5 件揃わなければ締め切り）で
+    推薦順位どおりの最終 5 件に並べ直す。
+    returns {'t_preview','t_final','final','disappeared','moved','preview'}
+      disappeared: 先行表示したが最終 5 件に入らず消えたカード数
+      moved      : 先行表示したカードのうち、最終の位置が先行時の位置と異なるもの
+    """
+    ao = append_only(r, deadline)
+    pre = ao[:5] if multi else ao[:1]
+    ps = prefix_stable(r, deadline)
+    final = [s for s, _t in ps]
+    t_final = ps[4][1] if len(ps) == 5 else (deadline if ps else None)
+    fin_ids = [s['place_id'] for s in final]
+    dis = sum(1 for s, _t in pre if s['place_id'] not in fin_ids)
+    moved = sum(1 for i, (s, _t) in enumerate(pre) if s['place_id'] in fin_ids and fin_ids.index(s['place_id']) != i)
+    return {'t_preview': pre[0][1] if pre else None, 't_final': t_final, 'final': final, 'disappeared': dis,
+            'moved': moved, 'preview': [s for s, _t in pre]}
+
+
+def print_two_stage(out, lab):
+    n = len(out)
+    print('\n## 5c. 二段階表示（先行カード → 推薦順位どおりの最終 5 件）')
+    print('| 方式 | 先行≤5秒 | 先行 p50/p95 | 先行カードが O | 最終確定 p50/p95 | 消えたカード | 位置が変わったカード | 最終 5 枚が全て O |')
+    print('|---|---:|---:|---:|---:|---:|---:|---:|')
+    for name, multi in (('先行 1 枚', False), ('先行 最大 5 枚', True)):
+        v = [two_stage(r, multi) for _tr, _q, r, _a in out]
+        tp = [x['t_preview'] for x in v]
+        tf = [x['t_final'] for x in v]
+        pre_ok = sum(1 for x in v if x['preview'] and _lbl(lab, x['preview'][0]) == 'O')
+        dis = sum(x['disappeared'] for x in v)
+        dis_lab = {}
+        for x in v:
+            ids = [s['place_id'] for s in x['final']]
+            for s in x['preview']:
+                if s['place_id'] not in ids:
+                    l = _lbl(lab, s)
+                    dis_lab[l] = dis_lab.get(l, 0) + 1
+        ok5 = sum(1 for x in v if len(x['final']) == 5 and all(_lbl(lab, s) == 'O' for s in x['final']))
+        print(f'| {name} | {sum(1 for t in tp if t is not None and t <= 5000)}/{n} | {m3.p(tp, 50)} / {m3.p(tp, 95)} | '
+              f'{pre_ok}/{n} | {m3.p(tf, 50)} / {m3.p(tf, 95)} | {dis} {dis_lab} | {sum(x["moved"] for x in v)} | {ok5}/{n} |')
+
+
 def _lbl(lab, s):
     return lab_of(lab, s['rec'], s['place_id'])
 
@@ -270,6 +314,7 @@ def main_m4():
     trials = [(t['trial'], t['q'], t['S10']) for t in results if 'S10' in t and 'error' not in t['S10']]
     out = [(tr, q, r, analyze_trial(r, lab)) for tr, q, r in trials]
     print_display(out, lab)
+    print_two_stage(out, lab)
     print_whatif(out, lab)
     print('\n## 8. 試行 20〜30 の採用カード（10 秒・順位 / 推薦名 / 判定 / 経路 / 確定ms）')
     for tr, q, r, a in out:

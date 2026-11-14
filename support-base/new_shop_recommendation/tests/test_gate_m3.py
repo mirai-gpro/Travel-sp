@@ -238,3 +238,15 @@ def test_prefix_stable_display():
           {'rank': 7, 'place_id': 'g', 't_done': 1000}]
     sh = an.prefix_stable({'stores': st})
     assert [(s['place_id'], t) for s, t in sh] == [('a', 4000), ('b', 4000), ('e', 10000), ('f', 10000), ('g', 10000)]
+
+
+def test_two_stage_display():
+    from new_shop_recommendation.poc import gate_m3_analyze as an
+    st = [{'rank': 1, 'place_id': 'a', 't_done': 7000}, {'rank': 2, 'place_id': 'b', 't_done': 3000},
+          {'rank': 3, 'place_id': 'c', 't_done': 3500}, {'rank': 4, 'place_id': 'd', 't_done': 4000},
+          {'rank': 5, 'place_id': 'e', 't_done': 4500}, {'rank': 6, 'place_id': 'f', 't_done': 2000}]
+    one = an.two_stage({'stores': st})
+    assert one['t_preview'] == 2000 and one['disappeared'] == 1 and one['t_final'] == 7000   # 6 位が先行し、最終で消える
+    multi = an.two_stage({'stores': st}, multi=True)
+    assert [s['place_id'] for s in multi['preview']] == ['f', 'b', 'c', 'd', 'e'] and multi['disappeared'] == 1
+    assert multi['moved'] == 0 and [s['place_id'] for s in multi['final']] == ['a', 'b', 'c', 'd', 'e']
