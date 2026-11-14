@@ -5,7 +5,7 @@
 #   bash ~/gate_m3_flow_s.sh 3
 #
 # 通常 10 クエリ × N 回。1 試行で 33（元の33秒版）/ D / S7 / S10 を順に実行（1 試行 約 1 分）
-# - 固定 SHA d0b4866 のコードをそのまま使う。キー入力は AQ キー 1 回だけ（非表示）
+# - 固定 SHA 40c32f0 のコードをそのまま使う。キー入力は AQ キー 1 回だけ（非表示）
 #   Google Maps 側（Agent Tools・Place Details・Geocoding・33秒版 Places）は本番リビジョンの Places キーをプロセス内で読む
 # - 画面出力は ~/m3_output.txt にも保存。結果（LLM 出力・place ID・時刻のみ）は ~/m3_results.json（試行ごとに上書き保存）
 # - Cloud Run・トラフィック・本番環境変数には一切触れない
@@ -15,7 +15,7 @@ PROJECT_ID="ai-avator-492205"
 REGION="us-central1"
 KEY_REVISION="travel-sp-base-00060-car"
 BRANCH="feature/new-shop-recommendation"
-EXPECTED_SHA="d0b4866a56fff6a1b4eb64ceab73783a96905cef"
+EXPECTED_SHA="40c32f0ab74993a2d411ea2a684a19414696130c"
 REPEAT="${1:-1}"
 case "${REPEAT}" in 1|2|3) ;; *) echo "繰り返し回数は 1〜3 で指定してください（指定値: ${REPEAT}）" >&2; exit 1;; esac
 WORK="$(mktemp -d)"
