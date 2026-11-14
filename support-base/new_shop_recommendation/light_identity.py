@@ -169,3 +169,42 @@ def judge(rec_name, cand, prefecture, area_center=None, max_km=3.0, allowed_muni
     if not any(bigrams(a) & bigrams(b) for a in rv for b in cv):
         return DIFFERENT, 'name_unrelated'
     return AMBIGUOUS, 'name_partial'
+
+
+# ------------------------------------------------------------------ M4 R2: 支店の明確な矛盾
+def _branch_core(b):
+    b = PUNCT.sub('', b or '')
+    return b[:-1] if b.endswith('店') else b
+
+
+def _implicit_branch(name, other):
+    """
+    支店表記が語として分かれていない店名（例: 松葉地下店）から、相手の中核名（屋号）に続く「〇〇店」を取り出す。
+    屋号が見つからない・「店」で終わらない場合は None
+    """
+    n = PUNCT.sub('', BRACKETS.sub('', norm(name)))
+    if not n.endswith('店'):
+        return None
+    for core in sorted(core_variants(other), key=len, reverse=True):
+        i = n.find(core)
+        if i >= 0 and len(n) - (i + len(core)) >= 2:
+            return n[i + len(core):]
+    return None
+
+
+def branch_conflict_clear(rec_name, cand_name):
+    """
+    推薦名と候補の支店名が明確に矛盾するか（選択 LLM の採用結果の検査に使う）。
+    次をすべて満たす場合だけ True:
+      - 両方に支店名がある（語として分かれていない場合は屋号に続く「〇〇店」）
+      - どちらも 本店・総本店・別館・本館 ではない（本店は地名で呼ばれることがあり、通称と区別できない）
+      - 支店名どうしに共通する 2 文字の並びが無く、どちらも他方を含まない（例: ルクア大阪店 と ルクアイーレ店 は矛盾としない）
+    """
+    rb = branch_of(rec_name) or _implicit_branch(rec_name, cand_name)
+    cb = branch_of(cand_name) or _implicit_branch(cand_name, rec_name)
+    if not rb or not cb or rb in MAIN + ANNEX or cb in MAIN + ANNEX:
+        return False
+    a, b = _branch_core(rb), _branch_core(cb)
+    if not a or not b or a in b or b in a:
+        return False
+    return not (bigrams(a) & bigrams(b))
