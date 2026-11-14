@@ -59,7 +59,8 @@ class _Frame:
 
 
 class CandidateStreamTracker:
-    def __init__(self):
+    def __init__(self, required_str=REQUIRED_STR):
+        self.required_str = tuple(required_str)   # 店舗オブジェクトの必須文字列項目（既定は推薦 LLM 一括版と同じ）
         self.buf = []            # 受信テキスト（文字のリスト）
         self.pos = 0
         self.stack = []
@@ -147,7 +148,7 @@ class CandidateStreamTracker:
                 cand['error'] = 'invalid_json'
                 return
             cand['obj'] = obj
-            cand['error'] = validate_item(obj, cand['index'])
+            cand['error'] = validate_item(obj, cand['index'], self.required_str)
             if cand['error'] is None:
                 cand['full_t'] = t
         if not self.stack:
@@ -211,11 +212,11 @@ class CandidateStreamTracker:
                 'syntax_errors': list(self.errors)}
 
 
-def validate_item(obj, index):
+def validate_item(obj, index, required_str=REQUIRED_STR):
     """recommender.parse_and_validate の 1 件分と同じ規則（重複は全体検証側で判定）"""
     if not isinstance(obj, dict):
         return 'invalid_output_schema'
-    for k in REQUIRED_STR:
+    for k in required_str:
         if not isinstance(obj.get(k), str):
             return 'invalid_output_schema'
     rank = obj.get('rank')
