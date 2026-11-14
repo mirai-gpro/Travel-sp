@@ -63,14 +63,57 @@ def pmap(fn, items):
         return list(pool.map(fn, items))
 
 
-def adopt(rank_places):
-    """33秒版の採用規則: 推薦順位のまま、place_id 重複は後順位を不採用、最大 5 件 → {rank: place}"""
-    out, seen = {}, set()
-    for rank, d in rank_places:
-        if d and d['place_id'] not in seen and len(out) < c.DISPLAY_COUNT:
-            seen.add(d['place_id'])
-            out[rank] = d
+# 除外理由（計測用。採用ロジックそのものは 33秒版の規則のまま）
+ADOPTED = 'adopted'
+DUPLICATE = 'duplicate'          # place_id 重複で後順位を不採用
+CAP = 'cap'                      # 5 件上限による押し出し
+NO_CANDIDATES = 'no_candidates'  # 検索結果 0 件
+SELECTION_NONE = 'selection_none'    # D: 選択 LLM が該当なし
+SELECTION_ERROR = 'selection_error'  # D: 選択 LLM のエラー
+
+
+def adopt_with_reasons(entries):
+    """
+    entries: 推薦順位順の [(rank, place_or_None, reason_if_none)]
+    33秒版の採用規則（推薦順位のまま・place_id 重複は後順位を不採用・最大 5 件）を適用し、
+    {rank: {'place': place|None, 'reason': adopted|duplicate|cap|<事前の除外理由>}} を返す
+    """
+    out, seen, n = {}, set(), 0
+    for rank, place, why in entries:
+        if not place:
+            out[rank] = {'place': None, 'reason': why or 'unknown'}
+        elif place['place_id'] in seen:
+            out[rank] = {'place': None, 'reason': DUPLICATE}
+        elif n >= c.DISPLAY_COUNT:
+            out[rank] = {'place': None, 'reason': CAP}
+        else:
+            seen.add(place['place_id'])
+            n += 1
+            out[rank] = {'place': place, 'reason': ADOPTED}
     return out
+
+
+def cards_of(adopted):
+    return {r: v['place'] for r, v in adopted.items() if v['place']}
+
+
+def search_reason(status):
+    return NO_CANDIDATES if status in ('OK', 'ZERO_RESULTS') else f'search_error:{status}'
+
+
+def shared_detail_targets(d_pick, e_pick):
+    """D・E が選んだ place を place_id で重複排除（同じ place_id の Place Details は 1 回だけ取得）"""
+    targets = {}
+    for p in list(d_pick.values()) + list(e_pick.values()):
+        targets.setdefault(p['place_id'], p)
+    return targets
+
+
+def fetch_shared_details(targets, geo, fetch=None):
+    """{place_id: (details|None, reason)}。fetch は agent_tools_places.details_for_card と同じ形"""
+    fetch = fetch or at.details_for_card
+    pids = list(targets)
+    return dict(zip(pids, pmap(lambda pid: fetch(targets[pid], geo), pids))) if pids else {}
 
 
 def run_trial(rec_client, selector, mkey, q):
@@ -96,7 +139,7 @@ def run_trial(rec_client, selector, mkey, q):
     at_res = pmap(lambda cd: at.search_text(mkey, cd.name, cd.area_hint, area, geo), cands)
     at_ms = ms_since(t)
 
-    # ---- D（Gate D1.7 と同じ: 選択 LLM 1 回 → 選ばれた place の Details）
+    # ---- D の選択（Gate D1.7 と同じ選択 LLM 1 回）
     nid, recs, idmap = 1, [], {}
     for cd, r in zip(cands, at_res):
         e = {'rank': cd.rank, 'recommended_name': cd.name, 'recommended_area': cd.area_hint,
@@ -113,37 +156,53 @@ def run_trial(rec_client, selector, mkey, q):
             sel, sel_ms, _ = selector.select(recs)
         except SelectionError as e:
             sel_err = e.error_type
-    d_pick = {rank: idmap[cid] for rank, (cid, _r) in sel.items() if cid is not None}
-    t = time.monotonic()
-    d_ranks = list(d_pick)
-    d_det = dict(zip(d_ranks, pmap(lambda rk: at.details_for_card(d_pick[rk][1], geo), d_ranks)))
-    d_dt = ms_since(t)
+    d_pick = {rank: idmap[cid][1] for rank, (cid, _r) in sel.items() if cid is not None}
+    d_pos = {rank: idmap[cid][0] for rank, (cid, _r) in sel.items() if cid is not None}
+    # ---- E の選択（選択 LLM なし: 検索 1 位）
+    e_pick = {cd.rank: r['places'][0] for cd, r in zip(cands, at_res) if r['places']}
 
-    # ---- E（選択 LLM なし: 検索 1 位 → Details）
-    e_ranks = [cd.rank for cd, r in zip(cands, at_res) if r['places']]
+    # ---- Place Details（D・E 共通。同じ place_id は 1 回だけ）
+    targets = shared_detail_targets(d_pick, e_pick)
     t = time.monotonic()
-    e_det = dict(zip(e_ranks, pmap(lambda rk: at.details_for_card(at_res[rk - 1]['places'][0], geo), e_ranks)))
-    e_dt = ms_since(t)
+    det = fetch_shared_details(targets, geo)
+    de_dt = ms_since(t)
 
-    a_cards = adopt([(cd.rank, d) for cd, d in zip(cands, a_det)])
-    d_cards = adopt([(cd.rank, (d_det.get(cd.rank) or (None, ''))[0]) for cd in cands])
-    e_cards = adopt([(cd.rank, (e_det.get(cd.rank) or (None, ''))[0]) for cd in cands])
+    a_entries, d_entries, e_entries = [], [], []
+    for cd, (a_c, a_st), ad, r in zip(cands, a_search, a_det, at_res):
+        a_entries.append((cd.rank, ad, search_reason(a_st) if not a_c else 'country_mismatch'))
+        if not r['places']:
+            d_entries.append((cd.rank, None, search_reason(r['status'])))
+            e_entries.append((cd.rank, None, search_reason(r['status'])))
+            continue
+        if sel_err:
+            d_entries.append((cd.rank, None, SELECTION_ERROR))
+        elif cd.rank not in d_pick:
+            d_entries.append((cd.rank, None, SELECTION_NONE))
+        else:
+            d_d, d_why = det[d_pick[cd.rank]['place_id']]
+            d_entries.append((cd.rank, d_d, d_why))
+        e_d, e_why = det[e_pick[cd.rank]['place_id']]
+        e_entries.append((cd.rank, e_d, e_why))
+    a_ad, d_ad, e_ad = adopt_with_reasons(a_entries), adopt_with_reasons(d_entries), adopt_with_reasons(e_entries)
+    a_cards, d_cards, e_cards = cards_of(a_ad), cards_of(d_ad), cards_of(e_ad)
+
+    shared = sum(1 for rk, p in d_pick.items() if rk in e_pick and e_pick[rk]['place_id'] == p['place_id'])
     m = {'q': q, 'rec_ms': rec_ms, 'area_ms': area_ms, 'a_ts': a_ts, 'a_dt': a_dt, 'at_ms': at_ms,
-         'sel_ms': sel_ms, 'sel_err': sel_err, 'd_dt': d_dt, 'e_dt': e_dt,
+         'sel_ms': sel_ms, 'sel_err': sel_err, 'de_dt': de_dt,
          'a_n': len(a_cards), 'd_n': len(d_cards), 'e_n': len(e_cards), 'gsearch': llm.google_search_calls,
-         'at_calls': len(cands), 'd_det_calls': len(d_ranks), 'e_det_calls': len(e_ranks), 'a_det_calls':
-         sum(1 for s in a_search if s[0])}
+         'at_calls': len(cands), 'de_det_calls': len(targets), 'de_det_shared': shared,
+         'a_det_calls': sum(1 for s in a_search if s[0])}
     base = rec_ms + area_ms
     m['a_total'] = base + a_ts + a_dt
-    m['d_total'] = base + at_ms + (sel_ms or 0) + d_dt
-    m['e_total'] = base + at_ms + e_dt
+    m['d_total'] = base + at_ms + (sel_ms or 0) + de_dt
+    m['e_total'] = base + at_ms + de_dt      # 共通取得の時間（D のみの place を含む）。E 単独より長めに出る
     rows = []
     for cd, r in zip(cands, at_res):
-        dp = d_pick.get(cd.rank)
         rows.append({'rank': cd.rank, 'rec': cd.name, 'hint': cd.area_hint,
                      'A': a_cards.get(cd.rank), 'D': d_cards.get(cd.rank), 'E': e_cards.get(cd.rank),
-                     'd_pos': dp[0] if dp else None, 'n_at': len(r['places']), 'at_status': r['status'],
-                     'd_why': (d_det.get(cd.rank) or (None, ''))[1], 'e_why': (e_det.get(cd.rank) or (None, ''))[1]})
+                     'A_reason': a_ad[cd.rank]['reason'], 'D_reason': d_ad[cd.rank]['reason'],
+                     'E_reason': e_ad[cd.rank]['reason'],
+                     'd_pos': d_pos.get(cd.rank), 'n_at': len(r['places']), 'at_status': r['status']})
     return m, rows
 
 
@@ -187,14 +246,15 @@ def main():
             continue
         metrics.append(m)
         say(f'\n({i}) [{q}] 推薦LLM={m["rec_ms"]}ms | A 合計={m["a_total"]} カード={m["a_n"]} | '
-            f'D AgentTools={m["at_ms"]} 選択LLM={m["sel_ms"]} Details={m["d_dt"]} 合計={m["d_total"]} カード={m["d_n"]} | '
-            f'E Details={m["e_dt"]} 合計={m["e_total"]} カード={m["e_n"]}' + (f' 選択エラー={m["sel_err"]}' if m['sel_err'] else ''))
+            f'D AgentTools={m["at_ms"]} 選択LLM={m["sel_ms"]} Details(D・E共通)={m["de_dt"]} 合計={m["d_total"]} カード={m["d_n"]} | '
+            f'E 合計={m["e_total"]} カード={m["e_n"]}' + (f' 選択エラー={m["sel_err"]}' if m['sel_err'] else ''))
         for r in rows:
             r['trial'] = i
             diff = (r['D'] or {}).get('place_id') != (r['E'] or {}).get('place_id')
             flag = '  ★D≠E' if diff else ''
             say(f'    {r["rank"]}. 推薦「{r["rec"]}」 A「{nm(r["A"])}」 D「{nm(r["D"])}」'
-                f'{pos_s(r)} E「{nm(r["E"])}」 AT候補{r["n_at"]}件{flag}')
+                f'{pos_s(r)} E「{nm(r["E"])}」 AT候補{r["n_at"]}件{flag}'
+                f'  理由 A={r["A_reason"]} D={r["D_reason"]} E={r["E_reason"]}')
             if diff:
                 de_diff.append(r)
             for k in 'ADE':
@@ -235,24 +295,25 @@ def report(metrics, all_rows, de_diff, review):
     say(f'  A Text Search / Details: {stats([m["a_ts"] for m in ok])} / {stats([m["a_dt"] for m in ok])}')
     say(f'  Agent Tools searchText（D・E 共通）: {stats([m["at_ms"] for m in ok])}')
     say(f'  D 選択LLM: {stats([m["sel_ms"] for m in ok])}')
-    say(f'  D Details: {stats([m["d_dt"] for m in ok])}')
-    say(f'  E Details: {stats([m["e_dt"] for m in ok])}')
+    say(f'  Place Details（D・E 共通取得）: {stats([m["de_dt"] for m in ok])}')
     say(f'  合計 A: {stats([m["a_total"] for m in ok])}')
     say(f'  合計 D: {stats([m["d_total"] for m in ok])}')
     say(f'  合計 E: {stats([m["e_total"] for m in ok])}')
+    say('  ※ D・E の Place Details は共通取得（同じ place_id は 1 回）。E の合計には D だけが選んだ place の取得時間も含む')
     diffs = [m['d_total'] - m['e_total'] for m in ok]
     say(f'  D − E（選択LLMの削除で短縮される時間）: {stats(diffs)}')
+
+    say('\n【不採用・除外の理由（推薦店舗単位）】')
+    reasons = sorted({r[k + '_reason'] for r in all_rows for k in 'ADE'})
+    say('| 理由 | A | D | E |')
+    say('|---|---:|---:|---:|')
+    for why in reasons:
+        say(f'| {why} | ' + ' | '.join(str(sum(1 for r in all_rows if r[k + '_reason'] == why)) for k in 'ADE') + ' |')
 
     say('\n【D と E で採用店舗が違ったケース（全件）】')
     say(f'  件数: {len(de_diff)}')
     for r in de_diff:
-        why = ''
-        if not r['D'] and r['d_pos'] is None and r['n_at']:
-            why = '（D: 選択LLMが該当なし）'
-        elif not r['D'] and r['d_why'] not in ('', 'ok'):
-            why = f'（D: {r["d_why"]}）'
-        if not r['E'] and r['e_why'] not in ('', 'ok'):
-            why += f'（E: {r["e_why"]}）'
+        why = f'（理由 D={r["D_reason"]} / E={r["E_reason"]}）'
         say(f'  ({r["trial"]}) {r["rank"]}. 推薦「{r["rec"]}」（{r["hint"]}） D「{nm(r["D"])}」'
             f'{pos_s(r)} / E「{nm(r["E"])}」{why}')
         for k in 'DE':
@@ -267,7 +328,9 @@ def report(metrics, all_rows, de_diff, review):
 
     say('\n【API 呼び出し数（第 2 部）】')
     say(f'  推薦LLM {n} / Agent Tools {sum(m["at_calls"] for m in ok)} / 選択LLM {sum(1 for m in ok if m["sel_ms"] is not None)} / '
-        f'Details A {sum(m["a_det_calls"] for m in ok)}・D {sum(m["d_det_calls"] for m in ok)}・E {sum(m["e_det_calls"] for m in ok)}')
+        f'Details A {sum(m["a_det_calls"] for m in ok)}・D/E 共通 {sum(m["de_det_calls"] for m in ok)}'
+        f'（うち D と E が同じ place_id で共有 {sum(m["de_det_shared"] for m in ok)} 件）')
+    say('  キャッシュ: なし（試行をまたぐ再利用はしない）。共通化: 推薦LLM＝A/D/E、Agent Tools＝D/E、Details＝D/E（同一 place_id）')
 
 
 if __name__ == '__main__':
