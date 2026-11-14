@@ -198,3 +198,13 @@ def test_analyze_trial_causes():
                      'g': 'CARD', 'h': 'CARD', 'i': 'CARD', 'j': 'CAP_PUSHED'}
     assert r['n_ok'] == 3 and r['short'] == 2 and {'WRONG_LLM', 'UNKNOWN', 'CAP_PUSHED'} <= set(r['causes'])
     assert an.replacement_events({'stores': st}) == 1                  # 3 位（6 秒）の後着で 10 位が押し出される
+
+
+def test_prefix_stable_display():
+    from new_shop_recommendation.poc import gate_m3_analyze as an
+    st = [{'rank': 1, 'place_id': 'a', 't_done': 4000}, {'rank': 2, 'place_id': 'b', 't_done': 2000},
+          {'rank': 3, 'place_id': None, 't_done': 3000}, {'rank': 4, 'place_id': 'd', 't_done': 11000},
+          {'rank': 5, 'place_id': 'e', 't_done': 5000}, {'rank': 6, 'place_id': 'f', 't_done': 6000},
+          {'rank': 7, 'place_id': 'g', 't_done': 1000}]
+    sh = an.prefix_stable({'stores': st})
+    assert [(s['place_id'], t) for s, t in sh] == [('a', 4000), ('b', 4000), ('e', 10000), ('f', 10000), ('g', 10000)]

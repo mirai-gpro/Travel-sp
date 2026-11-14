@@ -119,6 +119,24 @@ def replacement_events(r, deadline=DEADLINE_MS):
     return events
 
 
+def prefix_stable(r, deadline=DEADLINE_MS):
+    """上位が全て判定済みになってから表示する方式（差し替えなし）の各カード表示時刻。
+    10 秒までに判定が終わらない店舗は 10 秒時点で「不採用」と確定させる"""
+    stores = sorted([s for s in r['stores'] if s.get('rank') is not None], key=lambda x: x['rank'])
+    t_block, shown, seen = 0, [], set()
+    for s in stores:
+        td = s.get('t_done')
+        late = td is None or td > deadline
+        t_block = max(t_block, deadline if late else td)
+        if late or not s.get('place_id') or s['place_id'] in seen:
+            continue
+        seen.add(s['place_id'])
+        shown.append((s, t_block))
+        if len(shown) == 5:
+            break
+    return shown
+
+
 def main():
     results = json.load(open(sys.argv[1], encoding='utf-8'))
     lab = sc.load_labels(sys.argv[2])
@@ -176,6 +194,20 @@ def main():
     ev = [(tr, replacement_events(r)) for tr, _q, r, _a in out]
     print(f'差し替え発生 {sum(1 for _t, e in ev if e)}/{len(ev)} 試行、合計 {sum(e for _t, e in ev)} 回: '
           f'{[(t, e) for t, e in ev if e]}')
+
+    print('\n## 5b. 差し替えなし段階表示（上位確定後に表示）の初回カード・5 枚目の表示時刻')
+    firsts, fifths, rows5 = [], [], []
+    for tr, _q, r, _a in out:
+        sh = prefix_stable(r)
+        f = sh[0][1] if sh else None
+        v = sh[4][1] if len(sh) == 5 else None
+        firsts.append(f)
+        fifths.append(v)
+        rows5.append(f'{tr}:{f}/{v}')
+    print(f'初回カード ≤5秒 {sum(1 for x in firsts if x is not None and x <= 5000)}/{len(out)} '
+          f'p50={m3.p(firsts, 50)} p95={m3.p(firsts, 95)} | 5 枚目 ≤10秒 {sum(1 for x in fifths if x is not None)}/{len(out)} '
+          f'p50={m3.p(fifths, 50)} p95={m3.p(fifths, 95)}')
+    print('  試行:初回/5枚目(ms) ' + ' '.join(rows5))
 
     print('\n## 6. D 方式の採用カード（比較用・時間無制限）')
     for t in results:
