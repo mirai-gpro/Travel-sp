@@ -99,7 +99,7 @@ def test_single_char_area_and_building():
 def test_partial_area_is_split_to_finer_place():
     # M4 事前確認の実地結果: 「札幌すすきの」が札幌市（半径 10km）に解決されていた
     geo3 = dict(GEO)
-    geo3['札幌すすきの'] = G(43.06, 141.35, 0.15, '北海道', ['札幌市', '北海道'])
+    geo3['札幌すすきの'] = dict(G(43.06, 141.35, 0.15, '北海道', ['札幌市', '北海道']), partial_match=True)   # 実地でも部分一致
     geo3['すすきの'] = G(43.055, 141.353, 0.005, '北海道', ['すすきの', '中央区', '札幌市', '北海道'], ('neighborhood', 'political'))
     geo3['札幌 すすきの'] = geo3['すすきの']
     s = S.resolve_scope('札幌すすきので美味しいジンギスカン', geo3.get)
@@ -165,3 +165,55 @@ def test_area_radius_check():
     sc = S.resolve_scope('銀座で評判の老舗の天ぷら店', GEO.get)
     assert S.geo_verdict(sc, {'lat': 35.672, 'lng': 139.766})[0] is None
     assert S.geo_verdict(sc, {'lat': 35.690, 'lng': 139.700}) == ('DIFFERENT', 'area_mismatch')
+
+
+def test_places_deduplicated_in_query_order():
+    # 実地確認（プレビュー）で「祇園・京都・祇園」「国際通り・那覇・国際通り」と重複していた
+    g = dict(GEO)
+    g['京都の祇園'] = G(35.004, 135.775, 0.005, '京都府', ['祇園町', '東山区', '京都市', '京都府'], ('sublocality', 'political'))
+    g['京都の'] = G(35.012, 135.768, 0.15, '京都府', ['京都市', '京都府'])
+    s = S.resolve_scope('京都の祇園で記念日に行くカウンター割烹 予算1人2万円 2名', g.get)
+    assert s['places'] == ['京都', '祇園'] and s['area'] == '京都 祇園'
+
+
+# ------------------------------------------------------------------ 実地調査（m4/scope_debug、プレビュー）で判明した 3 件の再現
+def _real():
+    g = {}
+    g['札幌すすきの'] = dict(G(43.06, 141.35, 0.22, '北海道', ['札幌市', '北海道', '日本', 'JP']), partial_match=True)   # 対角約 62km
+    g['ホテルニューオータニ東京の中'] = dict(G(35.6800, 139.7330, 0.0014, '東京都', ['１', '４', '紀尾井町', '千代田区', '東京都', '日本'],
+                                       ('establishment', 'lodging', 'point_of_interest')), partial_match=True, place_id='HOTEL1',
+                                     formatted_address='日本、〒102-8578 東京都千代田区紀尾井町４−１')
+    g['ホテルニューオータニ東京'] = g['ホテルニューオータニ東京の中']
+    g['京都の祇園'] = G(35.004, 135.775, 0.005, '京都府', ['祇園', '東山区', '京都市', '京都府', '日本'], ('colloquial_area', 'political'))
+    g['京都'] = G(35.012, 135.768, 0.18, '京都府', ['京都市', '京都府', '日本', 'JP'])
+    g['祇園'] = g['京都の祇園']
+    g['京都 祇園'] = dict(G(35.0037, 135.7752, 0.0005, '京都府', ['祇園町南側', '東山区'], ('establishment', 'point_of_interest')),
+                        partial_match=False)
+    return g
+
+
+def test_partial_area_not_widened_when_rest_unverified():
+    s = S.resolve_scope('札幌すすきので美味しいジンギスカン', _real().get)
+    assert s['kind'] == 'unknown' and s['center'] is None          # 札幌市（半径 10km）に広げない
+
+
+def test_partial_area_uses_verified_combined_name():
+    g = _real()
+    g['札幌 すすきの'] = dict(G(43.055, 141.353, 0.005, '北海道', ['すすきの', '中央区', '札幌市'], ('neighborhood', 'political')),
+                            partial_match=False)
+    s = S.resolve_scope('札幌すすきので美味しいジンギスカン', g.get)
+    assert s['area'] == '札幌 すすきの' and s['kind'] == 'area' and s['radius_km'] == pytest.approx(1.5)
+
+
+def test_facility_confirmed_by_official_name():
+    names = {'HOTEL1': 'ホテルニューオータニ東京'}
+    s = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', _real().get, names.get)
+    assert s['kind'] == 'facility' and s['area'] == 'ホテルニューオータニ東京' and s['facility_address_key'] == '紀尾井町4-1'
+    s2 = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', _real().get, {'HOTEL1': '紀尾井町ビル'}.get)
+    assert s2['kind'] == 'unknown'                                  # 正式名が一致しなければ施設と認めない
+    assert S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', _real().get)['kind'] == 'unknown'
+
+
+def test_combined_name_resolving_to_a_business_is_not_used():
+    s = S.resolve_scope('京都の祇園で記念日に行くカウンター割烹 予算1人2万円 2名', _real().get)
+    assert s['kind'] == 'area' and s['area'] == '祇園' and s['radius_km'] == pytest.approx(1.5)   # 施設 0.3km にしない
