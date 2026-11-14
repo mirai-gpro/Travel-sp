@@ -102,21 +102,86 @@ def analyze_trial(r, lab, deadline=DEADLINE_MS):
             'causes': causes, 't_set': a['t_set']}
 
 
+def _decided_adopted(r, deadline=DEADLINE_MS):
+    """10 秒以内に判定が終わった店舗（判定時刻順）"""
+    return sorted([s for s in r['stores'] if s.get('rank') is not None and s.get('t_done') is not None
+                   and s['t_done'] <= deadline], key=lambda x: (x['t_done'], x['rank']))
+
+
 def replacement_events(r, deadline=DEADLINE_MS):
-    """確定順にカードを即時表示した場合、上位候補の後着で既表示カードが 5 枚から押し出される回数"""
-    stores = [s for s in r['stores'] if s.get('rank') is not None and s.get('t_done') is not None
-              and s['t_done'] <= deadline]
-    shown, events, seen = [], 0, set()
-    for s in sorted(stores, key=lambda x: x['t_done']):
-        if not s.get('place_id') or s['place_id'] in seen:
+    """
+    暫定表示（判定済みの採用店舗のうち推薦順位の上位 5 件を常に表示）をした場合の表示事象。
+      replaced : 既に表示されていたカードが表示から外れた回数（真の差し替え）
+      hidden   : 新しく確定した店舗が、上位 5 件に入らず表示されなかった回数（5 枚上限による非表示）
+      inserted : 新しいカードが既存カードより上の順位に入り、既存カードの位置が下がった回数（差し替えではない）
+      same_pid : 表示中の店と同じ place ID の別表記が確定した回数（表示は変えない）
+      t_first  : 最初のカード表示時刻、t_five: 5 枚目が表示された時刻、
+      shown_ever: 一度でも表示された店舗（rank の集合）
+    """
+    best = {}                     # place_id -> 最上位の rank（重複は上位を残す）
+    visible = []                  # 表示中の place_id（順位順）
+    out = {'replaced': 0, 'hidden': 0, 'inserted': 0, 'same_pid': 0, 't_first': None, 't_five': None,
+           'replaced_ranks': [], 'shown_ever': set()}
+    for s in _decided_adopted(r, deadline):
+        pid = s.get('place_id')
+        if not pid:
             continue
-        seen.add(s['place_id'])
-        shown.append(s)
-        shown.sort(key=lambda x: x['rank'])
-        if len(shown) > 5:
-            shown.pop()          # 最下位を押し出す（その店がすでに表示されていた場合のみ差し替え）
-            events += 1
-    return events
+        if pid in best:
+            if s['rank'] < best[pid]:
+                best[pid] = s['rank']
+            out['same_pid'] += 1
+            continue
+        best[pid] = s['rank']
+        new_vis = [p for p, _ in sorted(best.items(), key=lambda kv: kv[1])[:5]]
+        removed = [p for p in visible if p not in new_vis]
+        out['replaced'] += len(removed)
+        out['replaced_ranks'] += [best[p] for p in removed]
+        if pid not in new_vis:
+            out['hidden'] += 1
+        elif visible and s['rank'] < max(best[p] for p in visible):
+            out['inserted'] += 1
+        visible = new_vis
+        if visible and out['t_first'] is None:
+            out['t_first'] = s['t_done']
+        if len(visible) == 5 and out['t_five'] is None:
+            out['t_five'] = s['t_done']
+        out['shown_ever'] |= {best[p] for p in visible}
+    return out
+
+
+def append_only(r, deadline=DEADLINE_MS):
+    """追記のみ表示（判定順に最大 5 件。差し替えなし、順位は保証しない）: [(store, 表示時刻)]"""
+    shown, seen = [], set()
+    for s in _decided_adopted(r, deadline):
+        pid = s.get('place_id')
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        shown.append((s, s['t_done']))
+        if len(shown) == 5:
+            break
+    return shown
+
+
+def whatif(r, lab, reject_llm_x=False, fix_llm_miss=False, unknown_as_o=False, deadline=DEADLINE_MS):
+    """
+    既存データ上の上限計算（判定規則そのものではない。ラベルを使ったオラクル）:
+      reject_llm_x : 選択 LLM 経路で X になった採用を「不採用」にしていた場合
+      fix_llm_miss : 選択 LLM が none を返したが検索 1 位が O の店舗を、同じ時刻に採用していた場合
+      unknown_as_o : 判定不能（?）をすべて O とみなした場合
+    returns trial_metrics（10 秒）
+    """
+    st = []
+    for s in r['stores']:
+        s = dict(s)
+        path = (s.get('path') or '').split(':')[0]
+        if reject_llm_x and s.get('place_id') and path == 'llm' and lab_of(lab, s['rec'], s['place_id']) == 'X':
+            s['place_id'] = None
+        if fix_llm_miss and not s.get('place_id') and path == 'llm_none' and lab_of(lab, s['rec'], s.get('top1')) == 'O':
+            s['place_id'] = s['top1']
+        st.append(s)
+    lb = {k: ('O' if (unknown_as_o and v == '?') else v) for k, v in lab.items()}
+    return sc.trial_metrics(st, lb, deadline)
 
 
 def prefix_stable(r, deadline=DEADLINE_MS):
@@ -137,7 +202,91 @@ def prefix_stable(r, deadline=DEADLINE_MS):
     return shown
 
 
+def _lbl(lab, s):
+    return lab_of(lab, s['rec'], s['place_id'])
+
+
+def print_display(out, lab):
+    """§5: 表示方式の比較（10 秒・同じ 30 試行の保存データ）"""
+    n = len(out)
+    rows = {'暫定表示（上位 5 件を常に表示・差し替えあり）': [], '上位確定後表示（差し替えなし・順位保証）': [],
+            '追記のみ（判定順・差し替えなし・順位保証なし）': []}
+    tot = {'replaced': 0, 'hidden': 0, 'inserted': 0, 'same_pid': 0}
+    rep_trials, rep_lab, per = 0, {}, []
+    for tr, _q, r, _a in out:
+        ev = replacement_events(r)
+        for k in tot:
+            tot[k] += ev[k]
+        if ev['replaced']:
+            rep_trials += 1
+        for rk in ev['replaced_ranks']:
+            s = next(x for x in r['stores'] if x.get('rank') == rk)
+            l = _lbl(lab, s)
+            rep_lab[l] = rep_lab.get(l, 0) + 1
+        fin = m3.adopt(r['stores'], DEADLINE_MS)['cards']
+        rows['暫定表示（上位 5 件を常に表示・差し替えあり）'].append(
+            (ev['t_first'], ev['t_five'], [_lbl(lab, s) for s in fin],
+             _lbl(lab, next(x for x in r['stores'] if x.get('place_id') and x.get('t_done') == ev['t_first'])) if ev['t_first'] else None))
+        ps = prefix_stable(r)
+        rows['上位確定後表示（差し替えなし・順位保証）'].append(
+            (ps[0][1] if ps else None, ps[4][1] if len(ps) == 5 else None, [_lbl(lab, s) for s, _t in ps],
+             _lbl(lab, ps[0][0]) if ps else None))
+        ao = append_only(r)
+        rows['追記のみ（判定順・差し替えなし・順位保証なし）'].append(
+            (ao[0][1] if ao else None, ao[4][1] if len(ao) == 5 else None, [_lbl(lab, s) for s, _t in ao],
+             _lbl(lab, ao[0][0]) if ao else None))
+        per.append(f'{tr}:{ev["replaced"]}/{ev["hidden"]}')
+    print('\n## 5. 表示方式の比較（S10・10 秒・保存データ）')
+    print(f'暫定表示の事象: 真の差し替え {tot["replaced"]} 回（{rep_trials}/{n} 試行、外れたカードの正誤 {rep_lab}）'
+          f' / 5 枚上限で非表示 {tot["hidden"]} 回 / 上位挿入による位置ずれ {tot["inserted"]} 回 / 同一 place の別表記 {tot["same_pid"]} 回')
+    print('  試行:差し替え/非表示 ' + ' '.join(per))
+    print('| 方式 | 初回カード≤5秒 | 初回 p50/p95 | 初回カードが O | 5 枚目表示≤10秒 | 5 枚目 p50/p95 | 最終 5 枚が全て O |')
+    print('|---|---:|---:|---:|---:|---:|---:|')
+    for name, v in rows.items():
+        f = [x[0] for x in v]
+        five = [x[1] for x in v]
+        print(f'| {name} | {sum(1 for x in f if x is not None and x <= 5000)}/{n} | {m3.p(f, 50)} / {m3.p(f, 95)} | '
+              f'{sum(1 for x in v if x[3] == "O")}/{n} | {sum(1 for x in five if x is not None)}/{n} | '
+              f'{m3.p(five, 50)} / {m3.p(five, 95)} | {sum(1 for x in v if len(x[2]) == 5 and all(l == "O" for l in x[2]))}/{n} |')
+
+
+def print_whatif(out, lab):
+    """§7: 改善の上限（ラベルを使ったオラクル。判定規則の効果そのものではない）"""
+    n = len(out)
+    cases = [('現状', {}), ('選択 LLM の X 採用を不採用', {'reject_llm_x': True}),
+             ('選択 LLM の取りこぼしを採用', {'fix_llm_miss': True}),
+             ('上記 2 つ', {'reject_llm_x': True, 'fix_llm_miss': True}),
+             ('判定不能を全て O（上限）', {'unknown_as_o': True}),
+             ('上記 3 つ', {'reject_llm_x': True, 'fix_llm_miss': True, 'unknown_as_o': True})]
+    print('\n## 7. 改善の上限（S10・10 秒・正しい 5 件の試行数）')
+    for name, kw in cases:
+        ok = [tr for tr, _q, r, _a in out if whatif(r, lab, **kw)['complete']]
+        print(f'  {name}: {len(ok)}/{n} 未達={[tr for tr, *_x in out if tr not in ok]}')
+
+
+def main_m4():
+    results = json.load(open(sys.argv[1], encoding='utf-8'))
+    lab = sc.load_labels(sys.argv[2])
+    trials = [(t['trial'], t['q'], t['S10']) for t in results if 'S10' in t and 'error' not in t['S10']]
+    out = [(tr, q, r, analyze_trial(r, lab)) for tr, q, r in trials]
+    print_display(out, lab)
+    print_whatif(out, lab)
+    print('\n## 8. 試行 20〜30 の採用カード（10 秒・順位 / 推薦名 / 判定 / 経路 / 確定ms）')
+    for tr, q, r, a in out:
+        if tr >= 20:
+            print(f'  試行{tr} {q} | ' + ' / '.join(f'{s["rank"]}.{s["rec"]}[{l}|{(s.get("path") or "").split(":")[0]}|{s["t_done"]}]'
+                                                   for s, l in a['cards']))
+    print('\n## 9. 未達試行の不採用店舗（10 秒・順位 / 推薦名 / 経路 / 検索1位の判定 / 判定理由）')
+    for tr, q, r, a in out:
+        if a['short'] > 0:
+            miss = [x for x in a['rows'] if x['note'] in ('NOT_FOUND', 'MISS_LIGHT', 'MISS_LLM')]
+            print(f'  試行{tr} | ' + ' / '.join(f'{x["rank"]}.{x["rec"]}[{x["path"].split(":")[0]}|1位={x["top1_label"]}|'
+                                              f'{(x["verdicts"] or ["-"])[0].split(":")[-1]}]' for x in miss))
+
+
 def main():
+    if len(sys.argv) > 3 and sys.argv[3] == 'M4':
+        return main_m4()
     results = json.load(open(sys.argv[1], encoding='utf-8'))
     lab = sc.load_labels(sys.argv[2])
     key = sys.argv[3] if len(sys.argv) > 3 else 'S10'
@@ -190,24 +339,7 @@ def main():
                 print(f'  試行{tr} {q} | {x["rank"]}位 {x["rec"]}（{x["hint"]}） | {x["label"]} | {x["note"]} | '
                       f'{x["verdicts"]} | 範囲={sc_.get("area")} {round(sc_.get("radius_km") or 0, 1)}km({sc_.get("radius_reason")})')
 
-    print(f'\n## 5. 確定順に即時表示した場合の差し替え')
-    ev = [(tr, replacement_events(r)) for tr, _q, r, _a in out]
-    print(f'差し替え発生 {sum(1 for _t, e in ev if e)}/{len(ev)} 試行、合計 {sum(e for _t, e in ev)} 回: '
-          f'{[(t, e) for t, e in ev if e]}')
-
-    print('\n## 5b. 差し替えなし段階表示（上位確定後に表示）の初回カード・5 枚目の表示時刻')
-    firsts, fifths, rows5 = [], [], []
-    for tr, _q, r, _a in out:
-        sh = prefix_stable(r)
-        f = sh[0][1] if sh else None
-        v = sh[4][1] if len(sh) == 5 else None
-        firsts.append(f)
-        fifths.append(v)
-        rows5.append(f'{tr}:{f}/{v}')
-    print(f'初回カード ≤5秒 {sum(1 for x in firsts if x is not None and x <= 5000)}/{len(out)} '
-          f'p50={m3.p(firsts, 50)} p95={m3.p(firsts, 95)} | 5 枚目 ≤10秒 {sum(1 for x in fifths if x is not None)}/{len(out)} '
-          f'p50={m3.p(fifths, 50)} p95={m3.p(fifths, 95)}')
-    print('  試行:初回/5枚目(ms) ' + ' '.join(rows5))
+    print_display(out, lab)
 
     print('\n## 6. D 方式の採用カード（比較用・時間無制限）')
     for t in results:

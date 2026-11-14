@@ -197,7 +197,37 @@ def test_analyze_trial_causes():
     assert notes == {'a': 'CARD', 'b': 'MISS_LIGHT', 'c': 'CARD', 'd': 'DUPLICATE', 'e': 'MISS_LLM', 'f': 'LATE',
                      'g': 'CARD', 'h': 'CARD', 'i': 'CARD', 'j': 'CAP_PUSHED'}
     assert r['n_ok'] == 3 and r['short'] == 2 and {'WRONG_LLM', 'UNKNOWN', 'CAP_PUSHED'} <= set(r['causes'])
-    assert an.replacement_events({'stores': st}) == 1                  # 3 位（6 秒）の後着で 10 位が押し出される
+    ev = an.replacement_events({'stores': st})
+    # 判定順: a(3.0) b不採用 d=pa同一(3.2) e不採用 g,h,i,j(5.0) c(6.0) … 5 枚 = a,g,h,i,j → c(3位) 確定で j(10位) が外れる
+    assert ev['replaced'] == 1 and ev['replaced_ranks'] == [10] and ev['same_pid'] == 1 and ev['hidden'] == 0
+    assert ev['t_first'] == 3000 and ev['t_five'] == 5000 and ev['inserted'] == 1
+
+
+def test_display_hidden_is_not_replacement():
+    from new_shop_recommendation.poc import gate_m3_analyze as an
+    st = [{'rank': i, 'place_id': f'p{i}', 't_done': 1000 * i} for i in range(1, 8)]   # 順位順に確定
+    ev = an.replacement_events({'stores': st})
+    assert ev['replaced'] == 0 and ev['hidden'] == 2 and ev['inserted'] == 0          # 6・7 位は表示されないだけ
+    st2 = [{'rank': 2, 'place_id': 'b', 't_done': 1000}, {'rank': 1, 'place_id': 'a', 't_done': 2000}]
+    ev2 = an.replacement_events({'stores': st2})
+    assert ev2['replaced'] == 0 and ev2['inserted'] == 1
+    assert [s['place_id'] for s, _t in an.append_only({'stores': st2})] == ['b', 'a']
+
+
+def test_whatif_oracles():
+    from new_shop_recommendation.poc import gate_m3_analyze as an
+    st = [{'rank': 1, 'rec': 'a', 'place_id': 'pa', 'path': 'same', 't_done': 1000},
+          {'rank': 2, 'rec': 'b', 'place_id': 'pb', 'path': 'llm', 't_done': 2000},
+          {'rank': 3, 'rec': 'c', 'place_id': None, 'top1': 'pc', 'path': 'llm_none', 't_done': 2000},
+          {'rank': 4, 'rec': 'd', 'place_id': 'pd', 'path': 'same', 't_done': 2000},
+          {'rank': 5, 'rec': 'e', 'place_id': 'pe', 'path': 'same', 't_done': 2000},
+          {'rank': 6, 'rec': 'f', 'place_id': 'pf', 'path': 'same', 't_done': 2000}]
+    lab = {('a', 'pa'): 'O', ('b', 'pb'): 'X', ('c', 'pc'): 'O', ('d', 'pd'): 'O', ('e', 'pe'): '?', ('f', 'pf'): 'O'}
+    r = {'stores': st}
+    assert not an.whatif(r, lab)['complete']
+    assert not an.whatif(r, lab, reject_llm_x=True)['complete']                        # e が ? のまま
+    assert an.whatif(r, lab, reject_llm_x=True, unknown_as_o=True)['n'] == 4             # c が不採用のまま 4 枚
+    assert an.whatif(r, lab, fix_llm_miss=True, reject_llm_x=True, unknown_as_o=True)['complete']
 
 
 def test_prefix_stable_display():
