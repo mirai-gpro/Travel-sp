@@ -49,7 +49,7 @@ for api in secretmanager.googleapis.com apikeys.googleapis.com; do
 done
 for s in "${SECRETS[@]}"; do
   if gcloud secrets describe "${s}" --project="${PROJECT_ID}" > /dev/null 2>&1; then
-    echo "停止: Secret ${s} は既にあります（上書きしません）。再デプロイは後片付けの後に行ってください" >&2; exit 1
+    echo "停止: Secret ${s} は既にあります（上書きしません）。再デプロイは m4_cleanup_preview.sh --delete-secrets の後に行ってください" >&2; exit 1
   fi
 done
 python3 - "${WORK}/svc_before.json" "${WORK}/base_rev.json" "${BASE_REVISION}" "${TAG}" "${WORK}" <<'PYEOF'
