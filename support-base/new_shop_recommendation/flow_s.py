@@ -57,10 +57,10 @@ class HttpApis:
         return h
 
     def geocode(self, text):
-        import api_integrations as legacy
+        """Geocoding（プレビュー用 Maps キー。本番の Places キーは使わない）"""
         try:
-            d = legacy.requests.get(GEOCODE_URL, params={'address': text, 'key': legacy.GOOGLE_GEOCODING_API_KEY,
-                                                          'language': 'ja', 'region': 'jp'}, timeout=5).json()
+            d = requests.get(GEOCODE_URL, params={'address': text, 'key': self.mkey, 'language': 'ja', 'region': 'jp'},
+                             timeout=5).json()
         except Exception:
             return None
         if d.get('status') != 'OK' or not d.get('results'):
@@ -80,12 +80,10 @@ class HttpApis:
         return at.search_text(self.mkey, rec['name'], rec['area_hint'], scope.get('area') or '', scope.get('geo'))
 
     def details(self, place):
-        """判定とカードの両方に使う Place Details（1 回）。returns dict（error キーがあれば失敗）"""
-        import api_integrations as legacy
+        """判定とカードの両方に使う Place Details（1 回・プレビュー用 Maps キー）。returns dict（error キーがあれば失敗）"""
         try:
-            d = legacy.requests.get(DETAILS_URL, params={'place_id': place['place_id'], 'fields': DETAILS_FIELDS,
-                                                         'key': legacy.GOOGLE_PLACES_API_KEY, 'language': 'ja'},
-                                    timeout=10).json()
+            d = requests.get(DETAILS_URL, params={'place_id': place['place_id'], 'fields': DETAILS_FIELDS,
+                                                  'key': self.mkey, 'language': 'ja'}, timeout=10).json()
         except Exception as e:
             return {'error': type(e).__name__}
         if d.get('status') != 'OK':
@@ -481,7 +479,11 @@ class FlowS:
 
 
 def build_from_env():
-    """NEW_SHOP_FLOW=S10 のときだけ使う。GEMINI_RECOMMEND_API_KEY と MAPS_AGENT_TOOLS_API_KEY が必要"""
+    """
+    NEW_SHOP_FLOW=S10 のときだけ使う。キーは用途ごとに分ける（プレビューでは Secret Manager から参照）:
+      GEMINI_RECOMMEND_API_KEY : 推薦A・推薦B・選択 LLM
+      MAPS_AGENT_TOOLS_API_KEY : Agent Tools・Place Details・Geocoding（S10 の Maps 呼び出しすべて。本番の Places キーは使わない）
+    """
     from .redact import register_secret
     gkey = os.environ.get('GEMINI_RECOMMEND_API_KEY', '')
     mkey = os.environ.get('MAPS_AGENT_TOOLS_API_KEY', '')
@@ -491,7 +493,6 @@ def build_from_env():
         raise c.ConfigError('MAPS_AGENT_TOOLS_API_KEY が設定されていません')
     register_secret(gkey)
     register_secret(mkey)
-    register_secret(os.environ.get('GOOGLE_PLACES_API_KEY', ''))
     return FlowS(HttpApis(gkey, mkey))
 
 
