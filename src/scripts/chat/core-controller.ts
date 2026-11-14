@@ -23,6 +23,9 @@ export class CoreController {
   protected isTTSEnabled = true;
   protected isUserInteracted = false;
   protected currentShops: any[] = [];
+  // M4（プレビュー専用 NEW_SHOP_FLOW=S10）: 段階表示中の検索 request_id と、スクロール済みの request_id
+  protected m4StagedRid: string | null = null;
+  protected m4ScrolledRid: string | null = null;
   protected isFromVoiceInput = false;
   protected lastAISpeech = '';
   protected preGeneratedAcks: Map<string, string> = new Map();
@@ -414,6 +417,7 @@ export class CoreController {
     });
 
     this.socket.on('user_transcript', (data: any) => {
+      console.log('[M4] ' + JSON.stringify({ ev: 'user_transcript', perf: performance.now() }));   // M4 E0（計測ログのみ）
       if (!this.isLiveMode) return;
       const text = data.text;
       if (text) {
@@ -473,13 +477,57 @@ export class CoreController {
     // ★ ショップ検索開始（§3.6: 待機アニメーション表示）
     this.socket.on('shop_search_start', () => {
       console.log('[LiveAPI] shop_search_start: 待機アニメーション表示');
+      console.log('[M4] ' + JSON.stringify({ ev: 'start', perf: performance.now() }));   // M4 E2（計測ログのみ）
       this.showWaitOverlay();
+    });
+
+    // ★ M4（プレビュー専用）: 先行カード・最終カードの段階表示（カードは差分更新。全体の再描画はしない）
+    this.socket.on('shop_search_stage', (data: any) => {
+      const cards = data?.cards || [];
+      const rid = data?.request_id || null;
+      console.log('[M4] ' + JSON.stringify({ ev: 'stage_recv', stage: data?.stage, rid, n: cards.length,
+        t_ms: data?.t_ms, status: data?.status, shortfall: data?.shortfall, perf: performance.now() }));
+      this.hideWaitOverlay();
+      this.m4StagedRid = rid;
+      if (data?.stage === 'final') {
+        this.currentShops = cards;
+      }
+      if (cards.length > 0) {
+        this.els.reservationBtn?.classList.add('visible');
+        const section = document.getElementById('shopListSection');
+        if (section) section.classList.add('has-shops');
+      }
+      document.dispatchEvent(new CustomEvent('shopStage', {
+        detail: { stage: data?.stage, rid, cards, shortfall: data?.shortfall || 0, language: this.currentLanguage }
+      }));
+      // スクロールは 1 回の検索につき最初の 1 回だけ（モバイル）
+      if (cards.length > 0 && rid && this.m4ScrolledRid !== rid && window.innerWidth < 1024) {
+        this.m4ScrolledRid = rid;
+        setTimeout(() => {
+          const shopSection = document.getElementById('shopListSection');
+          if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 300);
+      }
+    });
+
+    // ★ M4（プレビュー専用）: 詳しい推薦理由の後からの反映（該当カードの説明だけを更新）
+    this.socket.on('shop_card_detail', (data: any) => {
+      console.log('[M4] ' + JSON.stringify({ ev: 'detail_recv', rid: data?.request_id, place_id: data?.place_id,
+        t_ms: data?.t_ms, perf: performance.now() }));
+      document.dispatchEvent(new CustomEvent('shopDetail', { detail: data }));
     });
 
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
       this.hideWaitOverlay();
+      // M4（プレビュー専用）: 段階表示済みの検索は、最終カードを送信済みのため描き直さない（スクロールもしない）
+      if (data?.request_id && data.request_id === this.m4StagedRid) {
+        console.log('[M4] ' + JSON.stringify({ ev: 'result_recv', rid: data.request_id, n: (data.shops || []).length,
+          status: data.status, perf: performance.now() }));
+        if ((data.shops || []).length > 0) this.currentShops = data.shops;
+        return;
+      }
       const shops = data?.shops || [];
       if (shops.length > 0) {
         this.currentShops = shops;

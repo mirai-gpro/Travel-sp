@@ -263,6 +263,36 @@ const { apiBaseUrl = '' } = Astro.props;
   }
 
   /* 説明 */
+  .shop-card-list :global(.stage-badge) {
+    display: inline-block;
+    margin: 0 0 6px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: #555;
+    background: #f0f0f0;
+  }
+
+  .shop-card-list :global(.geo-note) {
+    margin: 0 0 6px;
+    font-size: 12px;
+    color: #b06000;
+  }
+
+  .shop-card-list :global(.detail-pending) {
+    color: #888;
+  }
+
+  .shop-card-list :global(.maps-attribution) {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #666;
+  }
+
+  .shop-card-list :global(.maps-attribution a) {
+    color: #1a73e8;
+  }
+
   .shop-card-list :global(.description) {
     color: #4b5563;
     font-size: 13px;
@@ -636,6 +666,12 @@ const { apiBaseUrl = '' } = Astro.props;
     tripadvisor_reviews?: number;
     latitude?: number;
     longitude?: number;
+    // M4（プレビュー専用）
+    place_id?: string;
+    maps_attribution?: { title?: string; url?: string } | null;
+    stage?: string;
+    detail_pending?: boolean;
+    geo_check?: string | null;
   }
 
   class ShopCardManager {
@@ -746,6 +782,7 @@ const { apiBaseUrl = '' } = Astro.props;
     private createShopCard(shop: ShopData): HTMLElement {
       const card = document.createElement('div');
       card.className = 'shop-card';
+      if (shop.place_id) card.dataset.placeId = shop.place_id;
 
       // デフォルト画像
       const imageUrl = shop.image || 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=800&h=450&fit=crop';
@@ -841,7 +878,10 @@ const { apiBaseUrl = '' } = Astro.props;
               </div>
             </div>
           </a>
+          ${shop.stage === 'preview' ? `<span class="stage-badge">確認中</span>` : ''}
+          ${['geo_unverified', 'facility_unconfirmed', 'no_coordinates'].includes(shop.geo_check || '') ? `<p class="geo-note">ご希望の場所に合うかは確認できていません</p>` : ''}
           ${shop.description ? `<p class="description">${shop.description}</p>` : ''}
+          ${!shop.description && shop.detail_pending ? `<p class="description detail-pending">おすすめの理由を準備中です</p>` : ''}
           
           ${highlightsHtml}
           
@@ -850,10 +890,100 @@ const { apiBaseUrl = '' } = Astro.props;
           <div class="link-buttons">
             ${linksHtml}
           </div>
+          ${this.createMapsAttributionHtml(shop)}
         </div>
       `;
 
       return card;
+    }
+
+    // ===== M4（プレビュー専用 NEW_SHOP_FLOW=S10）: 段階表示・説明の後からの反映・Google Maps の出典 =====
+    private escapeHtml(v: string): string {
+      return String(v ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string));
+    }
+
+    // Google Maps の出典（Agent Tools の attribution と placeUrl）。カードごとに表示する
+    private createMapsAttributionHtml(shop: ShopData): string {
+      const att = shop.maps_attribution;
+      if (!att || !att.url) return '';
+      const title = this.escapeHtml(att.title || 'Google Maps');
+      const place = shop.maps_url
+        ? ` ・ <a href="${this.escapeHtml(shop.maps_url)}" target="_blank" rel="noopener noreferrer">Google マップで見る</a>`
+        : '';
+      return `<div class="maps-attribution">出典: <a href="${this.escapeHtml(att.url)}" target="_blank" rel="noopener noreferrer">${title}</a>${place}</div>`;
+    }
+
+    private m4Rid: string | null = null;
+
+    private m4Log(ev: string, extra: Record<string, unknown>) {
+      requestAnimationFrame(() => {
+        console.log('[M4] ' + JSON.stringify({ ev, ...extra, perf: performance.now() }));
+      });
+    }
+
+    // 先行カード（1 枚・確認中）と最終カード（推薦順位どおり）。既存のカードは作り直さず、並べ替えと表示の更新だけ行う
+    applyStage(stage: string, rid: string | null, shops: ShopData[], language?: string) {
+      if (language) this.currentLanguage = language;
+      if (rid !== this.m4Rid) {
+        this.m4Rid = rid;
+        this.container.innerHTML = '';          // 新しい検索のときだけ前回のカードを消す
+      }
+      const existing = new Map<string, HTMLElement>();
+      this.container.querySelectorAll<HTMLElement>('.shop-card').forEach((el) => {
+        if (el.dataset.placeId) existing.set(el.dataset.placeId, el);
+      });
+      if (stage === 'final' && shops.length === 0) {
+        this.container.innerHTML = `<div class="empty-state">条件に合うお店を確認できませんでした</div>`;
+        this.m4Log('final_render', { rid, n: 0, removed: existing.size, moved: 0 });
+        return;
+      }
+      const prevOrder = Array.from(existing.keys());
+      let created = 0;
+      const nodes = shops.map((shop) => {
+        const el = shop.place_id ? existing.get(shop.place_id) : undefined;
+        if (el) {
+          if (stage === 'final') el.querySelector('.stage-badge')?.remove();
+          if (shop.description) this.setDescription(el, (shop.highlights || [])[0] || '', shop.description);
+          return el;
+        }
+        created += 1;
+        return this.createShopCard(shop);
+      });
+      let removed = 0;
+      if (stage === 'final') {
+        const keep = new Set(shops.map((s) => s.place_id));
+        existing.forEach((el, pid) => { if (!keep.has(pid)) { el.remove(); removed += 1; } });
+      }
+      nodes.forEach((el) => this.container.appendChild(el));   // appendChild は既存ノードを移動するだけ（作り直さない）
+      const moved = prevOrder.filter((pid, i) => {
+        const j = shops.findIndex((s) => s.place_id === pid);
+        return j >= 0 && j !== i;
+      }).length;
+      this.m4Log(stage === 'final' ? 'final_render' : 'preview_render', { rid, n: shops.length, created, removed, moved });
+    }
+
+    private setDescription(el: HTMLElement, specialty: string, reason: string) {
+      const body = el.querySelector('.card-body');
+      if (!body) return;
+      let p = body.querySelector<HTMLElement>('p.description');
+      if (!p) {
+        p = document.createElement('p');
+        p.className = 'description';
+        body.querySelector('.link-buttons')?.before(p);
+      }
+      p.classList.remove('detail-pending');
+      p.textContent = reason;
+      body.querySelector('.highlights')?.remove();
+      if (specialty) p.insertAdjacentHTML('afterend', this.createHighlightsHtml([this.escapeHtml(specialty)]));
+    }
+
+    // 詳しい推薦理由を後から反映（該当カードだけ）
+    applyDetail(rid: string | null, placeId: string, specialty: string, reason: string) {
+      if (rid !== this.m4Rid) return;
+      const el = this.container.querySelector<HTMLElement>(`.shop-card[data-place-id="${CSS.escape(placeId)}"]`);
+      if (!el) return;
+      this.setDescription(el, specialty, reason);
+      this.m4Log('detail_render', { rid, place_id: placeId });
     }
 
     // 星の生成
@@ -1094,6 +1224,16 @@ const { apiBaseUrl = '' } = Astro.props;
   document.addEventListener('DOMContentLoaded', () => {
     const manager = new ShopCardManager('shopCardList');
     (window as any).shopCardManager = manager;
+
+    // M4（プレビュー専用）: 段階表示と説明の後からの反映
+    document.addEventListener('shopStage', ((event: CustomEvent) => {
+      const d = event.detail || {};
+      manager.applyStage(d.stage, d.rid, d.cards || [], d.language);
+    }) as EventListener);
+    document.addEventListener('shopDetail', ((event: CustomEvent) => {
+      const d = event.detail || {};
+      if (d.place_id) manager.applyDetail(d.request_id || null, d.place_id, d.specialty || '', d.reason || '');
+    }) as EventListener);
 
     // カスタムイベントをリッスン
     document.addEventListener('displayShops', ((event: CustomEvent) => {
