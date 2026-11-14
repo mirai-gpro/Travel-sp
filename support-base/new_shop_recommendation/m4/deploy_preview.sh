@@ -108,7 +108,13 @@ git -C "${WORK}/src" checkout -q "${EXPECTED_SHA}" || { echo "固定 SHA が見�
 IMAGE="${AR_IMAGE}:m4-${EXPECTED_SHA:0:12}"
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet > /dev/null 2>&1
 docker build -q -t "${IMAGE}" "${WORK}/src/support-base" > /dev/null
-docker push -q "${IMAGE}" > /dev/null
+pushed=0
+for i in 1 2 3 4; do
+  if docker push -q "${IMAGE}" > "${WORK}/push.log" 2>&1; then pushed=1; break; fi
+  echo "    push に失敗（${i}/4 回目）。$((i * 15)) 秒後に再試行します: $(tail -n 1 "${WORK}/push.log")"
+  sleep $((i * 15))
+done
+[ "${pushed}" = "1" ] || { echo "停止: Artifact Registry への push に 4 回失敗しました（Secret・IAM・Cloud Run は未変更）" >&2; exit 1; }
 DIGEST="$(gcloud artifacts docker images describe "${IMAGE}" --format='value(image_summary.digest)')"
 [ -n "${DIGEST}" ] || { echo "イメージ digest を取得できません" >&2; exit 1; }
 echo "    digest: ${DIGEST}"
