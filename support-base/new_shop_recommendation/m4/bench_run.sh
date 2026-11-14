@@ -15,7 +15,7 @@ REGION="us-central1"
 SERVICE="travel-sp-base"
 TAG="m4s10"
 BRANCH="feature/new-shop-recommendation"
-EXPECTED_SHA="4acfde951976ffcc9965bf2fc216190becd3fdc8"
+EXPECTED_SHA="8024dd23b70d440e3cfe55141e59a70ba26636a8"
 REPEAT="${1:-3}"
 [ -f "${HOME}/.m4_bench_token" ] || { echo "~/.m4_bench_token がありません（先に m4_deploy_preview.sh を実行）" >&2; exit 1; }
 URL="$(gcloud run services describe "${SERVICE}" --project="${PROJECT_ID}" --region="${REGION}" --format=json | python3 -c "import json,sys; print(next(t['url'] for t in json.load(sys.stdin)['status']['traffic'] if t.get('tag')=='${TAG}'))")"

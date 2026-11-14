@@ -73,8 +73,18 @@ class HttpApis:
         names = [x.get('long_name') for x in comps if x.get('long_name')] + \
                 [x.get('short_name') for x in comps if x.get('short_name')]
         return {'lat': loc.get('lat'), 'lng': loc.get('lng'), 'viewport': (r.get('geometry') or {}).get('viewport'),
+                'place_id': r.get('place_id'),
                 'prefecture': pref, 'country_code': cc, 'types': r.get('types') or [], 'component_names': names,
                 'formatted_address': r.get('formatted_address') or '', 'partial_match': bool(r.get('partial_match'))}
+
+    def place_name(self, place_id):
+        """施設の確認用に Place Details の正式名だけを取得（プレビュー用 Maps キー）"""
+        try:
+            d = requests.get(DETAILS_URL, params={'place_id': place_id, 'fields': 'name', 'key': self.mkey, 'language': 'ja'},
+                             timeout=5).json()
+        except Exception:
+            return None
+        return (d.get('result') or {}).get('name') if d.get('status') == 'OK' else None
 
     def search(self, rec, scope):
         return at.search_text(self.mkey, rec['name'], rec['area_hint'], scope.get('area') or '', scope.get('geo'))
@@ -356,7 +366,7 @@ class FlowS:
             if fc is not None:
                 finalize(fc, 'top5_decided' if len(fc) >= c.DISPLAY_COUNT and why != 'deadline' else why)
 
-        scope_f = misc_pool.submit(S.resolve_scope, user_request, self.apis.geocode)
+        scope_f = misc_pool.submit(S.resolve_scope, user_request, self.apis.geocode, getattr(self.apis, 'place_name', None))
 
         def task(rec):
             sc = scope_f.result()
