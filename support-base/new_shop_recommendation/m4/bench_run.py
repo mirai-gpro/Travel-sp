@@ -3,6 +3,7 @@
 M4 T4: 33 秒版と S10 の比較試験（隔離したプレビュー・リビジョンの /api/m4/bench を呼ぶだけ。本番キーは扱わない）
 
   python -m new_shop_recommendation.m4.bench_run <tag_url> <token_file> [repeat=3]
+  python -m new_shop_recommendation.m4.bench_run <tag_url> <token_file> scope     （R1 の検索範囲の回帰確認: M3・M4 の 20 クエリ）
 
 - 未使用 10 クエリ × repeat 回 × {33, S10} を順番に実行し、~/m4_bench.json に保存する（LLM の出力・place ID・時刻のみ）
 - 人による品質判定（T5）用に、方式を伏せた評価シート ~/m4_eval_sheet.tsv と対応表 ~/m4_eval_key.tsv を作る
@@ -17,7 +18,7 @@ import time
 
 import requests
 
-from new_shop_recommendation.m4.queries import M4_QUERIES
+from new_shop_recommendation.m4.queries import M3_QUERIES, M4_QUERIES
 
 MAPS_LINK = 'https://www.google.com/maps/search/?api=1&query=Google&query_place_id={}'
 
@@ -37,17 +38,34 @@ def call(url, token, q, method):
 
 
 def adopted(res):
-    """カードとして表示される店舗（33 秒版は Places で見つかった上位 5 件、S10 は最終カード）"""
-    if res.get('method') == '33':
-        return [s for s in res.get('stores') or [] if s.get('place_id')][:5]
+    """カードとして表示される店舗（33 秒版は本番と同じく enrich 後の全店舗、S10 は最終カード）"""
     return res.get('stores') or []
+
+
+def scope_check(url, token, home):
+    print('| 区分 | クエリ | 種類 | 地名 | 半径km | 根拠 | 認めた地名 | 施設の住所キー |')
+    print('|---|---|---|---|---:|---|---|---|')
+    out = []
+    for kind, qs in (('M3', M3_QUERIES), ('M4', M4_QUERIES)):
+        for q in qs:
+            r = call(url, token, q, 'scope')
+            out.append({'set': kind, **r})
+            if r.get('error'):
+                print(f'| {kind} | {q} | エラー {r["error"]} | | | | | |')
+                continue
+            print(f'| {kind} | {q} | {r.get("kind")} | {r.get("area") or "（なし）"} | {round(r.get("radius_km") or 0, 2)} | '
+                  f'{r.get("radius_reason")}/{r.get("scope_reason")} | {"・".join(r.get("places") or [])} | '
+                  f'{r.get("facility_address_key") or ""} |', flush=True)
+    json.dump(out, open(os.path.join(home, 'm4_scope.json'), 'w'), ensure_ascii=False)
 
 
 def main():
     url, token_file = sys.argv[1].rstrip('/'), sys.argv[2]
-    repeat = int(sys.argv[3]) if len(sys.argv) > 3 else 3
     token = open(token_file).read().strip()
     home = os.path.expanduser('~')
+    if len(sys.argv) > 3 and sys.argv[3] == 'scope':
+        return scope_check(url, token, home)
+    repeat = int(sys.argv[3]) if len(sys.argv) > 3 else 3
     out_path = os.path.join(home, 'm4_bench.json')
     results = []
     for rep in range(1, repeat + 1):
