@@ -12,6 +12,7 @@ M4 で承認された修正 R2〜R4 はこのファイルにだけ入れる（�
   5. 店名: 正規化した「中核名」が一致 → SAME（支店名が食い違う・候補が別館/本館なら AMBIGUOUS）
            英字表記とかな・漢字表記で比較できない → AMBIGUOUS(script_differs)
            中核名が 1 文字 → AMBIGUOUS(short_core)
+           推薦名の『』「」内の固有店名が候補と一致しない → AMBIGUOUS(quoted_name_mismatch)（M4 R4）
            漢字とかなの表記違いでありうる → AMBIGUOUS(kana_kanji)（M4 R3）
            中核名に共通する 2 文字の並びが無い → DIFFERENT(name_unrelated)
            それ以外 → AMBIGUOUS(name_partial)
@@ -150,6 +151,19 @@ def reading_variant_possible(a, b):
     return any(len(ra) <= len(m.group()) <= 3 * len(ra) + 1 for m in KANA_RUN.finditer(rb))
 
 
+QUOTED = re.compile(r'[『「]([^』」]+)[』」]')
+
+
+def quoted_name_cores(name):
+    """M4 R4: 『』「」内の固有店名の中核名（2 文字以上のもの）。括弧が無ければ空集合"""
+    out = set()
+    for m in QUOTED.findall(norm(name)):
+        c = PUNCT.sub('', m)
+        if len(c) >= 2:
+            out.add(c)
+    return out
+
+
 def judge(rec_name, cand, prefecture, area_center=None, max_km=3.0, allowed_municipalities=None):
     """
     cand: {'name','address','types'(任意),'business_status'(任意),'lat','lng'(任意)}
@@ -173,6 +187,9 @@ def judge(rec_name, cand, prefecture, area_center=None, max_km=3.0, allowed_muni
     if not rv or not cv:
         return AMBIGUOUS, 'name_empty_after_normalize'
     if rv & cv:
+        inner = quoted_name_cores(rec_name)
+        if inner and not inner & core_variants(cand.get('name')):
+            return AMBIGUOUS, 'quoted_name_mismatch'   # M4 R4: 『』内の固有店名が一致しない（括弧外の一般語だけの一致）
         rb, cb = branch_of(rec_name), branch_of(cand.get('name'))
         if rb and cb and PUNCT.sub('', rb).rstrip('店') != PUNCT.sub('', cb).rstrip('店') \
                 and not (rb in MAIN and cb in MAIN):

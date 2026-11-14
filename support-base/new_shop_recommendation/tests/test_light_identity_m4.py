@@ -43,3 +43,17 @@ def test_r3_kana_kanji_goes_to_llm_not_same(rec, name):
 def test_r3_keeps_unrelated_different():
     assert L.judge('焼鳥 幸羽', cand('焼鳥 美鶏'), None) == ('DIFFERENT', 'name_unrelated')
     assert L.reading_variant_possible('綱八', 'つな八') and not L.reading_variant_possible('つな八', '綱八')
+
+
+# ------------------------------------------------------------------ R4
+def test_r4_quoted_name_must_match():
+    rec = 'ジンギスカン 羊飼いの店 『白老亭』'
+    other = cand('ジンギスカン 羊飼いの店 『いただきます。』')
+    assert P.judge(rec, other, None)[0] == 'SAME'                       # v0.2 は括弧外の共通部分で SAME だった
+    assert L.judge(rec, other, None) == ('AMBIGUOUS', 'quoted_name_mismatch')
+
+
+@pytest.mark.parametrize('rec', ['ジンギスカン 羊飼いの店 『いただきます。』', 'ジンギスカン 羊飼いの店 『いただきま〜す』',
+                                 'ジンギスカン 羊飼いの店 『いただきまーす』', 'いただきます。'])
+def test_r4_keeps_correct_quoted_matches(rec):
+    assert L.judge(rec, cand('ジンギスカン 羊飼いの店 『いただきます。』'), None)[0] == 'SAME'
