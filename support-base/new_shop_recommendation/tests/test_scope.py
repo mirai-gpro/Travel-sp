@@ -165,3 +165,12 @@ def test_area_radius_check():
     sc = S.resolve_scope('銀座で評判の老舗の天ぷら店', GEO.get)
     assert S.geo_verdict(sc, {'lat': 35.672, 'lng': 139.766})[0] is None
     assert S.geo_verdict(sc, {'lat': 35.690, 'lng': 139.700}) == ('DIFFERENT', 'area_mismatch')
+
+
+def test_places_deduplicated_in_query_order():
+    # 実地確認（プレビュー）で「祇園・京都・祇園」「国際通り・那覇・国際通り」と重複していた
+    g = dict(GEO)
+    g['京都の祇園'] = G(35.004, 135.775, 0.005, '京都府', ['祇園町', '東山区', '京都市', '京都府'], ('sublocality', 'political'))
+    g['京都の'] = G(35.012, 135.768, 0.15, '京都府', ['京都市', '京都府'])
+    s = S.resolve_scope('京都の祇園で記念日に行くカウンター割烹 予算1人2万円 2名', g.get)
+    assert s['places'] == ['京都', '祇園'] and s['area'] == '京都 祇園'

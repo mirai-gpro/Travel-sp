@@ -156,6 +156,11 @@ def resolve_scope(q: str, geocode, max_workers: int = 6) -> dict:
     # 「京都の祇園」の候補「京都の祇園」「京都」「祇園」のうち、他の候補に含まれる長い候補は、構成する地名がすべて認められた場合だけ残す
     places = [(cd, g) for cd, g in places
               if not any(o != cd and o in cd for o, _g in places)]
+    # 同じ地名は 1 回だけ、依頼文に現れる順に並べる（例: 京都の祇園 → 京都・祇園）
+    qn, uniq = unicodedata.normalize('NFKC', q or ''), {}
+    for cd, g in places:
+        uniq.setdefault(cd, g)
+    places = sorted(uniq.items(), key=lambda x: (qn.find(x[0]) if x[0] in qn else len(qn), x[0]))
     chosen, reason = None, 'none'
     if len(places) == 1:
         chosen, reason = places[0], 'single'
