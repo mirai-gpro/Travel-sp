@@ -218,8 +218,19 @@ class Display:
 
 # ------------------------------------------------------------------ 店舗単位の照合
 def judge_with_scope(rec_name, d, scope):
-    return L.judge(rec_name, d, scope.get('prefecture'), area_center=scope.get('center'),
-                   max_km=scope.get('radius_km') or S.AREA_DEFAULT_KM)
+    """
+    軽量判定（閉業・業態・都道府県・店名）と、R1 の範囲検証（地域・駅・通り・施設内・不明）を合わせた判定。
+    範囲外 → DIFFERENT。範囲を確認できない（施設内か不明・地域不明）→ 店名が一致しても AMBIGUOUS（選択 LLM で確認）
+    """
+    v = L.judge(rec_name, d, scope.get('prefecture'))          # 地区の距離判定は下の geo_verdict で行う
+    if v[0] == L.DIFFERENT:
+        return v
+    g = S.geo_verdict(scope, d)
+    if g[0] == L.DIFFERENT:
+        return g
+    if g[0] == L.AMBIGUOUS and v[0] == L.SAME:
+        return L.AMBIGUOUS, g[1]
+    return v
 
 
 def match_store(rec, scope, apis, details_pool, ms):
@@ -273,6 +284,7 @@ def match_store(rec, scope, apis, details_pool, ms):
     if pick is not None:
         out['place_id'] = places[pick]['place_id']
         out['place'] = dets[pick]
+        out['geo'] = S.geo_verdict(scope, dets[pick])[1]      # in_area / on_road / in_facility / geo_unverified など
     out['t_done'] = ms()
     return out
 
@@ -285,6 +297,7 @@ def make_card(store, display_rank, request_id, stage, desc=None):
     card['maps_url'] = store['place'].get('maps_url') or card.get('maps_url')
     card['stage'] = stage
     card['detail_pending'] = desc is None
+    card['geo_check'] = store.get('geo')                    # 地理条件の検証結果（未確認なら画面に明示する）
     return card
 
 
@@ -331,8 +344,11 @@ class FlowS:
             for st in cards:
                 if st['rank'] in desc:
                     mark(f'detail_{st["rank"]}')        # 最終カードに説明を含めて送った
+            sk = (scope_f.result() if scope_f.done() else {}).get('kind') or 'unknown'
+            final_box['scope_kind'] = sk
             emit(STAGE_EVENT, {'request_id': request_id, 'stage': 'final', 'cards': fc, 'status': status,
-                               'shortfall': max(0, c.DISPLAY_COUNT - len(fc)), 'reason': why, 't_ms': ms()})
+                               'shortfall': max(0, c.DISPLAY_COUNT - len(fc)), 'reason': why, 'scope_kind': sk,
+                               't_ms': ms()})
             mark('final_sent')
             done_evt.set()
 
@@ -446,7 +462,7 @@ class FlowS:
         self.last_a_thread = a_thread
         done_evt.wait(self.deadline_sec + 1.0)
         sc = scope_f.result() if scope_f.done() else {}
-        m['scope'] = {k: sc.get(k) for k in ('area', 'radius_km', 'radius_reason', 'scope_reason', 'prefecture')}
+        m['scope'] = {k: sc.get(k) for k in ('area', 'kind', 'radius_km', 'radius_reason', 'scope_reason', 'prefecture')}
         if not stores_in and not final_box:
             m['final_status'] = c.ERROR if m['a_error'] else c.EMPTY
             logger.info('[NewShopRec][S10] ' + redact(json.dumps(m, ensure_ascii=False)))
@@ -460,6 +476,7 @@ class FlowS:
         narration = [{'number': i + 1, 'name': st['rec'], 'area': st['hint']} for i, st in enumerate(fc)]
         return {'request_id': request_id, 'status': final_box.get('status') or c.EMPTY, 'error_type': m['a_error'],
                 'cards': cards, 'narration': narration, 'narration_mode': 'D', 'request': user_request,
+                'geo_unverified': final_box.get('scope_kind') == 'unknown',
                 'shortfall': max(0, c.DISPLAY_COUNT - len(cards)), 'final_reason': final_box.get('why'), 'metrics': m}
 
 
