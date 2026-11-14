@@ -747,6 +747,29 @@ def get_session(session_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/m4/bench', methods=['POST'])
+def m4_bench():
+    """M4 T4 比較試験（プレビュー専用。NEW_SHOP_FLOW=S10 と M4_BENCH_TOKEN が両方設定されたリビジョンだけで有効）"""
+    from new_shop_recommendation import m4_bench as mb
+    if not mb.enabled():
+        return jsonify({'error': 'not_found'}), 404
+    if not mb.token_ok(request.headers.get('X-M4-Bench-Token')):
+        return jsonify({'error': 'forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    q, method = data.get('query') or '', data.get('method')
+    if not q:
+        return jsonify({'error': 'no_query'}), 400
+    if method == '33':
+        return jsonify(mb.run_33(q))
+    if method == 'S10':
+        try:
+            flow = _get_new_shop_flow_s()
+        except NewShopConfigError as e:
+            return jsonify({'error': f'config:{e}'}), 500
+        return jsonify(mb.run_s10(q, flow))
+    return jsonify({'error': 'bad_method'}), 400
+
+
 @app.route('/health', methods=['GET', 'OPTIONS'])
 def health_check():
     """ヘルスチェック"""

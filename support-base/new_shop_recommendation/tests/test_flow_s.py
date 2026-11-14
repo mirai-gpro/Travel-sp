@@ -221,3 +221,25 @@ def test_display_matches_m3_two_stage_analysis(seed):
     assert (pv['place_id'] if pv else None) == (ts['preview'][0]['place_id'] if ts['preview'] else None)
     if len(fin) == 5:
         assert t_fin == ts['t_final']
+
+
+# ------------------------------------------------------------------ T4 比較試験用モジュール（プレビュー専用）
+def test_bench_disabled_by_default_and_token(monkeypatch):
+    from new_shop_recommendation import m4_bench as mb
+    monkeypatch.delenv('NEW_SHOP_FLOW', raising=False)
+    monkeypatch.setenv('M4_BENCH_TOKEN', 'tok-123')
+    assert not mb.enabled()
+    monkeypatch.setenv('NEW_SHOP_FLOW', 'S10')
+    assert mb.enabled() and mb.token_ok('tok-123') and not mb.token_ok('tok-124') and not mb.token_ok(None)
+    monkeypatch.delenv('M4_BENCH_TOKEN')
+    assert not mb.enabled() and not mb.token_ok('')
+
+
+def test_bench_run_s10_returns_ids_and_llm_text_only():
+    from new_shop_recommendation import m4_bench as mb
+    apis = FakeApis([store(i) for i in range(1, 8)], b_delay_ms=1000, b_per_item_ms=200)
+    out = mb.run_s10('横浜で美味しい焼き鳥屋を5軒', F.FlowS(apis, deadline_sec=10 * SCALE))
+    assert out['status'] == c.COMPLETE and [s['place_id'] for s in out['stores']] == ['P1', 'P2', 'P3', 'P4', 'P5']
+    assert all(s['description'].startswith('理由') for s in out['stores'])
+    dumped = json.dumps(out, ensure_ascii=False)
+    assert '横浜市中区' not in dumped and 'SUMMARY-TEXT' not in dumped and '別表記' not in dumped
