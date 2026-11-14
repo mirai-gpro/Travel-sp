@@ -9,7 +9,7 @@
 # =====================================================================
 set -euo pipefail
 BRANCH="feature/new-shop-recommendation"
-EXPECTED_SHA="95aa6faa6a654450030e87e9af8b8e4882c32147"
+EXPECTED_SHA="dc1c350cf43df1bccd0254cae83e73678e9caee2"
 RESULTS="${1:-${HOME}/m3_results.json}"
 [ -f "${RESULTS}" ] || { echo "結果ファイルがありません: ${RESULTS}" >&2; exit 1; }
 WORK="$(mktemp -d)"
