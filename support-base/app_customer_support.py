@@ -58,6 +58,19 @@ def _get_new_shop_orchestrator():
             _new_shop_orchestrator = build_from_env()
         return _new_shop_orchestrator
 
+
+# M4 プレビュー専用: NEW_SHOP_FLOW=S10 のときだけ S10 フロー（既定は上の新エンジンのまま）
+_new_shop_flow_s = None
+
+
+def _get_new_shop_flow_s():
+    global _new_shop_flow_s
+    with _new_shop_orchestrator_lock:
+        if _new_shop_flow_s is None:
+            from new_shop_recommendation.flow_s import build_from_env as build_flow_s
+            _new_shop_flow_s = build_flow_s()
+        return _new_shop_flow_s
+
 # ロギング設定
 logging.basicConfig(
     level=logging.INFO,
@@ -809,6 +822,21 @@ def handle_live_start(data):
     # （推薦・照合・再試行のロジックは持たない。旧 gemini-2.5-flash + Google 検索方式は使わない）
     def shop_search_callback(user_request, lang, search_mode):
         """LiveAPI の search_shops から呼ばれ、新エンジンの確定結果（カードと読み上げデータ）を返す"""
+        from new_shop_recommendation import flow_s as _flow_s
+        if _flow_s.enabled():
+            # M4 S10: 先行カード・最終カード・説明の更新をこのクライアントへ段階送信し、最終確定（または 10 秒）で戻る
+            try:
+                flow = _get_new_shop_flow_s()
+            except NewShopConfigError as e:
+                logger.error(f"[NewShopRec][S10] 設定エラー: {e}")
+                return {'request_id': None, 'status': 'ERROR', 'error_type': 'config_missing',
+                        'shops': [], 'narration': [], 'response': ''}
+            result = flow.run(user_request,
+                              emit=lambda ev, payload: socketio.emit(ev, payload, room=client_sid))
+            return {'request_id': result['request_id'], 'status': result['status'],
+                    'error_type': result['error_type'], 'shops': result['cards'],
+                    'narration': result['narration'], 'narration_mode': result['narration_mode'],
+                    'request': result['request'], 'shortfall': result['shortfall'], 'response': ''}
         try:
             orchestrator = _get_new_shop_orchestrator()
         except NewShopConfigError as e:
