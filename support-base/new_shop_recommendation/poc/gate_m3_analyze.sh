@@ -27,7 +27,8 @@ python3 -m venv "${WORK}/venv" || { echo "venv の作成に失敗" >&2; exit 1; 
 "${WORK}/venv/bin/pip" install -q --disable-pip-version-check "requests==2.32.5" > "${WORK}/pip.log" 2>&1 \
   || { echo "requests のインストールに失敗:" >&2; tail -n 30 "${WORK}/pip.log" >&2; exit 1; }
 cd "${WORK}/src/support-base"
-"${WORK}/venv/bin/python" -I -c "import sys; sys.path.insert(0, '.'); sys.argv = ["analyze", sys.argv[1], sys.argv[2], "S10"]
+"${WORK}/venv/bin/python" -I -c "import sys; sys.path.insert(0, '.'); sys.argv = ['analyze', sys.argv[1], sys.argv[2], 'S10']
 from new_shop_recommendation.poc import gate_m3_analyze as g; g.main()" \
-  "${RESULTS}" new_shop_recommendation/poc/m3_labels.tsv > "${HOME}/m3_analysis.txt" 2>&1
+  "${RESULTS}" new_shop_recommendation/poc/m3_labels.tsv > "${HOME}/m3_analysis.txt" 2>&1 \
+  || { echo "分析に失敗しました:" >&2; tail -n 30 "${HOME}/m3_analysis.txt" >&2; exit 1; }
 echo "完了: ~/m3_analysis.txt（$(wc -l < "${HOME}/m3_analysis.txt") 行）"
