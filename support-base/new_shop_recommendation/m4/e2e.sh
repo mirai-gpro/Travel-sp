@@ -9,9 +9,9 @@
 # =====================================================================
 set -euo pipefail
 PROJECT_ID="ai-avator-492205"
-REVISION="travel-sp-base-m4s10-2764267"
+REVISION="travel-sp-base-m4s10-fa1b62f"
 BRANCH="feature/new-shop-recommendation"
-EXPECTED_SHA="e4830a4b9844a0e82125596db47c56a855a11711"
+EXPECTED_SHA="8024dd23b70d440e3cfe55141e59a70ba26636a8"
 CONSOLE_LOG="${1:?ブラウザのコンソールログのファイルを指定してください}"
 FRESH="${2:-6h}"
 [ -f "${CONSOLE_LOG}" ] || { echo "ファイルがありません: ${CONSOLE_LOG}" >&2; exit 1; }
