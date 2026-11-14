@@ -604,6 +604,41 @@ def strip_for_save(results):
     return out
 
 
+def preflight(apis, want_33):
+    """本計測の前に各 API を 1 回ずつ確認する。推薦用キーか Maps が使えなければ 30 試行を始めずに停止する"""
+    say('事前確認:')
+    try:
+        r = requests.post(c.INTERACTIONS_URL, headers=apis.headers(), timeout=30,
+                          json={'model': c.MODEL_ID, 'input': 'OK とだけ返してください。', 'stream': False, 'store': False,
+                                'generation_config': {'thinking_level': c.THINKING_LEVEL, 'max_output_tokens': 16}})
+        st = r.status_code
+    except requests.exceptions.RequestException as e:
+        st = f'network:{type(e).__name__}'
+    say(f'  推薦・説明・選択 LLM（{c.MODEL_ID} Interactions）: {"OK" if st == 200 else st}')
+    if st != 200:
+        say('  推薦用キーが使えないため停止します（入力した AQ キーを確認してください。401 はキーが無効、403 は権限なし）')
+        return False, False
+    res = at.search_text(apis.mkey, '茶亭 羽當', '渋谷', '渋谷', None)
+    say(f'  Agent Tools searchText: {res["status"]}')
+    if res['status'].startswith('ERROR'):
+        say('  Agent Tools を使えないため停止します')
+        return False, False
+    use_33 = want_33
+    if want_33:
+        try:
+            r = requests.post(GENERATE_33_URL, timeout=60,
+                              headers={'Content-Type': 'application/json', 'x-goog-api-key': apis.gkey},
+                              json={'contents': [{'role': 'user', 'parts': [{'text': 'OK とだけ返してください。'}]}]})
+            st33 = r.status_code
+        except requests.exceptions.RequestException as e:
+            st33 = f'network:{type(e).__name__}'
+        say(f'  33秒版の推薦（gemini-2.5-flash generateContent）: {"OK" if st33 == 200 else st33}')
+        if st33 != 200:
+            say('  33秒版の基準は実行できないため省略し、D / S7 / S10 だけ計測します（品質の基準比較は別途）')
+            use_33 = False
+    return True, use_33
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--repeat', type=int, default=1)
@@ -616,6 +651,10 @@ def main():
     for k in (gkey, mkey, os.environ.get('GOOGLE_PLACES_API_KEY', '')):
         register_secret(k)
     apis = Apis(gkey, mkey)
+    ok, use_33 = preflight(apis, not args.no_33)
+    if not ok:
+        return
+    args.no_33 = not use_33
     say(f'git_sha={os.environ.get("GIT_SHA", "unknown")}  推薦/説明/選択={c.MODEL_ID} thinking={c.THINKING_LEVEL}  '
         f'軽量判定=v0.2 固定（light_identity）  締め切り {DEADLINE_MS}ms / 初回 {FIRST_MS}ms  方式={"D,S7,S10" if args.no_33 else "33,D,S7,S10"}')
     results = []
