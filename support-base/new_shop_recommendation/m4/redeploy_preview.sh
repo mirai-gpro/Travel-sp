@@ -8,6 +8,7 @@
 # - 新リビジョンを「トラフィック 0%・タグ m4s10（付け替え）・最大 1 インスタンス」で追加。本番トラフィックは変更しない
 # - テンプレートの Secret 参照（バージョン固定）と NEW_SHOP_FLOW 等は引き継ぎ、GIT_SHA だけ更新する
 # - 事前・事後確認は m4_deploy_preview.sh と同じ（本番キーの値は読まない）
+# - Cloud Shell の docker から push できない場合: M4_BUILD=cloudbuild bash ~/m4_redeploy_preview.sh（Cloud Build でビルド）
 # =====================================================================
 set -euo pipefail
 PROJECT_ID="ai-avator-492205"
@@ -53,6 +54,11 @@ GIT_TERMINAL_PROMPT=0 git -C "${WORK}/src" fetch -q --depth=5 origin "${BRANCH}"
 git -C "${WORK}/src" checkout -q "${EXPECTED_SHA}" || { echo "固定 SHA が見つかりません" >&2; exit 1; }
 [ "$(git -C "${WORK}/src" rev-parse HEAD)" = "${EXPECTED_SHA}" ] || { echo "SHA 不一致" >&2; exit 1; }
 IMAGE="${AR_IMAGE}:m4-${EXPECTED_SHA:0:12}"
+if [ "${M4_BUILD:-docker}" = "cloudbuild" ]; then
+  # Cloud Shell の docker から Artifact Registry へ接続できない場合の代替: Google Cloud 側（Cloud Build）でビルド・push する
+  gcloud builds submit "${WORK}/src/support-base" --project="${PROJECT_ID}" --region="${REGION}" --tag="${IMAGE}" --quiet \
+    > "${WORK}/build.log" 2>&1 || { echo "停止: Cloud Build に失敗しました（Cloud Run は未変更）:" >&2; tail -n 15 "${WORK}/build.log" >&2; exit 1; }
+else
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet > /dev/null 2>&1
 docker build -q -t "${IMAGE}" "${WORK}/src/support-base" > /dev/null
 pushed=0
@@ -61,10 +67,11 @@ for i in 1 2 3 4; do
   echo "    push に失敗（${i}/4 回目）。$((i * 15)) 秒後に再試行します: $(tail -n 1 "${WORK}/push.log")"
   sleep $((i * 15))
 done
-[ "${pushed}" = "1" ] || { echo "停止: Artifact Registry への push に 4 回失敗しました（Cloud Run は未変更）" >&2; exit 1; }
+[ "${pushed}" = "1" ] || { echo "停止: Artifact Registry への push に 4 回失敗しました（Cloud Run は未変更）。M4_BUILD=cloudbuild で Cloud Build を使えます" >&2; exit 1; }
+fi
 DIGEST="$(gcloud artifacts docker images describe "${IMAGE}" --format='value(image_summary.digest)')"
 [ -n "${DIGEST}" ] || { echo "イメージ digest を取得できません" >&2; exit 1; }
-AMD64_DIGEST="$(docker buildx imagetools inspect --raw "${AR_IMAGE}@${DIGEST}" 2>/dev/null | python3 -c "import json,sys
+AMD64_DIGEST="$(docker buildx imagetools inspect --raw "${AR_IMAGE}@${DIGEST}" 2>/dev/null </dev/null | python3 -c "import json,sys
 d=json.load(sys.stdin)
 print(next((m['digest'] for m in d.get('manifests') or [] if (m.get('platform') or {}).get('os')=='linux' and (m.get('platform') or {}).get('architecture')=='amd64'), ''))" || true)"
 echo "    digest: ${DIGEST}（linux/amd64: ${AMD64_DIGEST:-単一イメージ}）"
