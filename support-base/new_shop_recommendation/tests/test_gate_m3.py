@@ -176,3 +176,25 @@ def test_score_closed_and_bad_cards_and_label_file():
     labels = sc.load_labels(path)
     assert labels and set(labels.values()) <= {'O', 'X', '?', 'Z'}
     assert all(len(pid) == 27 and pid.startswith('ChIJ') for _, pid in labels)
+
+
+def test_analyze_trial_causes():
+    from new_shop_recommendation.poc import gate_m3_analyze as an
+    st = [{'rank': 1, 'rec': 'a', 'place_id': 'pa', 'top1': 'pa', 'path': 'same', 't_done': 3000},
+          {'rank': 2, 'rec': 'b', 'place_id': None, 'top1': 'pb', 'path': 'all_different', 't_done': 3100},
+          {'rank': 3, 'rec': 'c', 'place_id': 'pc', 'top1': 'pc', 'path': 'llm', 't_done': 6000},
+          {'rank': 4, 'rec': 'd', 'place_id': 'pa', 'top1': 'pa', 'path': 'same', 't_done': 3200},
+          {'rank': 5, 'rec': 'e', 'place_id': None, 'top1': 'px', 'path': 'llm_none', 't_done': 4000},
+          {'rank': 6, 'rec': 'f', 'place_id': 'pf', 'top1': 'pf', 'path': 'same', 't_done': 12000},
+          {'rank': 7, 'rec': 'g', 'place_id': 'pg', 'top1': 'pg', 'path': 'same', 't_done': 5000},
+          {'rank': 8, 'rec': 'h', 'place_id': 'ph', 'top1': 'ph', 'path': 'same', 't_done': 5000},
+          {'rank': 9, 'rec': 'i', 'place_id': 'pi', 'top1': 'pi', 'path': 'same', 't_done': 5000},
+          {'rank': 10, 'rec': 'j', 'place_id': 'pj', 'top1': 'pj', 'path': 'same', 't_done': 5000}]
+    lab = {('a', 'pa'): 'O', ('b', 'pb'): 'O', ('c', 'pc'): 'X', ('d', 'pa'): 'O', ('e', 'px'): 'O',
+           ('f', 'pf'): 'O', ('g', 'pg'): '?', ('h', 'ph'): 'O', ('i', 'pi'): 'O', ('j', 'pj'): 'O'}
+    r = an.analyze_trial({'stores': st}, lab)
+    notes = {x['rec']: x['note'] for x in r['rows']}
+    assert notes == {'a': 'CARD', 'b': 'MISS_LIGHT', 'c': 'CARD', 'd': 'DUPLICATE', 'e': 'MISS_LLM', 'f': 'LATE',
+                     'g': 'CARD', 'h': 'CARD', 'i': 'CARD', 'j': 'CAP_PUSHED'}
+    assert r['n_ok'] == 3 and r['short'] == 2 and {'WRONG_LLM', 'UNKNOWN', 'CAP_PUSHED'} <= set(r['causes'])
+    assert an.replacement_events({'stores': st}) == 1                  # 3 位（6 秒）の後着で 10 位が押し出される
