@@ -161,3 +161,18 @@ def test_strip_for_save_has_no_places_content():
 def test_parse_33_json_like_production():
     assert g.parse_33_json('前置き {"shops": [{"name": "a"}], "message": "{x}"} 後') == {'shops': [{'name': 'a'}], 'message': '{x}'}
     assert g.parse_33_json('no json') is None
+
+
+def test_score_closed_and_bad_cards_and_label_file():
+    stores = [{'rank': i, 'rec': f'r{i}', 'place_id': f'p{i}', 't_done': 1000 * i + 2000, 'path': 'same'} for i in range(1, 6)]
+    lab = {(f'r{i}', f'p{i}'): 'O' for i in range(1, 6)}
+    lab[('r2', 'p2')] = 'Z'                                              # 閉業店のカードは正解に含めない
+    m = sc.trial_metrics(stores, lab, 10000)
+    assert m['z'] == 1 and m['x'] == 0 and not m['complete']
+    res = [{'trial': 1, 'q': 'q', 'S7': {'stores': stores}}]
+    assert sc.score(res, lab)['S7']['closed_all'] == 1
+    assert [r[3:5] for r in sc.bad_cards(res, lab, 'S7')] == [('r2', 'Z')]
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'poc', 'm3_labels.tsv')
+    labels = sc.load_labels(path)
+    assert labels and set(labels.values()) <= {'O', 'X', '?', 'Z'}
+    assert all(len(pid) == 27 and pid.startswith('ChIJ') for _, pid in labels)
