@@ -11,7 +11,7 @@ M3 で判明した誤り:
      （語末の「の」は区切らない: すすきの）
   2. 各候補を Geocoding し、次をすべて満たすものだけを「地名」と認める
        - 日本の結果
-       - 種別が行政区画・地区・駅などの地理的なもの。ホテル・商業施設などの建物は、候補の文字列が結果の住所表記に含まれる場合だけ
+       - 種別が行政区画・地区・駅・通りなどの地理的なもの。ホテル・商業施設などの建物は、Geocoding が部分一致でない場合だけ
        - 結果の住所要素の名称と候補が、どちらかに含まれる関係にある（末尾の都道府県市区町村駅は除いて比較）。
          曖昧一致で別の地名に解決されたものを除く
   3. 認めた地名を依頼文の順に連結して Geocoding し、結果が各地名の範囲内にあればそれを採用する（例: 京都 祇園 → 祇園）。
@@ -33,7 +33,7 @@ BUILDING_TYPES = {'premise', 'subpremise', 'establishment', 'point_of_interest',
 GEO_TYPES = {'locality', 'sublocality', 'sublocality_level_1', 'sublocality_level_2', 'sublocality_level_3',
              'sublocality_level_4', 'neighborhood', 'colloquial_area', 'administrative_area_level_1',
              'administrative_area_level_2', 'ward', 'political', 'train_station', 'transit_station',
-             'subway_station', 'light_rail_station'}
+             'subway_station', 'light_rail_station', 'route'}
 
 
 def haversine_km(a, b):
@@ -85,27 +85,35 @@ def _bare(s):
     return SUFFIX_RE.sub('', s) if len(s) > 2 else s
 
 
-def is_place_name(cand: str, g) -> bool:
+def match_info(cand: str, g):
     """
     Geocoding 結果 g が候補文字列 cand を地名として表しているか。
-    住所要素の名称（末尾の 都道府県市区町村駅 を除いたもの）と候補が、どちらかに含まれる関係にある場合だけ認める
-    （例: 東京駅 ⇔ 東京都、札幌すすきの ⇔ すすきの）。曖昧一致で無関係の地名に解決された結果を除くため。
+    returns None（地名ではない）/ ('exact', None) / ('partial', 一致した住所要素名)
+      - 地理的な種別: 住所要素の名称（末尾の 都道府県市区町村駅 を除く）と候補が、どちらかに含まれる関係にある
+        （候補の方が長い場合は 'partial'。例: 札幌すすきの ⊃ 札幌 → 残りの「すすきの」を別に確かめる）
+      - 建物（ホテル・商業施設など）: Geocoding が部分一致（partial_match）でなく、候補が 4 文字以上
+    曖昧一致で無関係の地名に解決された結果を除くための条件。
     """
     if not g or g.get('country_code') != 'JP' or g.get('lat') is None:
-        return False
+        return None
     types = set(g.get('types') or [])
     c = _bare(cand)
     if types & GEO_TYPES:
+        partial = None
         for n in g.get('component_names') or []:
             b = _bare(n)
-            if b == c or (len(b) >= 2 and len(c) >= 2 and (b in c or c in b)):
-                return True
-        return False
-    if types & BUILDING_TYPES:
-        # ホテル・商業施設などの建物: 候補の文字列（3 文字以上）が結果の住所表記に含まれる場合だけ認める
-        addr = unicodedata.normalize('NFKC', g.get('formatted_address') or '')
-        return len(cand) >= 3 and cand in addr
-    return False
+            if b == c or (len(b) >= 2 and len(c) >= 2 and c in b):
+                return ('exact', None)
+            if len(b) >= 2 and len(c) >= 2 and b in c and (partial is None or len(b) > len(partial)):
+                partial = b
+        return ('partial', partial) if partial else None
+    if types & BUILDING_TYPES and not g.get('partial_match') and len(cand) >= 4:
+        return ('exact', None)
+    return None
+
+
+def is_place_name(cand: str, g) -> bool:
+    return match_info(cand, g) is not None
 
 
 def radius_km(q: str, viewport):
@@ -127,7 +135,19 @@ def resolve_scope(q: str, geocode, max_workers: int = 6) -> dict:
     cands = candidates(q)
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(cands) or 1)), thread_name_prefix='scope') as ex:
         geos = list(ex.map(geocode, cands)) if cands else []
-    places = [(cd, g) for cd, g in zip(cands, geos) if is_place_name(cd, g)]
+    places = []
+    for cd, g in zip(cands, geos):
+        mi = match_info(cd, g)
+        if mi is None:
+            continue
+        if mi[0] == 'partial':
+            # 例: 「札幌すすきの」が札幌市に解決された → 残りの「すすきの」を確かめ、両方を地名として使う（細かい方を優先するため）
+            rest = _bare(cd).replace(mi[1], '', 1).strip()
+            g2 = geocode(rest) if len(rest) >= 2 else None
+            if g2 is not None and match_info(rest, g2) is not None:
+                places += [(mi[1], g), (rest, g2)]
+                continue
+        places.append((cd, g))
     # 「京都の祇園」の候補「京都の祇園」「京都」「祇園」のうち、他の候補に含まれる長い候補は、構成する地名がすべて認められた場合だけ残す
     places = [(cd, g) for cd, g in places
               if not any(o != cd and o in cd for o, _g in places)]

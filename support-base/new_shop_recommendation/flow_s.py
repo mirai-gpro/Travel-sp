@@ -74,7 +74,7 @@ class HttpApis:
                 [x.get('short_name') for x in comps if x.get('short_name')]
         return {'lat': loc.get('lat'), 'lng': loc.get('lng'), 'viewport': (r.get('geometry') or {}).get('viewport'),
                 'prefecture': pref, 'country_code': cc, 'types': r.get('types') or [], 'component_names': names,
-                'formatted_address': r.get('formatted_address') or ''}
+                'formatted_address': r.get('formatted_address') or '', 'partial_match': bool(r.get('partial_match'))}
 
     def search(self, rec, scope):
         return at.search_text(self.mkey, rec['name'], rec['area_hint'], scope.get('area') or '', scope.get('geo'))

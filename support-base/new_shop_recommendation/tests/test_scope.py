@@ -89,8 +89,27 @@ def test_single_char_area_and_building():
     s = S.resolve_scope('名古屋 栄 ひつまぶし 予算1人5000円', geo2.get)
     assert s['area'] == '名古屋 栄' and s['scope_reason'] == 'combined'
     hotel = dict(G(35.680, 139.733, 0.002, '東京都', ['紀尾井町', '千代田区', '東京都'], ('establishment', 'lodging', 'point_of_interest')),
-                 formatted_address='日本、〒102-8578 東京都千代田区紀尾井町4-1 ホテルニューオータニ東京')
+                 formatted_address='日本、〒102-8578 東京都千代田区紀尾井町4-1', partial_match=False)
     geo2['ホテルニューオータニ東京'] = hotel
     s2 = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', geo2.get)
     assert s2['area'] == 'ホテルニューオータニ東京' and s2['radius_km'] == pytest.approx(1.5)
-    assert not S.is_place_name('接待に使える鉄板焼き', dict(hotel, formatted_address='日本、東京都'))
+    assert not S.is_place_name('接待に使える鉄板焼き', dict(hotel, partial_match=True))
+
+
+def test_partial_area_is_split_to_finer_place():
+    # M4 事前確認の実地結果: 「札幌すすきの」が札幌市（半径 10km）に解決されていた
+    geo3 = dict(GEO)
+    geo3['札幌すすきの'] = G(43.06, 141.35, 0.15, '北海道', ['札幌市', '北海道'])
+    geo3['すすきの'] = G(43.055, 141.353, 0.005, '北海道', ['すすきの', '中央区', '札幌市', '北海道'], ('neighborhood', 'political'))
+    geo3['札幌 すすきの'] = geo3['すすきの']
+    s = S.resolve_scope('札幌すすきので美味しいジンギスカン', geo3.get)
+    assert s['area'] == '札幌 すすきの' and s['radius_km'] == pytest.approx(1.5) and s['scope_reason'] == 'combined'
+
+
+def test_route_name():
+    geo4 = dict(GEO)
+    geo4['那覇'] = G(26.21, 127.68, 0.06, '沖縄県', ['那覇市', '沖縄県'])
+    geo4['国際通り'] = G(26.215, 127.69, 0.004, '沖縄県', ['国際通り', '那覇市', '沖縄県'], ('route',))
+    geo4['那覇 国際通り'] = geo4['国際通り']
+    s = S.resolve_scope('那覇の国際通りで沖縄料理 3名', geo4.get)
+    assert s['area'] == '那覇 国際通り' and s['radius_km'] == pytest.approx(1.5)
