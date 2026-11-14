@@ -758,17 +758,21 @@ def m4_bench():
         return jsonify({'error': 'forbidden'}), 403
     data = request.get_json(silent=True) or {}
     q, method = data.get('query') or '', data.get('method')
-    if not q:
-        return jsonify({'error': 'no_query'}), 400
-    if method == '33':
-        return jsonify(mb.run_33(q))
-    if method == 'S10':
+    if not q or method not in ('33', 'S10', 'scope'):
+        return jsonify({'error': 'bad_request'}), 400
+    why = mb.acquire()                      # 呼び出し制限（同時 1 件・合計回数）
+    if why:
+        return jsonify({'error': why}), 429
+    try:
+        if method == '33':
+            return jsonify(mb.run_33(q))
         try:
             flow = _get_new_shop_flow_s()
         except NewShopConfigError as e:
             return jsonify({'error': f'config:{e}'}), 500
-        return jsonify(mb.run_s10(q, flow))
-    return jsonify({'error': 'bad_method'}), 400
+        return jsonify(mb.run_scope(q, flow) if method == 'scope' else mb.run_s10(q, flow))
+    finally:
+        mb.release()
 
 
 @app.route('/health', methods=['GET', 'OPTIONS'])
@@ -860,7 +864,8 @@ def handle_live_start(data):
             return {'request_id': result['request_id'], 'status': result['status'],
                     'error_type': result['error_type'], 'shops': result['cards'],
                     'narration': result['narration'], 'narration_mode': result['narration_mode'],
-                    'request': result['request'], 'shortfall': result['shortfall'], 'response': ''}
+                    'request': result['request'], 'shortfall': result['shortfall'],
+                    'geo_unverified': result.get('geo_unverified', False), 'response': ''}
         try:
             orchestrator = _get_new_shop_orchestrator()
         except NewShopConfigError as e:

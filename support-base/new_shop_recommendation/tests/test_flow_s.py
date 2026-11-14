@@ -243,3 +243,18 @@ def test_bench_run_s10_returns_ids_and_llm_text_only():
     assert all(s['description'].startswith('理由') for s in out['stores'])
     dumped = json.dumps(out, ensure_ascii=False)
     assert '横浜市中区' not in dumped and 'SUMMARY-TEXT' not in dumped and '別表記' not in dumped
+
+
+def test_unknown_scope_name_match_goes_to_llm_and_is_flagged():
+    class NoGeo(FakeApis):
+        def geocode(self, text):
+            return None
+    apis = NoGeo([store(i) for i in range(1, 7)])
+    flow = F.FlowS(apis, deadline_sec=10 * SCALE)
+    rec = Rec()
+    res = flow.run('美味しい焼き鳥', emit=rec, request_id='RID')
+    paths = {k: v['path'] for k, v in res['metrics']['stores'].items()}
+    assert all(p == 'llm' for p in paths.values())                 # 名前一致でも無条件には採用しない
+    fin = rec.stage('final')[0]
+    assert fin['scope_kind'] == 'unknown' and res['geo_unverified'] is True
+    assert all(cd['geo_check'] == 'geo_unverified' for cd in fin['cards'])
