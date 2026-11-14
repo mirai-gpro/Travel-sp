@@ -79,3 +79,18 @@ def test_candidates_do_not_split_trailing_no():
 def test_no_place_name():
     s = S.resolve_scope('美味しいお店', geo)
     assert s['area'] == '' and s['scope_reason'] == 'no_place_name' and s['center'] is None
+
+
+def test_single_char_area_and_building():
+    geo2 = dict(GEO)
+    geo2['名古屋'] = G(35.18, 136.90, 0.1, '愛知県', ['名古屋市', '愛知県'])
+    geo2['栄'] = G(35.17, 136.91, 0.006, '愛知県', ['栄', '中区', '名古屋市', '愛知県'], ('sublocality', 'political'))
+    geo2['名古屋 栄'] = geo2['栄']
+    s = S.resolve_scope('名古屋 栄 ひつまぶし 予算1人5000円', geo2.get)
+    assert s['area'] == '名古屋 栄' and s['scope_reason'] == 'combined'
+    hotel = dict(G(35.680, 139.733, 0.002, '東京都', ['紀尾井町', '千代田区', '東京都'], ('establishment', 'lodging', 'point_of_interest')),
+                 formatted_address='日本、〒102-8578 東京都千代田区紀尾井町4-1 ホテルニューオータニ東京')
+    geo2['ホテルニューオータニ東京'] = hotel
+    s2 = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', geo2.get)
+    assert s2['area'] == 'ホテルニューオータニ東京' and s2['radius_km'] == pytest.approx(1.5)
+    assert not S.is_place_name('接待に使える鉄板焼き', dict(hotel, formatted_address='日本、東京都'))

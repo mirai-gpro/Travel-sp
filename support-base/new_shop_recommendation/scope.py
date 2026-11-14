@@ -11,7 +11,7 @@ M3 で判明した誤り:
      （語末の「の」は区切らない: すすきの）
   2. 各候補を Geocoding し、次をすべて満たすものだけを「地名」と認める
        - 日本の結果
-       - 種別が行政区画・地区・駅などの地理的なもの（店舗・施設だけの結果は不可）
+       - 種別が行政区画・地区・駅などの地理的なもの。ホテル・商業施設などの建物は、候補の文字列が結果の住所表記に含まれる場合だけ
        - 結果の住所要素の名称と候補が、どちらかに含まれる関係にある（末尾の都道府県市区町村駅は除いて比較）。
          曖昧一致で別の地名に解決されたものを除く
   3. 認めた地名を依頼文の順に連結して Geocoding し、結果が各地名の範囲内にあればそれを採用する（例: 京都 祇園 → 祇園）。
@@ -29,6 +29,7 @@ WALK_DETOUR = 1.5
 MIN_WALK_KM = 0.6
 AREA_MIN_KM, AREA_MAX_KM, AREA_DEFAULT_KM = 1.5, 10.0, 3.0
 SPLIT_RE = re.compile(r'\s+|で|から|にある|周辺')
+BUILDING_TYPES = {'premise', 'subpremise', 'establishment', 'point_of_interest', 'lodging', 'shopping_mall'}
 GEO_TYPES = {'locality', 'sublocality', 'sublocality_level_1', 'sublocality_level_2', 'sublocality_level_3',
              'sublocality_level_4', 'neighborhood', 'colloquial_area', 'administrative_area_level_1',
              'administrative_area_level_2', 'ward', 'political', 'train_station', 'transit_station',
@@ -53,7 +54,8 @@ def candidates(q: str):
         if 'の' in seg[:-1]:
             parts += [p for p in re.split(r'の(?!$)', seg) if p]
         for p in parts:
-            if len(p) >= 2 and not WALK_RE.search(p) and p not in out:
+            # 空白で区切られた語は 1 文字でも候補にする（例: 名古屋 栄）
+            if (len(p) >= 2 or p == seg) and not WALK_RE.search(p) and p not in out:
                 out.append(p)
     return out
 
@@ -91,13 +93,18 @@ def is_place_name(cand: str, g) -> bool:
     """
     if not g or g.get('country_code') != 'JP' or g.get('lat') is None:
         return False
-    if not set(g.get('types') or []) & GEO_TYPES:
-        return False
+    types = set(g.get('types') or [])
     c = _bare(cand)
-    for n in g.get('component_names') or []:
-        b = _bare(n)
-        if len(b) >= 2 and len(c) >= 2 and (b in c or c in b):
-            return True
+    if types & GEO_TYPES:
+        for n in g.get('component_names') or []:
+            b = _bare(n)
+            if b == c or (len(b) >= 2 and len(c) >= 2 and (b in c or c in b)):
+                return True
+        return False
+    if types & BUILDING_TYPES:
+        # ホテル・商業施設などの建物: 候補の文字列（3 文字以上）が結果の住所表記に含まれる場合だけ認める
+        addr = unicodedata.normalize('NFKC', g.get('formatted_address') or '')
+        return len(cand) >= 3 and cand in addr
     return False
 
 
