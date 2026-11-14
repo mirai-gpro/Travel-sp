@@ -859,7 +859,8 @@ def handle_live_start(data):
             return {'request_id': result['request_id'], 'status': result['status'],
                     'error_type': result['error_type'], 'shops': result['cards'],
                     'narration': result['narration'], 'narration_mode': result['narration_mode'],
-                    'request': result['request'], 'shortfall': result['shortfall'], 'response': ''}
+                    'request': result['request'], 'shortfall': result['shortfall'],
+                    'geo_unverified': result.get('geo_unverified', False), 'response': ''}
         try:
             orchestrator = _get_new_shop_orchestrator()
         except NewShopConfigError as e:
