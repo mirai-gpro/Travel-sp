@@ -27,3 +27,19 @@ def cand(name, types=('restaurant', 'food'), status='OPERATIONAL', addr=''):
 ])
 def test_r2_branch_conflict_clear(rec, name, want):
     assert L.branch_conflict_clear(rec, name) is want
+
+
+# ------------------------------------------------------------------ R3
+@pytest.mark.parametrize('rec,name', [
+    ('天ぷら 新宿 綱八 京王店', '天ぷら新宿つな八 京王新宿店'),
+    ('美濃吉 新宿住友店', '日本料理 京懐石 みのきち 新宿住友店'),
+    ('中目黒 炭火焼鳥 塚田', '焼鳥つかだ 中目黒店'),
+])
+def test_r3_kana_kanji_goes_to_llm_not_same(rec, name):
+    assert P.judge(rec, cand(name), None)[0] == 'DIFFERENT'          # v0.2 は別店舗と判定していた
+    assert L.judge(rec, cand(name), None) == ('AMBIGUOUS', 'kana_kanji')   # 同一店とは確定しない
+
+
+def test_r3_keeps_unrelated_different():
+    assert L.judge('焼鳥 幸羽', cand('焼鳥 美鶏'), None) == ('DIFFERENT', 'name_unrelated')
+    assert L.reading_variant_possible('綱八', 'つな八') and not L.reading_variant_possible('つな八', '綱八')

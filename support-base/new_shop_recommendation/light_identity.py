@@ -12,6 +12,7 @@ M4 で承認された修正 R2〜R4 はこのファイルにだけ入れる（�
   5. 店名: 正規化した「中核名」が一致 → SAME（支店名が食い違う・候補が別館/本館なら AMBIGUOUS）
            英字表記とかな・漢字表記で比較できない → AMBIGUOUS(script_differs)
            中核名が 1 文字 → AMBIGUOUS(short_core)
+           漢字とかなの表記違いでありうる → AMBIGUOUS(kana_kanji)（M4 R3）
            中核名に共通する 2 文字の並びが無い → DIFFERENT(name_unrelated)
            それ以外 → AMBIGUOUS(name_partial)
 方針: SAME だけを即採用する。AMBIGUOUS は選択 LLM へ回す。DIFFERENT は採用しない。LLM・外部 API は使わない。
@@ -131,6 +132,24 @@ def haversine_km(a, b):
     return 6371 * 2 * math.asin(math.sqrt(h))
 
 
+KANJI_ONLY = re.compile(r'[\u4e00-\u9fff々]{1,4}')
+KANA_RUN = re.compile(r'[\u3041-\u3096ー]+')
+
+
+def reading_variant_possible(a, b):
+    """
+    M4 R3: 中核名 a と b が「漢字の部分」と「かなの部分」の表記違いでありうるか（読みは判定しない）。
+    共通の文字を除いた a の残りが漢字だけ（1〜4 字）で、b の残りにその字数〜3 倍＋1 の長さのかなの並びがある場合 True。
+    例: 綱八 ⇔ つな八、美濃吉 ⇔ みのきち、塚田 ⇔ つかだ
+    """
+    com = set(a) & set(b)
+    ra = ''.join(ch for ch in a if ch not in com)
+    rb = ''.join(ch for ch in b if ch not in com)
+    if not ra or not KANJI_ONLY.fullmatch(ra):
+        return False
+    return any(len(ra) <= len(m.group()) <= 3 * len(ra) + 1 for m in KANA_RUN.finditer(rb))
+
+
 def judge(rec_name, cand, prefecture, area_center=None, max_km=3.0, allowed_municipalities=None):
     """
     cand: {'name','address','types'(任意),'business_status'(任意),'lat','lng'(任意)}
@@ -166,6 +185,8 @@ def judge(rec_name, cand, prefecture, area_center=None, max_km=3.0, allowed_muni
         return AMBIGUOUS, 'script_differs'     # 英字とかな・漢字は機械的に比較できない
     if short_core(rec_name) or short_core(cand.get('name')):
         return AMBIGUOUS, 'short_core'         # 中核名が 1 文字（例: 響・雷・凡）は名前だけで別店舗と断定しない
+    if any(reading_variant_possible(a, b) or reading_variant_possible(b, a) for a in rv for b in cv):
+        return AMBIGUOUS, 'kana_kanji'         # M4 R3: 漢字とかなの読み違いの可能性。同一店とは確定せず選択 LLM で確認
     if not any(bigrams(a) & bigrams(b) for a in rv for b in cv):
         return DIFFERENT, 'name_unrelated'
     return AMBIGUOUS, 'name_partial'
