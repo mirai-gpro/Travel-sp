@@ -132,10 +132,22 @@ def radius_km(q: str, viewport):
     return AREA_DEFAULT_KM, 'default'
 
 
-def resolve_scope(q: str, geocode, max_workers: int = 6) -> dict:
+def _name_norm(s):
+    return PUNCT_RE.sub('', unicodedata.normalize('NFKC', s or ''))
+
+
+def facility_name_matches(cand: str, official: str) -> bool:
+    """施設の正式名（Place Details）と依頼の表記が、4 文字以上でどちらかに含まれる関係にあるか"""
+    a, b = _name_norm(cand), _name_norm(official)
+    return len(a) >= 4 and len(b) >= 4 and (a in b or b in a)
+
+
+def resolve_scope(q: str, geocode, place_name=None, max_workers: int = 6) -> dict:
     """
-    geocode(text) -> {'lat','lng','viewport','prefecture','country_code','types','component_names'} | None
-    returns {'area','prefecture','center','radius_km','radius_reason','places','geo'}
+    geocode(text) -> {'lat','lng','viewport','prefecture','country_code','types','component_names','partial_match',
+                      'place_id','formatted_address'} | None
+    place_name(place_id) -> 正式名 | None（施設の確認に使う。Geocoding が施設名を部分一致としか返さない場合）
+    returns {'area','kind','prefecture','center','radius_km','radius_reason','places','geo',...}
     """
     cands = candidates(q)
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(cands) or 1)), thread_name_prefix='scope') as ex:
@@ -143,15 +155,29 @@ def resolve_scope(q: str, geocode, max_workers: int = 6) -> dict:
     places = []
     for cd, g in zip(cands, geos):
         mi = match_info(cd, g)
+        if mi is None and g and set(g.get('types') or []) & BUILDING_TYPES and not set(g.get('types') or []) & GEO_TYPES \
+                and place_name and g.get('place_id') and g.get('country_code') == 'JP':
+            # 施設: Geocoding は施設名を部分一致としか返さないことがある（実地: ホテルニューオータニ東京）→ Place Details の正式名で確認
+            official = place_name(g['place_id'])
+            if official and facility_name_matches(cd, official):
+                mi = ('exact', None)
         if mi is None:
             continue
-        if mi[0] == 'partial':
-            # 例: 「札幌すすきの」が札幌市に解決された → 残りの「すすきの」を確かめ、両方を地名として使う（細かい方を優先するため）
+        if mi[0] == 'partial' and g.get('partial_match'):
+            # Geocoding 自身が部分一致とし、候補の一部だけが地名と一致（実地: 札幌すすきの → 札幌市）。残りを確かめられた場合だけ細かい方を使う。
+            # 確かめられなければ、この候補は使わない（一致した広い地名に広げない）
             rest = _bare(cd).replace(mi[1], '', 1).strip()
             g2 = geocode(rest) if len(rest) >= 2 else None
             if g2 is not None and match_info(rest, g2) is not None:
                 places += [(mi[1], g), (rest, g2)]
                 continue
+            both = f'{mi[1]} {rest}'
+            g3 = geocode(both) if len(rest) >= 2 else None
+            if g3 and not g3.get('partial_match') and kind_of(g3) != 'facility' and g3.get('lat') is not None \
+                    and _viewport_contains(g.get('viewport'), (g3['lat'], g3['lng'])) \
+                    and _vp_size_km(g3.get('viewport')) < _vp_size_km(g.get('viewport')):
+                places.append((both, g3))
+            continue
         places.append((cd, g))
     # 「京都の祇園」の候補「京都の祇園」「京都」「祇園」のうち、他の候補に含まれる長い候補は、構成する地名がすべて認められた場合だけ残す
     places = [(cd, g) for cd, g in places
@@ -167,7 +193,9 @@ def resolve_scope(q: str, geocode, max_workers: int = 6) -> dict:
     elif places:
         combo = ' '.join(cd for cd, _g in places)
         g = geocode(combo)
-        if g and g.get('country_code') == 'JP' and g.get('lat') is not None and all(
+        # 連結した地名の結果は、地域・駅・通りの種別で、各地名の範囲内にある場合だけ使う
+        # （実地: 「京都 祇園」が施設の種別で返り、半径 0.3km の施設扱いになっていた）
+        if g and g.get('country_code') == 'JP' and g.get('lat') is not None and kind_of(g) != 'facility' and all(
                 _viewport_contains(pg.get('viewport'), (g['lat'], g['lng'])) for _cd, pg in places):
             chosen, reason = (combo, g), 'combined'
         else:
@@ -209,6 +237,7 @@ def kind_of(g):
     return 'area'
 
 
+PUNCT_RE = re.compile(r'[\s・･\-‐ー―−–—_/|｜&＆\'’"“”.,、。!！?？:：~〜()（）]')
 DASH_RE = re.compile(r'[‐‑‒–—―−ー－-]')
 
 

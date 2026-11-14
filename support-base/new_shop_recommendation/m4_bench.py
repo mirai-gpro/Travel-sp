@@ -52,7 +52,7 @@ def release():
 def run_scope(q: str, flow) -> dict:
     """R1 の検索範囲の確認（Geocoding のみ。プレビュー用 Maps キーを使う）"""
     from . import scope as S
-    sc = S.resolve_scope(q, flow.apis.geocode)
+    sc = S.resolve_scope(q, flow.apis.geocode, getattr(flow.apis, 'place_name', None))
     return {'method': 'scope', 'query': q, **{k: sc.get(k) for k in ('area', 'kind', 'radius_km', 'radius_reason',
                                                                      'scope_reason', 'places', 'prefecture',
                                                                      'facility_address_key')}}
