@@ -273,6 +273,12 @@ const { apiBaseUrl = '' } = Astro.props;
     background: #f0f0f0;
   }
 
+  .shop-card-list :global(.geo-note) {
+    margin: 0 0 6px;
+    font-size: 12px;
+    color: #b06000;
+  }
+
   .shop-card-list :global(.detail-pending) {
     color: #888;
   }
@@ -665,6 +671,7 @@ const { apiBaseUrl = '' } = Astro.props;
     maps_attribution?: { title?: string; url?: string } | null;
     stage?: string;
     detail_pending?: boolean;
+    geo_check?: string | null;
   }
 
   class ShopCardManager {
@@ -872,6 +879,7 @@ const { apiBaseUrl = '' } = Astro.props;
             </div>
           </a>
           ${shop.stage === 'preview' ? `<span class="stage-badge">確認中</span>` : ''}
+          ${['geo_unverified', 'facility_unconfirmed', 'no_coordinates'].includes(shop.geo_check || '') ? `<p class="geo-note">ご希望の場所に合うかは確認できていません</p>` : ''}
           ${shop.description ? `<p class="description">${shop.description}</p>` : ''}
           ${!shop.description && shop.detail_pending ? `<p class="description detail-pending">おすすめの理由を準備中です</p>` : ''}
           

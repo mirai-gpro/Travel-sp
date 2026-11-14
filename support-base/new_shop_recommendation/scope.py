@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-M4 R1: 検索範囲（地名・中心・半径）の決定。ユーザーが指定した範囲を優先する。
+M4 R1: 検索範囲の決定と、候補店舗がその範囲に合うかの検証。ユーザーが指定した範囲を優先する。
 
-M3 で判明した誤り:
-  「銀座で評判の老舗」「新宿で接待向け」「吉祥寺で子連れ」「札幌すすき」のように地名以外を含む／途中で切れた文字列を
-  Geocoding に渡していた。また「京都の祇園」「大阪 梅田」は粗い方（京都・大阪 → 半径 10km）になっていた。
+範囲の種類（Geocoding の結果の種別で決める。キーワード一覧は使わない）:
+  area     地域（行政区画・地区・通称）  中心からの半径（viewport の対角の半分、1.5〜10km。「徒歩 N 分」は徒歩圏）
+  station  駅                            中心からの半径（同上。駅の viewport は小さいため通常 1.5km、徒歩指定があれば徒歩圏）
+  road     道路・通り沿い                通りの範囲（viewport）＋0.3km の帯。市全域には広げない
+  facility ホテル・商業施設などの施設内  施設の中の店舗であることを照合する（周辺検索に置き換えない）
+             施設から 0.3km 超 → 別店舗。施設の住所（丁目・番地）または施設名が候補の住所・店名にある → 施設内と確認。
+             近いが確認できない → 曖昧（選択 LLM で確認。同一店舗とは確定しない）
+  unknown  地名・施設を特定できない     地理条件を検証できない。名前が一致しても曖昧扱い（無条件には採用しない）
 
-方式（キーワード一覧は使わず、Geocoding の結果で地名かどうかを確かめる）:
-  1. 依頼文を空白と「で」「から」「にある」「周辺」で区切り、各区切りをさらに「の」で前後に分けた候補も作る
-     （語末の「の」は区切らない: すすきの）
-  2. 各候補を Geocoding し、次をすべて満たすものだけを「地名」と認める
-       - 日本の結果
-       - 種別が行政区画・地区・駅・通りなどの地理的なもの。ホテル・商業施設などの建物は、Geocoding が部分一致でない場合だけ
-       - 結果の住所要素の名称と候補が、どちらかに含まれる関係にある（末尾の都道府県市区町村駅は除いて比較）。
-         曖昧一致で別の地名に解決されたものを除く
-  3. 認めた地名を依頼文の順に連結して Geocoding し、結果が各地名の範囲内にあればそれを採用する（例: 京都 祇園 → 祇園）。
-     範囲外なら、他のすべての地名の範囲内にある最も狭い地名を採用する
-  4. 半径: 「徒歩 N 分」→ 徒歩圏（M3 と同じ）、それ以外 → 採用した地名の viewport の対角の半分（1.5〜10km、M3 と同じ）
+地名候補の作り方:
+  1. 依頼文を空白と「で」「から」「にある」「周辺」で区切り、各区切りをさらに「の」で前後に分けた候補も作る（語末の「の」は区切らない）
+  2. 各候補を Geocoding し、地名・施設と認めたものだけを使う（曖昧一致で別の地名に解決されたものを除く）
+     候補の一部だけが地名と一致した場合（例: 札幌すすきの → 札幌市）は、残り（すすきの）も確かめ、細かい方を使う
+  3. 複数の地名は依頼文の順に連結して Geocoding し、各地名の範囲内なら採用する（例: 京都 祇園、那覇 国際通り）
 """
 import math
 import re
@@ -29,6 +28,12 @@ WALK_DETOUR = 1.5
 MIN_WALK_KM = 0.6
 AREA_MIN_KM, AREA_MAX_KM, AREA_DEFAULT_KM = 1.5, 10.0, 3.0
 SPLIT_RE = re.compile(r'\s+|で|から|にある|周辺')
+STATION_TYPES = {'train_station', 'transit_station', 'subway_station', 'light_rail_station'}
+POLITICAL_TYPES = {'locality', 'sublocality', 'sublocality_level_1', 'sublocality_level_2', 'sublocality_level_3',
+                   'sublocality_level_4', 'neighborhood', 'colloquial_area', 'administrative_area_level_1',
+                   'administrative_area_level_2', 'ward', 'political'}
+FACILITY_KM = 0.3              # 施設内の店舗とみなす最大距離（これを超えると施設外）
+ROAD_MARGIN_KM = 0.3           # 通り沿いの帯の幅
 BUILDING_TYPES = {'premise', 'subpremise', 'establishment', 'point_of_interest', 'lodging', 'shopping_mall'}
 GEO_TYPES = {'locality', 'sublocality', 'sublocality_level_1', 'sublocality_level_2', 'sublocality_level_3',
              'sublocality_level_4', 'neighborhood', 'colloquial_area', 'administrative_area_level_1',
@@ -168,10 +173,93 @@ def resolve_scope(q: str, geocode, max_workers: int = 6) -> dict:
             reason = 'narrowest_inside' if inside else 'narrowest'
     if not chosen:
         r, why = radius_km(q, None)
-        return {'area': '', 'prefecture': None, 'center': None, 'radius_km': r, 'radius_reason': why,
+        return {'area': '', 'kind': 'unknown', 'prefecture': None, 'center': None, 'radius_km': r, 'radius_reason': why,
                 'places': [], 'geo': None, 'scope_reason': 'no_place_name'}
     area, g = chosen
+    kind = kind_of(g)
     r, why = radius_km(q, g.get('viewport'))
-    return {'area': area, 'prefecture': g.get('prefecture'), 'center': (g['lat'], g['lng']), 'radius_km': r,
-            'radius_reason': why, 'places': [cd for cd, _g in places], 'scope_reason': reason,
-            'geo': {'lat': g['lat'], 'lng': g['lng'], 'region': g.get('prefecture') or '', 'country_code': 'JP'}}
+    out = {'area': area, 'kind': kind, 'prefecture': g.get('prefecture'), 'center': (g['lat'], g['lng']), 'radius_km': r,
+           'radius_reason': why, 'places': [cd for cd, _g in places], 'scope_reason': reason,
+           'geo': {'lat': g['lat'], 'lng': g['lng'], 'region': g.get('prefecture') or '', 'country_code': 'JP'}}
+    if kind == 'road':
+        out['bbox'] = g.get('viewport')
+        out['radius_reason'] = 'road_band'
+    elif kind == 'facility':
+        out['facility_name'] = area
+        out['facility_address_key'] = address_key(g.get('formatted_address') or '', g.get('prefecture'))
+        out['radius_km'], out['radius_reason'] = FACILITY_KM, 'facility'
+    return out
+
+
+def kind_of(g):
+    types = set(g.get('types') or [])
+    if 'route' in types:
+        return 'road'
+    if types & STATION_TYPES:
+        return 'station'
+    if types & POLITICAL_TYPES:
+        return 'area'
+    if types & BUILDING_TYPES:
+        return 'facility'
+    return 'area'
+
+
+DASH_RE = re.compile(r'[‐‑‒–—―−ー－-]')
+
+
+def norm_address(a: str) -> str:
+    a = unicodedata.normalize('NFKC', a or '')
+    a = re.sub(r'^日本、?\s*', '', a)
+    a = re.sub(r'〒?\d{3}-?\d{4}\s*', '', a)
+    a = a.replace('丁目', '-').replace('番地', '-').replace('番', '-').replace('号', '')
+    a = DASH_RE.sub('-', a)
+    a = re.sub(r'-+', '-', a)
+    return re.sub(r'\s+', '', a)
+
+
+def address_key(formatted: str, prefecture=None) -> str:
+    """施設の住所から「町名＋丁目・番地」部分（例: 紀尾井町4-1、六本木6-10-1）を取り出す。取れなければ空"""
+    a = norm_address(formatted)
+    if prefecture:
+        a = a.split(unicodedata.normalize('NFKC', prefecture), 1)[-1]
+    m = re.search(r'(?:.+?[市区町村郡])?(?:.+?[区])?([^\d-]+?\d+(?:-\d+)+)', a)
+    return m.group(1) if m else ''
+
+
+def _in_bbox(vp, pt, margin_km):
+    return _viewport_contains(vp, pt, margin_km)
+
+
+def _facility_name_hit(name: str, text: str) -> bool:
+    """施設名（依頼文の表記）の 5 文字以上の連続部分が、候補の住所・店名に含まれるか"""
+    n, t = unicodedata.normalize('NFKC', name or ''), unicodedata.normalize('NFKC', text or '')
+    for k in range(len(n), 4, -1):
+        for i in range(0, len(n) - k + 1):
+            if n[i:i + k] in t:
+                return True
+    return False
+
+
+def geo_verdict(scope: dict, cand: dict):
+    """
+    候補店舗（Place Details: name・address・lat・lng）が検索範囲に合うか。
+    returns (None, 理由) = 合う / ('AMBIGUOUS', 理由) = 確認できない / ('DIFFERENT', 理由) = 範囲外
+    """
+    kind = (scope or {}).get('kind') or ('unknown' if not (scope or {}).get('center') else 'area')
+    if kind == 'unknown':
+        return 'AMBIGUOUS', 'geo_unverified'
+    if cand.get('lat') is None or cand.get('lng') is None:
+        return 'AMBIGUOUS', 'no_coordinates'
+    pt = (cand['lat'], cand['lng'])
+    if kind == 'road':
+        return (None, 'on_road') if _in_bbox(scope.get('bbox'), pt, ROAD_MARGIN_KM) else ('DIFFERENT', 'off_road')
+    d = haversine_km(scope['center'], pt)
+    if kind == 'facility':
+        if d > FACILITY_KM:
+            return 'DIFFERENT', 'outside_facility'
+        key = scope.get('facility_address_key') or ''
+        addr = norm_address(cand.get('address') or '')
+        if (key and key in addr) or _facility_name_hit(scope.get('facility_name'), (cand.get('address') or '') + ' ' + (cand.get('name') or '')):
+            return None, 'in_facility'
+        return 'AMBIGUOUS', 'facility_unconfirmed'
+    return (None, 'in_area') if d <= (scope.get('radius_km') or AREA_DEFAULT_KM) else ('DIFFERENT', 'area_mismatch')

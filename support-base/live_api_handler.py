@@ -852,6 +852,8 @@ class LiveAPISession:
         shortfall = result.get('shortfall') or 0
         found = (f"確認できたお店は{total}軒で、5軒には届きませんでした。このことも正直に伝えてください。"
                  if shortfall else '')
+        if result.get('geo_unverified'):
+            found += "ご依頼の場所を特定できなかったため、お店の場所がご希望に合うかは確認できていません。このことも一言伝えてください。"
         instruction = (
             f"ご依頼（{request}）に合うお店を{total}軒、画面のカードに表示しました。{found}"
             "最初に、ご依頼の条件に合わせて選んだことを一言で伝えてください。"

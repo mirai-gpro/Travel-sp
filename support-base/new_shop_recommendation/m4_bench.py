@@ -1,31 +1,61 @@
 # -*- coding: utf-8 -*-
 """
-M4 T4 の比較試験用（プレビュー専用。NEW_SHOP_FLOW=S10 かつ M4_BENCH_TOKEN が設定されたリビジョンでだけ有効）
+M4 T4 の比較試験用（呼び出しは認証トークンと回数制限つき）（プレビュー専用。NEW_SHOP_FLOW=S10 かつ M4_BENCH_TOKEN が設定されたリビジョンでだけ有効）
 
-  33  : 元の 33 秒版の推薦（gemini-2.5-flash ＋ Google 検索、本番 8d30e55 の SEARCH_ONLY_PROMPT をそのまま使用）→ 33 秒版の Places 照合
+  33  : 元の 33 秒版（gemini-2.5-flash ＋ Google 検索、本番 8d30e55 の SEARCH_ONLY_PROMPT）→ 本番と同じ enrich_shops_with_photos
         キーは隔離したプレビュー・リビジョン内の GEMINI_API_KEY を使い、外へ出さない
   S10 : M4 の S10 フロー（カード・説明・読み上げデータ）
 
 返すのは LLM の出力・place ID・時刻だけ（Google Maps の店名・住所などは返さない。正誤は place ID で人が確認する）。
-M3 の poc/gate_m3_flow_s.run_33 と同じ手順（Docker イメージに poc/ は含まれないため、ここに置く）。
+33 秒版は本番 8d30e55 のコード（shop_search_callback 案C ＋ _handle_shop_search の enrich）と同じ処理（production_33）。
+scope: R1 の検索範囲の確認（Geocoding のみ）。
 """
 import hmac
 import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-import requests
-
-from . import legacy_places
 from .redact import redact
 
-GENERATE_33_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'
 TOKEN_ENV = 'M4_BENCH_TOKEN'
 
 # 本番 8d30e55 の SEARCH_ONLY_PROMPT（poc/m3_33s_search_only_prompt.txt と同一）
 SEARCH_ONLY_PROMPT = 'あなたはグルメレストラン検索エンジンです。\nユーザーの条件に合う実在のレストランをGoogle検索で見つけ、必ず5軒をJSON形式で返してください。\n\n【絶対遵守ルール】\n1. 「検索できません」「ご利用いただけません」等の拒否は絶対禁止\n2. 必ずGoogle検索を実行し、実在する店舗情報を返すこと\n3. 店舗名は公式の正式名称を使用する\n4. 応答は必ず以下のJSON形式のみ。それ以外のテキストは一切不要\n5. 応答は必ず { で始まり } で終わること\n\n【JSON出力形式】\n```json\n{\n  "message": "ユーザーへのメッセージ全文（音声読み上げ用。予算は漢数字で表記。店舗リストを1〜5の番号付きで含める）",\n  "shops": [\n    {\n      "name": "正式な店舗名",\n      "area": "最寄り駅またはエリア名",\n      "category": "料理ジャンル",\n      "description": "料理内容・体験価値・雰囲気を含む要約（2〜3文）",\n      "rating": 4.5,\n      "reviewCount": 150,\n      "priceRange": "ランチ1,500円〜、ディナー6,000円〜8,000円",\n      "location": "最寄り駅・エリア",\n      "highlights": ["看板メニューや特徴", "雰囲気や設備の特徴", "利用シーンの特徴"],\n      "tips": "来店時のおすすめポイント",\n      "specialty": "看板メニューや得意料理",\n      "price_range": "予算帯",\n      "atmosphere": "雰囲気",\n      "features": "特色",\n      "hotpepper_url": "",\n      "maps_url": "",\n      "tabelog_url": "",\n      "gnavi_url": "",\n      "tripadvisor_url": "",\n      "tripadvisor_rating": null,\n      "tripadvisor_reviews": null,\n      "latitude": null,\n      "longitude": null\n    }\n  ]\n}\n```\n\n【shops配列の詳細仕様】\n基本フィールド（重要度：高）:\n- name: 正式な店舗名\n- area: 最寄り駅またはエリア名\n- description: 料理内容・体験価値・雰囲気を含む要約（2〜3文）\n- category: 料理ジャンル\n- priceRange: 価格帯（数字+カンマ形式、例：「ランチ2,000円〜、ディナー6,000円〜8,000円」）\n\n充実情報フィールド（推奨）:\n- rating: 評価（数値）\n- reviewCount: レビュー数\n- location: 最寄り駅・エリア\n- highlights: 3つ程度の特徴（配列）\n- tips: 来店時のおすすめポイント\n- specialty: 看板メニューや得意料理\n- atmosphere: 雰囲気\n- features: 特色\n\n外部リンク（取得できた場合のみ）:\n- hotpepper_url, maps_url, tabelog_url, gnavi_url, tripadvisor_url\n- tripadvisor_rating, tripadvisor_reviews\n- latitude, longitude\n\n【予算表記ルール】\n- messageフィールド内: 漢数字（五千円、一万円）で音声読み上げに対応\n- priceRangeフィールド: 数字+カンマ形式（6,000円〜8,000円）でカード表示に対応\n\n【messageの構成】\n1. 導入文（条件の要約）\n2. 店舗リスト（1〜5の番号付き、各店舗2〜3文の説明、予算は漢数字）\n3. 締め文（「気になるお店はありましたか？」等）\n'
+
+
+MAX_CALLS_ENV = 'M4_BENCH_MAX_CALLS'
+_guard_lock = threading.Lock()
+_busy = threading.Lock()
+_calls = {'n': 0}
+
+
+def acquire() -> str:
+    """呼び出し制限: 同時 1 件、リビジョンの起動から合計 M4_BENCH_MAX_CALLS 件（既定 150）。returns '' or 拒否理由"""
+    limit = int(os.environ.get(MAX_CALLS_ENV, '150') or 150)
+    with _guard_lock:
+        if _calls['n'] >= limit:
+            return 'call_limit_reached'
+        if not _busy.acquire(blocking=False):
+            return 'busy'
+        _calls['n'] += 1
+        return ''
+
+
+def release():
+    try:
+        _busy.release()
+    except RuntimeError:
+        pass
+
+
+def run_scope(q: str, flow) -> dict:
+    """R1 の検索範囲の確認（Geocoding のみ。プレビュー用 Maps キーを使う）"""
+    from . import scope as S
+    sc = S.resolve_scope(q, flow.apis.geocode)
+    return {'method': 'scope', 'query': q, **{k: sc.get(k) for k in ('area', 'kind', 'radius_km', 'radius_reason',
+                                                                     'scope_reason', 'places', 'prefecture',
+                                                                     'facility_address_key')}}
 
 
 def enabled() -> bool:
@@ -38,59 +68,79 @@ def token_ok(token) -> bool:
     return bool(want) and isinstance(token, str) and hmac.compare_digest(token, want)
 
 
-def parse_33_json(text):
-    """33 秒版本番と同じ JSON 抽出（最初の { から対応する } まで）"""
-    t = (text or '').strip()
-    start = t.find('{')
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(t)):
-        if t[i] == '{':
-            depth += 1
-        elif t[i] == '}':
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(t[start:i + 1])
-                except ValueError:
-                    return None
-    return None
+def production_33(user_request: str, lang: str = 'ja'):
+    """
+    本番 8d30e55 の 33 秒版と同じ処理（app_customer_support.shop_search_callback の 案C ＋
+    live_api_handler._handle_shop_search の enrich）。違いは計測用に時刻と LLM の店名を記録することだけ。
+      - google-genai SDK・gemini-2.5-flash・system_instruction=SEARCH_ONLY_PROMPT・Google 検索ツール・
+        contents=[{"role":"user","parts":[{"text": f"検索条件: {user_request}"}]}]・生成設定は既定のまま
+      - JSON 抽出（最初の { から対応する } まで）。json.JSONDecodeError のときだけ extract_shops_from_response
+      - shops があれば area = extract_area_from_text(user_request, lang)
+      - enrich_shops_with_photos(raw_shops, area, lang)。結果が空なら raw_shops を表示（本番と同じ）
+    returns (shops_for_cards, llm_names_by_id, t_rec_ms, t_done_ms)
+    """
+    from google import genai
+    from google.genai import types
+    import api_integrations as legacy
+    t0 = time.monotonic()
+    ms = lambda: int((time.monotonic() - t0) * 1000)  # noqa: E731
+    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    config = types.GenerateContentConfig(
+        system_instruction=SEARCH_ONLY_PROMPT,
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+    )
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
+        config=config
+    )
+    assistant_text = response.text
+    t_rec = ms()
+    shops = []
+    try:
+        text = assistant_text.strip()
+        start = text.find('{')
+        if start >= 0:
+            brace_count = 0
+            end = -1
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    brace_count += 1
+                elif text[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end = i + 1
+                        break
+            if end > 0:
+                data = json.loads(text[start:end])
+                shops = data.get('shops', [])
+    except json.JSONDecodeError:
+        shops = legacy.extract_shops_from_response(assistant_text)
+    if shops is None:
+        shops = []
+    names = {id(sh): (sh.get('name', ''), sh.get('area', ''), sh.get('specialty', ''), sh.get('description', ''))
+             for sh in shops if isinstance(sh, dict)}
+    if not shops:
+        return [], names, t_rec, ms()
+    area = legacy.extract_area_from_text(user_request, lang)
+    enriched = legacy.enrich_shops_with_photos(shops, area, lang)
+    out = enriched if enriched else shops
+    return out, names, t_rec, ms()
 
 
 def run_33(q: str) -> dict:
-    gkey = os.environ.get('GEMINI_API_KEY', '')
-    if not gkey:
+    if not os.environ.get('GEMINI_API_KEY'):
         return {'method': '33', 'error': 'no_gemini_api_key', 'stores': []}
-    t0 = time.monotonic()
-    ms = lambda: int((time.monotonic() - t0) * 1000)  # noqa: E731
-    body = {'systemInstruction': {'parts': [{'text': SEARCH_ONLY_PROMPT}]},
-            'contents': [{'role': 'user', 'parts': [{'text': f'検索条件: {q}'}]}],
-            'tools': [{'google_search': {}}]}
     try:
-        r = requests.post(GENERATE_33_URL, json=body, headers={'Content-Type': 'application/json', 'x-goog-api-key': gkey},
-                          timeout=90)
-    except requests.exceptions.RequestException as e:
-        return {'method': '33', 'error': f'network:{type(e).__name__}', 'stores': []}
-    t_rec = ms()
-    if r.status_code != 200:
-        return {'method': '33', 'error': redact(f'http_{r.status_code}'), 'stores': [], 't_rec': t_rec}
-    data = r.json()
-    text = ''.join(p.get('text', '') for cd in (data.get('candidates') or [])[:1]
-                   for p in ((cd.get('content') or {}).get('parts') or []))
-    obj = parse_33_json(text) or {}
-    shops = obj.get('shops') or []
-    area = legacy_places.resolve_area(q, 'ja')
-    geo = legacy_places.region_info(area, 'ja')
-    with ThreadPoolExecutor(max_workers=7) as ex:
-        found = list(ex.map(lambda s: legacy_places.lookup(s.get('name', ''), s.get('area', ''), area, geo, 'ja'), shops))
-    t_done = ms()
+        shops, names, t_rec, t_done = production_33(q)
+    except Exception as e:                  # 本番では callback が None を返し、カード 0 件になる
+        return {'method': '33', 'error': redact(f'exception:{type(e).__name__}'), 'stores': []}
     stores = []
-    for i, (s, pdat) in enumerate(zip(shops, found), 1):
-        stores.append({'rank': i, 'rec': s.get('name', ''), 'hint': s.get('area', ''), 'path': 'legacy_places',
-                       'place_id': (pdat or {}).get('place_id'), 't_done': t_done,
-                       'specialty': s.get('specialty', ''), 'description': s.get('description', '')})
-    return {'method': '33', 'stores': stores, 't_rec': t_rec, 't_done': t_done, 'n_shops': len(shops), 'parse_ok': bool(obj)}
+    for i, sh in enumerate(shops, 1):
+        llm_name, llm_area, sp, desc = names.get(id(sh), ('', '', '', ''))
+        stores.append({'rank': i, 'rec': llm_name, 'hint': llm_area, 'path': 'legacy_enrich',
+                       'place_id': sh.get('place_id'), 't_done': t_done, 'specialty': sp, 'description': desc})
+    return {'method': '33', 'stores': stores, 't_rec': t_rec, 't_done': t_done, 'n_shops': len(names)}
 
 
 def run_s10(q: str, flow) -> dict:

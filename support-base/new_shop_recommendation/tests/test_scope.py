@@ -92,7 +92,7 @@ def test_single_char_area_and_building():
                  formatted_address='日本、〒102-8578 東京都千代田区紀尾井町4-1', partial_match=False)
     geo2['ホテルニューオータニ東京'] = hotel
     s2 = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', geo2.get)
-    assert s2['area'] == 'ホテルニューオータニ東京' and s2['radius_km'] == pytest.approx(1.5)
+    assert s2['area'] == 'ホテルニューオータニ東京' and s2['kind'] == 'facility' and s2['radius_km'] == pytest.approx(0.3)
     assert not S.is_place_name('接待に使える鉄板焼き', dict(hotel, partial_match=True))
 
 
@@ -113,3 +113,55 @@ def test_route_name():
     geo4['那覇 国際通り'] = geo4['国際通り']
     s = S.resolve_scope('那覇の国際通りで沖縄料理 3名', geo4.get)
     assert s['area'] == '那覇 国際通り' and s['radius_km'] == pytest.approx(1.5)
+
+
+# ------------------------------------------------------------------ 範囲の種類と検証（M4 指示: 地域・駅・通り・施設内・不明を区別）
+def _geo_kinds():
+    g = dict(GEO)
+    g['ホテルニューオータニ東京'] = dict(G(35.6800, 139.7330, 0.002, '東京都', ['紀尾井町', '千代田区', '東京都'],
+                                         ('establishment', 'lodging', 'point_of_interest')),
+                                       formatted_address='日本、〒102-8578 東京都千代田区紀尾井町４−１', partial_match=False)
+    g['那覇'] = G(26.21, 127.68, 0.06, '沖縄県', ['那覇市', '沖縄県'])
+    g['国際通り'] = G(26.2150, 127.6890, 0.004, '沖縄県', ['国際通り', '那覇市', '沖縄県'], ('route',))
+    g['那覇 国際通り'] = g['国際通り']
+    return g
+
+
+def test_kinds():
+    g = _geo_kinds()
+    assert S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', g.get)['kind'] == 'facility'
+    assert S.resolve_scope('那覇の国際通りで沖縄料理 3名', g.get)['kind'] == 'road'
+    assert S.resolve_scope('東京駅から徒歩5分以内の美味しいラーメン', g.get)['kind'] == 'station'
+    assert S.resolve_scope('銀座で評判の老舗の天ぷら店', g.get)['kind'] == 'area'
+    assert S.resolve_scope('美味しいお店', g.get)['kind'] == 'unknown'
+
+
+def test_facility_requires_inside_evidence():
+    sc = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', _geo_kinds().get)
+    assert sc['facility_address_key'] == '紀尾井町4-1'
+    inside = {'name': '鉄板焼 石垣', 'address': '日本、〒102-8578 東京都千代田区紀尾井町４−１ ザ・メイン アーケード階', 'lat': 35.6801, 'lng': 139.7331}
+    by_name = {'name': '鉄板焼 X', 'address': '東京都千代田区紀尾井町4 ホテルニューオータニ ガーデンタワー', 'lat': 35.6802, 'lng': 139.7332}
+    near = {'name': '鉄板焼 Y', 'address': '東京都千代田区紀尾井町3-6', 'lat': 35.6810, 'lng': 139.7340}
+    far = {'name': '鉄板焼 Z', 'address': '東京都千代田区麹町3-1', 'lat': 35.6850, 'lng': 139.7400}
+    assert S.geo_verdict(sc, inside) == (None, 'in_facility')
+    assert S.geo_verdict(sc, by_name) == (None, 'in_facility')
+    assert S.geo_verdict(sc, near) == ('AMBIGUOUS', 'facility_unconfirmed')     # 周辺の店で置き換えない
+    assert S.geo_verdict(sc, far) == ('DIFFERENT', 'outside_facility')
+
+
+def test_road_band_not_whole_city():
+    sc = S.resolve_scope('那覇の国際通りで沖縄料理 3名', _geo_kinds().get)
+    assert sc['radius_reason'] == 'road_band'
+    assert S.geo_verdict(sc, {'lat': 26.2160, 'lng': 127.6900})[0] is None                   # 通り沿い
+    assert S.geo_verdict(sc, {'lat': 26.2120, 'lng': 127.6790}) == ('DIFFERENT', 'off_road')  # 那覇市内だが通りから約 1km
+
+
+def test_unknown_scope_is_not_verified():
+    sc = S.resolve_scope('美味しいお店', GEO.get)
+    assert S.geo_verdict(sc, {'lat': 35.0, 'lng': 139.0}) == ('AMBIGUOUS', 'geo_unverified')
+
+
+def test_area_radius_check():
+    sc = S.resolve_scope('銀座で評判の老舗の天ぷら店', GEO.get)
+    assert S.geo_verdict(sc, {'lat': 35.672, 'lng': 139.766})[0] is None
+    assert S.geo_verdict(sc, {'lat': 35.690, 'lng': 139.700}) == ('DIFFERENT', 'area_mismatch')
