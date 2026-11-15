@@ -43,6 +43,7 @@ DETAILS_FIELDS = ('name,rating,user_ratings_total,formatted_address,address_comp
 HARD_REJECT = {'closed', 'not_a_store', 'prefecture_mismatch', 'area_mismatch'}
 STAGE_EVENT = 'shop_search_stage'
 DETAIL_EVENT = 'shop_card_detail'
+PHOTO_EVENT = 'shop_card_photo'
 
 
 # ------------------------------------------------------------------ 外部 API（既定の実装。テストでは差し替える）
@@ -76,6 +77,11 @@ class HttpApis:
                 'place_id': r.get('place_id'),
                 'prefecture': pref, 'country_code': cc, 'types': r.get('types') or [], 'component_names': names,
                 'formatted_address': r.get('formatted_address') or '', 'partial_match': bool(r.get('partial_match'))}
+
+    def photo(self, place_id):
+        """カードの写真（Places API (New)。プレビュー用 Maps キーをヘッダーで送る）"""
+        from .place_photos import fetch_shop_photo
+        return fetch_shop_photo(self.mkey, place_id)
 
     def place_name(self, place_id):
         """施設の確認用に Place Details の正式名だけを取得（プレビュー用 Maps キー）"""
@@ -297,7 +303,7 @@ def match_store(rec, scope, apis, details_pool, ms):
     return out
 
 
-def make_card(store, display_rank, request_id, stage, desc=None):
+def make_card(store, display_rank, request_id, stage, desc=None, photo=None):
     cd = c.Candidate(rank=store['rank'], name=store['rec'], area_hint=store['hint'],
                      specialty=(desc or ('', ''))[0], reason=(desc or ('', ''))[1])
     card = build_card(c.Verification(cd, c.VERIFIED, store['path'], place=store['place']), display_rank, request_id)
@@ -306,6 +312,8 @@ def make_card(store, display_rank, request_id, stage, desc=None):
     card['stage'] = stage
     card['detail_pending'] = desc is None
     card['geo_check'] = store.get('geo')                    # 地理条件の検証結果（未確認なら画面に明示する）
+    card['image'] = (photo or {}).get('image')              # 写真（キーを含まない photoUri）。無ければ既定の画像
+    card['image_attributions'] = (photo or {}).get('attributions') or []
     return card
 
 
@@ -332,6 +340,7 @@ class FlowS:
         m = {'request_id': request_id, 'flow': f'S{self.n}', 'git_sha': os.environ.get('GIT_SHA', 'unknown'),
              'events': {}, 'stores': {}, 'a_error': None, 'b_error': None, 'scope': None}
         stores_in, desc, final_box = {}, {}, {}
+        photos, sent_pids = {}, set()          # 写真（place_id → 写真）と、カードを送った place_id
         store_pool = ThreadPoolExecutor(max_workers=self.store_workers, thread_name_prefix='s10-store')
         details_pool = ThreadPoolExecutor(max_workers=self.details_workers, thread_name_prefix='s10-det')
         misc_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='s10-misc')
@@ -341,12 +350,16 @@ class FlowS:
                 m['events'].setdefault(k, ms() if v is None else v)
 
         def send_preview(st):
-            card = make_card(st, 1, request_id, 'preview', desc.get(st['rank']))
+            card = make_card(st, 1, request_id, 'preview', desc.get(st['rank']), photos.get(st['place_id']))
+            sent_pids.add(st['place_id'])
             emit(STAGE_EVENT, {'request_id': request_id, 'stage': 'preview', 'cards': [card], 't_ms': ms()})
+            send_late_photos([card])
             mark('preview_sent')
 
         def finalize(cards, why):
-            fc = [make_card(st, i + 1, request_id, 'final', desc.get(st['rank'])) for i, st in enumerate(cards)]
+            fc = [make_card(st, i + 1, request_id, 'final', desc.get(st['rank']), photos.get(st['place_id']))
+                  for i, st in enumerate(cards)]
+            sent_pids.update(st['place_id'] for st in cards)
             status = c.COMPLETE if len(fc) >= c.DISPLAY_COUNT else (c.PARTIAL if fc else c.EMPTY)
             final_box.update(cards=fc, stores=cards, status=status, why=why)
             for st in cards:
@@ -357,14 +370,37 @@ class FlowS:
             emit(STAGE_EVENT, {'request_id': request_id, 'stage': 'final', 'cards': fc, 'status': status,
                                'shortfall': max(0, c.DISPLAY_COUNT - len(fc)), 'reason': why, 'scope_kind': sk,
                                't_ms': ms()})
+            send_late_photos(fc)
             mark('final_sent')
             done_evt.set()
+
+        def send_late_photos(cards):
+            """カードを作った直後に届いた写真（カードに入らなかったもの）を送る"""
+            for cd in cards:
+                ph = photos.get(cd.get('place_id'))
+                if ph and not cd.get('image'):
+                    emit(PHOTO_EVENT, {'request_id': request_id, 'place_id': cd['place_id'], 'image': ph['image'],
+                                       'image_attributions': ph['attributions'], 't_ms': ms()})
 
         def handle(pv, fc, why):
             if pv is not None:
                 send_preview(pv)
             if fc is not None:
                 finalize(fc, 'top5_decided' if len(fc) >= c.DISPLAY_COUNT and why != 'deadline' else why)
+
+        def get_photo(pid):
+            """採用された店の写真を取り、カードを送った後なら写真だけを送る（カードの表示を待たせない）"""
+            try:
+                ph = self.apis.photo(pid)
+            except Exception:
+                ph = None
+            if not ph:
+                return
+            photos[pid] = ph
+            mark(f'photo_{pid}')
+            if pid in sent_pids:
+                emit(PHOTO_EVENT, {'request_id': request_id, 'place_id': pid, 'image': ph['image'],
+                                   'image_attributions': ph['attributions'], 't_ms': ms()})
 
         scope_f = misc_pool.submit(S.resolve_scope, user_request, self.apis.geocode, getattr(self.apis, 'place_name', None))
 
@@ -377,6 +413,8 @@ class FlowS:
                 m['stores'][rec['rank']]['verdicts'] = st['verdicts']
             if st.get('place_id'):
                 mark('first_adopted', st['t_done'])
+                if hasattr(self.apis, 'photo'):
+                    threading.Thread(target=get_photo, args=(st['place_id'],), name='s10-photo', daemon=True).start()
             pv, fc = disp.on_decided(st)
             handle(pv, fc, 'all_decided')
 

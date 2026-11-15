@@ -258,3 +258,45 @@ def test_unknown_scope_name_match_goes_to_llm_and_is_flagged():
     fin = rec.stage('final')[0]
     assert fin['scope_kind'] == 'unknown' and res['geo_unverified'] is True
     assert all(cd['geo_check'] == 'geo_unverified' for cd in fin['cards'])
+
+
+def test_photos_are_added_without_delaying_cards():
+    class WithPhoto(FakeApis):
+        def photo(self, pid):
+            sl(6000 if pid == 'P1' else 200)          # 1 位の写真は最終カードより後に届く
+            return None if pid == 'P3' else {'image': f'https://lh3.googleusercontent.com/{pid}',
+                                              'attributions': [{'displayName': '撮影者', 'uri': 'https://maps.google.com/c/1'}]}
+    apis = WithPhoto([store(i) for i in range(1, 8)])
+    flow = F.FlowS(apis, deadline_sec=10 * SCALE)
+    rec = Rec()
+    res = flow.run('横浜で美味しい焼き鳥屋を5軒', emit=rec, request_id='RID')
+    time.sleep(8000 / 1000 * SCALE)
+    fin = rec.stage('final')[0]
+    by = {cd['place_id']: cd for cd in fin['cards']}
+    assert by['P2']['image'].endswith('/P2') and by['P2']['image_attributions'][0]['displayName'] == '撮影者'
+    assert by['P1']['image'] is None and by['P3']['image'] is None        # まだ届いていない／写真なし
+    late = [p for n, p in rec.ev if n == F.PHOTO_EVENT]
+    assert any(p['place_id'] == 'P1' and p['image'].endswith('/P1') for p in late)
+    assert not any(p['place_id'] == 'P3' for p in late)
+    assert 'googleusercontent' not in json.dumps(res['metrics'])           # 写真 URL はログに残さない
+
+
+def test_place_photos_key_in_header_only():
+    from new_shop_recommendation import place_photos as PP
+    calls = []
+
+    class H:
+        def get(self, url, params=None, headers=None, timeout=None):
+            calls.append((url, params, headers))
+
+            class R:
+                status_code = 200
+
+                def json(self_inner):
+                    if url.endswith('/media'):
+                        return {'photoUri': 'https://lh3.googleusercontent.com/x'}
+                    return {'photos': [{'name': 'places/P/photos/1', 'authorAttributions': [{'displayName': 'A', 'uri': 'https://maps.google.com/c/1'}]}]}
+            return R()
+    out = PP.fetch_shop_photo('SECRET-KEY', 'P', http=H())
+    assert out == {'image': 'https://lh3.googleusercontent.com/x', 'attributions': [{'displayName': 'A', 'uri': 'https://maps.google.com/c/1'}]}
+    assert all('SECRET-KEY' not in str(u) + str(p) for u, p, _h in calls) and all(h['X-Goog-Api-Key'] == 'SECRET-KEY' for *_x, h in calls)
