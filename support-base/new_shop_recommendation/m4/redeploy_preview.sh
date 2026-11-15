@@ -17,7 +17,7 @@ SERVICE="travel-sp-base"
 BASE_REVISION="travel-sp-base-00060-car"
 TAG="m4s10"
 BRANCH="preview-m4s10-backend"
-EXPECTED_SHA="d66d673392d9d4c56833cf2c7f0fd45f0ea4d200"
+EXPECTED_SHA="2128aeaad976e041fdc584fad3d1431a7f651f4d"
 AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${SERVICE}/${SERVICE}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
