@@ -9,7 +9,7 @@
 # =====================================================================
 set -euo pipefail
 PROJECT_ID="ai-avator-492205"
-REVISION="travel-sp-base-m4s10-d66d673"
+REVISION="travel-sp-base-m4s10-2128aea"
 BRANCH="feature/new-shop-recommendation"
 EXPECTED_SHA="3cb6177f0464ea9fdc6cb221a5ad9c9668558514"
 CONSOLE_LOG="${1:?ブラウザのコンソールログのファイルを指定してください}"
