@@ -3,7 +3,7 @@
 #   bash ~/m4_scope_debug.sh
 set -euo pipefail
 BRANCH="feature/new-shop-recommendation"
-EXPECTED_SHA="4f75ce6158448ac58fae17ff334ec5510311d81e"
+EXPECTED_SHA="c52fda0b9eea9f18f5a3dc39d36a8dc08cd0cf65"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 git init -q "${WORK}/src"
@@ -14,4 +14,4 @@ python3 -m venv "${WORK}/venv" && "${WORK}/venv/bin/pip" install -q --disable-pi
 cd "${WORK}/src/support-base"
 "${WORK}/venv/bin/python" -I -c "import sys; sys.path.insert(0, '.'); sys.argv = ['d'] + sys.argv[1:]
 from new_shop_recommendation.m4 import scope_debug; scope_debug.main()" \
-  '札幌すすきので美味しいジンギスカン' 'ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名' '京都の祇園で記念日に行くカウンター割烹 予算1人2万円 2名'
+  'ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名'

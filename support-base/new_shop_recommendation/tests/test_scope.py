@@ -217,3 +217,19 @@ def test_facility_confirmed_by_official_name():
 def test_combined_name_resolving_to_a_business_is_not_used():
     s = S.resolve_scope('京都の祇園で記念日に行くカウンター割烹 予算1人2万円 2名', _real().get)
     assert s['kind'] == 'area' and s['area'] == '祇園' and s['radius_km'] == pytest.approx(1.5)   # 施設 0.3km にしない
+
+
+@pytest.mark.parametrize('cand,official,want', [
+    ('ホテルニューオータニ東京', 'ホテルニューオータニ ザ・メイン', True),      # 実地（m4/scope_debug）
+    ('六本木ヒルズ', '六本木ヒルズ森タワー', True),
+    ('ホテルニューオータニ東京', '紀尾井町ビル', False),
+    ('ホテルニューオータニ東京', 'ホテルオークラ東京', False),                 # 共通は「ホテル」「東京」だけ
+    ('東京ミッドタウン', '東京駅', False),
+])
+def test_facility_name_matches(cand, official, want):
+    assert S.facility_name_matches(cand, official) is want
+
+
+def test_hotel_with_official_main_building_name():
+    s = S.resolve_scope('ホテルニューオータニ東京の中で接待に使える鉄板焼き 4名', _real().get, {'HOTEL1': 'ホテルニューオータニ ザ・メイン'}.get)
+    assert s['kind'] == 'facility' and s['facility_address_key'] == '紀尾井町4-1'
