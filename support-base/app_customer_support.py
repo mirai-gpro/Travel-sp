@@ -59,6 +59,25 @@ def _get_new_shop_orchestrator():
         return _new_shop_orchestrator
 
 
+# M4 プレビュー専用: R2.0 の会話プロンプト（486dace の prompts/concierge_v11_{ja,en}.txt をそのまま同梱。GCS は変えない）
+_concierge_v11_cache = None
+
+
+def _concierge_v11():
+    global _concierge_v11_cache
+    if _concierge_v11_cache is None:
+        out = {}
+        for lang in ('ja', 'en'):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts', f'concierge_v11_{lang}.txt')
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    out[lang] = f.read()
+            except FileNotFoundError:
+                logger.warning(f"[Prompt] concierge_v11 がありません: {path}")
+        _concierge_v11_cache = out
+    return _concierge_v11_cache
+
+
 # M4 プレビュー専用: NEW_SHOP_FLOW=S10 のときだけ S10 フロー（既定は上の新エンジンのまま）
 _new_shop_flow_s = None
 
@@ -843,8 +862,15 @@ def handle_live_start(data):
         except Exception as e:
             logger.warning(f"[LiveAPI] プロファイル取得エラー: {e}")
 
-    system_prompt = build_system_instruction(mode, user_profile=user_profile,
-                                               system_prompts=SYSTEM_PROMPTS, language=language)
+    from new_shop_recommendation import flow_s as _flow_s_prompt
+    if mode == 'concierge' and _flow_s_prompt.enabled() and language in _concierge_v11():
+        # M4 プレビュー専用（NEW_SHOP_FLOW=S10）: R2.0 の会話（486dace の concierge_v11、イメージ内のファイル）を使う。GCS は変更しない
+        system_prompt = build_system_instruction(mode, user_profile=user_profile,
+                                                   system_prompts={'concierge': _concierge_v11()}, language=language)
+        logger.info(f"[LiveAPI] concierge_v11（R2.0 の会話）を使用: lang={language}")
+    else:
+        system_prompt = build_system_instruction(mode, user_profile=user_profile,
+                                                   system_prompts=SYSTEM_PROMPTS, language=language)
 
     # ショップ検索コールバック: 新ショップ推薦エンジンへのアダプター
     # （推薦・照合・再試行のロジックは持たない。旧 gemini-2.5-flash + Google 検索方式は使わない）

@@ -246,6 +246,24 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     )
 )
 
+# M4 プレビュー専用（NEW_SHOP_FLOW=S10 のコンシェルジュ）: R2.0（486dace）の search_shops の説明。concierge_v11 の「同意してから呼ぶ」と揃える
+# （R2.0 の area 引数は使わない。S10 は検索範囲を R1 で決める）
+SEARCH_SHOPS_DECLARATION_R20 = types.FunctionDeclaration(
+    name="search_shops",
+    behavior=types.Behavior.BLOCKING,
+    description="お客様が条件の確認に承諾したときだけ呼ぶ。推薦システムにお店の候補を依頼する。",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "user_request": types.Schema(
+                type="STRING",
+                description="確認でお客様に伝えた条件の要約。お客様が言っていない条件は入れない。例: '恵比寿 イタリアン'、'恵比寿 デート イタリアン 予算1万円 2名'"
+            ),
+        },
+        required=["user_request"]
+    )
+)
+
 UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
     name="update_user_profile",
     behavior=types.Behavior.BLOCKING,
@@ -408,7 +426,10 @@ class LiveAPISession:
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
             # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+            from new_shop_recommendation import flow_s as _flow_s_decl
+            search_decl = (SEARCH_SHOPS_DECLARATION_R20 if self.mode == 'concierge' and _flow_s_decl.enabled()
+                           else SEARCH_SHOPS_DECLARATION)       # M4 プレビュー専用の切り替え（既定は従来の説明）
+            config["tools"] = [types.Tool(function_declarations=[search_decl, UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
