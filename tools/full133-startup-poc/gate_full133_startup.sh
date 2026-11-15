@@ -10,7 +10,7 @@
 # - 比べる構成: A 現行 / B 選択中 ZIP の先読み / C buildModelTexture の TypedArray 版 / D B+C+完成後の一括表示
 # - 結果: ~/full133_startup_results.json と ~/full133_startup_report.txt（途中で失敗しても、そこまでの結果と原因を書く）
 #         実行ログ: ~/full133_startup_run.log
-# - 所要時間の目安: 40〜60 分（PC 想定とスマホ想定の両方。FULL133_PROFILES=pc で PC 想定だけにできる）
+# - 所要時間の目安: 70〜90 分（PC 想定とスマホ想定の両方。FULL133_PROFILES=pc で PC 想定だけにできる）
 # - 作業ディレクトリは終了時に消す（FULL133_KEEP=1 で残す）
 # =====================================================================
 set -uo pipefail
@@ -78,9 +78,10 @@ if [ "${NODE_MAJOR}" -lt 18 ]; then step "Node.js" "NG: $(node -v)（18 以上�
 step "Node.js" "OK $(node -v) / npm $(npm -v)"
 
 # ---- 2. 固定 SHA の取得 ----
+say "GitHub から取得中（固定 SHA だけ・約 300MB。1〜3 分）..."
 git init -q "${SRC}" && git -C "${SRC}" remote add origin "${REPO}"
-if ! GIT_TERMINAL_PROMPT=0 git -C "${SRC}" fetch -q --depth=50 origin "${BRANCH}" >> "${LOG}" 2>&1; then step "GitHub から取得" "NG: ${BRANCH} を取得できません"; exit 1; fi
-if ! git -C "${SRC}" checkout -q "${SHA}" >> "${LOG}" 2>&1; then step "GitHub から取得" "NG: 固定 SHA ${SHA:0:7} が ${BRANCH} にありません"; exit 1; fi
+if ! GIT_TERMINAL_PROMPT=0 git -C "${SRC}" fetch -q --depth=1 origin "${SHA}" >> "${LOG}" 2>&1; then step "GitHub から取得" "NG: 固定 SHA ${SHA:0:7} を取得できません"; exit 1; fi
+if ! git -C "${SRC}" checkout -q FETCH_HEAD >> "${LOG}" 2>&1; then step "GitHub から取得" "NG: 展開に失敗しました"; exit 1; fi
 [ "$(git -C "${SRC}" rev-parse HEAD)" = "${SHA}" ] || { step "GitHub から取得" "NG: SHA が一致しません"; exit 1; }
 step "GitHub から取得" "OK ${BRANCH} ${SHA:0:7}"
 
@@ -101,6 +102,7 @@ grep -q "__FULL133_POC_OPT_BUILD" "${SRC}"/dist/assets/gaussian-splat-renderer-f
 step "フロントのビルド" "OK"
 
 # ---- 5. 計測ツールの依存 ----
+say "計測ツールの依存をインストール中..."
 if ! (cd "${TOOLS}" && npm ci --no-audit --no-fund >> "${LOG}" 2>&1); then step "計測ツールの依存" "NG: npm ci に失敗"; exit 1; fi
 step "計測ツールの依存" "OK"
 
@@ -108,7 +110,7 @@ step "計測ツールの依存" "OK"
 ZIPS=( "${SRC}/public/avatar/uika-meruru02-full133.zip" )
 for z in "${SRC}"/public/avatar/uika-*-full133.zip; do [ "${z}" != "${ZIPS[0]}" ] && ZIPS+=( "${z}" ); done
 say "buildModelTexture のベンチマーク: 代表 1 体（uika-meruru02-full133）"
-(cd "${TOOLS}" && node bench_bmt.mjs "${SRC}/${PKG_FILE}" "${ZIPS[0]}" > "${WORK}/bmt_first.json" 2>> "${LOG}")
+(cd "${TOOLS}" && node bench_bmt.mjs "${SRC}/${PKG_FILE}" "${ZIPS[0]}" > "${WORK}/bmt_first.json" 2> >(tee -a "${LOG}" >&2))
 FIRST_OK="$(node -e '
   const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
   const ok = r.length > 0 && r.every(x => !x.error) && new Set(r.map(x => x.sha256Int)).size === 1 && new Set(r.map(x => x.sha256Float)).size === 1;
@@ -116,7 +118,7 @@ FIRST_OK="$(node -e '
 if [ "${FIRST_OK}" = "1" ]; then
   step "buildModelTexture（代表 1 体）" "OK 旧と新の出力が一致"
   say "buildModelTexture のベンチマーク: 残り $(( ${#ZIPS[@]} - 1 )) 体（1 体ずつ）"
-  (cd "${TOOLS}" && node bench_bmt.mjs "${SRC}/${PKG_FILE}" "${ZIPS[@]:1}" > "${WORK}/bmt_rest.json" 2>> "${LOG}")
+  (cd "${TOOLS}" && node bench_bmt.mjs "${SRC}/${PKG_FILE}" "${ZIPS[@]:1}" > "${WORK}/bmt_rest.json" 2> >(tee -a "${LOG}" >&2))
   node -e 'const fs = require("fs"); const a = JSON.parse(fs.readFileSync(process.argv[1])); let b = []; try { b = JSON.parse(fs.readFileSync(process.argv[2])); } catch (e) {} fs.writeFileSync(process.argv[3], JSON.stringify(a.concat(b)));' \
     "${WORK}/bmt_first.json" "${WORK}/bmt_rest.json" "${WORK}/bmt.json" 2>> "${LOG}"
   step "buildModelTexture（全体）" "実行済み（結果は表を参照）"
@@ -151,8 +153,8 @@ SERVER_PID=$!
 for i in $(seq 1 30); do curl -fs -o /dev/null http://127.0.0.1:4411/health && curl -fs -o /dev/null http://127.0.0.1:4410/concierge/ && break; sleep 1; done
 if ! curl -fs -o /dev/null http://127.0.0.1:4410/concierge/; then step "ローカルのサーバー" "NG: 起動しません"; exit 0; fi
 step "ローカルのサーバー" "OK"
-say "ブラウザの計測（A〜D・キャッシュなし／あり・各 ${FULL133_E2E_REPS:-3} 回・${FULL133_PROFILES:-pc,mobile}）。時間がかかります..."
-if (cd "${TOOLS}" && node e2e.mjs http://127.0.0.1:4410 "${WORK}/e2e.json" 2>> "${LOG}"); then
+say "ブラウザの計測（A〜D・キャッシュなし／あり・各 ${FULL133_E2E_REPS:-3} 回・${FULL133_PROFILES:-pc,mobile}）。全 52 件で 65〜80 分。1 件ずつ表示します..."
+if (cd "${TOOLS}" && node e2e.mjs http://127.0.0.1:4410 "${WORK}/e2e.json" 2> >(tee -a "${LOG}" >&2)); then
   step "ブラウザの計測" "実行済み（結果は表を参照）"
 else
   step "ブラウザの計測" "NG: 途中で失敗（そこまでの結果を表に出します）"

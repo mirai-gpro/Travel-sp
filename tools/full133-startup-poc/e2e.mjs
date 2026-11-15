@@ -101,9 +101,9 @@ async function oneLoad(ctx, prof, cfg, userDir) {
           await ctx.addInitScript({ path: path.join(HERE, 'seed_full133.js') });
           await ctx.addInitScript({ path: path.join(HERE, 'probe.js') });
           for (const cache of ['cold', 'warm']) {
-            process.stderr.write(`[e2e] ${pname} ${cfg} rep${rep} ${cache} ...\n`);
             const r = await oneLoad(ctx, prof, cfg, userDir);
             results.runs.push({ profile: pname, config: cfg, rep, cache, ...r });
+            process.stderr.write(`[e2e] ${results.runs.length}/${PROFILES.length * CONFIGS.length * REPS * 2} 件 ${pname} ${cfg} ${cache === 'cold' ? '初回' : '2回目'} rep${rep + 1}: ${r.startFailed ? '起動失敗' : r.timedOut ? '時間切れ' : '完了'}（${(r.wallMs / 1000).toFixed(0)} 秒）\n`);
             save();
           }
           // ZIP の版が変わったときに、保存分を使わないか（B・D の rep0 だけ）
