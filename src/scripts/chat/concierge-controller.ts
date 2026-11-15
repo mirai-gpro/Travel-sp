@@ -205,6 +205,13 @@ export class ConciergeController extends CoreController {
       console.log('[Concierge] shop_search_result:', data?.status, data?.search_seq);
       // 待機画面は状態に関係なく消す（現行どおり）
       this.hideWaitOverlay();
+      // S10: 段階表示（shop_search_stage）で最終カードを表示済みの検索は、描き直さない（スクロールもしない）
+      if (data?.request_id && data.request_id === this.m4StagedRid) {
+        console.log('[M4] ' + JSON.stringify({ ev: 'result_recv', rid: data.request_id, n: (data.shops || []).length,
+          status: data.status, perf: performance.now() }));
+        if ((data.shops || []).length > 0) this.currentShops = data.shops;
+        return;
+      }
       this.applySearchOutcome(data, data?.shops || []);
     });
   }
