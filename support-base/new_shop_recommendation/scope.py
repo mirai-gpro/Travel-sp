@@ -136,10 +136,32 @@ def _name_norm(s):
     return PUNCT_RE.sub('', unicodedata.normalize('NFKC', s or ''))
 
 
+def _lcs_len(a, b):
+    best = 0
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
 def facility_name_matches(cand: str, official: str) -> bool:
-    """施設の正式名（Place Details）と依頼の表記が、4 文字以上でどちらかに含まれる関係にあるか"""
+    """
+    施設の正式名（Place Details）と依頼の表記が同じ施設を指すか。
+    どちらかに含まれる関係、または共通する連続部分が 5 文字以上で短い方の 6 割以上
+    （実地: 依頼「ホテルニューオータニ東京」⇔ 正式名「ホテルニューオータニ ザ・メイン」）
+    """
     a, b = _name_norm(cand), _name_norm(official)
-    return len(a) >= 4 and len(b) >= 4 and (a in b or b in a)
+    if len(a) < 4 or len(b) < 4:
+        return False
+    if a in b or b in a:
+        return True
+    n = _lcs_len(a, b)
+    return n >= 5 and n >= 0.6 * min(len(a), len(b))
 
 
 def resolve_scope(q: str, geocode, place_name=None, max_workers: int = 6) -> dict:
