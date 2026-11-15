@@ -158,7 +158,12 @@ def run_s10(q: str, flow) -> dict:
         a.join(max(0, t_end - time.monotonic()))
     final = next((p for ev, p in events if ev == 'shop_search_stage' and p.get('stage') == 'final'), None)
     preview = next((p for ev, p in events if ev == 'shop_search_stage' and p.get('stage') == 'preview'), None)
-    details = {p['place_id']: (p['specialty'], p['reason'], p['t_ms']) for ev, p in events if ev == 'shop_card_detail'}
+    details, summaries = {}, {}
+    for ev, p in events:
+        if ev == 'shop_card_detail' and 'reason' in p:
+            details[p['place_id']] = (p.get('specialty', ''), p['reason'], p['t_ms'])
+        if ev == 'shop_card_detail' and 'summary' in p:
+            summaries[p['place_id']] = p['summary']
     cards = (final or {}).get('cards') or []
     stores = []
     for cd in cards:
@@ -169,7 +174,8 @@ def run_s10(q: str, flow) -> dict:
             sp, rs, t = ((cd.get('highlights') or [''])[0], cd.get('description', ''),
                          None if cd.get('detail_pending') else (final or {}).get('t_ms'))
         stores.append({'rank': cd.get('recommend_rank'), 'rec': cd.get('llm_name'), 'hint': cd.get('area'),
-                       'place_id': pid, 'specialty': sp, 'description': rs, 't_detail': t})
+                       'place_id': pid, 'specialty': sp, 'description': rs, 't_detail': t,
+                       'summary': summaries.get(pid) or cd.get('summary') or ''})
     m = res.get('metrics') or {}
     return {'method': 'S10', 'status': res.get('status'), 'shortfall': res.get('shortfall'), 'final_reason': res.get('final_reason'),
             't_preview': (preview or {}).get('t_ms'), 't_final': (final or {}).get('t_ms'), 'stores': stores,

@@ -27,10 +27,11 @@ class FakeApis:
               'pid'}]
     """
 
-    def __init__(self, stores, b_delay_ms=4000, b_per_item_ms=900, a_error=None):
+    def __init__(self, stores, b_delay_ms=4000, b_per_item_ms=900, a_error=None, s_delay_ms=1500):
         self.stores, self.b_delay, self.b_per, self.a_error = stores, b_delay_ms, b_per_item_ms, a_error
+        self.s_delay = s_delay_ms
         self.by_name = {s['name']: s for s in stores}
-        self.calls = {'search': 0, 'details': 0, 'select': 0, 'a': 0, 'b': 0}
+        self.calls = {'search': 0, 'details': 0, 'select': 0, 'a': 0, 'b': 0, 's': 0}
         self.lock = threading.Lock()
 
     def _n(self, k):
@@ -87,14 +88,26 @@ class FakeApis:
                                                                ensure_ascii=False))
             on_text(']}')
             return None
-        self._n('b')
         lst = json.loads(body['input'].split('【推薦店舗】\n', 1)[1])
+        if '概要（summary）' in body['input']:
+            self._n('s')
+            sl(self.s_delay)
+            on_text('{"candidates": [')
+            for i, it in enumerate(lst):
+                sl(150)
+                on_text(('' if i == 0 else ', ') + json.dumps({'rank': it['rank'], 'name': it['name'], 'summary': f'概要{it["rank"]}'},
+                                                               ensure_ascii=False))
+            on_text(']}')
+            return None
+        self._n('b')
         sl(self.b_delay)
         on_text('{"candidates": [')
         for i, it in enumerate(lst):
             sl(self.b_per)
             on_text(('' if i == 0 else ', ') + json.dumps({'rank': it['rank'], 'name': it['name'], 'specialty': f'特徴{it["rank"]}',
-                                                           'reason': f'理由{it["rank"]}'}, ensure_ascii=False))
+                                                           'reason': f'理由{it["rank"]}', 'category': '焼き鳥',
+                                                           'highlights': [f'h{it["rank"]}a', f'h{it["rank"]}b'], 'tips': f'tips{it["rank"]}'},
+                                                          ensure_ascii=False))
         on_text(']}')
         return None
 
@@ -116,12 +129,15 @@ class Rec:
         return [p for n, p in self.ev if n == F.STAGE_EVENT and p['stage'] == st]
 
     def details(self):
-        return [p for n, p in self.ev if n == F.DETAIL_EVENT]
+        return [p for n, p in self.ev if n == F.DETAIL_EVENT and 'reason' in p]
+
+    def summaries(self):
+        return [p for n, p in self.ev if n == F.DETAIL_EVENT and 'summary' in p]
 
 
 def run(stores, deadline=10.0, **kw):
     apis = FakeApis(stores, **kw)
-    flow = F.FlowS(apis, deadline_sec=deadline * SCALE)
+    flow = F.FlowS(apis, deadline_sec=deadline * SCALE, summary_wait_sec=2500 / 1000 * SCALE)
     rec = Rec()
     res = flow.run('横浜で美味しい焼き鳥屋を5軒', emit=rec, request_id='RID')
     return res, rec, apis, flow
@@ -138,7 +154,8 @@ def test_two_stage_preview_then_rank_ordered_final_and_details_after():
     assert pv[0]['t_ms'] <= fin[0]['t_ms']
     assert all(cd['maps_attribution'] and cd['maps_url'] for cd in fin[0]['cards'] + pv[0]['cards'])   # 出典
     assert all(cd['detail_pending'] for cd in fin[0]['cards'])                                 # 説明は後から
-    assert res['narration'] == [{'number': i, 'name': f'焼鳥 店{i}', 'area': '関内'} for i in range(1, 6)]   # 方式 D
+    assert res['narration'] == [{'number': i, 'name': f'焼鳥 店{i}', 'area': '関内', 'summary': f'概要{i}'}
+                                for i in range(1, 6)]                                    # 方式 D ＋ 概要（カード冒頭と同じ）
     assert res['narration_mode'] == 'D' and res['status'] == c.COMPLETE
     flow.last_a_thread.join(5)
     det = rec.details()
@@ -300,3 +317,61 @@ def test_place_photos_key_in_header_only():
     out = PP.fetch_shop_photo('SECRET-KEY', 'P', http=H())
     assert out == {'image': 'https://lh3.googleusercontent.com/x', 'attributions': [{'displayName': 'A', 'uri': 'https://maps.google.com/c/1'}]}
     assert all('SECRET-KEY' not in str(u) + str(p) for u, p, _h in calls) and all(h['X-Goog-Api-Key'] == 'SECRET-KEY' for *_x, h in calls)
+
+
+
+def test_card_fields_like_33s_and_summary_for_live():
+    class Rich(FakeApis):
+        def extra(self, pid):
+            return {'image': f'https://lh3.googleusercontent.com/{pid}', 'attributions': [], 'price_range': '¥3,000〜¥4,000',
+                    'type_name': '焼き鳥店'}
+
+        def links(self, st, scope):
+            return {'hotpepper_url': 'https://www.hotpepper.jp/x', 'tabelog_url': 'https://tabelog.com/kanagawa/rstLst/?sw=x',
+                    'gnavi_url': 'https://www.google.com/search?q=x'}
+    apis = Rich([store(i) for i in range(1, 8)], b_delay_ms=500, b_per_item_ms=200, s_delay_ms=300)
+    flow = F.FlowS(apis, deadline_sec=10 * SCALE, summary_wait_sec=2500 / 1000 * SCALE)
+    rec = Rec()
+    res = flow.run('横浜で美味しい焼き鳥屋を5軒', emit=rec, request_id='RID')
+    flow.last_a_thread.join(5)
+    assert [x['summary'] for x in res['narration']] == [f'概要{i}' for i in range(1, 6)]     # Live が読み上げる概要
+    det = {p['place_id']: p for p in rec.details()}
+    assert det['P1']['category'] == '焼き鳥' and det['P1']['highlights'] == ['h1a', 'h1b'] and det['P1']['tips'] == 'tips1'
+    extras = [p for n, p in rec.ev if n == F.EXTRA_EVENT]
+    merged = {}
+    for p in extras:
+        merged.setdefault(p['place_id'], {}).update(p)
+    for cd in rec.stage('final')[0]['cards']:
+        got = dict(cd, **merged.get(cd['place_id'], {}))
+        assert (got.get('priceRange') or got.get('price_range')) == '¥3,000〜¥4,000'      # 価格帯は Places の値
+        assert got.get('hotpepper_url') and got.get('tabelog_url') and got.get('gnavi_url')
+        assert got.get('image', '').startswith('https://lh3.googleusercontent.com/')
+
+
+def test_summary_wait_is_capped():
+    apis = FakeApis([store(i) for i in range(1, 7)], s_delay_ms=60000)          # 概要が間に合わない
+    flow = F.FlowS(apis, deadline_sec=10 * SCALE, summary_wait_sec=2500 / 1000 * SCALE)
+    t = time.monotonic()
+    res = flow.run('横浜で美味しい焼き鳥屋を5軒', emit=Rec(), request_id='RID')
+    assert all('summary' not in x for x in res['narration'])                     # 地区と店名だけ
+    assert (time.monotonic() - t) / SCALE < 12.5                                 # 最終確定＋上限 2.5 秒以内に戻る
+
+
+def test_format_price_range():
+    from new_shop_recommendation.place_photos import format_price_range
+    assert format_price_range({'startPrice': {'units': '2000'}, 'endPrice': {'units': '3000'}}) == '¥2,000〜¥3,000'
+    assert format_price_range({'startPrice': {'units': '10000'}}) == '¥10,000〜'
+    assert format_price_range(None) == ''
+
+
+def test_card_links_rules_match_33s():
+    from new_shop_recommendation import card_links as CL
+    import types as T
+    leg = T.SimpleNamespace(search_hotpepper=lambda n, a, g: None, TRIPADVISOR_API_KEY='k',
+                            get_tripadvisor_data=lambda n, la, ln, lang: {'web_url': 'https://ta/x', 'rating': 4.5, 'num_reviews': 10}
+                            if lang == 'en' else None)
+    jp = CL.links_for('焼鳥 美鶏', '焼鳥 美鶏', '横浜', {'region': '神奈川県'}, 'JP', legacy=leg)
+    assert jp['hotpepper_url'].startswith('https://www.google.com/search?q=焼鳥 美鶏+横浜+ホットペッパーグルメ')
+    assert jp['tabelog_url'].startswith('https://tabelog.com/kanagawa/rstLst/?sw=') and jp['gnavi_url'].endswith('+ぐるなび')
+    ov = CL.links_for('X', 'X', 'Paris', {}, 'FR', legacy=leg)
+    assert ov == {'tripadvisor_url': 'https://ta/x', 'tripadvisor_rating': 4.5, 'tripadvisor_reviews': 10}

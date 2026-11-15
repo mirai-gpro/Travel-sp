@@ -517,11 +517,11 @@ export class CoreController {
       document.dispatchEvent(new CustomEvent('shopDetail', { detail: data }));
     });
 
-    // ★ M4（プレビュー専用）: 店の写真の後からの反映（該当カードの画像と撮影者表記だけを更新）
-    this.socket.on('shop_card_photo', (data: any) => {
-      console.log('[M4] ' + JSON.stringify({ ev: 'photo_recv', rid: data?.request_id, place_id: data?.place_id,
+    // ★ M4（プレビュー専用）: 写真・価格帯・外部リンクの後からの反映（該当カードだけを更新）
+    this.socket.on('shop_card_extra', (data: any) => {
+      console.log('[M4] ' + JSON.stringify({ ev: 'extra_recv', rid: data?.request_id, place_id: data?.place_id,
         t_ms: data?.t_ms, perf: performance.now() }));
-      document.dispatchEvent(new CustomEvent('shopPhoto', { detail: data }));
+      document.dispatchEvent(new CustomEvent('shopExtra', { detail: data }));
     });
 
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）

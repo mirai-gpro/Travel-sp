@@ -273,6 +273,12 @@ const { apiBaseUrl = '' } = Astro.props;
     background: #f0f0f0;
   }
 
+  .shop-card-list :global(.summary) {
+    margin: 0 0 6px;
+    font-weight: 600;
+    line-height: 1.5;
+  }
+
   .shop-card-list :global(.photo-attribution) {
     font-size: 11px;
     color: #666;
@@ -685,6 +691,7 @@ const { apiBaseUrl = '' } = Astro.props;
     detail_pending?: boolean;
     geo_check?: string | null;
     image_attributions?: { displayName: string; uri?: string }[];
+    summary?: string;
   }
 
   class ShopCardManager {
@@ -894,6 +901,7 @@ const { apiBaseUrl = '' } = Astro.props;
           </a>
           ${shop.stage === 'preview' ? `<span class="stage-badge">確認中</span>` : ''}
           ${['geo_unverified', 'facility_unconfirmed', 'no_coordinates'].includes(shop.geo_check || '') ? `<p class="geo-note">ご希望の場所に合うかは確認できていません</p>` : ''}
+          ${shop.summary ? `<p class="summary">${this.escapeHtml(shop.summary)}</p>` : ''}
           ${shop.description ? `<p class="description">${shop.description}</p>` : ''}
           ${!shop.description && shop.detail_pending ? `<p class="description detail-pending">おすすめの理由を準備中です</p>` : ''}
           
@@ -980,11 +988,15 @@ const { apiBaseUrl = '' } = Astro.props;
       }
       const prevOrder = Array.from(existing.keys());
       let created = 0;
+      shops.forEach((shop) => { if (shop.place_id) this.m4Data.set(shop.place_id, Object.assign({}, this.m4Data.get(shop.place_id) || {}, shop)); });
       const nodes = shops.map((shop) => {
         const el = shop.place_id ? existing.get(shop.place_id) : undefined;
         if (el) {
           if (stage === 'final') el.querySelector('.stage-badge')?.remove();
-          if (shop.description) this.setDescription(el, (shop.highlights || [])[0] || '', shop.description);
+          if (shop.description) this.setDescription(el, (shop.highlights || [])[0] || '', shop.description, shop.highlights || []);
+          if (shop.summary) this.setSummary(el, shop.summary);
+          if (shop.tips) this.setTips(el, shop.tips);
+          if (shop.category) this.setCategory(el, shop.category);
           return el;
         }
         created += 1;
@@ -1003,7 +1015,9 @@ const { apiBaseUrl = '' } = Astro.props;
       this.m4Log(stage === 'final' ? 'final_render' : 'preview_render', { rid, n: shops.length, created, removed, moved });
     }
 
-    private setDescription(el: HTMLElement, specialty: string, reason: string) {
+    private m4Data = new Map<string, ShopData>();
+
+    private setDescription(el: HTMLElement, specialty: string, reason: string, highlights?: string[]) {
       const body = el.querySelector('.card-body');
       if (!body) return;
       let p = body.querySelector<HTMLElement>('p.description');
@@ -1015,16 +1029,84 @@ const { apiBaseUrl = '' } = Astro.props;
       p.classList.remove('detail-pending');
       p.textContent = reason;
       body.querySelector('.highlights')?.remove();
-      if (specialty) p.insertAdjacentHTML('afterend', this.createHighlightsHtml([this.escapeHtml(specialty)]));
+      const hl = (highlights && highlights.length ? highlights : (specialty ? [specialty] : [])).map((h) => this.escapeHtml(h));
+      if (hl.length) p.insertAdjacentHTML('afterend', this.createHighlightsHtml(hl));
+    }
+
+    private setSummary(el: HTMLElement, summary: string) {
+      const body = el.querySelector('.card-body');
+      if (!body || !summary) return;
+      let p = body.querySelector<HTMLElement>('p.summary');
+      if (!p) {
+        p = document.createElement('p');
+        p.className = 'summary';
+        (body.querySelector('p.description') || body.querySelector('.link-buttons'))?.before(p);
+      }
+      p.textContent = summary;
+    }
+
+    private setTips(el: HTMLElement, tips: string) {
+      const body = el.querySelector('.card-body');
+      if (!body || !tips) return;
+      body.querySelector('.tips')?.remove();
+      body.querySelector('.link-buttons')?.insertAdjacentHTML('beforebegin', this.createTipsHtml(this.escapeHtml(tips)));
+    }
+
+    private setCategory(el: HTMLElement, category: string) {
+      const hero = el.querySelector('.hero-image');
+      if (!hero || !category) return;
+      let b = hero.querySelector<HTMLElement>('.category-badge');
+      if (!b) {
+        b = document.createElement('span');
+        b.className = 'category-badge';
+        hero.appendChild(b);
+      }
+      b.textContent = category;
+    }
+
+    private setPriceRange(el: HTMLElement, price: string) {
+      const meta = el.querySelector('.meta-info');
+      if (!meta || !price) return;
+      meta.querySelector('.price-range')?.remove();
+      meta.insertAdjacentHTML('beforeend', `
+        <div class="price-range">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+          </svg>
+          <span>${this.escapeHtml(price)}</span>
+        </div>`);
     }
 
     // 詳しい推薦理由を後から反映（該当カードだけ）
-    applyDetail(rid: string | null, placeId: string, specialty: string, reason: string) {
+    // 推薦B（説明・ジャンル・おすすめポイント・来店のポイント）または概要を、該当カードにだけ反映
+    applyDetail(rid: string | null, placeId: string, d: any) {
       if (rid !== this.m4Rid) return;
       const el = this.container.querySelector<HTMLElement>(`.shop-card[data-place-id="${CSS.escape(placeId)}"]`);
       if (!el) return;
-      this.setDescription(el, specialty, reason);
-      this.m4Log('detail_render', { rid, place_id: placeId });
+      if (d.summary) this.setSummary(el, d.summary);
+      if (d.reason) this.setDescription(el, d.specialty || '', d.reason, d.highlights || []);
+      if (d.tips) this.setTips(el, d.tips);
+      if (d.category) this.setCategory(el, d.category);
+      this.m4Log(d.summary && !d.reason ? 'summary_render' : 'detail_render', { rid, place_id: placeId });
+    }
+
+    // 写真・価格帯・外部リンク（33 秒版と同じリンク）を、該当カードにだけ反映
+    applyExtra(rid: string | null, placeId: string, d: any) {
+      if (rid !== this.m4Rid) return;
+      const el = this.container.querySelector<HTMLElement>(`.shop-card[data-place-id="${CSS.escape(placeId)}"]`);
+      if (!el) return;
+      if (d.image) this.applyPhoto(rid, placeId, d.image, d.image_attributions || []);
+      if (d.price_range) this.setPriceRange(el, d.price_range);
+      if (d.type_name && !el.querySelector('.category-badge')) this.setCategory(el, d.type_name);
+      const linkKeys = ['hotpepper_url', 'tabelog_url', 'gnavi_url', 'tripadvisor_url', 'tripadvisor_rating', 'tripadvisor_reviews'];
+      if (linkKeys.some((k) => d[k])) {
+        const merged: any = Object.assign({}, this.m4Data.get(placeId) || {});
+        linkKeys.forEach((k) => { if (d[k]) merged[k] = d[k]; });
+        this.m4Data.set(placeId, merged);
+        const box = el.querySelector('.link-buttons');
+        if (box) box.innerHTML = this.createLinksHtml(merged);
+      }
+      this.m4Log('extra_render', { rid, place_id: placeId });
     }
 
     // 星の生成
@@ -1271,13 +1353,13 @@ const { apiBaseUrl = '' } = Astro.props;
       const d = event.detail || {};
       manager.applyStage(d.stage, d.rid, d.cards || [], d.language);
     }) as EventListener);
-    document.addEventListener('shopPhoto', ((event: CustomEvent) => {
+    document.addEventListener('shopExtra', ((event: CustomEvent) => {
       const d = event.detail || {};
-      if (d.place_id) manager.applyPhoto(d.request_id || null, d.place_id, d.image || '', d.image_attributions || []);
+      if (d.place_id) manager.applyExtra(d.request_id || null, d.place_id, d);
     }) as EventListener);
     document.addEventListener('shopDetail', ((event: CustomEvent) => {
       const d = event.detail || {};
-      if (d.place_id) manager.applyDetail(d.request_id || null, d.place_id, d.specialty || '', d.reason || '');
+      if (d.place_id) manager.applyDetail(d.request_id || null, d.place_id, d);
     }) as EventListener);
 
     // カスタムイベントをリッスン

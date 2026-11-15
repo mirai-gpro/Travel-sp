@@ -33,3 +33,11 @@ def test_default_flow_unchanged():
     r = build({'status': 'COMPLETE', 'narration': nar})
     assert r['shops'][0]['description'] == 'd' and 'エリア・ジャンル・説明・予算を含めること' in r['result']
     assert build({'status': 'ERROR'})['result'].startswith('お店の検索中にエラー')
+
+
+
+def test_option_d_reads_summary_when_present():
+    nar = [{'number': 1, 'name': '店1', 'area': '関内', 'summary': '炭火の香りが自慢の老舗です'}, {'number': 2, 'name': '店2', 'area': '関内'}]
+    r = build({'status': 'COMPLETE', 'narration': nar, 'narration_mode': 'D', 'request': 'q', 'shortfall': 0})
+    assert r['shops'][0]['summary'] == '炭火の香りが自慢の老舗です' and 'summary' not in r['shops'][1]
+    assert 'summary（概要）がある店はその内容' in r['result']
