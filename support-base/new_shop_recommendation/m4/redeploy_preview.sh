@@ -8,6 +8,7 @@
 # - プレビューの Secret 参照（名前とバージョン）は今の m4s10 のリビジョンから写す（値は読まない）
 # - 追加の後、サービスのテンプレートを本番リビジョンの設定へ戻す（0% のリビジョンをもう 1 つ追加）。
 #   テンプレートに計測トークンやプレビュー用 Secret が残ると、次の CI のデプロイに引き継がれるため
+# - 本番が最新のリビジョンに追従していた場合は、最後に追従へ戻す（本番は同じイメージ・設定のテンプレートのリビジョンになる）
 # - 環境変数の値は GIT_SHA 以外読まない（名前と Secret 参照だけ）。ビルドは Cloud Build
 # =====================================================================
 set -euo pipefail
@@ -38,10 +39,11 @@ mine = [t for t in traffic if t.get('tag') == tag]
 if len(mine) != 1 or mine[0].get('percent'):
     sys.exit(f'停止: タグ {tag} のプレビュー（0%）がありません')
 open(f'{work}/prod_rev', 'w').write(live[0]['revisionName'])
+open(f'{work}/follow', 'w').write('1' if live[0].get('latestRevision') else '0')
 open(f'{work}/prev_rev', 'w').write(mine[0]['revisionName'])
-print(f'    本番トラフィック: {live[0]["revisionName"]} 100%／タグ {tag}: {mine[0]["revisionName"]}（0%）')
+print(f'    本番トラフィック: {live[0]["revisionName"]} 100%（{"最新に追従" if live[0].get("latestRevision") else "固定"}）／タグ {tag}: {mine[0]["revisionName"]}（0%）')
 PYEOF
-PROD_REV="$(cat "${WORK}/prod_rev")"; PREV_REV="$(cat "${WORK}/prev_rev")"
+PROD_REV="$(cat "${WORK}/prod_rev")"; PREV_REV="$(cat "${WORK}/prev_rev")"; FOLLOW="$(cat "${WORK}/follow")"
 gcloud run revisions describe "${PROD_REV}" "${GC[@]}" --format="${REV_FMT}" > "${WORK}/prod.json"
 gcloud run revisions describe "${PREV_REV}" "${GC[@]}" --format="${REV_FMT}" > "${WORK}/prev.json"
 # 本番の GIT_SHA だけを取り出す（ほかの値はファイルにも画面にも出さない）
@@ -111,12 +113,13 @@ gcloud run deploy "${SERVICE}" "${GC[@]}" --platform=managed \
   --update-env-vars="NEW_SHOP_FLOW=S10,GIT_SHA=${EXPECTED_SHA},M4_BENCH_MAX_CALLS=150" \
   --quiet > "${WORK}/deploy.log" 2>&1 || { echo "デプロイに失敗しました（トラフィックは変更していません）:" >&2; tail -n 20 "${WORK}/deploy.log" >&2; exit 1; }
 
+TMPL_SUFFIX="tmpl-$(date +%m%d%H%M)"; TMPL_REV="${SERVICE}-${TMPL_SUFFIX}"
 echo "[4/5] テンプレートを本番 ${PROD_REV} の設定へ戻す（0% のリビジョンを追加。トラフィックは変更しない）"
 gcloud run services update "${SERVICE}" "${GC[@]}" --platform=managed --no-traffic \
   --image="$(cat "${WORK}/prod_image")" --max-instances="${PROD_MAX}" \
   --remove-secrets=M4_BENCH_TOKEN --remove-env-vars=M4_BENCH_MAX_CALLS \
   --update-secrets="$(cat "${WORK}/prod_secrets")" --update-env-vars="NEW_SHOP_FLOW=S10,GIT_SHA=${PROD_GIT_SHA}" \
-  --revision-suffix="tmpl-$(date +%m%d%H%M)" \
+  --revision-suffix="${TMPL_SUFFIX}" \
   --quiet > "${WORK}/restore.log" 2>&1 || { echo "NG: テンプレートを戻せませんでした（トラフィックは変更していません）。次の CI の前に連絡してください:" >&2; tail -n 20 "${WORK}/restore.log" >&2; exit 1; }
 
 echo "[5/5] 事後確認"
@@ -160,4 +163,25 @@ code_health="$(curl -s -o /dev/null -w '%{http_code}' "${URL}/health")"
 code_bench="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"query":"x","method":"scope"}' "${URL}/api/m4/bench")"
 echo "    ${URL}/health → ${code_health}（200 なら正常）／計測エンドポイント（トークンなし）→ ${code_bench}（403 なら保護されている）"
 [ "${code_health}" = "200" ] && [ "${code_bench}" = "403" ] || { echo "NG: プレビューの事後確認に失敗しました（トラフィックは変更していません）" >&2; exit 1; }
+if [ "${FOLLOW}" = "1" ]; then
+  # 本番は最新のリビジョンに追従していた。--no-traffic のデプロイで固定に変わるため、追従に戻す。
+  # 最新は今追加したテンプレートのリビジョン（本番と同じイメージ・設定）。名前・Secret 参照・GIT_SHA が本番と同じことを確かめてから戻す
+  gcloud run revisions describe "${TMPL_REV}" "${GC[@]}" --format='json(spec.containers[0].env)' | python3 -c "
+import json, sys
+env = json.load(sys.stdin)['spec']['containers'][0].get('env') or []
+prod = json.load(open('${WORK}/prod.json'))['spec']['containers'][0].get('env') or []
+ref = lambda es: {e['name']: ((e.get('valueFrom') or {}).get('secretKeyRef') or {}).get('name') for e in es}
+sha = next((e.get('value') for e in env if e['name'] == 'GIT_SHA'), None)
+sys.exit(0 if ref(env) == ref(prod) and sha == '${PROD_GIT_SHA}' else 1)" \
+    || { echo "NG: ${TMPL_REV} が本番と同じ設定ではないため、追従に戻しません（本番は ${PROD_REV} に固定のまま）" >&2; exit 1; }
+  LATEST_READY="$(gcloud run services describe "${SERVICE}" "${GC[@]}" --format='value(status.latestReadyRevisionName)')"
+  [ "${LATEST_READY}" = "${TMPL_REV}" ] || { echo "NG: 最新のリビジョンが ${TMPL_REV} ではないため、追従に戻しません（本番は ${PROD_REV} に固定のまま）" >&2; exit 1; }
+  gcloud run services update-traffic "${SERVICE}" "${GC[@]}" --to-latest --quiet > /dev/null
+  gcloud run services describe "${SERVICE}" "${GC[@]}" --format='json(status.traffic)' | python3 -c "
+import json, sys
+live = [t for t in json.load(sys.stdin)['status']['traffic'] if t.get('percent')]
+print('    本番トラフィック:', [(t.get('revisionName'), t.get('percent'), '最新に追従' if t.get('latestRevision') else '固定') for t in live])
+sys.exit(0 if len(live) == 1 and live[0].get('latestRevision') and live[0].get('percent') == 100 else 1)" \
+    || { echo "NG: 追従に戻せませんでした" >&2; exit 1; }
+fi
 echo "完了: ${URL}（${NEW_REV}）"
