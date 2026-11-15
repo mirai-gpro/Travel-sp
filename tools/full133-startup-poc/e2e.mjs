@@ -36,6 +36,8 @@ async function oneLoad(ctx, prof, cfg, userDir) {
   const page = await ctx.newPage();
   const cdp = await ctx.newCDPSession(page);
   const net = new Map();
+  const failed = [];
+  page.on('requestfailed', q => { if (failed.length < 20) failed.push(`${q.url().slice(0, 120)} ${q.failure() && q.failure().errorText}`); });
   await cdp.send('Network.enable');
   cdp.on('Network.requestWillBeSent', e => { if (/\.zip(\?|$)/.test(e.request.url)) net.set(e.requestId, { url: e.request.url.replace(FRONT, ''), type: e.type, t: e.timestamp }); });
   cdp.on('Network.responseReceived', e => { const r = net.get(e.requestId); if (r) Object.assign(r, { status: e.response.status, fromDiskCache: !!e.response.fromDiskCache, fromServiceWorker: !!e.response.fromServiceWorker, fromPrefetchCache: !!e.response.fromPrefetchCache }); });
@@ -49,18 +51,23 @@ async function oneLoad(ctx, prof, cfg, userDir) {
   const url = `${FRONT}/concierge/?pocStartup=${cfg}&pocTrace=1`;
   const t0 = Date.now();
   let timedOut = false;
+  let startFailed = false;
   try {
     await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
     const deadline = Date.now() + prof.timeout;
     let audioSeen = null;
+    const startedBy = Date.now() + 30000;
+    let started = false;
     while (Date.now() < deadline) {
       await page.waitForTimeout(500);
-      const s = await page.evaluate(() => ({ a: (window.__probe && window.__probe.audio.length) || 0, fb: !!(window.__probe && window.__probe.splat.some(x => x.fb)), err: (window.__probe && window.__probe.errors.length) || 0 })).catch(() => null);
+      const s = await page.evaluate(() => ({ core: !!(window.__probe && window.__probe.logs.some(l => /\[Core\] Starting initialization/.test(l.m))), a: (window.__probe && window.__probe.audio.length) || 0, fb: !!(window.__probe && window.__probe.splat.some(x => x.fb)), err: (window.__probe && window.__probe.errors.length) || 0 })).catch(() => null);
       if (!s) continue;
+      if (s.core) started = true;
+      if (!started && Date.now() > startedBy) { startFailed = true; break; }
       if (s.a > 0 && s.fb && audioSeen === null) audioSeen = Date.now();
       if (audioSeen && Date.now() - audioSeen > 2500) break;
     }
-    if (!audioSeen) timedOut = true;
+    if (!audioSeen && !startFailed) timedOut = true;
   } catch (e) { results.errors.push({ cfg, err: String(e) }); }
   clearInterval(memTimer);
   const data = await page.evaluate(async () => {
@@ -77,7 +84,7 @@ async function oneLoad(ctx, prof, cfg, userDir) {
       gl: (() => { try { const c = document.createElement('canvas').getContext('webgl2'); const e = c.getExtension('WEBGL_debug_renderer_info'); return c.getParameter(e.UNMASKED_RENDERER_WEBGL); } catch (e) { return 'n/a'; } })() };
   }).catch(e => ({ error: String(e) }));
   await page.close();
-  return { wallMs: Date.now() - t0, timedOut, rssPeakMB: rssPeak || null, zipRequests: [...net.values()], ...data };
+  return { wallMs: Date.now() - t0, timedOut, startFailed, failedRequests: failed, rssPeakMB: rssPeak || null, zipRequests: [...net.values()], ...data };
 }
 
 (async () => {

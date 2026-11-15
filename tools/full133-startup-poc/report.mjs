@@ -64,6 +64,7 @@ if (e2e && Array.isArray(e2e.runs)) {
     const release = logT(/\[PlaybackHold\] release/), audio = r.probe?.audio?.[0]?.t ?? null;
     const zr = r.zipRequests || [];
     const sel = zr.filter(z => /uika-meruru02-full133\.zip/.test(z.url));
+    if (r.startFailed) { e2eOut.startFailures = (e2eOut.startFailures || []).concat([{ profile: r.profile, config: r.config, cache: r.cache, rep: r.rep, failedRequests: r.failedRequests }]); continue; }
     rows.push({ profile: r.profile, config: r.config, cache: r.cache, rep: r.rep, timedOut: r.timedOut,
       navResponseStart: r.nav?.responseStart ?? null, scriptStart: mk(`poc:mode:${r.config}`), initStart, zipFetch, zipDone: mk('poc:zip:done'),
       zipWaitAfterInit: mk('poc:zip:done') != null && initStart != null ? Math.max(0, mk('poc:zip:done') - initStart) : null,
@@ -80,7 +81,7 @@ if (e2e && Array.isArray(e2e.runs)) {
 }
 e2eOut.rows = rows;
 P('2. 起動の比較（Playwright の Chromium・ローカルのフロント・バックエンドの代わり）'); P('-'.repeat(60));
-if (!rows.length) P('未測定（ブラウザの計測が実行できませんでした。手順の結果とエラーを参照）');
+if (!rows.length) { P('未測定（ブラウザの計測が実行できませんでした。手順の結果とエラーを参照）'); (e2eOut.startFailures || []).slice(0, 5).forEach(x => P(`  ページが起動しない: ${x.profile} ${x.config} ${x.cache} rep${x.rep}: ${(x.failedRequests || []).slice(0, 2).join(' / ')}`)); }
 else {
   const gl = [...new Set(rows.map(r => r.gl))].join(' / ');
   P(`GPU: ${gl}`);
@@ -119,6 +120,7 @@ else {
       P('');
     }
   }
+  if (e2eOut.startFailures && e2eOut.startFailures.length) { P(`ページが起動しなかった読み込み（集計から除外）: ${e2eOut.startFailures.length} 件`); e2eOut.startFailures.slice(0, 5).forEach(x => P(`  ${x.profile} ${x.config} ${x.cache} rep${x.rep}: ${(x.failedRequests || []).slice(0, 2).join(' / ')}`)); }
   const tex = [...new Set(rows.map(r => r.texSha).filter(Boolean))];
   P(`ブラウザ内で作られたテクスチャ（flameModelDataInt）の SHA-256: ${tex.length === 1 ? 'A〜D の全試行で同一 ' + tex[0] : tex.length ? '一致しない: ' + tex.join(', ') : '未測定'}`);
   P('ZIP の版の変更（ETag を変えた後の読み込み）:');
