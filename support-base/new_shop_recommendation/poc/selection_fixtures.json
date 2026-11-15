@@ -1,0 +1,161 @@
+{
+  "_note": "Gate D1.6 の候補選択 PoC 用に独立して作成した架空データ（実在店・実際の Places 応答ではない）。各推薦店舗に最大 5 候補（検索順位順）。expected は正解候補の位置（1〜5）か null（該当なし）。allowed は許容する選択の集合（null を含む場合は該当なしも許容）。",
+  "sets": [
+    {"name": "1位が正解（表記揺れ含む）", "recs": [
+      {"recommended_name": "焼鳥 青葉", "recommended_area": "人形町", "kind": "業態接頭語", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "炭火焼鳥 青葉", "area": "日本、〒103-0013 東京都中央区日本橋人形町２丁目３−９"},
+        {"name": "鳥料理 青柳", "area": "日本、〒103-0013 東京都中央区日本橋人形町１丁目５−２"},
+        {"name": "やきとり 葉月", "area": "日本、〒103-0012 東京都中央区日本橋堀留町１丁目８−１"}]},
+      {"recommended_name": "トラットリア ルーチェ", "recommended_area": "恵比寿", "kind": "カナ／英字", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "Trattoria Luce", "area": "日本、〒150-0013 東京都渋谷区恵比寿１丁目８−２ 2F"},
+        {"name": "Osteria Lucciola", "area": "日本、〒150-0022 東京都渋谷区恵比寿南１丁目３−５"},
+        {"name": "ピッツェリア ルーナ", "area": "日本、〒150-0013 東京都渋谷区恵比寿４丁目２−１"},
+        {"name": "Bar Luce Ebisu", "area": "日本、〒150-0013 東京都渋谷区恵比寿１丁目１２−３"}]},
+      {"recommended_name": "らーめん 風月", "recommended_area": "高円寺", "kind": "かな／カナ・空白", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "ラーメン風月", "area": "日本、〒166-0003 東京都杉並区高円寺南４丁目２７−５"},
+        {"name": "中華そば 月光", "area": "日本、〒166-0002 東京都杉並区高円寺北３丁目２−１"}]},
+      {"recommended_name": "天ぷら 葵", "recommended_area": "神楽坂", "kind": "漢字／かな", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "天麩羅 あおい", "area": "日本、〒162-0825 東京都新宿区神楽坂３丁目６"},
+        {"name": "天ぷら 葵屋 飯田橋店", "area": "日本、〒102-0072 東京都千代田区飯田橋４丁目９−１"},
+        {"name": "てんぷら 蒼", "area": "日本、〒162-0825 東京都新宿区神楽坂６丁目１２"},
+        {"name": "割烹 あおい坂", "area": "日本、〒162-0826 東京都新宿区市谷船河原町２"},
+        {"name": "天丼 葵亭", "area": "日本、〒162-0825 東京都新宿区神楽坂１丁目１"}]},
+      {"recommended_name": "ビストロ・ミモザ", "recommended_area": "学芸大学", "kind": "記号の有無", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "ビストロ ミモザ", "area": "日本、〒152-0004 東京都目黒区鷹番３丁目７−１１"},
+        {"name": "Cafe Mimosa", "area": "日本、〒152-0004 東京都目黒区鷹番２丁目１−４"}]},
+      {"recommended_name": "串かつ 万作", "recommended_area": "梅田", "kind": "表記同一", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "串かつ 万作", "area": "日本、〒530-0012 大阪府大阪市北区芝田１丁目５−８"},
+        {"name": "串かつ 万作 天満店", "area": "日本、〒530-0041 大阪府大阪市北区天神橋５丁目２−１"},
+        {"name": "立呑み 万作", "area": "日本、〒530-0017 大阪府大阪市北区角田町３−２"}]},
+      {"recommended_name": "割烹 すずな", "recommended_area": "祇園", "kind": "業態語の省略", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "すずな", "area": "日本、〒605-0074 京都府京都市東山区祇園町南側５７０−１２"},
+        {"name": "割烹 すず川", "area": "日本、〒605-0073 京都府京都市東山区祇園町北側２８１"},
+        {"name": "京料理 すずの", "area": "日本、〒605-0083 京都府京都市東山区末吉町８２"}]}
+    ]},
+    {"name": "正解が2〜5位", "recs": [
+      {"recommended_name": "炭火焼鳥 とりまさ", "recommended_area": "野毛", "kind": "1位は類似名の別店", "expected": 2, "allowed": [2], "candidates": [
+        {"name": "とりまつ", "area": "日本、〒231-0064 神奈川県横浜市中区野毛町１丁目２３"},
+        {"name": "炭火焼鳥 とりまさ", "area": "日本、〒231-0064 神奈川県横浜市中区野毛町２丁目６０"},
+        {"name": "焼鳥 まさ", "area": "日本、〒231-0063 神奈川県横浜市中区花咲町２丁目５"}]},
+      {"recommended_name": "鮨 みなと", "recommended_area": "銀座", "kind": "1位は同名の別地域店", "expected": 3, "allowed": [3], "candidates": [
+        {"name": "鮨 みなと 横浜店", "area": "日本、〒220-0011 神奈川県横浜市西区高島２丁目１８−１"},
+        {"name": "鮨 港屋", "area": "日本、〒104-0061 東京都中央区銀座６丁目４−８"},
+        {"name": "鮨 みなと", "area": "日本、〒104-0061 東京都中央区銀座７丁目５−１２ 3F"},
+        {"name": "すし処 湊", "area": "日本、〒104-0061 東京都中央区銀座８丁目２−１"}]},
+      {"recommended_name": "カフェ ノワゼット", "recommended_area": "代官山", "kind": "1〜3位は近隣の別カフェ", "expected": 4, "allowed": [4], "candidates": [
+        {"name": "Cafe Noir Daikanyama", "area": "日本、〒150-0034 東京都渋谷区代官山町１３−２"},
+        {"name": "ノワール珈琲店", "area": "日本、〒150-0033 東京都渋谷区猿楽町１０−１"},
+        {"name": "Noisette Bakery", "area": "日本、〒153-0042 東京都目黒区青葉台１丁目２−４"},
+        {"name": "café noisette", "area": "日本、〒150-0034 東京都渋谷区代官山町１８−４"},
+        {"name": "カフェ ノア", "area": "日本、〒150-0034 東京都渋谷区代官山町２０−２３"}]},
+      {"recommended_name": "ジンギスカン 北斗", "recommended_area": "すすきの", "kind": "正解が5位", "expected": 5, "allowed": [5], "candidates": [
+        {"name": "ジンギスカン 北海", "area": "日本、〒064-0805 北海道札幌市中央区南５条西４丁目"},
+        {"name": "成吉思汗 北星", "area": "日本、〒064-0806 北海道札幌市中央区南６条西３丁目"},
+        {"name": "羊肉酒場 ほくと", "area": "日本、〒060-0063 北海道札幌市中央区南３条西２丁目"},
+        {"name": "北斗星 すすきの店", "area": "日本、〒064-0804 北海道札幌市中央区南４条西５丁目"},
+        {"name": "ジンギスカン北斗", "area": "日本、〒064-0806 北海道札幌市中央区南６条西４丁目８"}]},
+      {"recommended_name": "中華そば 一灯", "recommended_area": "東京駅", "kind": "1位は系列の別業態", "expected": 2, "allowed": [2], "candidates": [
+        {"name": "つけ麺 一灯 八重洲店", "area": "日本、〒103-0028 東京都中央区八重洲１丁目９−１"},
+        {"name": "中華そば 一灯 東京駅店", "area": "日本、〒100-0005 東京都千代田区丸の内１丁目９−１ 東京駅一番街 B1F"},
+        {"name": "らぁ麺 一燈", "area": "日本、〒100-0005 東京都千代田区丸の内２丁目４−１"}]},
+      {"recommended_name": "天ぷら 松風", "recommended_area": "銀座", "kind": "英字表記が3位", "expected": 3, "allowed": [3], "candidates": [
+        {"name": "天ぷら 松乃", "area": "日本、〒104-0061 東京都中央区銀座５丁目９−１５"},
+        {"name": "松風庵 そば", "area": "日本、〒104-0061 東京都中央区銀座３丁目２−１"},
+        {"name": "Tempura Matsukaze", "area": "日本、〒104-0061 東京都中央区銀座６丁目１２−１５ 6F"}]},
+      {"recommended_name": "イタリア食堂 ポモドーロ", "recommended_area": "吉祥寺", "kind": "通称が4位", "expected": 4, "allowed": [4], "candidates": [
+        {"name": "Pizzeria Pomodorino", "area": "日本、〒180-0004 東京都武蔵野市吉祥寺本町２丁目８−３"},
+        {"name": "トマト食堂", "area": "日本、〒180-0003 東京都武蔵野市吉祥寺南町１丁目５"},
+        {"name": "ポモドーロ 三鷹店", "area": "日本、〒181-0013 東京都三鷹市下連雀３丁目２５−１"},
+        {"name": "ポモドーロ", "area": "日本、〒180-0004 東京都武蔵野市吉祥寺本町１丁目１１−２２ 2F"}]}
+    ]},
+    {"name": "該当なし", "recs": [
+      {"recommended_name": "焼鳥 ひばり", "recommended_area": "中目黒", "kind": "類似名のみ", "expected": null, "allowed": [null], "candidates": [
+        {"name": "焼鳥 ひばな", "area": "日本、〒153-0051 東京都目黒区上目黒２丁目１−３"},
+        {"name": "やきとり 雲雀", "area": "日本、〒150-0031 東京都渋谷区桜丘町２５−１"},
+        {"name": "鳥ひろ", "area": "日本、〒153-0051 東京都目黒区上目黒１丁目１０−４"}]},
+      {"recommended_name": "割烹 たまき", "recommended_area": "祇園", "kind": "同名の別地域店のみ", "expected": null, "allowed": [null], "candidates": [
+        {"name": "割烹 たまき 赤坂", "area": "日本、〒107-0052 東京都港区赤坂３丁目１４−２"},
+        {"name": "割烹 たまき", "area": "日本、〒530-0001 大阪府大阪市北区梅田１丁目２−２"}]},
+      {"recommended_name": "ラーメン 朱雀", "recommended_area": "東京駅", "kind": "別業態の同名", "expected": null, "allowed": [null], "candidates": [
+        {"name": "朱雀 ホテルラウンジ", "area": "日本、〒100-0005 東京都千代田区丸の内１丁目８−２"},
+        {"name": "Bar Suzaku", "area": "日本、〒104-0028 東京都中央区八重洲２丁目１"},
+        {"name": "中華料理 朱華", "area": "日本、〒100-0005 東京都千代田区丸の内２丁目７−２"}]},
+      {"recommended_name": "カフェ ソレイユ", "recommended_area": "渋谷", "kind": "架空店（検索ヒットは無関係）", "expected": null, "allowed": [null], "candidates": [
+        {"name": "Soleil Hair Salon Cafe", "area": "日本、〒150-0001 東京都渋谷区神宮前６丁目５"},
+        {"name": "スターライトコーヒー 渋谷店", "area": "日本、〒150-0043 東京都渋谷区道玄坂２丁目１"},
+        {"name": "喫茶 ひまわり", "area": "日本、〒150-0042 東京都渋谷区宇田川町３１−２"},
+        {"name": "ソレイユ 美容室", "area": "日本、〒150-0041 東京都渋谷区神南１丁目１２"}]},
+      {"recommended_name": "串揚げ 二代目 角屋", "recommended_area": "梅田", "kind": "初代店のみ（屋号相違）", "expected": null, "allowed": [null], "candidates": [
+        {"name": "串揚げ 角屋本舗 京橋店", "area": "日本、〒534-0024 大阪府大阪市都島区東野田町３丁目"},
+        {"name": "串カツ 角", "area": "日本、〒530-0012 大阪府大阪市北区芝田２丁目３"}]},
+      {"recommended_name": "和食 こもれび", "recommended_area": "新宿", "kind": "かな一致だが別地域", "expected": null, "allowed": [null], "candidates": [
+        {"name": "和ダイニング 木漏れ日 渋谷", "area": "日本、〒150-0002 東京都渋谷区渋谷１丁目１２−３"},
+        {"name": "こもれび カフェ", "area": "日本、〒160-0022 東京都新宿区新宿３丁目３５"},
+        {"name": "和食 こまち", "area": "日本、〒160-0023 東京都新宿区西新宿１丁目１"}]},
+      {"recommended_name": "ステーキハウス 大輝", "recommended_area": "銀座", "kind": "名前一部一致の別店", "expected": null, "allowed": [null], "candidates": [
+        {"name": "大輝食堂", "area": "日本、〒104-0061 東京都中央区銀座１丁目１３"},
+        {"name": "ステーキハウス 大和", "area": "日本、〒104-0061 東京都中央区銀座４丁目８"},
+        {"name": "鉄板焼 輝", "area": "日本、〒104-0061 東京都中央区銀座７丁目２"},
+        {"name": "Steak House Taiki 横浜", "area": "日本、〒231-0023 神奈川県横浜市中区山下町１２３"}]}
+    ]},
+    {"name": "支店違い", "recs": [
+      {"recommended_name": "とんかつ 丸善 本店", "recommended_area": "上野", "kind": "1位は別支店・本店は3位", "expected": 3, "allowed": [3], "candidates": [
+        {"name": "とんかつ 丸善 アトレ上野店", "area": "日本、〒110-0005 東京都台東区上野７丁目１−１ アトレ上野"},
+        {"name": "とんかつ 丸善 御徒町店", "area": "日本、〒110-0016 東京都台東区台東４丁目２"},
+        {"name": "とんかつ 丸善 本店", "area": "日本、〒110-0005 東京都台東区上野３丁目２８−５"}]},
+      {"recommended_name": "うなぎ 川瀬 日本橋店", "recommended_area": "日本橋", "kind": "支店が1位で正解", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "うなぎ 川瀬 日本橋店", "area": "日本、〒103-0027 東京都中央区日本橋２丁目３−１"},
+        {"name": "うなぎ 川瀬 本店", "area": "日本、〒130-0001 東京都墨田区吾妻橋１丁目２"}]},
+      {"recommended_name": "そば処 更科庵", "recommended_area": "神田", "kind": "他地域支店のみ", "expected": null, "allowed": [null], "candidates": [
+        {"name": "そば処 更科庵 大宮店", "area": "日本、〒330-0846 埼玉県さいたま市大宮区大門町２丁目"},
+        {"name": "更科庵 池袋東口店", "area": "日本、〒171-0022 東京都豊島区南池袋１丁目２８"}]},
+      {"recommended_name": "焼肉 牛若 新宿三丁目店", "recommended_area": "新宿三丁目", "kind": "同エリア支店が2つ", "expected": 2, "allowed": [2], "candidates": [
+        {"name": "焼肉 牛若 新宿東口店", "area": "日本、〒160-0022 東京都新宿区新宿３丁目２６−６"},
+        {"name": "焼肉 牛若 新宿三丁目店", "area": "日本、〒160-0022 東京都新宿区新宿３丁目８−８"},
+        {"name": "焼肉 牛若 西新宿店", "area": "日本、〒160-0023 東京都新宿区西新宿７丁目１"}]},
+      {"recommended_name": "餃子 福来", "recommended_area": "宇都宮駅", "kind": "支店名無し推薦・駅前店が4位", "expected": 4, "allowed": [4], "candidates": [
+        {"name": "餃子 福来 本店", "area": "日本、〒320-0026 栃木県宇都宮市馬場通り２丁目"},
+        {"name": "餃子 福来 ララスクエア店", "area": "日本、〒321-0964 栃木県宇都宮市駅前通り３丁目"},
+        {"name": "福来軒", "area": "日本、〒321-0965 栃木県宇都宮市川向町１"},
+        {"name": "餃子 福来 宇都宮駅東口店", "area": "日本、〒321-0969 栃木県宇都宮市宮みらい１−２"}]},
+      {"recommended_name": "パティスリー ルポ 本店", "recommended_area": "自由が丘", "kind": "1位は百貨店内の別店", "expected": 2, "allowed": [2], "candidates": [
+        {"name": "Patisserie Repos 玉川高島屋店", "area": "日本、〒158-0094 東京都世田谷区玉川３丁目１７−１"},
+        {"name": "パティスリー ルポ", "area": "日本、〒152-0035 東京都目黒区自由が丘１丁目２５−９"}]},
+      {"recommended_name": "居酒屋 ほたる 中洲店", "recommended_area": "中洲", "kind": "中洲店なし", "expected": null, "allowed": [null], "candidates": [
+        {"name": "居酒屋 ほたる 天神店", "area": "日本、〒810-0001 福岡県福岡市中央区天神２丁目５"},
+        {"name": "居酒屋 ほたる 博多駅前店", "area": "日本、〒812-0011 福岡県福岡市博多区博多駅前３丁目"},
+        {"name": "炉端 蛍", "area": "日本、〒810-0801 福岡県福岡市博多区中洲３丁目７"}]}
+    ]},
+    {"name": "混在（表記揺れ×順位）", "recs": [
+      {"recommended_name": "ル・ジャルダン", "recommended_area": "広尾", "kind": "仏語表記が2位", "expected": 2, "allowed": [2], "candidates": [
+        {"name": "ジャルダン カフェ 恵比寿", "area": "日本、〒150-0013 東京都渋谷区恵比寿２丁目３"},
+        {"name": "Le Jardin", "area": "日本、〒106-0047 東京都港区南麻布５丁目１−６"},
+        {"name": "花屋 ジャルダン", "area": "日本、〒150-0012 東京都渋谷区広尾５丁目１"}]},
+      {"recommended_name": "すし 匠海", "recommended_area": "四谷", "kind": "読み表記が3位", "expected": 3, "allowed": [3], "candidates": [
+        {"name": "鮨 匠", "area": "日本、〒160-0004 東京都新宿区四谷１丁目２"},
+        {"name": "すし 海匠", "area": "日本、〒160-0004 東京都新宿区四谷３丁目５"},
+        {"name": "Sushi Takumi", "area": "日本、〒160-0004 東京都新宿区四谷２丁目１４−８"}]},
+      {"recommended_name": "そば 一茶庵", "recommended_area": "麻布十番", "kind": "正式名称が1位", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "手打ちそば 一茶庵 麻布十番", "area": "日本、〒106-0045 東京都港区麻布十番２丁目８−１"},
+        {"name": "一茶 カフェ", "area": "日本、〒106-0045 東京都港区麻布十番１丁目５"}]},
+      {"recommended_name": "インド料理 ガネーシャ", "recommended_area": "神保町", "kind": "英字が5位", "expected": 5, "allowed": [5], "candidates": [
+        {"name": "カレー ガネッシュ", "area": "日本、〒101-0051 東京都千代田区神田神保町１丁目１"},
+        {"name": "スパイス食堂 ガネ", "area": "日本、〒101-0051 東京都千代田区神田神保町２丁目１"},
+        {"name": "ネパール料理 ヒマラヤ", "area": "日本、〒101-0051 東京都千代田区神田神保町１丁目３"},
+        {"name": "Ganesha Curry 水道橋", "area": "日本、〒101-0061 東京都千代田区神田三崎町２丁目"},
+        {"name": "Indian Restaurant Ganesha", "area": "日本、〒101-0051 東京都千代田区神田神保町１丁目３５−２"}]},
+      {"recommended_name": "居酒屋 だるま", "recommended_area": "浅草", "kind": "ひらがな／漢字が2位", "expected": 2, "allowed": [2], "candidates": [
+        {"name": "だるま寿司", "area": "日本、〒111-0032 東京都台東区浅草１丁目３"},
+        {"name": "居酒屋 達磨", "area": "日本、〒111-0032 東京都台東区浅草２丁目５−６"},
+        {"name": "だるま 上野店", "area": "日本、〒110-0005 東京都台東区上野６丁目１"}]},
+      {"recommended_name": "ベーカリー こむぎ", "recommended_area": "谷中", "kind": "1位が正解・他は同名別地域", "expected": 1, "allowed": [1], "candidates": [
+        {"name": "Bakery Komugi", "area": "日本、〒110-0001 東京都台東区谷中３丁目１０−２"},
+        {"name": "こむぎ 千駄木", "area": "日本、〒113-0022 東京都文京区千駄木２丁目"}]},
+      {"recommended_name": "おでん 蔦", "recommended_area": "門前仲町", "kind": "旧字・かな表記が4位", "expected": 4, "allowed": [4], "candidates": [
+        {"name": "おでん 鶴", "area": "日本、〒135-0048 東京都江東区門前仲町１丁目３"},
+        {"name": "蔦屋 酒場", "area": "日本、〒135-0047 東京都江東区富岡１丁目"},
+        {"name": "おでん つた 清澄", "area": "日本、〒135-0024 東京都江東区清澄３丁目"},
+        {"name": "おでん つた", "area": "日本、〒135-0048 東京都江東区門前仲町２丁目７−３"}]}
+    ]}
+  ]
+}

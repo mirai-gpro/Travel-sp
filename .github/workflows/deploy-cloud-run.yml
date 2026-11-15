@@ -80,7 +80,10 @@ jobs:
             --set-env-vars="TRIPADVISOR_API_KEY=${{ secrets.TRIPADVISOR_API_KEY }}" \
             --set-env-vars="SUPABASE_URL=${{ secrets.SUPABASE_URL }}" \
             --set-env-vars="SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" \
-            --set-env-vars="A2E_SERVICE_URL=${{ secrets.A2E_SERVICE_URL }}"
+            --set-env-vars="A2E_SERVICE_URL=${{ secrets.A2E_SERVICE_URL }}" \
+            --set-env-vars="NEW_SHOP_FLOW=S10" \
+            --set-env-vars="GIT_SHA=${{ github.sha }}" \
+            --update-secrets="GEMINI_RECOMMEND_API_KEY=new-shop-recommend-key:1,MAPS_AGENT_TOOLS_API_KEY=new-shop-maps-key:1"
 
       - name: Show deployed URL
         run: |
