@@ -2,7 +2,19 @@
 import fs from 'node:fs';
 const [ENV_JSON, BMT_JSON, E2E_JSON, OUT_JSON, OUT_TXT] = process.argv.slice(2);
 const rd = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return null; } };
-const env = rd(ENV_JSON) || {}, bmt = rd(BMT_JSON), e2e = rd(E2E_JSON);
+const env = rd(ENV_JSON) || {}, bmt = rd(BMT_JSON);
+// E2E_JSON はファイル、またはパートごとの e2e_*.json が入ったディレクトリ（パートの結果をまとめる）
+let e2e = null;
+try {
+  const files = fs.statSync(E2E_JSON).isDirectory() ? fs.readdirSync(E2E_JSON).filter(f => /^e2e_.*\.json$/.test(f)).sort().map(f => E2E_JSON + '/' + f) : [E2E_JSON];
+  for (const f of files) {
+    const x = rd(f); if (!x) continue;
+    if (!e2e) e2e = { profiles: {}, runs: [], versionCheck: [], errors: [], parts: [] };
+    Object.assign(e2e.profiles, x.profiles || {});
+    e2e.runs.push(...(x.runs || [])); e2e.versionCheck.push(...(x.versionCheck || [])); e2e.errors.push(...(x.errors || []));
+    e2e.parts.push({ file: f.split('/').pop(), startedAt: x.startedAt, finishedAt: x.finishedAt || null, runs: (x.runs || []).length });
+  }
+} catch (e) {}
 const med = a => { const b = a.filter(x => typeof x === 'number' && isFinite(x)).sort((x, y) => x - y); if (!b.length) return null; const m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
 const s = (x, d = 2) => x == null ? '未測定' : (x / 1000).toFixed(d);
 const n = (x, d = 0) => x == null ? '未測定' : Number(x).toFixed(d);
@@ -12,6 +24,7 @@ const P = (...a) => L.push(a.join(''));
 P('UIKA FULL133 起動の比較 PoC（Cloud Shell）'); P('='.repeat(60));
 P(`実行: ${env.startedAt || '?'}  コミット: ${env.sha || '?'}`);
 P(`環境: ${env.os || '?'} / CPU ${env.cpus || '?'} 個 (${env.cpuModel || '?'}) / メモリ ${env.memGB || '?'} GB / Node ${env.node || '?'}`);
+if (e2e && e2e.parts) P(`ブラウザの計測のパート: ${e2e.parts.map(p => `${p.file}（${p.runs} 件${p.finishedAt ? '' : '・途中まで'}）`).join(' / ')}`);
 P(`renderer パッケージ: 元ファイル SHA-256 ${env.pkgShaBefore || '?'}（期待値 ${env.pkgShaExpected || '?'}）→ パッチ後 ${env.pkgShaAfter || '?'}`);
 if (env.steps) { P('手順の結果:'); for (const [k, v] of Object.entries(env.steps)) P(`  - ${k}: ${v}`); }
 P('');

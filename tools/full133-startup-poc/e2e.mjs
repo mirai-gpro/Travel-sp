@@ -11,6 +11,9 @@ const [FRONT, OUT] = process.argv.slice(2);
 const PROFILES = (process.env.FULL133_PROFILES || 'pc,mobile').split(',');
 const CONFIGS = (process.env.FULL133_CONFIGS || 'A,B,C,D').split(',');
 const REPS = Number(process.env.FULL133_E2E_REPS || 3);
+const REP_FROM = Number(process.env.FULL133_REP_FROM || 1) - 1;
+const REP_TO = Number(process.env.FULL133_REP_TO || REPS) - 1;
+const TOTAL = PROFILES.length * CONFIGS.length * (REP_TO - REP_FROM + 1) * 2;
 const PROFILE_DEF = {
   pc: { label: 'PC 想定（下り 50Mbps・上り 10Mbps・RTT 20ms・CPU 等倍）', down: 50e6, up: 10e6, rtt: 20, cpu: 1, ctx: { viewport: { width: 1440, height: 900 } }, timeout: 120000 },
   mobile: { label: 'スマホ想定（Pixel 7 の画面・下り 20Mbps・上り 5Mbps・RTT 40ms・CPU 4 倍遅く）', down: 20e6, up: 5e6, rtt: 40, cpu: 4, ctx: { ...devices['Pixel 7'] }, timeout: 240000 },
@@ -91,7 +94,7 @@ async function oneLoad(ctx, prof, cfg, userDir) {
   for (const pname of PROFILES) {
     const prof = PROFILE_DEF[pname];
     results.profiles[pname] = prof.label;
-    for (let rep = 0; rep < REPS; rep++) {
+    for (let rep = REP_FROM; rep <= REP_TO; rep++) {
       for (const cfg of CONFIGS) {
         const userDir = fs.mkdtempSync(path.join(os.tmpdir(), `f133-${pname}-${cfg}-`));
         let ctx;
@@ -103,7 +106,7 @@ async function oneLoad(ctx, prof, cfg, userDir) {
           for (const cache of ['cold', 'warm']) {
             const r = await oneLoad(ctx, prof, cfg, userDir);
             results.runs.push({ profile: pname, config: cfg, rep, cache, ...r });
-            process.stderr.write(`[e2e] ${results.runs.length}/${PROFILES.length * CONFIGS.length * REPS * 2} 件 ${pname} ${cfg} ${cache === 'cold' ? '初回' : '2回目'} rep${rep + 1}: ${r.startFailed ? '起動失敗' : r.timedOut ? '時間切れ' : '完了'}（${(r.wallMs / 1000).toFixed(0)} 秒）\n`);
+            process.stderr.write(`[e2e] ${results.runs.length}/${TOTAL} 件 ${pname} ${cfg} ${cache === 'cold' ? '初回' : '2回目'} rep${rep + 1}: ${r.startFailed ? '起動失敗' : r.timedOut ? '時間切れ' : '完了'}（${(r.wallMs / 1000).toFixed(0)} 秒）\n`);
             save();
           }
           // ZIP の版が変わったときに、保存分を使わないか（B・D の rep0 だけ）
