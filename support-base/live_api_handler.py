@@ -878,12 +878,15 @@ class LiveAPISession:
         instruction = (
             f"ご依頼（{request}）に合うお店を{total}軒、画面のカードに表示しました。{found}"
             "最初に、ご依頼の条件に合わせて選んだことを一言で伝えてください。"
-            f"そのあと1軒目から{total}軒目まで順に、地区と店名を、前後のお店とのつながりが分かる自然な話し言葉で紹介してください。"
+            f"そのあと1軒目から{total}軒目まで順に、地区と店名に続けて、summary（概要）がある店はその内容を、"
+            "前後のお店とのつながりが分かる自然な話し言葉で紹介してください。summary がない店は地区と店名だけを伝えてください。"
             "渡した項目以外の特徴・料理・価格・受賞歴・営業時間は述べないでください。"
             "各店の詳しい特徴と推薦理由はカードに順次表示されることを最後に案内し、気になるお店はありましたかと尋ねて締めてください。"
             "マークダウン記法や記号は使わないこと。"
         )
-        return {"result": instruction, "shops": [{"number": x['number'], "name": x['name'], "area": x['area']} for x in shops]}
+        items = [dict({"number": x['number'], "name": x['name'], "area": x['area']},
+                      **({"summary": x['summary']} if x.get('summary') else {})) for x in shops]
+        return {"result": instruction, "shops": items}
 
     def _build_shop_tool_response(self, shops: list) -> dict:
         """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""

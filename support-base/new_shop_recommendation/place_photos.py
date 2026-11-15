@@ -40,13 +40,31 @@ def fetch_photo(api_key, photo, http=requests):
     return {'image': uri, 'attributions': attributions}
 
 
-def fetch_shop_photo(api_key, place_id, http=requests):
-    """店の 1 枚目の写真（photoUri と撮影者表記）。returns {'image','attributions'} or None"""
+def format_price_range(pr):
+    """Places API (New) の priceRange（例: {startPrice:{units:'2000'}, endPrice:{units:'3000'}}）→ 「¥2,000〜¥3,000」"""
+    if not isinstance(pr, dict):
+        return ''
+
+    def yen(p):
+        try:
+            return f"¥{int((p or {}).get('units')):,}"
+        except (TypeError, ValueError):
+            return ''
+    a, b = yen(pr.get('startPrice')), yen(pr.get('endPrice'))
+    return f'{a}〜{b}' if a and b else (f'{a}〜' if a else (f'〜{b}' if b else ''))
+
+
+def fetch_place_extra(api_key, place_id, http=requests):
+    """
+    カードに足す Places (New) の情報: 写真（photoUri・撮影者表記）、価格帯（priceRange）、業種名（primaryTypeDisplayName）。
+    returns {'image','attributions','price_range','type_name'}（取れた項目だけ）or None
+    """
     if not api_key or not place_id:
         return None
     try:
-        resp = http.get(f'{PLACES_API_BASE}/places/{place_id}', headers={'X-Goog-Api-Key': api_key, 'X-Goog-FieldMask': 'photos'},
-                        timeout=TIMEOUT_SEC)
+        resp = http.get(f'{PLACES_API_BASE}/places/{place_id}',
+                        headers={'X-Goog-Api-Key': api_key, 'X-Goog-FieldMask': 'photos,priceRange,primaryTypeDisplayName',
+                                 'Accept-Language': 'ja'}, timeout=TIMEOUT_SEC)
     except requests.exceptions.RequestException as e:
         logger.warning(f'[NewShopRec][photo] 写真情報の取得失敗 ({type(e).__name__})')
         return None
@@ -54,7 +72,24 @@ def fetch_shop_photo(api_key, place_id, http=requests):
         logger.warning(f'[NewShopRec][photo] 写真情報の取得失敗 HTTP {resp.status_code}')
         return None
     try:
-        photos = (resp.json() or {}).get('photos') or []
+        data = resp.json() or {}
     except ValueError:
         return None
-    return fetch_photo(api_key, photos[0], http=http) if photos else None
+    out = {}
+    photos = data.get('photos') or []
+    ph = fetch_photo(api_key, photos[0], http=http) if photos else None
+    if ph:
+        out.update(ph)
+    pr = format_price_range(data.get('priceRange'))
+    if pr:
+        out['price_range'] = pr
+    tn = (data.get('primaryTypeDisplayName') or {}).get('text')
+    if tn:
+        out['type_name'] = tn
+    return out or None
+
+
+def fetch_shop_photo(api_key, place_id, http=requests):
+    """互換用: 写真だけ（{'image','attributions'} or None）"""
+    ex = fetch_place_extra(api_key, place_id, http=http) or {}
+    return {'image': ex['image'], 'attributions': ex.get('attributions') or []} if ex.get('image') else None

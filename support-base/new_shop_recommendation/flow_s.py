@@ -43,7 +43,9 @@ DETAILS_FIELDS = ('name,rating,user_ratings_total,formatted_address,address_comp
 HARD_REJECT = {'closed', 'not_a_store', 'prefecture_mismatch', 'area_mismatch'}
 STAGE_EVENT = 'shop_search_stage'
 DETAIL_EVENT = 'shop_card_detail'
-PHOTO_EVENT = 'shop_card_photo'
+EXTRA_EVENT = 'shop_card_extra'     # 写真・価格帯・外部リンクの後からの反映
+PHOTO_EVENT = EXTRA_EVENT
+SUMMARY_WAIT_SEC = 2.5             # 最終確定の後、tool_response を送る前に概要を待つ上限
 
 
 # ------------------------------------------------------------------ 外部 API（既定の実装。テストでは差し替える）
@@ -78,10 +80,17 @@ class HttpApis:
                 'prefecture': pref, 'country_code': cc, 'types': r.get('types') or [], 'component_names': names,
                 'formatted_address': r.get('formatted_address') or '', 'partial_match': bool(r.get('partial_match'))}
 
-    def photo(self, place_id):
-        """カードの写真（Places API (New)。プレビュー用 Maps キーをヘッダーで送る）"""
-        from .place_photos import fetch_shop_photo
-        return fetch_shop_photo(self.mkey, place_id)
+    def extra(self, place_id):
+        """カードの写真・価格帯・業種名（Places API (New)。プレビュー用 Maps キーをヘッダーで送る）"""
+        from .place_photos import fetch_place_extra
+        return fetch_place_extra(self.mkey, place_id)
+
+    def links(self, store, scope):
+        """33 秒版と同じ外部リンク（ホットペッパー・食べログ・ぐるなび／TripAdvisor）"""
+        from .card_links import links_for
+        pl = store.get('place') or {}
+        return links_for(store['rec'], pl.get('name') or '', scope.get('area') or '',
+                         {'region': scope.get('prefecture') or ''}, pl.get('country_code') or 'JP', pl.get('lat'), pl.get('lng'))
 
     def place_name(self, place_id):
         """施設の確認用に Place Details の正式名だけを取得（プレビュー用 Maps キー）"""
@@ -303,23 +312,37 @@ def match_store(rec, scope, apis, details_pool, ms):
     return out
 
 
-def make_card(store, display_rank, request_id, stage, desc=None, photo=None):
+def make_card(store, display_rank, request_id, stage, desc=None, photo=None, summary=None):
+    """desc: 推薦B の {'specialty','reason','category','highlights','tips'}、photo: 写真・価格帯・リンクなどの追加情報"""
+    d = desc or {}
     cd = c.Candidate(rank=store['rank'], name=store['rec'], area_hint=store['hint'],
-                     specialty=(desc or ('', ''))[0], reason=(desc or ('', ''))[1])
+                     specialty=d.get('specialty', ''), reason=d.get('reason', ''))
     card = build_card(c.Verification(cd, c.VERIFIED, store['path'], place=store['place']), display_rank, request_id)
     card['maps_attribution'] = store['place'].get('maps_attribution')   # Google Maps の出典（表示必須）
     card['maps_url'] = store['place'].get('maps_url') or card.get('maps_url')
     card['stage'] = stage
     card['detail_pending'] = desc is None
     card['geo_check'] = store.get('geo')                    # 地理条件の検証結果（未確認なら画面に明示する）
-    card['image'] = (photo or {}).get('image')              # 写真（キーを含まない photoUri）。無ければ既定の画像
-    card['image_attributions'] = (photo or {}).get('attributions') or []
+    ex = photo or {}
+    card['image'] = ex.get('image')                         # 写真（キーを含まない photoUri）。無ければ既定の画像
+    card['image_attributions'] = ex.get('attributions') or []
+    card['summary'] = summary or ''                          # 概要（カード冒頭。Live が読み上げる）
+    if d.get('highlights'):
+        card['highlights'] = d['highlights']
+    card['category'] = d.get('category') or ex.get('type_name') or card.get('category') or ''
+    card['tips'] = d.get('tips') or ''
+    if ex.get('price_range'):
+        card['priceRange'] = ex['price_range']                # 価格帯は Places の値だけ（LLM に作らせない）
+    for k in ('hotpepper_url', 'tabelog_url', 'gnavi_url', 'tripadvisor_url', 'tripadvisor_rating', 'tripadvisor_reviews'):
+        if ex.get(k):
+            card[k] = ex[k]
     return card
 
 
 # ------------------------------------------------------------------ フロー本体
 class FlowS:
     def __init__(self, apis, n=SP.A_COUNT, deadline_sec=DEADLINE_SEC, now=time.monotonic, store_workers=12,
+                 summary_wait_sec=SUMMARY_WAIT_SEC,
                  details_workers=30):
         self.apis = apis
         self.n = n
@@ -327,6 +350,7 @@ class FlowS:
         self._now = now
         self.store_workers = store_workers
         self.details_workers = details_workers
+        self.summary_wait_sec = summary_wait_sec
 
     def run(self, user_request: str, emit=None, request_id: str = None) -> dict:
         request_id = request_id or uuid.uuid4().hex
@@ -340,7 +364,8 @@ class FlowS:
         m = {'request_id': request_id, 'flow': f'S{self.n}', 'git_sha': os.environ.get('GIT_SHA', 'unknown'),
              'events': {}, 'stores': {}, 'a_error': None, 'b_error': None, 'scope': None}
         stores_in, desc, final_box = {}, {}, {}
-        photos, sent_pids = {}, set()          # 写真（place_id → 写真）と、カードを送った place_id
+        photos, sent_pids = {}, set()          # 追加情報（place_id → 写真・価格帯・リンク）と、カードを送った place_id
+        summaries, summary_cv = {}, threading.Condition()
         store_pool = ThreadPoolExecutor(max_workers=self.store_workers, thread_name_prefix='s10-store')
         details_pool = ThreadPoolExecutor(max_workers=self.details_workers, thread_name_prefix='s10-det')
         misc_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='s10-misc')
@@ -350,21 +375,24 @@ class FlowS:
                 m['events'].setdefault(k, ms() if v is None else v)
 
         def send_preview(st):
-            card = make_card(st, 1, request_id, 'preview', desc.get(st['rank']), photos.get(st['place_id']))
+            card = make_card(st, 1, request_id, 'preview', desc.get(st['rank']), photos.get(st['place_id']),
+                             summaries.get(st['rank']))
             sent_pids.add(st['place_id'])
             emit(STAGE_EVENT, {'request_id': request_id, 'stage': 'preview', 'cards': [card], 't_ms': ms()})
             send_late_photos([card])
             mark('preview_sent')
 
         def finalize(cards, why):
-            fc = [make_card(st, i + 1, request_id, 'final', desc.get(st['rank']), photos.get(st['place_id']))
-                  for i, st in enumerate(cards)]
+            fc = [make_card(st, i + 1, request_id, 'final', desc.get(st['rank']), photos.get(st['place_id']),
+                            summaries.get(st['rank'])) for i, st in enumerate(cards)]
             sent_pids.update(st['place_id'] for st in cards)
             status = c.COMPLETE if len(fc) >= c.DISPLAY_COUNT else (c.PARTIAL if fc else c.EMPTY)
             final_box.update(cards=fc, stores=cards, status=status, why=why)
             for st in cards:
                 if st['rank'] in desc:
                     mark(f'detail_{st["rank"]}')        # 最終カードに説明を含めて送った
+                if st['rank'] in summaries:
+                    mark(f'summary_{st["rank"]}')
             sk = (scope_f.result() if scope_f.done() else {}).get('kind') or 'unknown'
             final_box['scope_kind'] = sk
             emit(STAGE_EVENT, {'request_id': request_id, 'stage': 'final', 'cards': fc, 'status': status,
@@ -374,13 +402,22 @@ class FlowS:
             mark('final_sent')
             done_evt.set()
 
+        def extra_payload(pid):
+            ex = photos.get(pid) or {}
+            out = {'request_id': request_id, 'place_id': pid, 't_ms': ms()}
+            if ex.get('image'):
+                out.update(image=ex['image'], image_attributions=ex.get('attributions') or [])
+            for k in ('price_range', 'type_name', 'hotpepper_url', 'tabelog_url', 'gnavi_url', 'tripadvisor_url',
+                      'tripadvisor_rating', 'tripadvisor_reviews'):
+                if ex.get(k):
+                    out[k] = ex[k]
+            return out
+
         def send_late_photos(cards):
-            """カードを作った直後に届いた写真（カードに入らなかったもの）を送る"""
+            """カードを作った直後に届いた追加情報（カードに入らなかったもの）を送る"""
             for cd in cards:
-                ph = photos.get(cd.get('place_id'))
-                if ph and not cd.get('image'):
-                    emit(PHOTO_EVENT, {'request_id': request_id, 'place_id': cd['place_id'], 'image': ph['image'],
-                                       'image_attributions': ph['attributions'], 't_ms': ms()})
+                if photos.get(cd.get('place_id')):
+                    emit(EXTRA_EVENT, extra_payload(cd['place_id']))
 
         def handle(pv, fc, why):
             if pv is not None:
@@ -388,19 +425,34 @@ class FlowS:
             if fc is not None:
                 finalize(fc, 'top5_decided' if len(fc) >= c.DISPLAY_COUNT and why != 'deadline' else why)
 
-        def get_photo(pid):
-            """採用された店の写真を取り、カードを送った後なら写真だけを送る（カードの表示を待たせない）"""
-            try:
-                ph = self.apis.photo(pid)
-            except Exception:
-                ph = None
-            if not ph:
-                return
-            photos[pid] = ph
-            mark(f'photo_{pid}')
-            if pid in sent_pids:
-                emit(PHOTO_EVENT, {'request_id': request_id, 'place_id': pid, 'image': ph['image'],
-                                   'image_attributions': ph['attributions'], 't_ms': ms()})
+        def get_extra(st):
+            """採用された店の写真・価格帯（Places New）と外部リンク（33 秒版と同じ）を取り、カードを送った後なら追加情報だけ送る"""
+            pid = st['place_id']
+            ex = {}
+            for fn in ('extra', 'photo'):
+                if hasattr(self.apis, fn):
+                    try:
+                        r = getattr(self.apis, fn)(pid)
+                    except Exception:
+                        r = None
+                    if r:
+                        ex.update(r)
+                    break
+            if ex:
+                photos[pid] = dict(photos.get(pid) or {}, **ex)
+                mark(f'photo_{pid}')
+                if pid in sent_pids:
+                    emit(EXTRA_EVENT, extra_payload(pid))
+            if hasattr(self.apis, 'links'):
+                try:
+                    lk = self.apis.links(st, scope_f.result())
+                except Exception:
+                    lk = None
+                if lk:
+                    photos[pid] = dict(photos.get(pid) or {}, **lk)
+                    mark(f'links_{pid}')
+                    if pid in sent_pids:
+                        emit(EXTRA_EVENT, extra_payload(pid))
 
         scope_f = misc_pool.submit(S.resolve_scope, user_request, self.apis.geocode, getattr(self.apis, 'place_name', None))
 
@@ -413,8 +465,7 @@ class FlowS:
                 m['stores'][rec['rank']]['verdicts'] = st['verdicts']
             if st.get('place_id'):
                 mark('first_adopted', st['t_done'])
-                if hasattr(self.apis, 'photo'):
-                    threading.Thread(target=get_photo, args=(st['place_id'],), name='s10-photo', daemon=True).start()
+                threading.Thread(target=get_extra, args=(st,), name='s10-extra', daemon=True).start()
             pv, fc = disp.on_decided(st)
             handle(pv, fc, 'all_decided')
 
@@ -465,11 +516,11 @@ class FlowS:
                         continue
                     sent.add(cd['index'])
                     try:
-                        rank, sp, rs = SP.check_b_item(cd['obj'], by_rank)
+                        rank, dd = SP.check_b_item(cd['obj'], by_rank)
                     except c.RecommendationError as e:
                         m['b_error'] = m['b_error'] or e.error_type
                         continue
-                    desc[rank] = (sp, rs)
+                    desc[rank] = dd
                     send_detail(rank, t)
 
             err = self.apis.stream(SP.b_body(user_request, b_stores), on_b_text, lambda: False)
@@ -483,9 +534,48 @@ class FlowS:
             for st in final_box.get('stores') or []:
                 if st['rank'] == rank and rank in desc and f'detail_{rank}' not in m['events']:
                     mark(f'detail_{rank}', t)
-                    sp, rs = desc[rank]
+                    emit(DETAIL_EVENT, dict({'request_id': request_id, 'place_id': st['place_id'], 'recommend_rank': rank,
+                                             't_ms': t}, **desc[rank]))
+
+        def run_s(s_stores):
+            """概要（カード冒頭の 1 文。Live はこれを読み上げる）を推薦B と並行して生成する"""
+            by_rank = {st['rank']: st for st in s_stores}
+            stt, sent = CandidateStreamTracker(required_str=('name', 'summary')), set()
+
+            def on_s_text(text):
+                t = ms()
+                mark('s_first_text', t)
+                stt.feed(text, t)
+                for cd in stt.candidates:
+                    if cd['obj'] is None or cd['index'] in sent:
+                        continue
+                    sent.add(cd['index'])
+                    try:
+                        rank, sm = SP.check_s_item(cd['obj'], by_rank)
+                    except c.RecommendationError as e:
+                        m['s_error'] = m.get('s_error') or e.error_type
+                        continue
+                    with summary_cv:
+                        summaries[rank] = sm
+                        summary_cv.notify_all()
+                    send_summary(rank, t)
+
+            try:
+                err = self.apis.stream(SP.s_body(user_request, s_stores), on_s_text, lambda: False)
+                m['s_error'] = m.get('s_error') or err
+            finally:
+                mark('s_done')
+                with summary_cv:
+                    summary_cv.notify_all()
+                for st in final_box.get('stores') or []:
+                    send_summary(st['rank'], ms())
+
+        def send_summary(rank, t):
+            for st in final_box.get('stores') or []:
+                if st['rank'] == rank and rank in summaries and f'summary_{rank}' not in m['events']:
+                    mark(f'summary_{rank}', t)
                     emit(DETAIL_EVENT, {'request_id': request_id, 'place_id': st['place_id'], 'recommend_rank': rank,
-                                        'specialty': sp, 'reason': rs, 't_ms': t})
+                                        'summary': summaries[rank], 't_ms': t})
 
         def run_a():
             a_err = self.apis.stream(SP.a_body(user_request, self.n), on_a_text, done_evt.is_set)
@@ -497,6 +587,7 @@ class FlowS:
                 return
             handle(None, disp.on_a_done(), 'all_decided')
             b_stores = [stores_in[r] for r in sorted(stores_in)]
+            threading.Thread(target=run_s, args=(b_stores,), name='s10-summary', daemon=True).start()
             try:
                 run_b(b_stores)
             finally:
@@ -516,10 +607,21 @@ class FlowS:
                     'cards': [], 'narration': [], 'narration_mode': 'D', 'request': user_request, 'shortfall': c.DISPLAY_COUNT,
                     'final_reason': 'error', 'metrics': m}
         fc, cards = final_box.get('stores') or [], final_box.get('cards') or []
+        # tool_response の前に、最終カードの概要を最大 SUMMARY_WAIT_SEC だけ待つ（揃わない店は地区と店名だけを伝える）
+        t_wait = self._now() + self.summary_wait_sec
+        with summary_cv:
+            while fc and not all(st['rank'] in summaries for st in fc) and 's_done' not in m['events']:
+                left = t_wait - self._now()
+                if left <= 0:
+                    break
+                summary_cv.wait(left)
+        mark('narration_ready')
         m['final_status'] = final_box.get('status')
         m['final_reason'] = final_box.get('why')
         m['final_place_ids'] = [st['place_id'] for st in fc]
-        narration = [{'number': i + 1, 'name': st['rec'], 'area': st['hint']} for i, st in enumerate(fc)]
+        narration = [dict({'number': i + 1, 'name': st['rec'], 'area': st['hint']},
+                          **({'summary': summaries[st['rank']]} if st['rank'] in summaries else {}))
+                     for i, st in enumerate(fc)]
         return {'request_id': request_id, 'status': final_box.get('status') or c.EMPTY, 'error_type': m['a_error'],
                 'cards': cards, 'narration': narration, 'narration_mode': 'D', 'request': user_request,
                 'geo_unverified': final_box.get('scope_kind') == 'unknown',
