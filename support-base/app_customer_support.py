@@ -969,6 +969,22 @@ def handle_live_audio_in(data):
         logger.error(f"[LiveAPI] 音声デコードエラー: {e}")
 
 
+@socketio.on('live_text_in')
+def handle_live_text_in(data):
+    """ブラウザ → LiveAPI キーボード入力のテキスト（R2.0 §8.2）。応答は音声とテキストの両方で Live から返る"""
+    client_sid = request.sid
+    live_session = active_live_sessions.get(client_sid)
+    text = ((data or {}).get('text') or '').strip()
+    if not text:
+        return
+    if not live_session or not live_session.is_running:
+        logger.warning("[LiveAPI] Live が動いていないため、キーボード入力を送れない")
+        emit('live_text_rejected', {'reason': 'not_running'})
+        return
+    if not live_session.enqueue_text(text):
+        emit('live_text_rejected', {'reason': 'not_ready'})
+
+
 @socketio.on('live_stop')
 def handle_live_stop():
     """LiveAPIセッション終了"""
