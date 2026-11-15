@@ -1,74 +1,94 @@
 #!/usr/bin/env bash
 # =====================================================================
-# M4 プレビューの入れ替え（Cloud Shell）— 既存の Secret・IAM はそのまま、イメージだけ新しいバックエンド SHA にする
+# M4 プレビューの入れ替え（Cloud Shell）— S10 本番化の後に使う
 #
 #   bash ~/m4_redeploy_preview.sh
 #
-# - 前提: m4_deploy_preview.sh でタグ m4s10・Secret 3 つ・IAM が設定済み
-# - 新リビジョンを「トラフィック 0%・タグ m4s10（付け替え）・最大 1 インスタンス」で追加。本番トラフィックは変更しない
-# - テンプレートの Secret 参照（バージョン固定）と NEW_SHOP_FLOW 等は引き継ぎ、GIT_SHA だけ更新する
-# - 事前・事後確認は m4_deploy_preview.sh と同じ（本番キーの値は読まない）
-# - Cloud Shell の docker から push できない場合: M4_BUILD=cloudbuild bash ~/m4_redeploy_preview.sh（Cloud Build でビルド）
+# - 新リビジョンを「トラフィック 0%・タグ m4s10（付け替え）・最大 1 インスタンス」で追加する。本番トラフィックは変更しない
+# - プレビューの Secret 参照（名前とバージョン）は今の m4s10 のリビジョンから写す（値は読まない）
+# - 追加の後、サービスのテンプレートを本番リビジョンの設定へ戻す（0% のリビジョンをもう 1 つ追加）。
+#   テンプレートに計測トークンやプレビュー用 Secret が残ると、次の CI のデプロイに引き継がれるため
+# - 環境変数の値は GIT_SHA 以外読まない（名前と Secret 参照だけ）。ビルドは Cloud Build
 # =====================================================================
 set -euo pipefail
 PROJECT_ID="ai-avator-492205"
 REGION="us-central1"
 SERVICE="travel-sp-base"
-BASE_REVISION="travel-sp-base-00060-car"
 TAG="m4s10"
 BRANCH="preview-m4s10-backend"
-EXPECTED_SHA="2128aeaad976e041fdc584fad3d1431a7f651f4d"
+EXPECTED_SHA="76481cb09046c82897894de7a5a74f4473912f8d"
 AR_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${SERVICE}/${SERVICE}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 GC=(--project="${PROJECT_ID}" --region="${REGION}")
-SVC_FMT='json(status.traffic,spec.template.spec.containers[0].env[].name,spec.template.spec.containers[0].env[].valueFrom)'
-REV_FMT='json(spec.containers[0].env[].name,spec.containers[0].env[].valueFrom,spec.containers[0].image)'
+SVC_FMT='json(status.traffic,spec.template.spec.containers[0].env[].name,spec.template.spec.containers[0].env[].valueFrom,spec.template.spec.containers[0].image)'
+REV_FMT='json(spec.containers[0].env[].name,spec.containers[0].env[].valueFrom,spec.containers[0].image,metadata.annotations)'
+PREVIEW_SECRETS='GEMINI_RECOMMEND_API_KEY=m4-preview-recommend-key MAPS_AGENT_TOOLS_API_KEY=m4-preview-maps-key M4_BENCH_TOKEN=m4-preview-bench-token'
 
-echo "[1/4] 事前確認（読み取りのみ）"
+echo "[1/5] 事前確認（読み取りのみ）"
 gcloud run services describe "${SERVICE}" "${GC[@]}" --format="${SVC_FMT}" > "${WORK}/svc_before.json"
-python3 - "${WORK}/svc_before.json" "${BASE_REVISION}" "${TAG}" <<'PYEOF'
+python3 - "${WORK}/svc_before.json" "${TAG}" "${WORK}" <<'PYEOF'
 import json, sys
-svc = json.load(open(sys.argv[1]))
-base_rev, tag = sys.argv[2], sys.argv[3]
+svc, tag, work = json.load(open(sys.argv[1])), sys.argv[2], sys.argv[3]
 traffic = svc['status']['traffic']
 live = [t for t in traffic if t.get('percent')]
-if len(live) != 1 or live[0].get('revisionName') != base_rev or live[0].get('percent') != 100:
-    sys.exit(f'停止: 本番トラフィックが {base_rev} 100% ではありません')
+if len(live) != 1 or live[0].get('percent') != 100:
+    sys.exit('停止: 本番トラフィックが 1 つのリビジョンに 100% ではありません')
 mine = [t for t in traffic if t.get('tag') == tag]
 if len(mine) != 1 or mine[0].get('percent'):
-    sys.exit(f'停止: タグ {tag} のプレビュー（0%）がありません。先に m4_deploy_preview.sh を実行してください')
-env = {e['name']: e.get('valueFrom') for e in svc['spec']['template']['spec']['containers'][0].get('env') or []}
-for n in ('GEMINI_RECOMMEND_API_KEY', 'MAPS_AGENT_TOOLS_API_KEY', 'M4_BENCH_TOKEN'):
-    if not ((env.get(n) or {}).get('secretKeyRef') or {}).get('name'):
-        sys.exit(f'停止: テンプレートの {n} が Secret 参照ではありません')
-if 'NEW_SHOP_FLOW' not in env:
-    sys.exit('停止: テンプレートに NEW_SHOP_FLOW がありません')
-print(f'    本番トラフィック: {base_rev} 100%／タグ {tag}: {mine[0]["revisionName"]}（0%）／Secret 参照: 3 つとも設定済み')
+    sys.exit(f'停止: タグ {tag} のプレビュー（0%）がありません')
+open(f'{work}/prod_rev', 'w').write(live[0]['revisionName'])
+open(f'{work}/prev_rev', 'w').write(mine[0]['revisionName'])
+print(f'    本番トラフィック: {live[0]["revisionName"]} 100%／タグ {tag}: {mine[0]["revisionName"]}（0%）')
 PYEOF
+PROD_REV="$(cat "${WORK}/prod_rev")"; PREV_REV="$(cat "${WORK}/prev_rev")"
+gcloud run revisions describe "${PROD_REV}" "${GC[@]}" --format="${REV_FMT}" > "${WORK}/prod.json"
+gcloud run revisions describe "${PREV_REV}" "${GC[@]}" --format="${REV_FMT}" > "${WORK}/prev.json"
+# 本番の GIT_SHA だけを取り出す（ほかの値はファイルにも画面にも出さない）
+PROD_GIT_SHA="$(gcloud run revisions describe "${PROD_REV}" "${GC[@]}" --format='json(spec.containers[0].env)' | python3 -c "
+import json, sys
+print(next((e.get('value') or '' for e in json.load(sys.stdin)['spec']['containers'][0].get('env') or [] if e['name'] == 'GIT_SHA'), ''))")"
+python3 - "${WORK}/prod.json" "${WORK}/prev.json" "${PREVIEW_SECRETS}" "${WORK}" <<'PYEOF'
+import json, sys
+prod, prev, work = json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[4]
+want = dict(x.split('=') for x in sys.argv[3].split())
+def refs(r):
+    return {e['name']: ((e.get('valueFrom') or {}).get('secretKeyRef') or {}) for e in r['spec']['containers'][0].get('env') or []}
+pv, pr = refs(prev), refs(prod)
+args = []
+for env_name, secret in want.items():
+    r = pv.get(env_name) or {}
+    if r.get('name') != secret or not r.get('key'):
+        sys.exit(f'停止: プレビューの {env_name} が Secret {secret} の参照ではありません')
+    args.append(f'{env_name}={secret}:{r["key"]}')
+open(f'{work}/preview_secrets', 'w').write(','.join(args))
+p_args = []
+for env_name in ('GEMINI_RECOMMEND_API_KEY', 'MAPS_AGENT_TOOLS_API_KEY'):
+    r = pr.get(env_name) or {}
+    if not r.get('name') or not r.get('key') or r['name'].startswith('m4-preview-'):
+        sys.exit(f'停止: 本番の {env_name} が本番用 Secret の参照ではありません')
+    p_args.append(f'{env_name}={r["name"]}:{r["key"]}')
+if 'M4_BENCH_TOKEN' in pr:
+    sys.exit('停止: 本番に計測トークンが設定されています')
+open(f'{work}/prod_secrets', 'w').write(','.join(p_args))
+open(f'{work}/prod_image', 'w').write(prod['spec']['containers'][0]['image'])
+open(f'{work}/prod_max', 'w').write((prod['metadata'].get('annotations') or {}).get('autoscaling.knative.dev/maxScale', ''))
+print(f'    プレビューの Secret 参照: {", ".join(args)}')
+print(f'    本番の Secret 参照: {", ".join(p_args)}（計測トークンなし）')
+PYEOF
+[ -n "${PROD_GIT_SHA}" ] || { echo "停止: 本番の GIT_SHA を取得できません" >&2; exit 1; }
+PROD_MAX="$(cat "${WORK}/prod_max")"
+[ -n "${PROD_MAX}" ] || { echo "停止: 本番の最大インスタンス数を取得できません" >&2; exit 1; }
 
-echo "[2/4] ${BRANCH} を取得（固定 SHA ${EXPECTED_SHA:0:7}）とイメージのビルド"
+echo "[2/5] ${BRANCH} を取得（固定 SHA ${EXPECTED_SHA:0:7}）し Cloud Build でビルド"
 git init -q "${WORK}/src"
 git -C "${WORK}/src" remote add origin https://github.com/mirai-gpro/Travel-sp.git
 GIT_TERMINAL_PROMPT=0 git -C "${WORK}/src" fetch -q --depth=5 origin "${BRANCH}" || { echo "GitHub から取得できません" >&2; exit 1; }
 git -C "${WORK}/src" checkout -q "${EXPECTED_SHA}" || { echo "固定 SHA が見つかりません" >&2; exit 1; }
 [ "$(git -C "${WORK}/src" rev-parse HEAD)" = "${EXPECTED_SHA}" ] || { echo "SHA 不一致" >&2; exit 1; }
 IMAGE="${AR_IMAGE}:m4-${EXPECTED_SHA:0:12}"
-if [ "${M4_BUILD:-docker}" = "cloudbuild" ]; then
-  # Cloud Shell の docker から Artifact Registry へ接続できない場合の代替: Google Cloud 側（Cloud Build）でビルド・push する
-  gcloud builds submit "${WORK}/src/support-base" --project="${PROJECT_ID}" --region="${REGION}" --tag="${IMAGE}" --quiet \
-    > "${WORK}/build.log" 2>&1 || { echo "停止: Cloud Build に失敗しました（Cloud Run は未変更）:" >&2; tail -n 15 "${WORK}/build.log" >&2; exit 1; }
-else
-gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet > /dev/null 2>&1
-docker build -q -t "${IMAGE}" "${WORK}/src/support-base" > /dev/null
-pushed=0
-for i in 1 2 3 4; do
-  if docker push -q "${IMAGE}" > "${WORK}/push.log" 2>&1; then pushed=1; break; fi
-  echo "    push に失敗（${i}/4 回目）。$((i * 15)) 秒後に再試行します: $(tail -n 1 "${WORK}/push.log")"
-  sleep $((i * 15))
-done
-[ "${pushed}" = "1" ] || { echo "停止: Artifact Registry への push に 4 回失敗しました（Cloud Run は未変更）。M4_BUILD=cloudbuild で Cloud Build を使えます" >&2; exit 1; }
-fi
+gcloud builds submit "${WORK}/src/support-base" --project="${PROJECT_ID}" --region="${REGION}" --tag="${IMAGE}" --quiet \
+  > "${WORK}/build.log" 2>&1 || { echo "停止: Cloud Build に失敗しました（Cloud Run は未変更）:" >&2; tail -n 15 "${WORK}/build.log" >&2; exit 1; }
 DIGEST="$(gcloud artifacts docker images describe "${IMAGE}" --format='value(image_summary.digest)')"
 [ -n "${DIGEST}" ] || { echo "イメージ digest を取得できません" >&2; exit 1; }
 AMD64_DIGEST="$(docker buildx imagetools inspect --raw "${AR_IMAGE}@${DIGEST}" 2>/dev/null </dev/null | python3 -c "import json,sys
@@ -76,7 +96,7 @@ d=json.load(sys.stdin)
 print(next((m['digest'] for m in d.get('manifests') or [] if (m.get('platform') or {}).get('os')=='linux' and (m.get('platform') or {}).get('architecture')=='amd64'), ''))" || true)"
 echo "    digest: ${DIGEST}（linux/amd64: ${AMD64_DIGEST:-単一イメージ}）"
 
-echo "[3/4] デプロイ直前の再確認とデプロイ（--no-traffic --tag=${TAG}）"
+echo "[3/5] デプロイ直前の再確認とプレビューの追加（--no-traffic --tag=${TAG}）"
 gcloud run services describe "${SERVICE}" "${GC[@]}" --format="${SVC_FMT}" > "${WORK}/svc_recheck.json"
 python3 - "${WORK}/svc_before.json" "${WORK}/svc_recheck.json" <<'PYEOF'
 import json, sys
@@ -84,45 +104,60 @@ a, b = (json.load(open(p))['status']['traffic'] for p in sys.argv[1:3])
 if a != b:
     sys.exit('停止: 事前確認の後にトラフィック設定が変わりました。デプロイしません')
 PYEOF
+NEW_REV="${SERVICE}-m4s10-${EXPECTED_SHA:0:7}"
 gcloud run deploy "${SERVICE}" "${GC[@]}" --platform=managed \
   --image="${AR_IMAGE}@${DIGEST}" --no-traffic --tag="${TAG}" --revision-suffix="m4s10-${EXPECTED_SHA:0:7}" \
-  --max-instances=1 --update-env-vars="GIT_SHA=${EXPECTED_SHA}" \
+  --max-instances=1 --update-secrets="$(cat "${WORK}/preview_secrets")" \
+  --update-env-vars="NEW_SHOP_FLOW=S10,GIT_SHA=${EXPECTED_SHA},M4_BENCH_MAX_CALLS=150" \
   --quiet > "${WORK}/deploy.log" 2>&1 || { echo "デプロイに失敗しました（トラフィックは変更していません）:" >&2; tail -n 20 "${WORK}/deploy.log" >&2; exit 1; }
 
-echo "[4/4] 事後確認"
-NEW_REV="${SERVICE}-m4s10-${EXPECTED_SHA:0:7}"
+echo "[4/5] テンプレートを本番 ${PROD_REV} の設定へ戻す（0% のリビジョンを追加。トラフィックは変更しない）"
+gcloud run services update "${SERVICE}" "${GC[@]}" --platform=managed --no-traffic \
+  --image="$(cat "${WORK}/prod_image")" --max-instances="${PROD_MAX}" \
+  --remove-secrets=M4_BENCH_TOKEN --remove-env-vars=M4_BENCH_MAX_CALLS \
+  --update-secrets="$(cat "${WORK}/prod_secrets")" --update-env-vars="NEW_SHOP_FLOW=S10,GIT_SHA=${PROD_GIT_SHA}" \
+  --revision-suffix="tmpl-$(date +%m%d%H%M)" \
+  --quiet > "${WORK}/restore.log" 2>&1 || { echo "NG: テンプレートを戻せませんでした（トラフィックは変更していません）。次の CI の前に連絡してください:" >&2; tail -n 20 "${WORK}/restore.log" >&2; exit 1; }
+
+echo "[5/5] 事後確認"
 gcloud run services describe "${SERVICE}" "${GC[@]}" --format="${SVC_FMT}" > "${WORK}/svc_after.json"
 gcloud run revisions describe "${NEW_REV}" "${GC[@]}" --format="${REV_FMT}" > "${WORK}/new_rev.json"
-python3 - "${WORK}/svc_before.json" "${WORK}/svc_after.json" "${WORK}/new_rev.json" "${BASE_REVISION}" "${TAG}" "${NEW_REV}" "${DIGEST}" "${AMD64_DIGEST}" "${WORK}" <<'PYEOF'
+python3 - "${WORK}/svc_before.json" "${WORK}/svc_after.json" "${WORK}/new_rev.json" "${WORK}/prod.json" "${TAG}" "${NEW_REV}" "${DIGEST}" "${AMD64_DIGEST}" "${WORK}" <<'PYEOF'
 import json, sys
-before, after, rev = (json.load(open(p)) for p in sys.argv[1:4])
-base_rev, tag, new_rev, digest, amd64, work = sys.argv[4:10]
-tb, ta = before['status']['traffic'], after['status']['traffic']
+before, after, rev, prod = (json.load(open(p)) for p in sys.argv[1:5])
+tag, new_rev, digest, amd64, work = sys.argv[5:10]
 ok = True
-live = [t for t in ta if t.get('percent')]
-if len(live) != 1 or live[0].get('revisionName') != base_rev or live[0].get('percent') != 100:
+live_b = [(t.get('revisionName'), t.get('percent')) for t in before['status']['traffic'] if t.get('percent')]
+live_a = [(t.get('revisionName'), t.get('percent')) for t in after['status']['traffic'] if t.get('percent')]
+if live_a != live_b:
     print('NG: 本番トラフィックが変わっています'); ok = False
-others_b = {(t.get('tag'), t.get('revisionName')) for t in tb if t.get('tag') and t.get('tag') != tag}
-others_a = {(t.get('tag'), t.get('revisionName')) for t in ta if t.get('tag') and t.get('tag') != tag}
+others_b = {(t.get('tag'), t.get('revisionName')) for t in before['status']['traffic'] if t.get('tag') and t.get('tag') != tag}
+others_a = {(t.get('tag'), t.get('revisionName')) for t in after['status']['traffic'] if t.get('tag') and t.get('tag') != tag}
 if others_b != others_a:
     print('NG: ほかのタグが変わっています'); ok = False
-mine = [t for t in ta if t.get('tag') == tag]
+mine = [t for t in after['status']['traffic'] if t.get('tag') == tag]
 if len(mine) != 1 or mine[0].get('revisionName') != new_rev or mine[0].get('percent'):
     print(f'NG: タグ {tag} が新リビジョン（0%）を指していません'); ok = False
 img = rev['spec']['containers'][0]['image']
 if not (img.endswith(digest) or (amd64 and img.endswith(amd64))):
     print('NG: 新リビジョンのイメージが今回のビルドではありません'); ok = False
-env = {e['name']: e.get('valueFrom') for e in rev['spec']['containers'][0].get('env') or []}
-for n in ('GEMINI_RECOMMEND_API_KEY', 'MAPS_AGENT_TOOLS_API_KEY', 'M4_BENCH_TOKEN'):
-    if not ((env.get(n) or {}).get('secretKeyRef') or {}).get('name'):
-        print(f'NG: {n} が Secret 参照ではありません'); ok = False
+def refs(containers):
+    return {e['name']: (((e.get('valueFrom') or {}).get('secretKeyRef') or {}).get('name')) for e in containers[0].get('env') or []}
+rv = refs(rev['spec']['containers'])
+for n, s in (('GEMINI_RECOMMEND_API_KEY', 'm4-preview-recommend-key'), ('MAPS_AGENT_TOOLS_API_KEY', 'm4-preview-maps-key'), ('M4_BENCH_TOKEN', 'm4-preview-bench-token')):
+    if rv.get(n) != s:
+        print(f'NG: プレビューの {n} が {s} の参照ではありません'); ok = False
+tv, pv = refs(after['spec']['template']['spec']['containers']), refs(prod['spec']['containers'])
+if tv != pv:
+    print(f'NG: テンプレートが本番リビジョンと一致しません（名前・Secret 参照）: 余分 {sorted(set(tv) - set(pv))} / 不足 {sorted(set(pv) - set(tv))}'); ok = False
 open(f'{work}/url', 'w').write((mine[0].get('url') if mine else '') or '')
-print(f'    本番トラフィック: {base_rev} 100%（変更なし）／ほかのタグ: 変更なし／タグ {tag} → {new_rev}（0%）／キーは Secret 参照')
+if ok:
+    print(f'    本番トラフィック: 変更なし／タグ {tag} → {new_rev}（0%）／テンプレート: 本番リビジョンと同じ（計測トークンなし）')
 sys.exit(0 if ok else 1)
 PYEOF
 URL="$(cat "${WORK}/url")"
 code_health="$(curl -s -o /dev/null -w '%{http_code}' "${URL}/health")"
 code_bench="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"query":"x","method":"scope"}' "${URL}/api/m4/bench")"
 echo "    ${URL}/health → ${code_health}（200 なら正常）／計測エンドポイント（トークンなし）→ ${code_bench}（403 なら保護されている）"
-[ "${code_health}" = "200" ] && [ "${code_bench}" = "403" ] || { echo "NG: 事後確認に失敗しました（トラフィックは変更していません）" >&2; exit 1; }
+[ "${code_health}" = "200" ] && [ "${code_bench}" = "403" ] || { echo "NG: プレビューの事後確認に失敗しました（トラフィックは変更していません）" >&2; exit 1; }
 echo "完了: ${URL}（${NEW_REV}）"
