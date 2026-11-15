@@ -273,6 +273,18 @@ const { apiBaseUrl = '' } = Astro.props;
     background: #f0f0f0;
   }
 
+  .shop-card-list :global(.photo-attribution) {
+    font-size: 11px;
+    color: #666;
+    text-align: right;
+    padding: 2px 8px 0;
+  }
+
+  .shop-card-list :global(.photo-attribution a) {
+    color: inherit;
+    text-decoration: underline;
+  }
+
   .shop-card-list :global(.geo-note) {
     margin: 0 0 6px;
     font-size: 12px;
@@ -672,6 +684,7 @@ const { apiBaseUrl = '' } = Astro.props;
     stage?: string;
     detail_pending?: boolean;
     geo_check?: string | null;
+    image_attributions?: { displayName: string; uri?: string }[];
   }
 
   class ShopCardManager {
@@ -853,6 +866,7 @@ const { apiBaseUrl = '' } = Astro.props;
             ` : ''}
           </div>
         </a>
+        ${this.createPhotoAttributionHtml(shop)}
         <div class="card-body">
           
           <a href="${mapsUrl}" target="_blank" rel="noopener noreferrer" class="shop-header-link">
@@ -911,6 +925,33 @@ const { apiBaseUrl = '' } = Astro.props;
         ? ` ・ <a href="${this.escapeHtml(shop.maps_url)}" target="_blank" rel="noopener noreferrer">Google マップで見る</a>`
         : '';
       return `<div class="maps-attribution">出典: <a href="${this.escapeHtml(att.url)}" target="_blank" rel="noopener noreferrer">${title}</a>${place}</div>`;
+    }
+
+    // 写真の撮影者表記（Google の写真を使う時は表示が必要。名前と URL はエスケープして出す）
+    private createPhotoAttributionHtml(shop: ShopData): string {
+      const attrs = (shop.image && shop.image_attributions) || [];
+      if (attrs.length === 0) return '';
+      const items = attrs.map((a) => {
+        const name = this.escapeHtml(a.displayName || '');
+        const uri = a.uri || '';
+        return /^https:\/\//.test(uri)
+          ? `<a href="${this.escapeHtml(uri)}" target="_blank" rel="noopener noreferrer">${name}</a>`
+          : name;
+      });
+      return `<div class="photo-attribution">Photo: ${items.join(', ')}</div>`;
+    }
+
+    // 店の写真を後から反映（該当カードの画像と撮影者表記だけ）
+    applyPhoto(rid: string | null, placeId: string, image: string, attributions: { displayName: string; uri?: string }[]) {
+      if (rid !== this.m4Rid || !/^https:\/\//.test(image || '')) return;
+      const el = this.container.querySelector<HTMLElement>(`.shop-card[data-place-id="${CSS.escape(placeId)}"]`);
+      if (!el) return;
+      const img = el.querySelector<HTMLImageElement>('.hero-image img');
+      if (img) img.src = image;
+      el.querySelector('.photo-attribution')?.remove();
+      const html = this.createPhotoAttributionHtml({ name: '', image, image_attributions: attributions || [] });
+      if (html) el.querySelector('.hero-image-link')?.insertAdjacentHTML('afterend', html);
+      this.m4Log('photo_render', { rid, place_id: placeId });
     }
 
     private m4Rid: string | null = null;
@@ -1229,6 +1270,10 @@ const { apiBaseUrl = '' } = Astro.props;
     document.addEventListener('shopStage', ((event: CustomEvent) => {
       const d = event.detail || {};
       manager.applyStage(d.stage, d.rid, d.cards || [], d.language);
+    }) as EventListener);
+    document.addEventListener('shopPhoto', ((event: CustomEvent) => {
+      const d = event.detail || {};
+      if (d.place_id) manager.applyPhoto(d.request_id || null, d.place_id, d.image || '', d.image_attributions || []);
     }) as EventListener);
     document.addEventListener('shopDetail', ((event: CustomEvent) => {
       const d = event.detail || {};
