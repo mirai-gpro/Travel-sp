@@ -110,7 +110,7 @@ async function oneLoad(ctx, prof, cfg, userDir) {
             save();
           }
           // ZIP の版が変わったときに、保存分を使わないか（B・D の rep0 だけ）
-          if (rep === 0 && (cfg === 'B' || cfg === 'D')) {
+          if (process.env.FULL133_VERSION_CHECK !== '0' && rep === 0 && (cfg === 'B' || cfg === 'D')) {
             await fetch(`${FRONT}/__poc/zip-version`, { method: 'POST' });
             const r = await oneLoad(ctx, prof, cfg, userDir);
             results.versionCheck.push({ profile: pname, config: cfg, zipRequests: r.zipRequests, marks: Object.keys(r.marks || {}).filter(k => k.startsWith('poc:prefetch')), texSha: r.texSha });

@@ -32,7 +32,7 @@ P('');
 // ---------- 1. buildModelTexture（Node・CPU）----------
 const bmtOut = { perAvatar: [], allIdentical: null };
 P('1. buildModelTexture() 旧実装と TypedArray 版（Node・CPU のみ。ソフトウェア GPU の影響なし）'); P('-'.repeat(60));
-if (!Array.isArray(bmt)) { P('未測定（ベンチマークが実行できませんでした。手順の結果を参照）'); }
+if (!Array.isArray(bmt)) { P(process.env.FULL133_REPORT_NO_BMT === '1' ? 'この確認では対象外（9 体の結果は results/2026-11-15_claude-code/ の記録を参照）' : '未測定（ベンチマークが実行できませんでした。手順の結果を参照）'); }
 else {
   const zips = [...new Set(bmt.map(r => r.zip))];
   P('アバター                         旧(ms)   新(ms)  短縮率  CPU旧(ms) CPU新(ms) ピーク増 旧/新(MB)  出力 SHA-256 一致');
