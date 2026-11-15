@@ -40,55 +40,11 @@ from support_core import (
     SYSTEM_PROMPTS,
     SupportSession,
     SupportAssistant,
-    gemini_client
+    gemini_client,
+    CONCIERGE_V11,
+    concierge_text,
 )
 from live_api_handler import LiveAPISession, build_system_instruction
-from new_shop_recommendation.contracts import ConfigError as NewShopConfigError
-
-# 新ショップ推薦エンジン（初回利用時に環境変数から構築。GEMINI_RECOMMEND_API_KEY 未設定なら設定エラー）
-_new_shop_orchestrator = None
-_new_shop_orchestrator_lock = threading.Lock()
-
-
-def _get_new_shop_orchestrator():
-    global _new_shop_orchestrator
-    with _new_shop_orchestrator_lock:
-        if _new_shop_orchestrator is None:
-            from new_shop_recommendation.orchestrator import build_from_env
-            _new_shop_orchestrator = build_from_env()
-        return _new_shop_orchestrator
-
-
-# M4 プレビュー専用: R2.0 の会話プロンプト（486dace の prompts/concierge_v11_{ja,en}.txt をそのまま同梱。GCS は変えない）
-_concierge_v11_cache = None
-
-
-def _concierge_v11():
-    global _concierge_v11_cache
-    if _concierge_v11_cache is None:
-        out = {}
-        for lang in ('ja', 'en'):
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts', f'concierge_v11_{lang}.txt')
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    out[lang] = f.read()
-            except FileNotFoundError:
-                logger.warning(f"[Prompt] concierge_v11 がありません: {path}")
-        _concierge_v11_cache = out
-    return _concierge_v11_cache
-
-
-# M4 プレビュー専用: NEW_SHOP_FLOW=S10 のときだけ S10 フロー（既定は上の新エンジンのまま）
-_new_shop_flow_s = None
-
-
-def _get_new_shop_flow_s():
-    global _new_shop_flow_s
-    with _new_shop_orchestrator_lock:
-        if _new_shop_flow_s is None:
-            from new_shop_recommendation.flow_s import build_from_env as build_flow_s
-            _new_shop_flow_s = build_flow_s()
-        return _new_shop_flow_s
 
 # ロギング設定
 logging.basicConfig(
@@ -128,6 +84,7 @@ allowed_origins = [
     "https://gourmet-sp3.vercel.app",
     "https://travel-sp.vercel.app",
     "https://travel-sp-git-preview-live38-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（本番に merge しない）
+    "https://travel-sp-git-rebuild-b-mirais-projects-87257550.vercel.app",  # 検証用プレビュー専用（B の再構築・本番に merge しない）
     "http://localhost:4321"
 ]
 
@@ -276,6 +233,62 @@ def start_session():
         return jsonify({'error': str(e)}), 500
 
 
+def _handle_concierge_chat(session, session_data, user_message, stage, language):
+    """
+    コンシェルジュのキーボード会話（R1.4 §5）。音は出さず、文字とカードだけを返す（③）。
+    返答の項目は既存の /api/chat と同じで、outcome を足す（§5.4）。
+    """
+    user_id = session_data.get('user_id')
+
+    def on_action(action):
+        # 現行の名前登録と同じ処理（推薦より先に呼ばれる。失敗しても推薦は続ける）
+        if not LONG_TERM_MEMORY_ENABLED:
+            return
+        updates = action.get('updates') or {}
+        if updates and user_id:
+            ltm = LongTermMemory()
+            if ltm.update_profile(user_id, updates):
+                logger.info(f"[LTM] LLMからの指示でプロファイル更新成功: updates={updates}, user_id={user_id}")
+            else:
+                logger.error(f"[LTM] LLMからの指示でプロファイル更新失敗: updates={updates}, user_id={user_id}")
+        elif not user_id:
+            logger.warning(f"[LTM] user_id が空のためプロファイル更新をスキップ: action={action}")
+
+    assistant = SupportAssistant(session, SYSTEM_PROMPTS)
+    result = assistant.process_concierge_message(user_message, stage, on_action=on_action)
+
+    # 返答を履歴に 1 回記録する。C1 の出力が読めなかったときは表示も記録もしない
+    if result['record']:
+        session.add_message('model', result['response'], 'chat')
+        if result['summary']:
+            session.add_message('model', result['summary'], 'summary')
+
+    outcome = result.get('outcome')
+    if outcome and outcome['status'] == 'complete' and LONG_TERM_MEMORY_ENABLED and user_id:
+        try:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+            shop_summary = f"[{timestamp}] 検索条件: {user_message[:100]}\n提案店舗: {', '.join(result['shop_names'])}"
+            ltm = LongTermMemory()
+            if ltm.append_conversation_summary(user_id, shop_summary):
+                logger.info(f"[LTM] ショップ提案サマリー保存成功: {len(result['shop_names'])}件")
+            else:
+                logger.warning("[LTM] ショップ提案サマリー保存失敗")
+        except Exception as e:
+            logger.error(f"[LTM] ショップサマリー保存エラー: {e}")
+
+    response_data = {
+        'response': result['response'],
+        'summary': result['summary'],
+        'shops': result['shops'],
+        'should_confirm': result['record'] and stage == 'conversation',
+        'is_followup': False,
+    }
+    if outcome:
+        response_data['outcome'] = outcome
+    logger.info(f"[Chat] コンシェルジュ: outcome={outcome['status'] if outcome else None}, shops={len(result['shops'])}件")
+    return jsonify(response_data)
+
+
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
 def chat():
     """
@@ -316,6 +329,10 @@ def chat():
 
         # 2. ユーザー入力を記録
         session.add_message('user', user_message, 'chat')
+
+        # コンシェルジュは C1 → 推薦 → 確定（R1.4 §5）。chat・lesson は以下の既存の処理のまま
+        if mode == 'concierge':
+            return _handle_concierge_chat(session, session_data, user_message, stage, language)
 
         # 3. 知能生成 (Assistant作成)
         assistant = SupportAssistant(session, SYSTEM_PROMPTS)
@@ -766,33 +783,6 @@ def get_session(session_id):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/m4/bench', methods=['POST'])
-def m4_bench():
-    """M4 T4 比較試験（プレビュー専用。NEW_SHOP_FLOW=S10 と M4_BENCH_TOKEN が両方設定されたリビジョンだけで有効）"""
-    from new_shop_recommendation import m4_bench as mb
-    if not mb.enabled():
-        return jsonify({'error': 'not_found'}), 404
-    if not mb.token_ok(request.headers.get('X-M4-Bench-Token')):
-        return jsonify({'error': 'forbidden'}), 403
-    data = request.get_json(silent=True) or {}
-    q, method = data.get('query') or '', data.get('method')
-    if not q or method not in ('33', 'S10', 'scope'):
-        return jsonify({'error': 'bad_request'}), 400
-    why = mb.acquire()                      # 呼び出し制限（同時 1 件・合計回数）
-    if why:
-        return jsonify({'error': why}), 429
-    try:
-        if method == '33':
-            return jsonify(mb.run_33(q))
-        try:
-            flow = _get_new_shop_flow_s()
-        except NewShopConfigError as e:
-            return jsonify({'error': f'config:{e}'}), 500
-        return jsonify(mb.run_scope(q, flow) if method == 'scope' else mb.run_s10(q, flow))
-    finally:
-        mb.release()
-
-
 @app.route('/health', methods=['GET', 'OPTIONS'])
 def health_check():
     """ヘルスチェック"""
@@ -861,46 +851,185 @@ def handle_live_start(data):
         except Exception as e:
             logger.warning(f"[LiveAPI] プロファイル取得エラー: {e}")
 
-    from new_shop_recommendation import flow_s as _flow_s_prompt
-    if mode == 'concierge' and _flow_s_prompt.enabled() and language in _concierge_v11():
-        # M4 プレビュー専用（NEW_SHOP_FLOW=S10）: R2.0 の会話（486dace の concierge_v11、イメージ内のファイル）を使う。GCS は変更しない
-        system_prompt = build_system_instruction(mode, user_profile=user_profile,
-                                                   system_prompts={'concierge': _concierge_v11()}, language=language)
-        logger.info(f"[LiveAPI] concierge_v11（R2.0 の会話）を使用: lang={language}")
-    else:
-        system_prompt = build_system_instruction(mode, user_profile=user_profile,
-                                                   system_prompts=SYSTEM_PROMPTS, language=language)
+    system_prompt = build_system_instruction(mode, user_profile=user_profile,
+                                               system_prompts=SYSTEM_PROMPTS, language=language)
 
-    # ショップ検索コールバック: 新ショップ推薦エンジンへのアダプター
-    # （推薦・照合・再試行のロジックは持たない。旧 gemini-2.5-flash + Google 検索方式は使わない）
+    # コンシェルジュ：v11 + Live 用規則、共通の推薦、SupportSession の確定店（R1.4 §6・§7）
+    shops_store = None
+    concierge_search_callback = None
+    if mode == 'concierge':
+        if language not in CONCIERGE_V11:
+            # その言語の v11 がなければ Live を始めずエラーを送る（§9）
+            emit('error', {'message': concierge_text(language, 'unsupported_language')})
+            logger.warning(f"[LiveAPI] v11 がない言語のため Live を始めない: {language}")
+            return
+        system_prompt = build_system_instruction('concierge', user_profile=user_profile,
+                                                 system_prompts={'concierge': CONCIERGE_V11}, language=language)
+        shops_store = SupportSession(session_id) if session_id else None
+        if shops_store and shops_store.get_data() is None:
+            # このインスタンスに REST のセッションがない（別のインスタンスで作られた）：確定店の保存先だけを作る。
+            # user_info がないので user_id はなく、長期記憶の読み込みと名前の保存はできない（R2.0 §8.6・A-7）
+            shops_store.initialize({}, language=language, mode='concierge')
+            logger.warning("[LiveAPI] このインスタンスに SupportSession がないため、確定店の保存先だけを作成")
+
+        def _concierge_search(user_request, lang, search_mode, search_seq, area=''):
+            """Live の search_shops：recommend_shops(origin='live') を呼び、5 店なら commit_shops で保存する"""
+            from concierge_recommender import recommend_shops
+            out = recommend_shops(user_request, lang, 'live', gemini_client, area=area)
+            out['shops_version'] = None
+            if out['status'] == 'complete':
+                if search_seq is None:
+                    # このインスタンスに SupportSession がない：保存せず、カードと紹介は現行どおり行う
+                    logger.warning("[Concierge] SupportSession がないため確定店を保存できない")
+                else:
+                    version = shops_store.commit_shops(search_seq, out['shops'], origin='live')
+                    if version is None:
+                        out['status'] = 'superseded'
+                        out['reason_code'] = None
+                    elif version is False:
+                        logger.warning("[Concierge] SupportSession がないため確定店を保存できない")
+                    else:
+                        out['shops_version'] = version
+            if out['shops_version'] is None and shops_store:
+                state = shops_store.get_shops_state()
+                if state:
+                    out['shops_version'] = state[1]
+            return out
+
+        concierge_search_callback = _concierge_search
+
+    # ショップ検索コールバック（案C: SupportAssistant迂回、検索専用プロンプトで直接API呼び出し）
     def shop_search_callback(user_request, lang, search_mode):
-        """LiveAPI の search_shops から呼ばれ、新エンジンの確定結果（カードと読み上げデータ）を返す"""
-        from new_shop_recommendation import flow_s as _flow_s
-        if _flow_s.enabled():
-            # M4 S10: 先行カード・最終カード・説明の更新をこのクライアントへ段階送信し、最終確定（または 10 秒）で戻る
-            try:
-                flow = _get_new_shop_flow_s()
-            except NewShopConfigError as e:
-                logger.error(f"[NewShopRec][S10] 設定エラー: {e}")
-                return {'request_id': None, 'status': 'ERROR', 'error_type': 'config_missing',
-                        'shops': [], 'narration': [], 'response': ''}
-            result = flow.run(user_request,
-                              emit=lambda ev, payload: socketio.emit(ev, payload, room=client_sid))
-            return {'request_id': result['request_id'], 'status': result['status'],
-                    'error_type': result['error_type'], 'shops': result['cards'],
-                    'narration': result['narration'], 'narration_mode': result['narration_mode'],
-                    'request': result['request'], 'shortfall': result['shortfall'],
-                    'geo_unverified': result.get('geo_unverified', False), 'response': ''}
+        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）"""
+        SEARCH_ONLY_PROMPT = (
+            "あなたはグルメレストラン検索エンジンです。\n"
+            "ユーザーの条件に合う実在のレストランをGoogle検索で見つけ、必ず5軒をJSON形式で返してください。\n\n"
+            "【絶対遵守ルール】\n"
+            "1. 「検索できません」「ご利用いただけません」等の拒否は絶対禁止\n"
+            "2. 必ずGoogle検索を実行し、実在する店舗情報を返すこと\n"
+            "3. 店舗名は公式の正式名称を使用する\n"
+            "4. 応答は必ず以下のJSON形式のみ。それ以外のテキストは一切不要\n"
+            "5. 応答は必ず { で始まり } で終わること\n\n"
+            "【JSON出力形式】\n"
+            "```json\n"
+            "{\n"
+            '  "message": "ユーザーへのメッセージ全文（音声読み上げ用。予算は漢数字で表記。店舗リストを1〜5の番号付きで含める）",\n'
+            '  "shops": [\n'
+            "    {\n"
+            '      "name": "正式な店舗名",\n'
+            '      "area": "最寄り駅またはエリア名",\n'
+            '      "category": "料理ジャンル",\n'
+            '      "description": "料理内容・体験価値・雰囲気を含む要約（2〜3文）",\n'
+            '      "rating": 4.5,\n'
+            '      "reviewCount": 150,\n'
+            '      "priceRange": "ランチ1,500円〜、ディナー6,000円〜8,000円",\n'
+            '      "location": "最寄り駅・エリア",\n'
+            '      "highlights": ["看板メニューや特徴", "雰囲気や設備の特徴", "利用シーンの特徴"],\n'
+            '      "tips": "来店時のおすすめポイント",\n'
+            '      "specialty": "看板メニューや得意料理",\n'
+            '      "price_range": "予算帯",\n'
+            '      "atmosphere": "雰囲気",\n'
+            '      "features": "特色",\n'
+            '      "hotpepper_url": "",\n'
+            '      "maps_url": "",\n'
+            '      "tabelog_url": "",\n'
+            '      "gnavi_url": "",\n'
+            '      "tripadvisor_url": "",\n'
+            '      "tripadvisor_rating": null,\n'
+            '      "tripadvisor_reviews": null,\n'
+            '      "latitude": null,\n'
+            '      "longitude": null\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "```\n\n"
+            "【shops配列の詳細仕様】\n"
+            "基本フィールド（重要度：高）:\n"
+            "- name: 正式な店舗名\n"
+            "- area: 最寄り駅またはエリア名\n"
+            "- description: 料理内容・体験価値・雰囲気を含む要約（2〜3文）\n"
+            "- category: 料理ジャンル\n"
+            "- priceRange: 価格帯（数字+カンマ形式、例：「ランチ2,000円〜、ディナー6,000円〜8,000円」）\n\n"
+            "充実情報フィールド（推奨）:\n"
+            "- rating: 評価（数値）\n"
+            "- reviewCount: レビュー数\n"
+            "- location: 最寄り駅・エリア\n"
+            "- highlights: 3つ程度の特徴（配列）\n"
+            "- tips: 来店時のおすすめポイント\n"
+            "- specialty: 看板メニューや得意料理\n"
+            "- atmosphere: 雰囲気\n"
+            "- features: 特色\n\n"
+            "外部リンク（取得できた場合のみ）:\n"
+            "- hotpepper_url, maps_url, tabelog_url, gnavi_url, tripadvisor_url\n"
+            "- tripadvisor_rating, tripadvisor_reviews\n"
+            "- latitude, longitude\n\n"
+            "【予算表記ルール】\n"
+            "- messageフィールド内: 漢数字（五千円、一万円）で音声読み上げに対応\n"
+            "- priceRangeフィールド: 数字+カンマ形式（6,000円〜8,000円）でカード表示に対応\n\n"
+            "【messageの構成】\n"
+            "1. 導入文（条件の要約）\n"
+            "2. 店舗リスト（1〜5の番号付き、各店舗2〜3文の説明、予算は漢数字）\n"
+            "3. 締め文（「気になるお店はありましたか？」等）\n"
+        )
         try:
-            orchestrator = _get_new_shop_orchestrator()
-        except NewShopConfigError as e:
-            logger.error(f"[NewShopRec] 設定エラー: {e}")
-            return {'request_id': None, 'status': 'ERROR', 'error_type': 'config_missing',
-                    'shops': [], 'narration': [], 'response': ''}
-        result = orchestrator.run(user_request, language_code=(lang or 'ja'), region_code='JP')
-        return {'request_id': result['request_id'], 'status': result['status'],
-                'error_type': result['error_type'], 'shops': result['cards'],
-                'narration': result['narration'], 'response': ''}
+            logger.info(f"[ShopSearch] 案C: 検索専用プロンプトで直接API呼び出し: '{user_request}'")
+            config = types.GenerateContentConfig(
+                system_instruction=SEARCH_ONLY_PROMPT,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            )
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
+                config=config
+            )
+            assistant_text = response.text
+            logger.info(f"[ShopSearch] 案C: Gemini応答 {len(assistant_text)}文字: {assistant_text[:200]}")
+
+            # JSON解析（extract_shops_from_responseでフォールバック）
+            import json as _json
+            shops = []
+            response_msg = assistant_text
+            try:
+                # JSON部分を抽出
+                text = assistant_text.strip()
+                start = text.find('{')
+                if start >= 0:
+                    brace_count = 0
+                    end = -1
+                    for i in range(start, len(text)):
+                        if text[i] == '{': brace_count += 1
+                        elif text[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end = i + 1
+                                break
+                    if end > 0:
+                        data = _json.loads(text[start:end])
+                        response_msg = data.get('message', assistant_text)
+                        shops = data.get('shops', [])
+            except _json.JSONDecodeError as e:
+                logger.warning(f"[ShopSearch] 案C: JSONパース失敗: {e}")
+                from api_integrations import extract_shops_from_response
+                shops = extract_shops_from_response(assistant_text)
+
+            if shops is None:
+                shops = []
+            logger.info(f"[ShopSearch] 案C: {len(shops)}件のショップを取得")
+
+            result = {
+                'response': response_msg,
+                'shops': shops,
+                'summary': f"{len(shops)}軒のお店を提案しました。" if shops else None,
+                'should_confirm': True,
+                'is_followup': False,
+            }
+            if shops:
+                area = extract_area_from_text(user_request, lang)
+                result['area'] = area
+            return result
+        except Exception as e:
+            logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)
+            return None
 
     # LiveAPIセッション作成
     live_session = LiveAPISession(
@@ -910,10 +1039,11 @@ def handle_live_start(data):
         system_prompt=system_prompt,
         socketio=socketio,
         client_sid=client_sid,
-        shop_search_callback=shop_search_callback,
+        shop_search_callback=concierge_search_callback if mode == 'concierge' else shop_search_callback,
         user_id=user_id,
         voice_model=voice_model,
-        live_voice=live_voice
+        live_voice=live_voice,
+        shops_store=shops_store,
     )
     # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
     #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
@@ -967,6 +1097,22 @@ def handle_live_audio_in(data):
         live_session.enqueue_audio(pcm_bytes)
     except Exception as e:
         logger.error(f"[LiveAPI] 音声デコードエラー: {e}")
+
+
+@socketio.on('live_text_in')
+def handle_live_text_in(data):
+    """ブラウザ → LiveAPI キーボード入力のテキスト（R2.0 §8.2）。応答は音声とテキストの両方で Live から返る"""
+    client_sid = request.sid
+    live_session = active_live_sessions.get(client_sid)
+    text = ((data or {}).get('text') or '').strip()
+    if not text:
+        return
+    if not live_session or not live_session.is_running:
+        logger.warning("[LiveAPI] Live が動いていないため、キーボード入力を送れない")
+        emit('live_text_rejected', {'reason': 'not_running'})
+        return
+    if not live_session.enqueue_text(text):
+        emit('live_text_rejected', {'reason': 'not_ready'})
 
 
 @socketio.on('live_stop')

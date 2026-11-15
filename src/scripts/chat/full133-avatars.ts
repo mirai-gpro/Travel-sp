@@ -22,6 +22,10 @@ export const FULL133_AVATAR_IDS: ReadonlySet<string> = new Set([
     'uika-okabe02-full133',
     'uika-ryusei02-full133',
     'uika-sakura-full133',
+    // BATCH_20261103_01 (2026-11-03 採用)
+    'uika-fumiya02-full133',
+    'uika-hitomi-full133',
+    'uika-sades-full133',
 ]);
 
 export function isFull133AvatarId(id: string | null | undefined): boolean {

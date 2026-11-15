@@ -48,6 +48,8 @@ export interface ExpressionFrame {
 
 export class LiveAudioManager {
     private audioContext: AudioContext | null = null;
+    // 真ならマイクを取得できなくても初期化を終える（コンシェルジュだけ真にする。R2.0 §8.3）
+    public allowWithoutMic = false;
     private mediaStream: MediaStream | null = null;
     private audioWorkletNode: AudioWorkletNode | null = null;
     private sourceNode: MediaStreamAudioSourceNode | null = null;
@@ -75,13 +77,32 @@ export class LiveAudioManager {
 
         this.socket = socket;
 
-        // 1. AudioContext (1つだけ) - 48kHzでマイク入力
+        // 1. AudioContext (1つだけ) - 48kHzでマイク入力。AI 音声の再生もこれを使う
         // @ts-ignore
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         this.audioContext = new AudioContextClass({ sampleRate: 48000 });
 
+        // 2〜5. マイクの準備（R2.0 §8.3）。再生はマイクに依存しないので分けておく
+        try {
+            await this.setupMicrophone();
+        } catch (error) {
+            // コンシェルジュはマイクがなくても Live を始める（キーボードの回答も Live の音声で返す）
+            if (!this.allowWithoutMic) throw error;
+            console.warn('[LiveAudioManager] マイクを使わずに初期化（再生のみ）:', error);
+        }
+
+        console.log('[LiveAudioManager] 初期化完了');
+    }
+
+    // ========================================
+    // マイクの準備（getUserMedia・AudioWorklet・ノードの接続）。initialize() から分けただけで中身は同じ
+    // ========================================
+    private async setupMicrophone(): Promise<void> {
+        if (!this.audioContext) throw new Error('AudioContext が未作成');
+        if (this.mediaStream) return;
+
         // 2. getUserMedia (1回だけ)
-        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
@@ -89,6 +110,8 @@ export class LiveAudioManager {
                 channelCount: 1,
             }
         });
+
+        this.mediaStream = stream;
 
         // 3. AudioWorklet登録 (1回だけ)
         // 48kHz → 16kHz ダウンサンプリング + Int16変換
@@ -155,7 +178,27 @@ export class LiveAudioManager {
             this.socket.emit('live_audio_in', { data: base64 });
         };
 
-        console.log('[LiveAudioManager] 初期化完了');
+    }
+
+    // ========================================
+    // マイクの有無・後からの取得・再生の再開（R2.0 §8.3）
+    // ========================================
+    hasMicrophone(): boolean {
+        return !!this.mediaStream;
+    }
+
+    async enableMicrophone(): Promise<void> {
+        await this.setupMicrophone();
+    }
+
+    isOutputRunning(): boolean {
+        return !!this.audioContext && this.audioContext.state === 'running';
+    }
+
+    async resumeOutput(): Promise<void> {
+        if (this.audioContext && this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+        }
     }
 
     // ========================================
