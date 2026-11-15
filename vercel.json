@@ -6,7 +6,8 @@
   "installCommand": "npm install",
   "git": {
     "deploymentEnabled": {
-      "main": true
+      "main": true,
+      "poc/full133-startup": false
     }
   }
 }
