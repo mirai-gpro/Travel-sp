@@ -122,6 +122,55 @@ const {
   const mode = window.location.pathname.includes('concierge') ? 'concierge' : 'lesson';
   const storedUrl = localStorage.getItem('selectedAvatarUrl_' + mode);
   window.__lamAvatarConfig = { modelUrl: storedUrl || modelUrl };
+
+  // ===== [FULL133 startup PoC] 比較用（?pocStartup=A|B|C|D、?pocTrace=1）。指定が無ければ何もしない =====
+  //   A: 現行のまま  B: 選択中 ZIP の先読み  C: buildModelTexture の TypedArray 版  D: B + C + 完成後の一括表示
+  //   先読みは ZIP の取得（ネットワーク）だけを早める。アバターの初期化の開始（linkLamAvatar）は変えない
+  (function () {
+    var q;
+    try { q = new URLSearchParams(location.search); } catch (e) { return; }
+    if (q.get('pocTrace') === '1') window.__FULL133_POC_TRACE = true;
+    var poc = (q.get('pocStartup') || '').toUpperCase();
+    if (!/^[ABCD]$/.test(poc)) return;
+    window.__FULL133_POC_MODE = poc;
+    var mark = function (n) { if (window.__FULL133_POC_TRACE) performance.mark(n); };
+    mark('poc:mode:' + poc);
+    if (poc === 'C' || poc === 'D') window.__FULL133_POC_OPT_BUILD = true;
+    if (poc !== 'B' && poc !== 'D') return;
+    var url = new URL(window.__lamAvatarConfig.modelUrl, location.href).href;
+    var CACHE_NAME = 'full133-zip-poc-v1';
+    mark('poc:prefetch:start');
+    // 端末への保存は Cache API（ETag つき）。毎回 If-None-Match で確かめ、304 のときだけ保存分を使う
+    // （ZIP が更新されて ETag が変われば 200 で取り直し、保存分を置き換える）。HTTP キャッシュは使わない（no-store）
+    var p = (async function () {
+      var cache = null, cached = null;
+      try { cache = await caches.open(CACHE_NAME); cached = await cache.match(url); } catch (e) { cache = null; cached = null; }
+      var headers = {};
+      var etag = cached ? cached.headers.get('ETag') : null;
+      if (etag) headers['If-None-Match'] = etag;
+      var res = await fetch(url, { cache: 'no-store', headers: headers });
+      if (res.status === 304 && cached) {
+        mark('poc:prefetch:304');
+        var b = await cached.arrayBuffer();
+        mark('poc:prefetch:done');
+        return b;
+      }
+      if (!res.ok) throw new Error('[FULL133 PoC] ZIP の先読みに失敗: HTTP ' + res.status);
+      var buf = await res.arrayBuffer();
+      mark('poc:prefetch:200');
+      if (cache) {
+        var et = res.headers.get('ETag') || '';
+        cache.put(url, new Response(buf.slice(0), { headers: { 'ETag': et, 'Content-Type': 'application/zip' } }))
+          .then(function () { mark('poc:prefetch:stored'); }, function () { mark('poc:prefetch:store-failed'); });
+      }
+      mark('poc:prefetch:done');
+      return buf;
+    })();
+    // renderer（getInstance）は同じ URL のときだけこの Promise を使う。別の URL なら従来どおり自分で取得する
+    window.__FULL133_ZIP_PREFETCH = function (path) {
+      try { return new URL(path, location.href).href === url ? p : null; } catch (e) { return null; }
+    };
+  })();
 </script>
 
 <script>
@@ -249,6 +298,11 @@ const {
         console.log(
           '[TRACE] a2eTrace=1 (通常 avatar 経路のまま trace のみ有効 / cache path は本番と同一)'
         );
+      }
+      // [FULL133 startup PoC] D だけ: 完成するまでキャンバスを見せない（フェードなし。完成した時点で一度に表示）
+      if ((window as any).__FULL133_POC_MODE === 'D') {
+        this.containerEl.style.visibility = 'hidden';
+        this.lamManager.setPocRevealGate(this.containerEl);
       }
       try {
         await this.lamManager.initialize({

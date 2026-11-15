@@ -1,0 +1,12 @@
+{
+  "name": "full133-startup-poc",
+  "private": true,
+  "description": "UIKA FULL133 起動の比較 PoC（Cloud Shell 用・本番には使わない）",
+  "type": "module",
+  "dependencies": {
+    "jszip": "3.10.1",
+    "playwright": "1.63.0",
+    "socket.io": "4.7.2",
+    "three": "0.173.0"
+  }
+}

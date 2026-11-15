@@ -113,6 +113,11 @@ export class LAMWebSocketManager {
     private avatarVisibleInfo: AvatarVisibleInfo | null = null;
     private avatarVisibleListener: ((info: AvatarVisibleInfo) => void) | null = null;
     private _prevConsecutiveRenderFrames: number = 0;
+    // [FULL133 startup PoC] D だけ: 完成するまでキャンバスを見せない（setPocRevealGate で有効になる。既定では無効）
+    private _pocRevealEl: HTMLElement | null = null;
+    private _pocRevealed: boolean = false;
+    // [FULL133 startup PoC] FULL133 の差し替えの列（multi-bone → runtime → predeform → adaptive sort → RenderBudget → frameCost）が終わったか
+    private _pocPatchChainDone: boolean = false;
     private _rendersSinceFirstValidFrame: number = 0;
     private _exprDebugCounter: number = 0;  // デバッグログ間引き用
     private _prevMouthValues: Record<string, number> = {};  // スムージング用前フレーム値
@@ -425,7 +430,12 @@ export class LAMWebSocketManager {
                 .then(() => installFrameCost(this.renderer))
                 .then(p => console.log('[PoC frameCost]', JSON.stringify(p)))
                 .then(() => logRunConfig(this.renderer, getDiagMode()))
-                .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e));
+                .catch(e => console.error('[PERF RUN CONFIG] 取得に失敗:', e))
+                // [FULL133 startup PoC] 列の完了を記録するだけ（順番・中身は変えない）
+                .finally(() => {
+                    this._pocPatchChainDone = true;
+                    if ((window as any).__FULL133_POC_TRACE) performance.mark('poc:patches:done');
+                });
 
             this._markModelReady('LAM');
             console.log('[LAMWebSocketManager] モデルロード完了');
@@ -602,11 +612,45 @@ export class LAMWebSocketManager {
      * 観測するので、新しい loop / setInterval / 固定待機 / monkey patch を作らない。
      * node_modules は読むだけで一切変更しない。
      */
+    /** [FULL133 startup PoC] D だけ: 完成するまで el を見せない。完成したら同じフレームで表示し、その後の描画で AVATAR_VISIBLE を出す */
+    setPocRevealGate(el: HTMLElement): void {
+        this._pocRevealEl = el;
+        this._pocRevealed = false;
+    }
+
+    /** [FULL133 startup PoC] 完成の条件（finalBuild・全数の splat・差し替えの列の完了・FULL133 runtime の最初の完全な morph） */
+    private _pocCompletionState(viewer: any): { ok: boolean; finalBuild: boolean; count: number; expected: number; patches: boolean; fullRuns: number | null; runtimeApplied: boolean } {
+        const sm = viewer?.splatMesh;
+        const finalBuild = !!sm && sm.finalBuild === true;
+        const count = sm && typeof sm.getSplatCount === 'function' ? sm.getSplatCount() : 0;
+        const expected = typeof viewer?.gaussianSplatCount === 'number' ? viewer.gaussianSplatCount : 0;
+        const rt = (window as any).__full133Runtime;
+        const runtimeApplied = !!rt && rt.applied === true;
+        const fullRuns = rt && typeof rt.fullRuns === 'number' ? rt.fullRuns : null;
+        const runtimeOk = !runtimeApplied || (fullRuns !== null && fullRuns >= 1);
+        const ok = finalBuild && expected > 0 && count === expected && this._pocPatchChainDone && runtimeOk;
+        return { ok, finalBuild, count, expected, patches: this._pocPatchChainDone, fullRuns, runtimeApplied };
+    }
+
     private _observeFirstValidFrame(): void {
         if (this.avatarVisibleReported) return;
 
         const viewer = (this.renderer as any)?.viewer;
         if (!viewer) return;
+        // ===== [FULL133 startup PoC] D だけ: 段階 0（完成するまで見せない）=====
+        if (this._pocRevealEl && !this._pocRevealed) {
+            const st = this._pocCompletionState(viewer);
+            if (!st.ok) return;
+            this._pocRevealEl.style.visibility = '';
+            this._pocRevealed = true;
+            if ((window as any).__FULL133_POC_TRACE) performance.mark('poc:reveal');
+            console.log('[FULL133 PoC] reveal'
+                + ` t=${performance.now().toFixed(1)}ms`
+                + ` finalBuild=${st.finalBuild} splats=${st.count}/${st.expected}`
+                + ` patches=${st.patches} fullRuns=${st.fullRuns}`);
+            // 表示した後のフレームから、既存の段階 1・2 で FIRST_VALID_FRAME と AVATAR_VISIBLE を判定する
+            return;
+        }
         const splatMesh = viewer.splatMesh;
         if (!splatMesh) return;                                   // 1
         const scenes = splatMesh.scenes;
@@ -636,6 +680,7 @@ export class LAMWebSocketManager {
             this._prevConsecutiveRenderFrames = viewer.consecutiveRenderFrames || 0;
             this._rendersSinceFirstValidFrame = 0;
 
+            if ((window as any).__FULL133_POC_TRACE) performance.mark('poc:first_valid');
             console.log('[AVATAR] first_valid_frame_rendered'
                 + ` t=${observedAt.toFixed(1)}ms`
                 + ` firstRenderTime=${firstRenderTime.toFixed(1)}ms`
@@ -680,6 +725,11 @@ export class LAMWebSocketManager {
         this.avatarVisibleReported = true;
         this.avatarVisibleInfo = vinfo;
 
+        if ((window as any).__FULL133_POC_TRACE) {
+            performance.mark('poc:visible');
+            // 計測用: AVATAR_VISIBLE の時点で完成していたか（A〜C で「完成前に出たか」を数えるため）
+            (window as any).__FULL133_POC_VISIBLE_STATE = this._pocCompletionState(viewer);
+        }
         console.log('[AVATAR] visible'
             + ` t=${visibleAt.toFixed(1)}ms`
             + ` barrier=${vinfo.barrierMs.toFixed(1)}ms`

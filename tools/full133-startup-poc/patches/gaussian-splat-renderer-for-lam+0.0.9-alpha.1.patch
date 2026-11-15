@@ -1,0 +1,129 @@
+--- a/node_modules/gaussian-splat-renderer-for-lam/build/gaussian-splat-renderer-for-lam.module.js
++++ b/node_modules/gaussian-splat-renderer-for-lam/build/gaussian-splat-renderer-for-lam.module.js
+@@ -63990,6 +63990,7 @@
+ 
+         this.sceneOptions = sceneOptions;
+         this.finalBuild = finalBuild;
++        if ((typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true)) performance.mark(finalBuild ? 'poc:build:final' : 'poc:build:partial');
+ 
+         const maxSplatCount = SplatMesh.getTotalMaxSplatCountForSplatBuffers(splatBuffers);
+ 
+@@ -64723,6 +64724,14 @@
+ 
+ 
+     buildModelTexture(flameModel) {
++        // [FULL133 startup PoC] 既定では旧実装のまま。globalThis.__FULL133_POC_OPT_BUILD === true のときだけ TypedArray 版を使う
++        const __pocTrace = (typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true);
++        if (__pocTrace) performance.mark('poc:bmt:start');
++        if (typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_OPT_BUILD === true) {
++            this.__full133OptBuildModelTexture(flameModel);
++            if (__pocTrace) performance.mark('poc:bmt:end');
++            return;
++        }
+         const flameModelTexSize = new Vector2(4096, 2048);
+ 
+         var shapedMesh = flameModel.geometry.attributes.position.array;
+@@ -64770,6 +64779,70 @@
+             'size': flameModelTexSize,
+         };
+         this.splatDataTextures.baseData['flameModelPos'] = flameModelData;
++        if (__pocTrace) performance.mark('poc:bmt:end');
++    }
++
++    /**
++     * [FULL133 startup PoC] buildModelTexture() の TypedArray 版。
++     * 旧実装と同じ値を同じ位置へ書く（同じ並び: blendshape を morphTargetDictionary のキー順に連結し、最後に基本形）。
++     * - 旧実装の JS 配列（concat / Array.from）を作らず、元の配列から直接読む
++     * - 値の書き込みは旧実装と同じく Float32Array への代入、整数は uintEncodedFloat と同じ Float32→Int32 の読み替え
++     * - 読む位置が元データの外なら undefined を書く（旧実装と同じ）。書く位置がテクスチャの外なら書かない（TypedArray の範囲外の書き込みと同じ）
++     */
++    __full133OptBuildModelTexture(flameModel) {
++        const flameModelTexSize = new Vector2(4096, 2048);
++
++        const shapedMesh = flameModel.geometry.attributes.position.array;
++        const pointNum = shapedMesh.length / 3;
++        const bsLength = flameModel.geometry.morphAttributes.position.length;
++        const morphTargetNames = Object.keys(flameModel.morphTargetDictionary);
++        const parts = [];
++        morphTargetNames.forEach((name) => {
++            const originalIndex = flameModel.morphTargetDictionary[name];
++            parts.push(flameModel.geometry.morphAttributes.position[originalIndex].array);
++        });
++        parts.push(shapedMesh);
++
++        const total = flameModelTexSize.x * flameModelTexSize.y * 4;
++        let flameModelData = new Float32Array(total);
++        let flameModelDataInt = new Uint32Array(total);
++        const fv = new Float32Array(1);
++        const iv = new Int32Array(fv.buffer);
++        // 旧実装のループ回数: for (c = 0; c < pointNum * (bsLength + 1); c++)
++        const loopLimit = pointNum * (bsLength + 1);
++        let cCount = 0;
++        if (loopLimit > 0) cCount = Math.ceil(loopLimit);
++        const need = cCount * 3;
++        let i = 0, c = 0, k = 0;
++        const put = (v) => {
++            const d = c * 4 + k;
++            flameModelData[d] = v;            // 範囲外は無視される（旧実装と同じ）
++            fv[0] = flameModelData[d];
++            flameModelDataInt[d] = iv[0];
++            if (++k === 3) { k = 0; c++; }
++        };
++        for (let p = 0; p < parts.length && i < need; p++) {
++            const a = parts[p];
++            const n = a.length;
++            for (let j = 0; j < n && i < need; j++, i++) put(a[j]);
++        }
++        for (; i < need; i++) put(undefined);
++
++        const flameModelTex = new DataTexture(flameModelDataInt, flameModelTexSize.x, flameModelTexSize.y,
++                                                     RGBAIntegerFormat, UnsignedIntType);
++        flameModelTex.internalFormat = 'RGBA32UI';
++        flameModelTex.needsUpdate = true;
++        this.material.uniforms.flameModelTexture.value = flameModelTex;
++        this.material.uniforms.flameModelTextureSize.value.copy(flameModelTexSize);
++        this.material.uniformsNeedUpdate = true;
++        this.material.uniforms.gaussianSplatCount.value = this.gaussianSplatCount;
++
++        this.splatDataTextures['flameModel'] = {
++            'data': flameModelDataInt,
++            'texture': flameModelTex,
++            'size': flameModelTexSize,
++        };
++        this.splatDataTextures.baseData['flameModelPos'] = flameModelData;
+     }
+ 
+     updateTetureAfterBSAndSkeleton(fromSplat, toSplat, useFlameModel = true) {
+@@ -152220,7 +152293,11 @@
+                     throw new Error('character model is not found');
+                 }
+                 NProgress.start();
+-                const characterZipResponse = yield axios.get(characterPath, {
++                // [FULL133 startup PoC] globalThis.__FULL133_ZIP_PREFETCH が同じ ZIP の Promise<ArrayBuffer> を返したときだけ、それを使う
++                const __pocPre = (typeof globalThis !== 'undefined' && typeof globalThis.__FULL133_ZIP_PREFETCH === 'function')
++                    ? globalThis.__FULL133_ZIP_PREFETCH(characterPath) : null;
++                if ((typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true)) performance.mark(__pocPre ? 'poc:zip:from-prefetch' : 'poc:zip:axios');
++                const characterZipResponse = __pocPre ? { data: yield __pocPre } : yield axios.get(characterPath, {
+                     responseType: 'arraybuffer',
+                     timeout: 100000,
+                     onDownloadProgress: (progressEvent) => {
+@@ -152236,7 +152313,9 @@
+                 NProgress.done();
+                 console.log('download completed:', characterZipResponse.data);
+                 const arrayBuffer = characterZipResponse.data;
++                if ((typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true)) performance.mark('poc:zip:done');
+                 const zipData = yield jszip_minExports.loadAsync(arrayBuffer);
++                if ((typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true)) performance.mark('poc:jszip:done');
+                 let fileName = '';
+                 Object.values(zipData.files).forEach(file => {
+                     var _a, _b;
+@@ -152293,7 +152372,9 @@
+                     yield renderer.loadModel(fileName, animationConfig, motionConfig);
+                 }
+                 (options === null || options === void 0 ? void 0 : options.loadProgress) && (options === null || options === void 0 ? void 0 : options.loadProgress(0.2));
++                if ((typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true)) performance.mark('poc:loadModel:done');
+                 const offsetFileUrl = yield renderer.unpackFileAsBlob(fileName + '/offset.ply');
++                if ((typeof globalThis !== 'undefined' && globalThis.__FULL133_POC_TRACE === true)) performance.mark('poc:offset:done');
+                 (options === null || options === void 0 ? void 0 : options.loadProgress) && (options === null || options === void 0 ? void 0 : options.loadProgress(0.3));
+                 renderer.viewer
+                     .addSplatScene(offsetFileUrl, {

@@ -6,7 +6,8 @@
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",
-    "preview": "astro preview"
+    "preview": "astro preview",
+    "postinstall": "node tools/full133-startup-poc/apply-patch.mjs"
   },
   "dependencies": {
     "@vite-pwa/astro": "^1.2.0",
