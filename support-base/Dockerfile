@@ -12,6 +12,8 @@ COPY support_core.py .
 COPY api_integrations.py .
 COPY long_term_memory.py .
 COPY live_api_handler.py .
+# 新ショップ推薦エンジン（モジュールのみ。tests/ はイメージに含めない）
+COPY new_shop_recommendation/*.py new_shop_recommendation/
 COPY templates/ templates/
 COPY prompts/ prompts/
 

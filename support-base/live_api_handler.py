@@ -246,6 +246,24 @@ SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     )
 )
 
+# M4 プレビュー専用（NEW_SHOP_FLOW=S10 のコンシェルジュ）: R2.0（486dace）の search_shops の説明。concierge_v11 の「同意してから呼ぶ」と揃える
+# （R2.0 の area 引数は使わない。S10 は検索範囲を R1 で決める）
+SEARCH_SHOPS_DECLARATION_R20 = types.FunctionDeclaration(
+    name="search_shops",
+    behavior=types.Behavior.BLOCKING,
+    description="お客様が条件の確認に承諾したときだけ呼ぶ。推薦システムにお店の候補を依頼する。",
+    parameters=types.Schema(
+        type="OBJECT",
+        properties={
+            "user_request": types.Schema(
+                type="STRING",
+                description="確認でお客様に伝えた条件の要約。お客様が言っていない条件は入れない。例: '恵比寿 イタリアン'、'恵比寿 デート イタリアン 予算1万円 2名'"
+            ),
+        },
+        required=["user_request"]
+    )
+)
+
 UPDATE_USER_PROFILE_DECLARATION = types.FunctionDeclaration(
     name="update_user_profile",
     behavior=types.Behavior.BLOCKING,
@@ -353,6 +371,9 @@ class LiveAPISession:
 
         # 非同期キュー
         self.audio_queue_to_gemini = None
+        # キーボード入力のテキスト（R2.0 §8.2）。音声のキューは満杯なら捨てるので、別のキューにする
+        self.text_queue_to_gemini = None
+        self._loop = None
         self.is_running = False
 
     def _build_config(self, with_context=None):
@@ -408,7 +429,10 @@ class LiveAPISession:
             config["tools"] = [types.Tool(function_declarations=[UPDATE_USER_PROFILE_DECLARATION])]
         else:
             # conciergeモード等はショップ検索 + プロファイル更新
-            config["tools"] = [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION, UPDATE_USER_PROFILE_DECLARATION])]
+            from new_shop_recommendation import flow_s as _flow_s_decl
+            search_decl = (SEARCH_SHOPS_DECLARATION_R20 if self.mode == 'concierge' and _flow_s_decl.enabled()
+                           else SEARCH_SHOPS_DECLARATION)       # M4 プレビュー専用の切り替え（既定は従来の説明）
+            config["tools"] = [types.Tool(function_declarations=[search_decl, UPDATE_USER_PROFILE_DECLARATION])]
 
         return config
 
@@ -447,6 +471,16 @@ class LiveAPISession:
             except asyncio.QueueFull:
                 pass  # キューが満杯の場合はドロップ
 
+    def enqueue_text(self, text: str) -> bool:
+        """
+        キーボード入力のテキストを Live に送る（R2.0 §8.2）。Socket.IO のスレッドから呼ばれるので、
+        Live のイベントループに call_soon_threadsafe で渡す。捨てずに順番どおり送る。
+        """
+        if not (self.text_queue_to_gemini and self.is_running and self._loop):
+            return False
+        self._loop.call_soon_threadsafe(self.text_queue_to_gemini.put_nowait, text)
+        return True
+
     def stop(self):
         """セッションを停止"""
         self.is_running = False
@@ -458,6 +492,8 @@ class LiveAPISession:
         仕様書 セクション6.1 の run() を移植
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
+        self.text_queue_to_gemini = asyncio.Queue()
+        self._loop = asyncio.get_running_loop()
         self.is_running = True
         self._a2e_worker_task = asyncio.ensure_future(self._a2e_send_worker())
 
@@ -574,6 +610,25 @@ class LiveAPISession:
                     self.needs_reconnect = True
                     return
 
+        async def send_text():
+            """キーボード入力のテキストを LiveAPI に送る（R2.0 §8.2）。再開文と同じ send_realtime_input(text=) を使う"""
+            while not self.needs_reconnect and self.is_running:
+                try:
+                    text = await asyncio.wait_for(self.text_queue_to_gemini.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    await session.send_realtime_input(text=text)
+                    # 再接続時の履歴に残す（テキスト入力には入力の文字起こしが来ない）
+                    self._add_to_history("user", text)
+                    logger.info(f"[LiveAPI] キーボード入力を送信: {len(text)}文字")
+                except Exception as e:
+                    if self.needs_reconnect or not self.is_running:
+                        return
+                    logger.error(f"[LiveAPI] テキスト送信エラー: {e}")
+                    self.needs_reconnect = True
+                    return
+
         async def receive():
             """LiveAPIからの応答を受信してブラウザに転送"""
             try:
@@ -601,6 +656,7 @@ class LiveAPISession:
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(send_audio())
+                tg.create_task(send_text())
                 tg.create_task(receive())
         except* Exception as eg:
             if not self.needs_reconnect:
@@ -721,6 +777,7 @@ class LiveAPISession:
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
+                logger.info(f"[NewShopRec] tool_call_received t={time.time():.3f}")   # M4 E1（計測ログのみ）
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
                 self.socketio.emit('shop_search_start', {},
@@ -738,7 +795,7 @@ class LiveAPISession:
                 please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
 
                 # ショップ検索を実行（カード表示まで。読み上げは LiveAPI が行う）
-                shops = await self._handle_shop_search(user_request)
+                search_result = await self._handle_shop_search(user_request)
 
                 # 検索完了 → 未再生のタスクをキャンセル
                 for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
@@ -748,16 +805,20 @@ class LiveAPISession:
 
                 # function responseを返す（LiveAPI SDK: キーワード引数必須）
                 # 読み上げは REST TTS ではなく LiveAPI のモデル発話で行う
+                # 新ショップ推薦エンジン: カードと同じ確定結果の読み上げデータ（LLM 由来のみ）を返す
                 await session.send_tool_response(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
-                        response=self._build_shop_tool_response(shops)
+                        response=self._build_new_shop_tool_response(search_result)
                     )]
                 )
-                if shops:
+                narration = search_result.get('narration') or []
+                logger.info(f"[NewShopRec] function_response_sent request_id={search_result.get('request_id')} "
+                            f"status={search_result.get('status')} items={len(narration)} t={time.time():.3f}")
+                if narration:
                     self._shop_intro_turn_pending = True
-                    logger.info(f"[ShopDesc] LiveAPI読み上げ: {len(shops)}件をtool_responseで送信")
+                    logger.info(f"[ShopDesc] LiveAPI読み上げ: {len(narration)}件をtool_responseで送信")
             elif fc.name == "update_user_profile":
                 # ユーザー名登録・変更をDBに永続化
                 updates = fc.args or {}
@@ -784,69 +845,83 @@ class LiveAPISession:
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
-    async def _handle_shop_search(self, user_request: str):
+    async def _handle_shop_search(self, user_request: str) -> dict:
         """
-        ショップ検索を実行し、結果をブラウザに送信する（案A: enrich並行方式）
+        ショップ検索を実行し、確定結果をブラウザに送信する（新ショップ推薦エンジン）
 
-        【設計】
-        - callbackでLLM JSON生成のみ（enrichなし）→ raw_shopsを取得
-        - raw_shopsで即座にTTS並行生成を開始
-        - enrichをTTS生成と並行でrun_in_executor実行
-        - enrich完了後にショップカードをブラウザに送信
-        - TTS再生（生成済みタスクを_describe_shops_via_liveに渡す）
+        - callback が新エンジンの確定結果（Places API (New) で検証済みのカードと読み上げデータ）を返す
+        - 旧 enrich_shops_with_photos による再検索・店名上書きは行わない（二重照合しない）
+        - 成功・部分成功・0 件・エラーのいずれでも shop_search_result を 1 回送り、待機 UI を解除させる
         """
+        empty = {'request_id': None, 'status': 'ERROR', 'error_type': 'callback_missing',
+                 'shops': [], 'narration': [], 'response': ''}
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
             self.socketio.emit('shop_search_result', {
-                'shops': [], 'response': '',
+                'shops': [], 'response': '', 'status': 'ERROR',
             }, room=self.client_sid)
-            return
+            return empty
 
         try:
-            # 1. callbackでLLM JSON生成（enrichなし）
             loop = asyncio.get_event_loop()
-            shop_data = await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None,
                 self._shop_search_callback,
                 user_request, self.language, self.mode
             )
-
-            if not shop_data or not shop_data.get('shops'):
-                logger.info("[ShopSearch] ショップ見つからず")
-                self.socketio.emit('shop_search_result', {
-                    'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
-                }, room=self.client_sid)
-                return []
-
-            raw_shops = shop_data['shops']
-            response_text = shop_data.get('response', '')
-            area = shop_data.get('area', '')
-
-            # 2. enrich実行
-            from api_integrations import enrich_shops_with_photos
-            enriched = await loop.run_in_executor(
-                None, enrich_shops_with_photos, raw_shops, area, self.language
-            )
-            shops = enriched if enriched else raw_shops
-            logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
-
-            # 3. ショップカードデータをブラウザに送信
-            self.socketio.emit('shop_search_result', {
-                'shops': shops,
-                'response': response_text,
-            }, room=self.client_sid)
-            logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
-
-            # 4. 読み上げは LiveAPI（tool_response → モデル発話）で行うため、ここでは返すだけ
-            #    旧方式: await self._describe_shops_via_live(shops)  ※REST TTS
-            return shops
-
+            if not result:
+                result = dict(empty, error_type='empty_callback_result')
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
-            self.socketio.emit('shop_search_result', {
-                'shops': [], 'response': '',
-            }, room=self.client_sid)
-            return []
+            result = dict(empty, error_type='exception')
+
+        shops = result.get('shops') or []
+        self.socketio.emit('shop_search_result', {
+            'shops': shops,
+            'response': result.get('response', ''),
+            'request_id': result.get('request_id'),
+            'status': result.get('status'),
+        }, room=self.client_sid)
+        logger.info(f"[NewShopRec] card_sent request_id={result.get('request_id')} status={result.get('status')} "
+                    f"cards={len(shops)} t={time.time():.3f}")
+        return result
+
+    def _build_new_shop_tool_response(self, result: dict) -> dict:
+        """確定結果から tool_response を作る。エラー時は失敗を伝える（旧方式へのフォールバックはしない）"""
+        if result.get('status') in ('ERROR', 'TIMED_OUT'):
+            return {"result": "お店の検索中にエラーが発生し、結果を表示できませんでした。"
+                              "申し訳ないと伝え、少し時間をおいてもう一度探すことを提案してください。"}
+        if result.get('narration_mode') == 'D':
+            return self._build_shop_tool_response_d(result)
+        return self._build_shop_tool_response(result.get('narration') or [])
+
+    def _build_shop_tool_response_d(self, result: dict) -> dict:
+        """
+        M4 方式 D（プレビュー専用 NEW_SHOP_FLOW=S10）: 推薦A 由来の店名・地区と依頼条件だけを渡す。
+        詳しい特徴・推薦理由はカードに後から表示されるため、ここには入れない（Google Maps の情報も入れない）。
+        """
+        shops = result.get('narration') or []
+        if not shops:
+            return {"result": "条件に合うお店を確認できませんでした。条件を変えて探すことを提案してください。"}
+        total = len(shops)
+        request = result.get('request') or ''
+        shortfall = result.get('shortfall') or 0
+        found = (f"確認できたお店は{total}軒で、5軒には届きませんでした。このことも正直に伝えてください。"
+                 if shortfall else '')
+        if result.get('geo_unverified'):
+            found += "ご依頼の場所を特定できなかったため、お店の場所がご希望に合うかは確認できていません。このことも一言伝えてください。"
+        instruction = (
+            f"ご依頼（{request}）に合うお店を{total}軒、画面のカードに表示しました。{found}"
+            "最初に、ご依頼の条件に合わせて選んだことを一言で伝えてください。"
+            f"そのあと1軒目から{total}軒目まで順に、地区と店名に続けて、summary（概要）がある店はその内容を、"
+            "前後のお店とのつながりが分かる自然な話し言葉で紹介してください。summary がない店は地区と店名だけを伝えてください。"
+            "渡した項目以外の特徴・料理・価格・受賞歴・営業時間は述べないでください。"
+            "各店の詳しい特徴と推薦理由はカードに順次表示されることを最後に案内し、気になるお店はありましたかと尋ねて締めてください。"
+            "マークダウン記法や記号は使わないこと。"
+        )
+        items = [dict({"number": x['number'], "name": x['name'], "area": x['area']},
+                      **({"summary": x['summary']} if x.get('summary') else {})) for x in shops]
+        return {"result": instruction, "shops": items}
 
     def _build_shop_tool_response(self, shops: list) -> dict:
         """search_shops の tool_response。LiveAPI のモデルがこの内容でショップを紹介する"""

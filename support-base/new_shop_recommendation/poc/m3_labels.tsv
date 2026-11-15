@@ -1,0 +1,308 @@
+# Gate M3 独立判定ラベル（推薦店名<TAB>place_id<TAB>O|X|?|Z<TAB>判定リスト番号）
+# O=推薦店と同一の実店舗 / X=別店舗（別支店・別地域・ビル等） / ?=判定不能（正解に含めない） / Z=同一店舗だが閉業
+地葉	ChIJM5Yxz25dGGARKm5E2A2DC10	O	P001
+里葉亭	ChIJY9sy4fRcGGARw4iYzfav7KM	O	P002
+美鶏	ChIJ___WtPBcGGARqTjZdkhqtKU	O	P003
+炭火やきとり 伝兵衛	ChIJ24N3vnpdGGAR4Jc9i2zDveg	O	P004
+炭火焼鳥 榊	ChIJ830S7V9cGGARUXNy-e5Fcs8	O	P005
+地鶏や たづや	ChIJzeanvfZcGGAR7b0A1zeLrig	X	P006
+やきとり 弥平	ChIJZ6ZRPhFcGGAR9CB5ytm2JKY	O	P007
+鳥恵	ChIJM9OxWgBdGGARhDOBoRFiT0U	X	P008
+やきとり 弥七	ChIJGR_NyvBcGGARvx9_FN0sV20	X	P009
+炭火焼鳥 カッパ	ChIJo79TTMpdGGARB8osxV1gEKI	?	P010
+炭火焼 濱浪漫	ChIJp6C9d_ZcGGARtjKBO-A68-M	X	P011
+末広	ChIJteiK_V9cGGAR_MWW_ixCBR0	O	P012
+野毛末広 本店	ChIJteiK_V9cGGAR_MWW_ixCBR0	O	P013
+焼鳥 幸羽	ChIJW33U12xcGGARxSmDsbQwUxk	X	P014
+てんぷら 近藤	ChIJX2Mb_eWLGGARvhx7F4hr3FA	O	P015
+銀座 天一 本店	ChIJbVNcVO-LGGARKdnkhXmDs0s	O	P016
+銀座 天國 本店	ChIJAQDAdeiLGGARtFxeTTOBBYo	O	P017
+てんぷら 真	ChIJxWhkveiLGGAR5PJuUlT10Vo	O	P018
+天ぷら 銀座 おのでら 並木通り店	ChIJB1KbH-mLGGARvVhyTbR9k9Y	O	P019
+茂竹	ChIJ0y9niS2LGGAROjbVNMDwcA4	O	P020
+天ぷら 茂竹	ChIJ0y9niS2LGGAROjbVNMDwcA4	O	P021
+銀座 天國	ChIJAQDAdeiLGGARtFxeTTOBBYo	O	P022
+天ぷら 銀座 おのでら	ChIJJVI5vzqLGGARUd03DWerqwY	O	P023
+天ぷら 阿部 銀座本店	ChIJn6g0xeWLGGART_DHpuMtqKM	O	P024
+天青	ChIJI1EzZgCLGGARq36eNvOwI9w	X	P025
+銀座天ぷら よしたけ	ChIJD-S92uiLGGARt0rOyMWwE5o	O	P026
+天ぷら すずき	ChIJRZGCCOWLGGARTbuL5FrsFcM	X	P027
+茶亭 羽當	ChIJGQivCliLGGARQGD2vV8CIII	O	P028
+WHITE GLASS COFFEE	ChIJYcfmTGOLGGAReESqYToNQ8Q	O	P029
+FabCafe Tokyo	ChIJpZQcxVWLGGARUqBJbgjvKME	O	P030
+森の図書室	ChIJ_76U71WLGGARn9Yb93Tk-Io	O	P031
+喫茶 ライオン	ChIJFQdviqmMGGAR1muN_DAZFwQ	O	P032
+人間関係 cafe de copain	ChIJ76H2VKiMGGARebAiZm_A8X0	O	P033
+カフェ マメヒコ 宇田川町店	ChIJUV3f96uMGGARHOdO7xNBHG8	Z	P034
+Roasted COFFEE LABORATORY 渋谷神南店	ChIJnePTxuONGGARfBYFCdwD660	O	P035
+ダブルトールカフェ 渋谷店	ChIJZVvX8FuLGGARF2RFaGMYulk	Z	P036
+ABOUT LIFE COFFEE BREWERS 渋谷一丁目	ChIJDWr6oBuNGGARyOyEt5evu0A	O	P037
+珈琲専門店 シャルマン 桜丘店	ChIJzfoPyquMGGARlQr-_HYJwas	X	P038
+ロイヤルガーデンカフェ 渋谷	ChIJ0ZxvJKmMGGARXpl_62k5Tus	Z	P039
+ストリーマー コーヒーカンパニー 渋谷店	ChIJJ-aF_6aMGGARfbFeJO3hQuU	O	P040
+FREEMAN CAFE	ChIJWxYl66eMGGARdIaHqgLs45c	O	P041
+日本料理 水天一碧	ChIJDW4JOaiLGGARI9avImcrqXs	X	P042
+新宿星のなる木	ChIJm59-ijqNGGARE1Qz5ybMYjI	O	P043
+個室割烹 新宿 下遠	ChIJI8XHwSmNGGARz4Ksdf5qLjc	X	P044
+北大路 新宿茶寮	ChIJn2fJGdWMGGARWO9Tsz3FHXw	O	P045
+茶寮 一凛	ChIJ4YBRSL2MGGAR_mNICyn4a20	?	P046
+個室和食 東山 新宿本店	ChIJR4sOntOMGGARoWOvHsUP_L0	O	P047
+星のなる木 新宿	ChIJm59-ijqNGGARE1Qz5ybMYjI	O	P048
+車屋別館	ChIJkSMU8dmMGGARU20fByF59WI	O	P049
+京都 瓢喜 新宿店	ChIJMYbbY3qLGGARrkpgrhiVtdU	X	P050
+日本料理 「みやま」 ヒルトン東京	ChIJlVe4oleLGGARDsczGV9jSIU	X	P051
+玄海 本店	ChIJSYndPt2MGGARtYlu5-qcgTw	O	P052
+佳香 京王プラザホテル	ChIJDwlszSrzGGARTGOn58BxsMY	Z	P053
+日本料理 佳香（小田急ホテルセンチュリーサザンタワー）	ChIJDwlszSrzGGARTGOn58BxsMY	Z	P054
+隠れ房 新宿店	ChIJH2PYJ9qMGGARS9pBVEQW_7E	O	P055
+音音 新宿センタービル店	ChIJ7VkXMtSMGGARF_zzhpGZa0s	O	P056
+十二颯（ヒルトン東京）	ChIJbUijqirzGGARDmn7smUZOI4	O	P057
+ピッツェリアGG 吉祥寺	ChIJedWyjjfuGGARqr39AWk06Zs	O	P058
+マザーズ 吉祥寺店	ChIJrbQd7jfuGGAR-v9w1d3R-74	O	P059
+カッフェ プリミ・バチ	ChIJRRf0jzfuGGARN-rfU9MmAKY	?	P060
+トラットリア ピッツェリア アミーカ	ChIJ0c6Ow8v0GGAR3Zy-A7TZzBk	X	P061
+イル キャンティ 吉祥寺店	ChIJu53oWzjuGGARu4PmJT75_Ds	O	P062
+ヴィッラ マニョーリア	ChIJGdRyHEjuGGARLNwysH2t1Io	Z	P063
+カプリチョーザ コピス吉祥寺店	ChIJF7d81EfuGGARWQbmo4MFsiY	O	P064
+トニーノ 吉祥寺店	ChIJP2MkUTjuGGARWL7kqqCQgQo	X	P065
+トスカーナ 吉祥寺店	ChIJdQ9O40juGGARZwTBkExp12Y	O	P066
+スパ吉	ChIJc5dW5kfuGGAR41S6W9pwsrQ	O	P067
+ラ・ベファーナ 吉祥寺	ChIJcVVDGEjuGGARKLdKmFgmgBo	O	P068
+ヴィレッジヴァンガード ダイナー 吉祥寺	ChIJH29BDEnuGGARa6ZxjT5cVww	O	P069
+キャンティ・セッテ 吉祥寺	ChIJI1P-PEjuGGAR3695ogjh7y0	Z	P070
+六厘舎 東京駅ラーメンストリート店	ChIJtxODuv6LGGARnELlksWTmZo	O	P071
+東京駅 斑鳩	ChIJ5wI-efyLGGARp-hRs2vNgD4	O	P072
+松戸富田麺絆	ChIJP37FH5OLGGARIciadpVyREo	O	P073
+ソラのいろ NIPPON	ChIJG7k9efyLGGARy12VNvIo8xk	O	P074
+かね田	ChIJmw_rfLCLGGARxLK2a5RMjgk	O	P075
+ひるがお 東京駅店	ChIJU57BePyLGGARbtRWIQ8Fhgg	O	P076
+ラーメン 雷 東京本丸店	ChIJy7scAo-LGGARh1SXDUz9bXQ	O	P077
+雷 東京本丸店	ChIJy7scAo-LGGARh1SXDUz9bXQ	O	P078
+極味や 東京駅店	ChIJCzeBdjeLGGAR9lv5bx5a91s	O	P079
+斑鳩	ChIJ5wI-efyLGGARp-hRs2vNgD4	O	P080
+NIPPON RAMEN 凛 RIN TOKYO	ChIJ7Vz-GyyLGGARH49aczFdLIc	O	P081
+駄目な隣人 KITTE丸の内店	ChIJ9a4CpQ-JGGARzjE-eNLDOzs	X	P082
+つじ田 味噌の章 東京駅店	ChIJ70Dm6DSLGGAR4mLUTMrb-ts	Z	P083
+串若丸	ChIJ__-a0U6LGGARyn3JzmT4OXw	O	P084
+焼鶏 あきら 中目黒本店	ChIJ1V1L30eLGGARkBygEoWW8yY	O	P085
+焼鳥スエヒロガリ	ChIJ4583FEmLGGARlmRJkaz83p4	O	P086
+中目黒いぐち 上ル	ChIJAQBLvkGLGGARgx4UcjAU-Ps	O	P087
+串若丸 本店	ChIJ__-a0U6LGGARyn3JzmT4OXw	O	P088
+中目黒いぐち 恵比寿店	ChIJY0aX2kCLGGARqgXgqu1ZjCk	O	P089
+炭火焼 鳥よし 中目黒店	ChIJIet-TkiLGGARXCtjpLWwA8M	O	P090
+ハナレ 中目黒	ChIJISv1DlyLGGARKtftbe6nzhM	X	P091
+焼き鳥 つの田	ChIJBXoj2kiLGGAR-sWbX5HtR6s	X	P092
+スエヒロガリ	ChIJ4583FEmLGGARlmRJkaz83p4	O	P093
+炭火焼鳥 森田	ChIJBXoj2kiLGGAR-sWbX5HtR6s	X	P094
+中目黒 焼鳥 ギガス	ChIJgY8mCzmLGGARR0vJpiDH1zE	X	P095
+焼鳥 弥栄	ChIJgY8mCzmLGGARR0vJpiDH1zE	X	P096
+nakameguro 虜	ChIJFej12UiLGGARmwlzjjqulo0	X	P097
+てっぺん 中目黒分家	ChIJ81anOUmLGGARBIyuNq4NQqQ	X	P098
+鳥よし 中目黒店	ChIJIet-TkiLGGARXCtjpLWwA8M	O	P099
+成吉思汗 だるま 本店	ChIJbQQV34UpC18RgzQI7TQon1g	O	P100
+いただきます。	ChIJkWU54IUpC18RILG14Mo_wmM	O	P101
+生ラムジンギスカン 山小屋	ChIJR85KUYQpC18RQDtgu0ufpHo	O	P102
+しろくま 札幌本店	ChIJxaD-i4YpC18RkcPDS3Ir6Jk	O	P103
+ジンギスカン 羊飼いの店 『いただきます。』	ChIJkWU54IUpC18RILG14Mo_wmM	O	P104
+士別バーベキュー	ChIJacRlUIUpC18R58DpeEVS6SE	O	P105
+夜空のジンギスカン 本店	ChIJ_f-jVoQpC18RgV2DhGWN4zE	O	P106
+炭坊主	ChIJP8h21PYpC18RQEh2__xn9mY	X	P107
+ジンギスカン 羊飼いの店 『いただきま〜す』	ChIJkWU54IUpC18RILG14Mo_wmM	O	P108
+ジンギスカン 札幌 大黒屋 札幌すすきの店	ChIJgymraAYpC18R2OQQim1brTU	?	P109
+ひげのうし 本店	ChIJZ6HX7oQpC18RtN4bBmEt2Lg	O	P110
+ぎおん 遠藤	ChIJAzNy98EIAWARGaT8xpm38Pg	O	P111
+祇園 にしかわ	ChIJr_coF8UIAWARUR1aoCXA4s4	X	P112
+ぎおん 阪川	ChIJE1F2oPGGHWAR_kh__bwhJfc	O	P113
+祇園 川上	ChIJTes-nsEIAWAR3eEmRXY-OhQ	O	P114
+祇園 又吉	ChIJF2tmi8MIAWARjnuvxZjfwTk	O	P115
+祇園 にしかわ	ChIJB1aZxO0HAWAR8l3CP2AA0C8	O	P116
+祇園 松むろ	ChIJMWSZ_cEIAWARnIIv9Oi_KUY	O	P117
+祇園 おかる	ChIJUTMVxcEIAWARBFGCRj4GmWo	O	P118
+割烹 梅津	ChIJq8wf-MEIAWARsVmyKePb7P0	O	P119
+祇園 迦陵	ChIJjbOS9sMIAWARn4xC7JAw2iQ	O	P120
+割烹 八日	ChIJdapH2MEIAWAR4M8GwwL-axs	X	P121
+祇園 岩元	ChIJsY-fb8EIAWARo2m4aXodDdI	O	P122
+祇園 きだ	ChIJAQAk58MIAWARqfORBa_fkO4	O	P123
+祇園 おがわ	ChIJrXgIaOoIAWARKEqaGw1WQqk	O	P124
+祇園 くらした	ChIJgUJUYMEIAWARv4z7sfnF_oo	O	P125
+串かつ 松葉 総本店	ChIJJc7FZZLmAGAR1jjQRBK4t1c	O	P126
+串かつ 七福神	ChIJmTWHVcfmAGARiYbuKwA1H98	?	P127
+ヨネヤ 梅田本店	ChIJveHcA5PmAGARfs11IF0-8Rw	O	P128
+庶民 大阪駅前第2ビル店	ChIJuyBiQ3nnAGAROQf2cDUPUOg	O	P129
+串かつ でんがな 大阪駅前第4ビル店	ChIJqRKlmxfnAGARlVLSCWHmScQ	O	P130
+立ち呑み処 徳田酒店 第4ビル店	ChIJUxf7Iu3mAGARPxQMufyyEZg	O	P131
+串かつ ヨネヤ 梅田本店	ChIJveHcA5PmAGARfs11IF0-8Rw	O	P132
+松葉地下店	ChIJJc7FZZLmAGAR1jjQRBK4t1c	X	P133
+串かつ専門店 串かつ まる	ChIJ71os__ndAGARUVtjv5WkSMc	X	P134
+立ちぶどう 千勝	ChIJH3TKoPLmAGAR5ZPJJR5x7IU	?	P135
+串カツ・立ち飲み ぶらり横丁 まる福	ChIJf7EYLwDnAGARYEnr9Ra2dxw	X	P136
+立呑処 赤垣屋 梅田店	ChIJcfLRsY3mAGARcKeXqiZmWoE	O	P137
+百式	ChIJWUdcb5LmAGARtX99h-wZPKQ	X	P138
+松葉地下店	ChIJpXs-KADnAGAR4pVuEXX8QGU	X	P139
+串カツ酒場 えびすや	ChIJP7hBc0PnAGARUjf32DU-dtk	X	P140
+立ちぶどう 千両	ChIJH3TKoPLmAGAR5ZPJJR5x7IU	?	P141
+串カツ専門店 串かつだるま ルクア大阪店	ChIJrfIhlY3mAGARqHszwmz38Dg	O	P142
+大衆酒場 金獅子 大阪駅前第3ビル店	ChIJJV9JVezmAGARCmPZNij6nog	X	P143
+銀座屋	ChIJU1OQovLmAGARZmgin3aP9PI	O	P144
+串かつ 知留久 本店	ChIJL5qokezmAGARowLEilXv6pw	O	P145
+地鶏や 一乃蔵	ChIJZYGA6PNcGGARIYRHtllfv8A	X	P146
+やきとり 荒井屋	ChIJ26pjkYpcGGARnHFZEzJ6I_4	X	P147
+炭火焼鳥 末広	ChIJteiK_V9cGGAR_MWW_ixCBR0	O	P148
+鳥恵	ChIJ13KHYexdGGAROz9d0dqZZJI	X	P149
+1000	ChIJCUN8juZcGGARaQ4E7TrV31Y	X	P150
+地葉 はなれ	ChIJ_cygxLJdGGARNYYwwOmwfyg	O	P151
+野毛末広	ChIJteiK_V9cGGAR_MWW_ixCBR0	O	P152
+若よし	ChIJE_mHOvRcGGARjvBKRVMPzUY	X	P153
+鳥ぎん 横浜関内店	ChIJ0y1zAV9cGGARU18jEORMmTg	X	P154
+てんぷら 深町	ChIJrXFD_uKLGGARseFHs8I_T38	O	P155
+天ぷら 銀座 茂竹	ChIJ0y9niS2LGGAROjbVNMDwcA4	O	P156
+天ぷら よしたけ	ChIJD-S92uiLGGARt0rOyMWwE5o	O	P157
+銀座 ざくろ 室町店 (銀座天一プロデュースなど含む)	ChIJwQtRl-aLGGARjRCh9-wGq8w	X	P158
+天朝	ChIJCXD9zuGLGGARrvarid1BzGk	O	P159
+天ぷら 由松	ChIJWeue0-6LGGARll8huNVIRvo	O	P160
+銀座 天あさ	ChIJzdgq7uiLGGARgGKgWWs2GJ4	O	P161
+銀座 天春	ChIJWxN5ruGLGGARyraHhDpLpxs	Z	P162
+銀座 ハゲ天 銀座本店	ChIJ-fNPOuSLGGARm_lqX9W_5vQ	O	P163
+ホワイト グラス コーヒー	ChIJYcfmTGOLGGAReESqYToNQ8Q	O	P164
+人间関系 cafe de copain	ChIJ76H2VKiMGGARebAiZm_A8X0	O	P165
+珈琲店 nesdays	ChIJD-MiGACLGGAR_w2rqU81Vlo	X	P166
+名曲喫茶ライオン	ChIJFQdviqmMGGAR1muN_DAZFwQ	O	P167
+STREAMER COFFEE COMPANY SHIBUYA	ChIJJ-aF_6aMGGARfbFeJO3hQuU	O	P168
+喫茶 サテラ	ChIJ4VSISMyLGGARlOfA6PW7ga4	O	P169
+ホワイトグラスコーヒー 渋谷店	ChIJYcfmTGOLGGAReESqYToNQ8Q	O	P170
+フリーマン カフェ	ChIJWxYl66eMGGARdIaHqgLs45c	O	P171
+新宿 星のなる木	ChIJm59-ijqNGGARE1Qz5ybMYjI	O	P172
+新宿 車屋別館	ChIJkSMU8dmMGGARU20fByF59WI	O	P173
+美濃吉 新宿住友店	ChIJn2fJGdWMGGAR7Bs_P9tNm4I	O	P174
+新宿 割烹 中嶋	ChIJi5oUHduMGGARtCDZOFfeJas	O	P175
+響 新宿サザンタワー店	ChIJzwyHGdCMGGARgmFrp82i9Kw	O	P176
+日本料理 峰ひろ	ChIJnXwRRyrzGGARMmWw_bhoFV0	X	P177
+鮨割烹 志げる	ChIJB2h0EO6MGGAR31rYtTZG9SQ	?	P178
+日本料理 前田	ChIJDTah3CuNGGARSlZWPBxUhCo	X	P179
+新宿 瀬里奈	ChIJx9IGwMGNGGAR3IFntIiExDE	X	P180
+柿傳	ChIJ--7nndCMGGARFBjhjiEIS_o	O	P181
+割烹 船比佐	ChIJB9Ci4-mMGGARtv6Ovqt1ds8	X	P182
+板前心 菊うら	ChIJazu5zQKNGGAREyAMJNhJV3Q	O	P183
+ろばた結 新宿本店	ChIJmy2dMbONGGARwA76JOifPO0	O	P184
+新宿なだ万賓館	ChIJBxOp3ESNGGARh2NX4jJsd2U	O	P185
+ミア ボッカ コピス吉祥寺店	ChIJNeXSTZnvGGARkyAdKhYZtT4	X	P186
+Pizzeria GG 吉祥寺	ChIJedWyjjfuGGARqr39AWk06Zs	O	P187
+イルキャンティ 吉祥寺店	ChIJu53oWzjuGGARu4PmJT75_Ds	O	P188
+Trattoria e Pizzeria MOTHERS 吉祥寺店	ChIJrbQd7jfuGGAR-v9w1d3R-74	O	P189
+イルキャンティ 吉祥寺	ChIJu53oWzjuGGARu4PmJT75_Ds	O	P190
+六厘舎 東京駅店	ChIJtxODuv6LGGARnELlksWTmZo	O	P191
+ラーメン 雷 丸の内店	ChIJy7scAo-LGGARh1SXDUz9bXQ	?	P192
+東京煮干し らーめん玉 東京駅店	ChIJQ20ZS4uLGGARjYAtnPy9WpQ	O	P193
+斑鳩 東京駅店	ChIJ5wI-efyLGGARp-hRs2vNgD4	O	P194
+四川担担麺 阿吽 キッテ グランシェ店	ChIJdUbpSvqLGGARCmbc6R7hZJ8	X	P195
+中目黒 焼鳥 ももたろう	ChIJB-snJUmLGGAR4KNs-RbgAVY	O	P196
+クシワカ（KUSHIWAKA）	ChIJpaeLCbGLGGAR-YPsSssoqpM	X	P197
+炭火焼き鳥専門店 焼鶏 あきら 中目黒本店	ChIJ1V1L30eLGGARkBygEoWW8yY	O	P198
+Nakameguro 恋しぐれ	ChIJs8KhbdqMGGARXWxh64CFs6s	X	P199
+ハジメ	ChIJoUbCL3H1GGARX4RHZsrGnXk	X	P200
+焼鳥 喜作	ChIJpfjAcimLGGAR65oZslCnZZA	Z	P201
+やきとり 串若丸	ChIJ__-a0U6LGGARyn3JzmT4OXw	O	P202
+中目黒 いぐち 本店	ChIJRZkup0iLGGARdlfLXlp46e0	O	P203
+中目黒ひのや	ChIJQxAyPtn0GGAR0HgTl1grTLI	?	P204
+立道	ChIJnVMW-0WLGGARfm2sIfec85g	?	P205
+炭火焼き鳥 母屋	ChIJvQWIeUKNGGARui9i6uWuV6g	X	P206
+中目黒 焼鳥 つむぎ	ChIJu0mKxwmLGGARlJZcJJK_ZrI	O	P207
+地鶏庵	ChIJd7cyMUmLGGARYypa0_yQIMs	X	P208
+ふくろう亭	ChIJy-px9IgpC18Rrx9YIdlkf-0	O	P209
+夜空の味羊肉（夜空のジンギスカン 本店）	ChIJ_f-jVoQpC18RgV2DhGWN4zE	O	P210
+炭火兜ひつじ	ChIJVVXEiYYpC18R32rcXl8dBh0	O	P211
+さっぽろジンギスカン 本店	ChIJhwg_94UpC18RF0j8TEmLd_o	O	P212
+夜空の味羊肉	ChIJ_f-jVoQpC18RgV2DhGWN4zE	O	P213
+ジンギスカン 羊飼いの店 『白老亭』	ChIJkWU54IUpC18RILG14Mo_wmM	X	P214
+成吉思汗 ふくろう亭	ChIJy-px9IgpC18Rrx9YIdlkf-0	O	P215
+めんよう亭 五条店	ChIJjTgP3IUpC18R3gYTvZ4EHII	O	P216
+祇園 なん波	ChIJO7opKcIIAWARkoH2tY0jk1E	O	P217
+祇園 おかだ	ChIJG897Y8EIAWAR3du21_MjfE8	O	P218
+割烹 智映	ChIJuwMgL58JAWARBZzxqcS6pG0	X	P219
+祇園 ろはん	ChIJI-P4dpwIAWARaKnCn13rN28	O	P220
+割烹 大渡	ChIJzSbocsQIAWAR_nZSJamugG8	O	P221
+祇園 末友	ChIJAWwhhZkIAWARr45BBjZc8Is	O	P222
+実怜	ChIJCa3VkX0IAWARX_ia2Ery9Q0	?	P223
+祇園 うえもり	ChIJG897Y8EIAWARajhCHzqbisk	O	P224
+割烹 八日	ChIJa3rGWAAJAWARr33udcSCHhY	X	P225
+串かつ専門店 串かつ 知留久 本店	ChIJL5qokezmAGARowLEilXv6pw	O	P226
+串かつ だるま ルクア大阪店	ChIJrfIhlY3mAGARqHszwmz38Dg	O	P227
+串かつ 松葉 新梅田食道街店	ChIJJc7FZZLmAGAR1jjQRBK4t1c	O	P228
+立ち呑み 串かつ まるよし	ChIJvzA_K83nAGARe7_B9Sd8E7Q	X	P229
+松葉地下店	ChIJQ1bwrpPmAGARtZXsmD76BFQ	X	P230
+串かつ 七福神	ChIJpxExI-3mAGARumB6rIcdWNY	?	P231
+串かつ まるよし	ChIJ3zgaAnPnAGARnuSgFSpQLyc	X	P232
+串かつ 百式	ChIJLyr2YADnAGAReIBZ79bGFDM	X	P233
+立ち呑み処 松葉地下店	ChIJJc7FZZLmAGAR1jjQRBK4t1c	X	P234
+立ち呑み まる	ChIJlQvaQk3nAGARUqR08F4qGxk	X	P235
+串カツ酒場 えびす 梅田店	ChIJP7hBc0PnAGARUjf32DU-dtk	X	P236
+焼鳥 末広	ChIJteiK_V9cGGAR_MWW_ixCBR0	O	P237
+炭火焼鳥 里葉亭	ChIJY9sy4fRcGGARw4iYzfav7KM	O	P238
+焼鳥 ゑびす	ChIJ9ZZ5SABdGGARkqL7Det8Kb4	O	P239
+やきとり処 いし松	ChIJlTlSsV9cGGARg7KMWDP7hMY	?	P240
+鳥恵	ChIJ2XpD119cGGARNk2ATtUa8rg	X	P241
+やきとり 荒井屋	ChIJTbSLbPRcGGARz3WyUDTmwo4	X	P242
+炭火焼き鳥 榊	ChIJ830S7V9cGGARUXNy-e5Fcs8	O	P243
+鳥恵	ChIJK2Jr0PVcGGARCTkOgrdjK5c	X	P244
+焼鳥 ゑびす丸	ChIJGxPXNQBdGGARmMD1c5jTujc	X	P245
+銀座天一 本店	ChIJbVNcVO-LGGARKdnkhXmDs0s	O	P246
+天ぷら 銀座 おのでら	ChIJB1KbH-mLGGARvVhyTbR9k9Y	O	P247
+銀座 吉平	ChIJtRMt9yWLGGARem4mGnJHyYI	?	P248
+天亭	ChIJLz1g6uiLGGARvGu_MlIMwdQ	O	P249
+てんぷら 浅沼	ChIJ5XMPiEmJGGARxY9sDd3BhOM	O	P250
+銀座天富	ChIJW1dQDgCLGGAR5A4pZkQz_dA	X	P251
+ホワイトグラスコーヒー	ChIJYcfmTGOLGGAReESqYToNQ8Q	O	P252
+名曲・珈琲 新宿 ライオン	ChIJFQdviqmMGGAR1muN_DAZFwQ	?	P253
+珈琲専門店 シャルマン	ChIJzfoPyquMGGARlQr-_HYJwas	O	P254
+HOTEL EMANON	ChIJi543KVGLGGAR8SXA6PFBHRQ	?	P255
+ブルーボトルコーヒー 渋谷カフェ	ChIJiXocb7WNGGAReVVBhRwWLoQ	O	P256
+koe lobby	ChIJoeLd3aiMGGARxygmD9TJhsg	Z	P257
+京懐石 美濃吉 新宿住友店	ChIJn2fJGdWMGGAR7Bs_P9tNm4I	O	P258
+新宿 なだ万	ChIJ-dDhlm2LGGARBIoeY8S4bUU	?	P259
+個室和食 音音 新宿センタービル店	ChIJ7VkXMtSMGGARF_zzhpGZa0s	O	P260
+今半 新宿第一生命ビル店	ChIJc_7ltCrzGGAR2ExiesGimR4	O	P261
+懐石 料理屋 三幸	ChIJK8ENB1uMGGARZFjmMR1Bvus	?	P262
+大志満 新宿店	ChIJ_fFg4taMGGAR9isiiagQt4g	Z	P263
+日本料理 僖成	ChIJZQAzR5yMGGARsI6RXWjVkSo	O	P264
+日本料理 佳香	ChIJDwlszSrzGGARTGOn58BxsMY	Z	P265
+新宿 つな八 総本店	ChIJ03KAfQCNGGARLSdmjEXVUkQ	X	P266
+天ぷら 新宿 綱八 京王店	ChIJsf3b5NCMGGARnEmGa09lha4	O	P267
+割烹 中嶋	ChIJi5oUHduMGGARtCDZOFfeJas	O	P268
+カフェ リゴレット 吉祥寺	ChIJ5zUetkjuGGAR9F9ge6hfR6k	O	P269
+トラットリア チッチョ	ChIJAQAEskjuGGAR4HBNsoj2vdY	O	P270
+カッフェ エ トラットリア ドマーニ 吉祥寺店	ChIJu53oWzjuGGARu4PmJT75_Ds	X	P271
+イル キャンティ 吉祥寺	ChIJu53oWzjuGGARu4PmJT75_Ds	O	P272
+六厘舎 東京駅ラーメンストリート	ChIJtxODuv6LGGARnELlksWTmZo	O	P273
+つじ田 味噌の章 東京駅店	ChIJl0Ku6v2LGGARvpXcXbcA3AM	X	P274
+ラーメン 雷 KITTE丸の内店	ChIJy7scAo-LGGARh1SXDUz9bXQ	?	P275
+東京ギョーザスタンド ウーロン	ChIJoxDq6uGLGGARyH1YW0CfUh4	O	P276
+炭火串焼 喜口屋	ChIJz03SVkiLGGAR0bVq79l63hg	O	P277
+炭火焼き 鳥よし 中目黒店	ChIJIet-TkiLGGARXCtjpLWwA8M	O	P278
+中目黒 炭火焼鳥 塚田	ChIJBXoj2kiLGGAR-sWbX5HtR6s	?	P279
+炭火焼 喜鶏	ChIJa0ko2hqLGGARMAdF1yPoXes	X	P280
+炭火焼き鳥 母屋 中目黒店	ChIJB-snJUmLGGAR4KNs-RbgAVY	X	P281
+焼鳥 つむぎ	ChIJu0mKxwmLGGARlJZcJJK_ZrI	O	P282
+やきとり 茂	ChIJfdeZQjWLGGAR5D-3Ci4a0jU	?	P283
+中目黒 焼鳥 塚田農場	ChIJBXoj2kiLGGAR-sWbX5HtR6s	?	P284
+ジンギスカン 羊飼いの店 『いただきまーす』	ChIJkWU54IUpC18RILG14Mo_wmM	O	P285
+夜空の味羊 本店	ChIJ_f-jVoQpC18RgV2DhGWN4zE	O	P286
+炭坊主	ChIJU6VM5kopC18ROdikpwemQ1w	X	P287
+ふく亭	ChIJzVYwnUYpC18RCwopeo1Q0Ew	?	P288
+ジンギスカン 羊飼いの店 『いただきます。』 2号店	ChIJkWU54IUpC18RILG14Mo_wmM	X	P289
+祇園 おくむら	ChIJq7L-wMEIAWARcD7fxqE5AV0	O	P290
+祇園 津かもと	ChIJJUkcc8EIAWARClLYISAgv_c	X	P291
+祇園 まつもと	ChIJ6dIeosEIAWARXxd2aOzLKjQ	?	P292
+柚子屋旅館 一心居	ChIJ6eNEgjQJAWARD460Vi17rA0	O	P293
+七津屋 ホワイティ梅田店	ChIJC9YpvhDnAGAROkhY6iysbIA	O	P294
+奴	ChIJJc7FZZLmAGARr1tChe-lPWA	O	P295
+立ちぶどう 千本	ChIJH3TKoPLmAGAR5ZPJJR5x7IU	O	P296
+串かつ酒場 ひろかつ 梅田第4ビル店	ChIJz5b3Iu3mAGARK6vdN_2YRtQ	X	P297
+串かつ 百式	ChIJMyRhDoTnAGAR86ARy8OShQI	X	P298
+立呑処 新梅田食道街 松葉地下店	ChIJJc7FZZLmAGAR1jjQRBK4t1c	X	P299
+立喰酒場 金獅子 大阪駅前第4ビル店	ChIJz5b3Iu3mAGARK6vdN_2YRtQ	X	P300
+松葉地下店	ChIJM8ms0Y3mAGARyFLspFNYgTk	X	P301
+串カツ・立ち飲み 勝男 ホワイティうめだ	ChIJH6EIVpLmAGARlsGNaxysEfE	X	P302
+立ちぶどう 千勝串カツ	ChIJOb9YXubnAGARJSMfrkeW5jo	X	P303
+新世界 串かつ だるま 北新地店	ChIJOcBwnO3mAGARm-kXGGsf_X4	O	P304
+大衆酒場 じんべえ	ChIJVVUlo-zmAGAR4WsB2aCjhNg	O	P305
+百式	ChIJgSuk_tHnAGAR4QONF8tvRCE	X	P306

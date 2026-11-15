@@ -1,0 +1,139 @@
+# -*- coding: utf-8 -*-
+"""
+新ショップ推薦エンジンの入出力契約・状態・定数。
+
+上位仕様: 「Travel-sp 新ショップ推薦エンジン — Claude Code詳細実装指示書（確定版）」2026-11-13
+- 推薦 LLM: gemini-3.8-flash / thinking_level=low / REST Interactions API / 非ストリーミング一括
+- Google 検索・外部ツールは使わない（リクエストに tools キーを含めない）
+- Places 照合は 33秒版本番と同じ方式（api_integrations.search_place をそのまま使用）
+"""
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# ---------------------------------------------------------------- 確定設定（自動切替しない）
+MODEL_ID = 'gemini-3.8-flash'
+THINKING_LEVEL = 'low'
+MAX_OUTPUT_TOKENS = 3072
+CANDIDATE_LIMIT = 7          # 推薦 5 + 予備 2
+DISPLAY_COUNT = 5
+INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions'
+INTERACTIONS_API_REVISION = '2026-05-20'   # steps 形式の応答スキーマに固定（公式 May 2026 移行ガイド）
+
+# Places 照合は 33秒版本番の api_integrations.search_place をそのまま使う（legacy_places.py）
+PLACES_MAX_PARALLEL = 7   # 候補ごとの search_place 呼び出しの並列数（上限 7）
+
+# 推薦 LLM の生成スキーマ（指示書 4.1 と同一）
+RECOMMENDATION_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'freshness_intent': {'type': 'string', 'enum': ['not_needed', 'useful', 'essential']},
+        'candidates': {'type': 'array', 'items': {
+            'type': 'object',
+            'properties': {
+                'rank': {'type': 'integer'},
+                'name': {'type': 'string'},
+                'area_hint': {'type': 'string'},
+                'specialty': {'type': 'string'},
+                'reason': {'type': 'string'},
+            },
+            'required': ['rank', 'name', 'area_hint', 'specialty', 'reason'],
+        }},
+    },
+    'required': ['freshness_intent', 'candidates'],
+}
+FRESHNESS_VALUES = ('not_needed', 'useful', 'essential')
+
+# ---------------------------------------------------------------- 同一性判定 LLM（Gate D1.5 PoC）
+# 推薦 LLM と同じモデル・thinking low。別リクエストで、1 検索につき 1 回だけ最大 7 組を一括判定する
+IDENTITY_MAX_OUTPUT_TOKENS = 1024
+IDENTITY_MAX_PAIRS = 7
+SAME = 'SAME'
+DIFFERENT = 'DIFFERENT'
+UNCERTAIN = 'UNCERTAIN'
+IDENTITY_VALUES = (SAME, DIFFERENT, UNCERTAIN)
+IDENTITY_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'results': {'type': 'array', 'items': {
+            'type': 'object',
+            'properties': {
+                'id': {'type': 'integer'},
+                'judgment': {'type': 'string', 'enum': list(IDENTITY_VALUES)},
+                'reason': {'type': 'string'},
+            },
+            'required': ['id', 'judgment', 'reason'],
+        }},
+    },
+    'required': ['results'],
+}
+# 実 Places データを判定 LLM に送るか（既定 OFF）。
+# Google Maps Platform 規約 3.2.3(a)(c)・Service Specific Terms 10 により許容を確認できていないため、
+# 規約確認が済むまで ON にしない。環境変数 NEW_SHOP_LLM_IDENTITY_CHECK=on のときだけ有効。
+IDENTITY_ENV_FLAG = 'NEW_SHOP_LLM_IDENTITY_CHECK'
+
+# ---------------------------------------------------------------- Places 候補選択 LLM（Gate D1.6）
+# 1 検索につき 1 回、最大 7 店舗 × 最大 5 候補。既定 OFF（実 Places データを LLM に送る規約上の許容が未確認）
+SELECTION_MAX_CANDIDATES = 5
+SELECTION_MAX_OUTPUT_TOKENS = 2048
+SELECTION_ENV_FLAG = 'NEW_SHOP_PLACES_SELECTION'
+
+# ---------------------------------------------------------------- 状態
+COMPLETE = 'COMPLETE'        # 5 件
+PARTIAL = 'PARTIAL'          # 1〜4 件
+EMPTY = 'EMPTY'              # 0 件
+ERROR = 'ERROR'
+TIMED_OUT = 'TIMED_OUT'
+
+VERIFIED = 'VERIFIED'
+AMBIGUOUS = 'AMBIGUOUS'
+NOT_VERIFIED = 'NOT_VERIFIED'
+CLOSED = 'CLOSED'
+API_ERROR = 'API_ERROR'
+
+
+class ConfigError(Exception):
+    """必要な設定（API キー等）が無い。旧キー等で黙って代替しない"""
+
+
+class RecommendationError(Exception):
+    """推薦 LLM 呼び出しの失敗。error_type で原因を分類する（秘密情報は含めない）"""
+
+    def __init__(self, error_type: str, detail: str = '', http_status: Optional[int] = None):
+        super().__init__(f'{error_type}: {detail}')
+        self.error_type = error_type
+        self.detail = detail
+        self.http_status = http_status
+
+
+@dataclass
+class Candidate:
+    rank: int
+    name: str
+    area_hint: str
+    specialty: str
+    reason: str
+
+
+@dataclass
+class LlmOutput:
+    freshness_intent: str
+    candidates: List[Candidate]
+    duration_ms: int
+    google_search_calls: int
+    interaction_status: str
+    usage: dict = field(default_factory=dict)
+
+
+@dataclass
+class Verification:
+    candidate: Candidate
+    status: str                      # VERIFIED / AMBIGUOUS / NOT_VERIFIED / CLOSED / API_ERROR
+    reason: str                      # 判定理由（機械可読な短いコード）
+    place: Optional[dict] = None     # VERIFIED のときだけ（カード用。LLM・Live には渡さない）
+    evidence: List[dict] = field(default_factory=list)   # Places 各結果の判定根拠（place_id と判定のみ）
+    duration_ms: int = 0
+
+# ---------------------------------------------------------------- Maps Experience Agent Tools + 選択 LLM（Gate D1.7）
+# 既定 OFF。ON にするには MAPS_AGENT_TOOLS_API_KEY も必要。本番投入にはフロントのカードに
+# Google Maps の出典（attribution・placeUrl）表示が必要（Service Specific Terms §10.2.1）
+AGENT_TOOLS_ENV_FLAG = 'NEW_SHOP_AGENT_TOOLS_SELECTION'
