@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# M4 プレビューの後片付け（Cloud Shell）— S10 本番化（travel-sp-base-prod-b53037f）の後に使う
+# M4 プレビューの後片付け（Cloud Shell）— S10 本番化の後に使う（本番は 100% を受けている 1 つのリビジョン）
 #
 #   bash ~/m4_cleanup_preview.sh                    タグ m4s10 を外す
 #   bash ~/m4_cleanup_preview.sh --delete-secrets   さらにプレビュー用 Secret 3 つを削除する
@@ -13,7 +13,6 @@ set -euo pipefail
 PROJECT_ID="ai-avator-492205"
 REGION="us-central1"
 SERVICE="travel-sp-base"
-PROD_REVISION="travel-sp-base-prod-b53037f"
 TAG="m4s10"
 SECRETS=(m4-preview-recommend-key m4-preview-maps-key m4-preview-bench-token)
 GC=(--project="${PROJECT_ID}" --region="${REGION}")
@@ -24,6 +23,8 @@ REV_FMT='json(spec.containers[0].env[].name,spec.containers[0].env[].valueFrom)'
 
 echo "[1/3] 事前確認（読み取りのみ）"
 gcloud run services describe "${SERVICE}" "${GC[@]}" --format="${SVC_FMT}" > "${WORK}/before.json"
+PROD_REVISION="$(python3 -c "import json,sys; live=[t for t in json.load(open('${WORK}/before.json'))['status']['traffic'] if t.get('percent')]; print(live[0].get('revisionName') if len(live)==1 and live[0].get('percent')==100 else '')")"
+[ -n "${PROD_REVISION}" ] || { echo "停止: 本番トラフィックが 1 つのリビジョンに 100% ではありません（何も変更しません）" >&2; exit 1; }
 gcloud run revisions describe "${PROD_REVISION}" "${GC[@]}" --format="${REV_FMT}" > "${WORK}/prod.json"
 python3 - "${WORK}/before.json" "${WORK}/prod.json" "${PROD_REVISION}" "${SECRETS[*]}" <<'PYEOF'
 import json, sys
